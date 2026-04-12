@@ -133,6 +133,62 @@ function getTty(): string | null {
   return null;
 }
 
+// --- F2: Process-ancestry tmux detection ---
+
+interface TmuxPaneInfo {
+  session: string;
+  window_index: string;
+  window_name: string;
+}
+
+async function detectTmuxPane(): Promise<TmuxPaneInfo | null> {
+  try {
+    // 1. Get all tmux panes with their pane_pid
+    const listProc = Bun.spawn(
+      ["tmux", "list-panes", "-a", "-F", "#{pane_pid} #{session_name} #{window_index} #{window_name}"],
+      { stdout: "pipe", stderr: "ignore" }
+    );
+    const listText = await new Response(listProc.stdout).text();
+    const listCode = await listProc.exited;
+    if (listCode !== 0) return null;
+
+    // 2. Parse into a map keyed by pane_pid
+    const paneMap = new Map<number, TmuxPaneInfo>();
+    for (const line of listText.trim().split("\n")) {
+      const parts = line.trim().split(" ");
+      if (parts.length >= 4) {
+        const pid = parseInt(parts[0]!, 10);
+        if (!isNaN(pid)) {
+          paneMap.set(pid, {
+            session: parts[1]!,
+            window_index: parts[2]!,
+            window_name: parts.slice(3).join(" "),
+          });
+        }
+      }
+    }
+
+    if (paneMap.size === 0) return null;
+
+    // 3. Walk upward from process.ppid
+    let currentPid = process.ppid;
+    for (let i = 0; i < 20; i++) {
+      if (paneMap.has(currentPid)) {
+        return paneMap.get(currentPid)!;
+      }
+      // Get parent of currentPid
+      const psProc = Bun.spawnSync(["ps", "-o", "ppid=", "-p", String(currentPid)]);
+      const ppidStr = new TextDecoder().decode(psProc.stdout).trim();
+      const parentPid = parseInt(ppidStr, 10);
+      if (isNaN(parentPid) || parentPid <= 1) break;
+      currentPid = parentPid;
+    }
+  } catch {
+    // tmux not installed or not running — graceful failure
+  }
+  return null;
+}
+
 // --- State ---
 
 let myId: PeerId | null = null;
@@ -219,6 +275,24 @@ const TOOLS = [
     },
   },
   {
+    name: "find_peer",
+    description:
+      "Find Claude Code instances by human-readable name (set via CLAUDE_PEER_NAME env var) or tmux session. Returns matching peer IDs.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        name: {
+          type: "string" as const,
+          description: "Exact match on the peer's CLAUDE_PEER_NAME",
+        },
+        tmux: {
+          type: "string" as const,
+          description: "Match against tmux session name",
+        },
+      },
+    },
+  },
+  {
     name: "check_messages",
     description:
       "Manually check for new messages from other Claude Code instances. Messages are normally pushed automatically via channel notifications, but you can use this as a fallback.",
@@ -266,8 +340,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             `PID: ${p.pid}`,
             `CWD: ${p.cwd}`,
           ];
+          if (p.name) parts.push(`Name: ${p.name}`);
           if (p.git_root) parts.push(`Repo: ${p.git_root}`);
           if (p.tty) parts.push(`TTY: ${p.tty}`);
+          if (p.tmux_session) parts.push(`Tmux: ${p.tmux_session}:${p.tmux_window_index}:${p.tmux_window_name}`);
           if (p.summary) parts.push(`Summary: ${p.summary}`);
           parts.push(`Last seen: ${p.last_seen}`);
           return parts.join("\n  ");
@@ -351,6 +427,42 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
               text: `Error setting summary: ${e instanceof Error ? e.message : String(e)}`,
             },
           ],
+          isError: true,
+        };
+      }
+    }
+
+    case "find_peer": {
+      const { name: findName, tmux: findTmux } = args as { name?: string; tmux?: string };
+      if (!findName && !findTmux) {
+        return {
+          content: [{ type: "text" as const, text: "Provide at least one of: name, tmux" }],
+          isError: true,
+        };
+      }
+      try {
+        const allPeers = await brokerFetch<Peer[]>("/list-peers", {
+          scope: "machine" as const,
+          cwd: myCwd,
+          git_root: myGitRoot,
+        });
+        const matches = allPeers.filter((p) => {
+          if (findName && p.name !== findName) return false;
+          if (findTmux && p.tmux_session !== findTmux) return false;
+          return true;
+        });
+        if (matches.length === 0) {
+          return {
+            content: [{ type: "text" as const, text: `No peers found matching${findName ? ` name="${findName}"` : ""}${findTmux ? ` tmux="${findTmux}"` : ""}` }],
+          };
+        }
+        const lines = matches.map((p) => `${p.id}${p.name ? ` (${p.name})` : ""}${p.tmux_session ? ` [tmux ${p.tmux_session}:${p.tmux_window_name}]` : ""}`);
+        return {
+          content: [{ type: "text" as const, text: `Found ${matches.length} peer(s):\n${lines.join("\n")}` }],
+        };
+      } catch (e) {
+        return {
+          content: [{ type: "text" as const, text: `Error finding peers: ${e instanceof Error ? e.message : String(e)}` }],
           isError: true,
         };
       }
@@ -458,10 +570,14 @@ async function main() {
   myCwd = process.cwd();
   myGitRoot = await getGitRoot(myCwd);
   const tty = getTty();
+  const peerName = process.env.CLAUDE_PEER_NAME ?? null;
+  const tmuxInfo = await detectTmuxPane();
 
   log(`CWD: ${myCwd}`);
   log(`Git root: ${myGitRoot ?? "(none)"}`);
   log(`TTY: ${tty ?? "(unknown)"}`);
+  if (peerName) log(`Peer name: ${peerName}`);
+  if (tmuxInfo) log(`Tmux: ${tmuxInfo.session}:${tmuxInfo.window_index}:${tmuxInfo.window_name}`);
 
   // 3. Generate initial summary via gpt-5.4-nano (non-blocking, best-effort)
   let initialSummary = "";
@@ -487,12 +603,21 @@ async function main() {
   // Wait briefly for summary, but don't block startup
   await Promise.race([summaryPromise, new Promise((r) => setTimeout(r, 3000))]);
 
+  // Prepend tmux tag to summary if detected
+  if (tmuxInfo && initialSummary) {
+    initialSummary = `[tmux ${tmuxInfo.session}:${tmuxInfo.window_name}] ${initialSummary}`;
+  }
+
   // 4. Register with broker
   const reg = await brokerFetch<RegisterResponse>("/register", {
     pid: process.pid,
     cwd: myCwd,
     git_root: myGitRoot,
     tty,
+    name: peerName,
+    tmux_session: tmuxInfo?.session ?? null,
+    tmux_window_index: tmuxInfo?.window_index ?? null,
+    tmux_window_name: tmuxInfo?.window_name ?? null,
     summary: initialSummary,
   });
   myId = reg.id;
@@ -502,6 +627,10 @@ async function main() {
   if (!initialSummary) {
     summaryPromise.then(async () => {
       if (initialSummary && myId) {
+        // Prepend tmux tag to late summary
+        if (tmuxInfo) {
+          initialSummary = `[tmux ${tmuxInfo.session}:${tmuxInfo.window_name}] ${initialSummary}`;
+        }
         try {
           await brokerFetch("/set-summary", { id: myId, summary: initialSummary });
           log(`Late auto-summary applied: ${initialSummary}`);
