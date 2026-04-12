@@ -58,6 +58,21 @@ db.run(`
   )
 `);
 
+// --- Idempotent schema migrations (F1+F2) ---
+const migrationColumns = [
+  { name: "name", type: "TEXT" },
+  { name: "tmux_session", type: "TEXT" },
+  { name: "tmux_window_index", type: "TEXT" },
+  { name: "tmux_window_name", type: "TEXT" },
+];
+for (const col of migrationColumns) {
+  try {
+    db.run(`ALTER TABLE peers ADD COLUMN ${col.name} ${col.type}`);
+  } catch {
+    // Column already exists — safe to ignore
+  }
+}
+
 // Clean up stale peers (PIDs that no longer exist) on startup
 function cleanStalePeers() {
   const peers = db.query("SELECT id, pid FROM peers").all() as { id: string; pid: number }[];
@@ -81,8 +96,8 @@ setInterval(cleanStalePeers, 30_000);
 // --- Prepared statements ---
 
 const insertPeer = db.prepare(`
-  INSERT INTO peers (id, pid, cwd, git_root, tty, summary, registered_at, last_seen)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO peers (id, pid, cwd, git_root, tty, name, tmux_session, tmux_window_index, tmux_window_name, summary, registered_at, last_seen)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const updateLastSeen = db.prepare(`
@@ -145,7 +160,7 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
     deletePeer.run(existing.id);
   }
 
-  insertPeer.run(id, body.pid, body.cwd, body.git_root, body.tty, body.summary, now, now);
+  insertPeer.run(id, body.pid, body.cwd, body.git_root, body.tty, body.name ?? null, body.tmux_session ?? null, body.tmux_window_index ?? null, body.tmux_window_name ?? null, body.summary, now, now);
   return { id };
 }
 
