@@ -2,8 +2,8 @@
  * Generate a 1-2 sentence summary of what a Claude Code instance is likely
  * working on, based on its working directory and git context.
  *
- * Uses OpenAI's gpt-5.4-nano for cheap, fast inference.
- * Requires OPENAI_API_KEY environment variable.
+ * Uses Anthropic's Claude Haiku for cheap, fast inference.
+ * Requires ANTHROPIC_API_KEY environment variable.
  * Falls back gracefully if unavailable.
  */
 
@@ -13,7 +13,7 @@ export async function generateSummary(context: {
   git_branch?: string | null;
   recent_files?: string[];
 }): Promise<string | null> {
-  const apiKey = process.env.OPENAI_API_KEY;
+  const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
     return null;
   }
@@ -30,27 +30,24 @@ export async function generateSummary(context: {
   }
 
   try {
-    const res = await fetch("https://api.openai.com/v1/chat/completions", {
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
       },
       body: JSON.stringify({
-        model: "gpt-5.4-nano",
+        model: "claude-haiku-4-5-20250414",
+        system:
+          "You generate brief summaries of what a developer is working on based on their project context. Respond with exactly 1-2 sentences, no more. Be specific about the project name and likely task.",
         messages: [
-          {
-            role: "system",
-            content:
-              "You generate brief summaries of what a developer is working on based on their project context. Respond with exactly 1-2 sentences, no more. Be specific about the project name and likely task.",
-          },
           {
             role: "user",
             content: `Based on this context, what is this developer likely working on?\n\n${parts.join("\n")}`,
           },
         ],
         max_tokens: 100,
-        temperature: 0.3,
       }),
       signal: AbortSignal.timeout(5000),
     });
@@ -60,9 +57,9 @@ export async function generateSummary(context: {
     }
 
     const data = (await res.json()) as {
-      choices: Array<{ message: { content: string } }>;
+      content: Array<{ text: string }>;
     };
-    return data.choices[0]?.message?.content?.trim() ?? null;
+    return data.content[0]?.text?.trim() ?? null;
   } catch {
     return null;
   }
