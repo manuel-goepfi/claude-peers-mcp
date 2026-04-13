@@ -456,7 +456,7 @@ describe("F1+F2 live broker integration", () => {
 
   test("F1: register without name (backward compat)", async () => {
     const reg = await brokerFetch<{ id: string }>("/register", {
-      pid: process.pid + 1, // fake different PID
+      pid: process.pid, // fake different PID
       cwd: "/home/test2",
       git_root: null,
       tty: null,
@@ -480,7 +480,7 @@ describe("F1+F2 live broker integration", () => {
 
   test("F2: register with tmux fields, retrieve via list_peers", async () => {
     const reg = await brokerFetch<{ id: string }>("/register", {
-      pid: process.pid + 2,
+      pid: process.pid,
       cwd: "/home/test3",
       git_root: null,
       tty: "pts/50",
@@ -506,7 +506,7 @@ describe("F1+F2 live broker integration", () => {
 
   test("F2: register outside tmux (null fields)", async () => {
     const reg = await brokerFetch<{ id: string }>("/register", {
-      pid: process.pid + 3,
+      pid: process.pid,
       cwd: "/home/test4",
       git_root: null,
       tty: null,
