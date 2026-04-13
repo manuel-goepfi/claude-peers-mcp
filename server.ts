@@ -25,7 +25,6 @@ import type {
   RegisterResponse,
   PollMessagesResponse,
   Message,
-  AckMessagesRequest,
 } from "./shared/types.ts";
 import {
   generateSummary,
@@ -519,14 +518,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           if (findTmux && p.tmux_session !== findTmux) return false;
           return true;
         });
+        const pending = await drainPendingMessages();
         if (matches.length === 0) {
           return {
-            content: [{ type: "text" as const, text: `No peers found matching${findName ? ` name="${findName}"` : ""}${findTmux ? ` tmux="${findTmux}"` : ""}` }],
+            content: [{ type: "text" as const, text: `No peers found matching${findName ? ` name="${findName}"` : ""}${findTmux ? ` tmux="${findTmux}"` : ""}${pending ?? ""}` }],
           };
         }
         const lines = matches.map((p) => `${p.id}${p.name ? ` (${p.name})` : ""}${p.tmux_session ? ` [tmux ${p.tmux_session}:${p.tmux_window_name}]` : ""}`);
         return {
-          content: [{ type: "text" as const, text: `Found ${matches.length} peer(s):\n${lines.join("\n")}` }],
+          content: [{ type: "text" as const, text: `Found ${matches.length} peer(s):\n${lines.join("\n")}${pending ?? ""}` }],
         };
       } catch (e) {
         return {
@@ -789,16 +789,22 @@ async function main() {
   }, HEARTBEAT_INTERVAL_MS);
 
   // 8. Prune confirmedDeliveredIds and localMessageBuffer periodically
+  // Caps raised from upstream PR #25 defaults (1000/200) to (5000/1000) to
+  // reduce the data-loss window in heavy-peer sessions. The localMessageBuffer
+  // overflow path acks-and-drops undelivered messages — only triggered if no
+  // tool call drains the buffer for several minutes.
+  const DEDUP_CAP = 5000;
+  const DEDUP_DRAIN_TO = 2500;
+  const BUFFER_CAP = 1000;
+  const BUFFER_DRAIN_TO = 500;
   const pruneTimer = setInterval(() => {
-    if (confirmedDeliveredIds.size > 1000) {
+    if (confirmedDeliveredIds.size > DEDUP_CAP) {
       const arr = [...confirmedDeliveredIds];
-      const toRemove = arr.slice(0, arr.length - 500);
+      const toRemove = arr.slice(0, arr.length - DEDUP_DRAIN_TO);
       for (const id of toRemove) confirmedDeliveredIds.delete(id);
     }
-    // Cap the local buffer if no tool calls drain it for a long time.
-    // Ack pruned messages with broker to prevent zombie re-delivery cycle.
-    if (localMessageBuffer.length > 200) {
-      const removed = localMessageBuffer.splice(0, localMessageBuffer.length - 100);
+    if (localMessageBuffer.length > BUFFER_CAP) {
+      const removed = localMessageBuffer.splice(0, localMessageBuffer.length - BUFFER_DRAIN_TO);
       const removedIds = removed.map((m) => m.id);
       for (const id of removedIds) confirmedDeliveredIds.add(id);
       if (myId) {
@@ -806,7 +812,7 @@ async function main() {
       }
       localBufferIds.clear();
       for (const m of localMessageBuffer) localBufferIds.add(m.id);
-      log(`WARNING: Pruned ${removed.length} undelivered messages from local buffer (overflow)`);
+      log(`WARNING: Pruned ${removed.length} undelivered messages from local buffer (overflow at ${BUFFER_CAP})`);
     }
   }, 60_000);
 
