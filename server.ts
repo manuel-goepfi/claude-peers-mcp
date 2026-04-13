@@ -40,6 +40,7 @@ const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const BROKER_SCRIPT = new URL("./broker.ts", import.meta.url).pathname;
 const BROKER_LOG = `${process.env.HOME}/.claude-peers-broker.log`;
+const BROKER_LOG_MAX_BYTES = 10 * 1024 * 1024; // 10MB
 
 // --- Broker communication ---
 
@@ -65,12 +66,25 @@ async function isBrokerAlive(): Promise<boolean> {
   }
 }
 
+async function rotateBrokerLogIfLarge(): Promise<void> {
+  try {
+    const file = Bun.file(BROKER_LOG);
+    if ((await file.exists()) && file.size > BROKER_LOG_MAX_BYTES) {
+      // Move current log to .old, overwriting any previous .old
+      Bun.spawnSync(["mv", "-f", BROKER_LOG, `${BROKER_LOG}.old`]);
+    }
+  } catch {
+    // Best-effort rotation — never block broker startup
+  }
+}
+
 async function ensureBroker(): Promise<void> {
   if (await isBrokerAlive()) {
     log("Broker already running");
     return;
   }
 
+  await rotateBrokerLogIfLarge();
   log(`Starting broker daemon (log: ${BROKER_LOG})...`);
   const proc = Bun.spawn(["bun", BROKER_SCRIPT], {
     // Redirect stderr to a log file instead of inheriting — inheriting causes
