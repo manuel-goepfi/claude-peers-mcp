@@ -10,6 +10,7 @@ import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { Database } from "bun:sqlite";
 import type { Peer, RegisterRequest } from "../shared/types.ts";
 import { parseTmuxPanes, parsePsTree } from "../shared/tmux.ts";
+import { generateSummary } from "../shared/summarize.ts";
 
 // --- Broker-level tests (schema + registration + queries) ---
 
@@ -574,5 +575,116 @@ describe("F1+F2 live broker integration", () => {
     expect(found!.tmux_session).toBeNull();
     expect(found!.tmux_window_index).toBeNull();
     expect(found!.tmux_window_name).toBeNull();
+  });
+});
+
+// --- N10: generateSummary deterministic helper (replaces the AI version) ---
+
+describe("generateSummary (deterministic git-based)", () => {
+  test("project name from git_root basename", () => {
+    expect(generateSummary({ cwd: "/tmp", git_root: "/home/manzo/claude-peers-mcp" })).toBe("claude-peers-mcp");
+  });
+
+  test("falls back to cwd basename when git_root is null", () => {
+    expect(generateSummary({ cwd: "/home/user/some-project", git_root: null })).toBe("some-project");
+  });
+
+  test("suppresses 'main' branch from output", () => {
+    expect(generateSummary({ cwd: "/", git_root: "/x", git_branch: "main" })).toBe("x");
+  });
+
+  test("suppresses 'master' branch from output", () => {
+    expect(generateSummary({ cwd: "/", git_root: "/x", git_branch: "master" })).toBe("x");
+  });
+
+  test("includes non-default branch in parentheses", () => {
+    expect(generateSummary({ cwd: "/", git_root: "/x", git_branch: "feat/foo" })).toBe("x (feat/foo)");
+  });
+
+  test("includes first recent file with em-dash separator", () => {
+    expect(generateSummary({ cwd: "/", git_root: "/proj", recent_files: ["src/index.ts"] })).toBe("proj — editing src/index.ts");
+  });
+
+  test("appends +N suffix when more than one recent file", () => {
+    expect(generateSummary({
+      cwd: "/", git_root: "/proj",
+      recent_files: ["a.ts", "b.ts", "c.ts"]
+    })).toBe("proj — editing a.ts +2");
+  });
+
+  test("combines branch and recent file", () => {
+    expect(generateSummary({
+      cwd: "/", git_root: "/proj",
+      git_branch: "fix/bug",
+      recent_files: ["x.ts"]
+    })).toBe("proj (fix/bug) — editing x.ts");
+  });
+
+  test("empty recent_files array does not add separator", () => {
+    expect(generateSummary({ cwd: "/", git_root: "/proj", recent_files: [] })).toBe("proj");
+  });
+
+  test("regression guard: function is synchronous, not async", () => {
+    // generateSummary used to be `async` (legacy from the API-call era).
+    // Post-refactor it MUST be sync. If someone re-adds `async` this fails.
+    const result = generateSummary({ cwd: "/", git_root: "/x" });
+    expect(typeof result).toBe("string");
+    expect(result).not.toBeInstanceOf(Promise);
+  });
+});
+
+// --- N5: ALTER TABLE re-throw negative path ---
+
+describe("M5 ALTER TABLE strict catch (re-throw on non-duplicate-column)", () => {
+  // Replicates the broker.ts migration loop error handling: only swallows
+  // "duplicate column name" errors; everything else must propagate.
+
+  function migrateColumnsStrict(
+    db: Database,
+    cols: { name: string; type: string }[]
+  ): void {
+    for (const col of cols) {
+      try {
+        db.run(`ALTER TABLE peers ADD COLUMN ${col.name} ${col.type}`);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        if (!msg.includes("duplicate column name")) {
+          throw e;
+        }
+      }
+    }
+  }
+
+  test("happy path: add new columns then re-run is idempotent", () => {
+    const db = new Database(":memory:");
+    db.run("CREATE TABLE peers (id TEXT PRIMARY KEY)");
+    expect(() =>
+      migrateColumnsStrict(db, [{ name: "x", type: "TEXT" }, { name: "y", type: "TEXT" }])
+    ).not.toThrow();
+    // Re-run should also not throw (idempotent)
+    expect(() =>
+      migrateColumnsStrict(db, [{ name: "x", type: "TEXT" }, { name: "y", type: "TEXT" }])
+    ).not.toThrow();
+    db.close();
+  });
+
+  test("non-duplicate-column error MUST propagate (not silently swallowed)", () => {
+    const db = new Database(":memory:");
+    db.run("CREATE TABLE peers (id TEXT PRIMARY KEY)");
+    // Inject a syntax error via an invalid type — SQLite raises a non-duplicate
+    // error, which our catch must re-throw.
+    expect(() =>
+      migrateColumnsStrict(db, [{ name: "bad", type: "INVALID_TYPE_NAME(((" }])
+    ).toThrow();
+    db.close();
+  });
+
+  test("re-throws on missing table (not 'duplicate column name')", () => {
+    const db = new Database(":memory:");
+    // No CREATE TABLE — ALTER on missing table raises a different error.
+    expect(() =>
+      migrateColumnsStrict(db, [{ name: "x", type: "TEXT" }])
+    ).toThrow();
+    db.close();
   });
 });

@@ -1,8 +1,8 @@
 /**
  * Generate a 1-2 sentence summary of what a Claude Code instance is working on.
  *
- * Pure function — derives the summary deterministically from git context.
- * No network calls, no API keys, no failure modes. Free.
+ * Deterministic — derives the summary from git context with no network calls,
+ * no API keys, and no failure modes. Returns null only if every input is empty.
  *
  * Replaces the previous Anthropic API integration (PR #25-era code that called
  * Claude Haiku for the same purpose). The AI version added an external dependency,
@@ -13,12 +13,12 @@
 
 import { basename } from "node:path";
 
-export async function generateSummary(context: {
+export function generateSummary(context: {
   cwd: string;
   git_root: string | null;
   git_branch?: string | null;
   recent_files?: string[];
-}): Promise<string | null> {
+}): string | null {
   const project = basename(context.git_root || context.cwd);
   const parts = [project];
 

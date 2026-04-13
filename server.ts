@@ -19,7 +19,13 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { openSync, statSync, existsSync } from "node:fs";
+import { openSync, closeSync, statSync, existsSync } from "node:fs";
+
+// --- Tiny error formatting helper (avoids the e instanceof Error ternary
+//     repeated at every catch site) ---
+function errMsg(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
 import type {
   PeerId,
   Peer,
@@ -70,18 +76,16 @@ async function isBrokerAlive(): Promise<boolean> {
 
 function rotateBrokerLogIfLarge(): void {
   try {
-    if (existsSync(BROKER_LOG)) {
-      // Use fresh statSync — Bun.file().size is cached at file-handle creation
-      // and does not refresh after .exists() resolves.
-      const size = statSync(BROKER_LOG).size;
-      if (size > BROKER_LOG_MAX_BYTES) {
-        // Move current log to .old, overwriting any previous .old
-        Bun.spawnSync(["mv", "-f", BROKER_LOG, `${BROKER_LOG}.old`]);
-      }
-    }
+    if (!existsSync(BROKER_LOG)) return;
+    // Fresh statSync — Bun.file().size is cached at file-handle creation
+    // and does not refresh after .exists() resolves.
+    const size = statSync(BROKER_LOG).size;
+    if (size <= BROKER_LOG_MAX_BYTES) return;
+    // Move current log to .old, overwriting any previous .old
+    Bun.spawnSync(["mv", "-f", BROKER_LOG, `${BROKER_LOG}.old`]);
   } catch (e) {
     // Best-effort rotation — never block broker startup, but surface the error
-    log(`Log rotation failed (non-blocking): ${e instanceof Error ? e.message : String(e)}`);
+    log(`Log rotation failed (non-blocking): ${errMsg(e)}`);
   }
 }
 
@@ -102,6 +106,10 @@ async function ensureBroker(): Promise<void> {
   const proc = Bun.spawn(["bun", BROKER_SCRIPT], {
     stdio: ["ignore", "ignore", logFd],
   });
+  // Close parent's copy of the fd — the child has its own dup. Without this
+  // we leak one fd per ensureBroker() call AND the parent holding the fd
+  // blocks the SIGPIPE-on-close behavior that motivated PR #34 in the first place.
+  closeSync(logFd);
 
   // Unref so this process can exit without waiting for the broker
   proc.unref();
@@ -136,8 +144,10 @@ async function getGitRoot(cwd: string): Promise<string | null> {
     if (code === 0) {
       return text.trim();
     }
-  } catch {
-    // not a git repo
+    // Non-zero exit (most common: not a git repo) — return null silently.
+  } catch (e) {
+    // Spawn-level failures: git binary not found, OOM, etc. Worth a log line.
+    log(`getGitRoot: spawn failed — ${errMsg(e)}`);
   }
   return null;
 }
@@ -153,8 +163,8 @@ function getTty(): string | null {
         return tty;
       }
     }
-  } catch {
-    // ignore
+  } catch (e) {
+    log(`getTty: ${errMsg(e)}`);
   }
   return null;
 }
@@ -227,6 +237,34 @@ const confirmedDeliveredIds = new Set<number>();
 // to append to any tool response. This ensures messages arrive even when
 // channel push fails — Claude gets them on the next tool call of any kind.
 
+// Acknowledge a batch of message IDs to the broker AND mark them locally as
+// confirmed-delivered. This is the SHARED logic between drainPendingMessages
+// (piggyback path) and check_messages (explicit path).
+//
+// Critical invariant: this function is called AFTER the messages have been
+// rendered into a tool response that Claude will read. The display itself is
+// the actual delivery point — once Claude has the text, the message has been
+// delivered regardless of whether the broker's `delivered=1` flag gets set.
+//
+// Therefore we add to confirmedDeliveredIds UNCONDITIONALLY after the display.
+// If the broker ack fails (network error, old broker without /ack-messages),
+// the broker keeps its `delivered=0` row but we know we already showed it; the
+// dedup add prevents re-display from this session. On session restart the
+// dedup set is gone and any still-undelivered broker rows will re-deliver,
+// which is the safety net.
+async function ackAndDedup(ids: number[], context: string): Promise<void> {
+  if (!myId || ids.length === 0) return;
+  try {
+    await brokerFetch("/ack-messages", { id: myId, ids });
+  } catch (e) {
+    // Either an old broker without /ack-messages or a transient network blip.
+    // Surface in log — the local dedup add below is still correct (we already
+    // showed the messages to Claude before calling this function).
+    log(`${context}: ack failed — ${errMsg(e)}`);
+  }
+  for (const id of ids) confirmedDeliveredIds.add(id);
+}
+
 async function drainPendingMessages(): Promise<string | null> {
   if (!myId) return null;
   const buffered = localMessageBuffer.splice(0, localMessageBuffer.length);
@@ -234,26 +272,14 @@ async function drainPendingMessages(): Promise<string | null> {
   const unseen = buffered.filter((m) => !confirmedDeliveredIds.has(m.id));
   if (unseen.length === 0) return null;
 
-  const ids = unseen.map((m) => m.id);
-  let ackOk = false;
-  try {
-    await brokerFetch("/ack-messages", { id: myId, ids });
-    ackOk = true;
-  } catch (e) {
-    // Either old broker without /ack-messages endpoint OR transient network failure.
-    // Either way: surface in log so silent ack drops are observable.
-    log(`drainPendingMessages: ack failed — ${e instanceof Error ? e.message : String(e)}`);
-  }
-
-  // Only add to local dedup if the broker confirmed the ack. Otherwise leave the
-  // IDs unconfirmed so the next poll cycle can retry — the messages still appear
-  // in the tool response below, so Claude sees them exactly once per session.
-  if (ackOk) {
-    for (const id of ids) confirmedDeliveredIds.add(id);
-  }
-
   const lines = unseen.map((m) => `From ${m.from_id} (${m.sent_at}):\n${m.text}`);
-  return `\n\n---\n${unseen.length} pending peer message(s):\n\n${lines.join("\n\n---\n\n")}`;
+  const display = `\n\n---\n${unseen.length} pending peer message(s):\n\n${lines.join("\n\n---\n\n")}`;
+
+  // Display IS delivery — ack + dedup unconditionally after building the
+  // response text (which the caller appends to the tool result).
+  await ackAndDedup(unseen.map((m) => m.id), "drainPendingMessages");
+
+  return display;
 }
 
 // --- MCP Server ---
@@ -575,21 +601,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           };
         }
 
-        // Explicitly ack all messages we're returning, then add to local dedup
-        // ONLY if the ack succeeded — otherwise leave them unconfirmed so the
-        // next poll cycle can retry.
-        const ids = allMessages.map((m) => m.id);
-        let ackOk = false;
-        try {
-          await brokerFetch("/ack-messages", { id: myId, ids });
-          ackOk = true;
-        } catch (e) {
-          log(`check_messages: ack failed — ${e instanceof Error ? e.message : String(e)}`);
-        }
-
-        if (ackOk) {
-          for (const id of ids) confirmedDeliveredIds.add(id);
-        }
+        // Display IS delivery. ackAndDedup adds to local dedup unconditionally
+        // after we build the response text below.
+        await ackAndDedup(allMessages.map((m) => m.id), "check_messages");
 
         const lines = allMessages.map(
           (m) => `From ${m.from_id} (${m.sent_at}):\n${m.text}`
@@ -720,7 +734,7 @@ async function main() {
     try {
       const branch = await getGitBranch(myCwd);
       const recentFiles = await getRecentFiles(myCwd);
-      const summary = await generateSummary({
+      const summary = generateSummary({
         cwd: myCwd,
         git_root: myGitRoot,
         git_branch: branch,
@@ -804,10 +818,14 @@ async function main() {
 
   // 8. Prune confirmedDeliveredIds and localMessageBuffer periodically.
   //
-  // Caps reference: upstream PR #25 used DEDUP_CAP=1000 / BUFFER_CAP=200.
-  // Fork raises to DEDUP_CAP=5000 / BUFFER_CAP=10000 to make overflow practically
-  // unreachable. At 1 message/sec sustained without ANY tool call, that is ~3
-  // hours of pure inbound before the buffer overflows.
+  // Cap history (this fork's main):
+  //   - upstream louislva PR #25 originally:    DEDUP_CAP=1000 / BUFFER_CAP=200
+  //   - fork commit 9264a0b raised to:          DEDUP_CAP=5000 / BUFFER_CAP=1000
+  //   - fork commit e3f535f raised again to:    DEDUP_CAP=5000 / BUFFER_CAP=10000
+  //
+  // BUFFER_CAP=10000 makes overflow practically unreachable. At 1 message/sec
+  // sustained without ANY tool call (which would drain via piggyback), that is
+  // ~2.8 hours of pure inbound before the buffer overflows.
   //
   // Overflow handling change from upstream: we DO NOT ack pruned messages to
   // the broker. Upstream's behavior was silent data loss (broker thinks delivered,

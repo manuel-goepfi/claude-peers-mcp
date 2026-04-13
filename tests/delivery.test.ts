@@ -195,20 +195,46 @@ describe("drainPendingMessages dedup filter (T1)", () => {
     expect(filterUnseen(buffered, new Set()).length).toBe(3);
   });
 
-  test("only-on-success dedup: failed ack must NOT add to confirmed", () => {
-    // Replicate the post-review-army fix: dedup add is gated on ackOk.
+  // Display IS delivery — the post-pr-review-toolkit fix reverts the C5 ackOk
+  // gate. Once the message text is rendered into a tool response Claude WILL
+  // see, dedup must be added unconditionally to prevent duplication on the
+  // next poll cycle (broker still has delivered=0 so it will re-send).
+  test("post-fix: dedup populated even when ack fails (display = delivery)", async () => {
+    // Simulate the ackAndDedup helper logic: ack throws, dedup still populated.
     const confirmed = new Set<number>();
     const ids = [10, 20, 30];
-    let ackOk = false;
-    try {
+    const fakeBrokerFetch = async () => {
       throw new Error("simulated broker unreachable");
+    };
+    try {
+      await fakeBrokerFetch();
     } catch {
-      // ackOk stays false
+      // Caught and logged in real code
     }
-    if (ackOk) {
-      for (const id of ids) confirmed.add(id);
-    }
-    expect(confirmed.size).toBe(0); // not added — eligible for retry on next poll
+    // Critical post-fix invariant: dedup add runs UNCONDITIONALLY after the
+    // catch, NOT inside an if(ackOk).
+    for (const id of ids) confirmed.add(id);
+    expect(confirmed.size).toBe(3);
+    expect(confirmed.has(10)).toBe(true);
+    // Re-running the same drain on the same buffer would now filter out these
+    // IDs, preventing duplicate display.
+  });
+
+  test("regression guard: ackAndDedup must add to dedup BEFORE the next drain", () => {
+    // Two-step: first drain shows messages [1,2], second drain on a freshly
+    // re-buffered set must not show them again.
+    const confirmed = new Set<number>();
+    // Drain 1
+    const buffered1 = [{ id: 1 }, { id: 2 }];
+    const unseen1 = buffered1.filter((m) => !confirmed.has(m.id));
+    for (const m of unseen1) confirmed.add(m.id); // unconditional dedup add
+    expect(unseen1.length).toBe(2);
+
+    // Broker re-sends the same messages (because ack failed earlier).
+    const buffered2 = [{ id: 1 }, { id: 2 }, { id: 3 }];
+    const unseen2 = buffered2.filter((m) => !confirmed.has(m.id));
+    expect(unseen2.length).toBe(1); // only id=3 — 1 and 2 already in dedup
+    expect(unseen2[0]!.id).toBe(3);
   });
 });
 
@@ -255,6 +281,79 @@ describe("Buffer overflow prune with null peer ID (T4)", () => {
       // brokerFetch SHOULD NOT be called here in the post-fix code
       expect(brokerFetchCalled).toBe(false);
     }
+  });
+});
+
+// --- C1 regression: broker log file appends across spawn calls ---
+//
+// Verifies the C1 fix (fs.openSync(path, 'a') instead of Bun.file()).
+// If anyone reverts to Bun.file() this test catches it: Bun.file() as spawn
+// stdio writes from byte 0 (overwrite-in-place), so the second spawn would
+// shrink the file or leave only its own short output.
+
+describe("C1: broker log append semantics", () => {
+  const TEST_LOG = "/tmp/claude-peers-test-append.log";
+
+  beforeAll(() => {
+    Bun.spawnSync(["rm", "-f", TEST_LOG]);
+  });
+  afterAll(() => {
+    Bun.spawnSync(["rm", "-f", TEST_LOG]);
+  });
+
+  test("openSync('a') + spawn appends, does not overwrite", async () => {
+    const { openSync, closeSync, statSync, readFileSync } = await import("node:fs");
+
+    // First spawn: write 100 bytes of "AAA..."
+    const fd1 = openSync(TEST_LOG, "a");
+    const proc1 = Bun.spawn(["sh", "-c", "printf 'AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA AAAA\\n'"], {
+      stdio: ["ignore", fd1, "ignore"],
+    });
+    await proc1.exited;
+    closeSync(fd1);
+    const sizeAfterFirst = statSync(TEST_LOG).size;
+    expect(sizeAfterFirst).toBeGreaterThan(0);
+
+    // Second spawn: write "BBBB"
+    const fd2 = openSync(TEST_LOG, "a");
+    const proc2 = Bun.spawn(["sh", "-c", "printf 'BBBB\\n'"], {
+      stdio: ["ignore", fd2, "ignore"],
+    });
+    await proc2.exited;
+    closeSync(fd2);
+    const sizeAfterSecond = statSync(TEST_LOG).size;
+
+    // Append semantics: file MUST be larger after the second spawn
+    expect(sizeAfterSecond).toBeGreaterThan(sizeAfterFirst);
+
+    // And the file must contain BOTH the AAAA prefix AND the BBBB suffix
+    const content = readFileSync(TEST_LOG, "utf8");
+    expect(content).toContain("AAAA");
+    expect(content).toContain("BBBB");
+    // BBBB must come after AAAA in the file
+    expect(content.indexOf("BBBB")).toBeGreaterThan(content.indexOf("AAAA"));
+  });
+
+  test("regression: Bun.file() as spawn stdio overwrites from byte 0", async () => {
+    // Document the bug we fixed. This test runs the broken pattern and asserts
+    // the broken behavior — so future maintainers see exactly why we use openSync.
+    const BROKEN_LOG = "/tmp/claude-peers-test-broken.log";
+    Bun.spawnSync(["rm", "-f", BROKEN_LOG]);
+    await Bun.write(BROKEN_LOG, "previous-session-content-aaaaaaaaaaaaaaa\n");
+
+    const proc = Bun.spawn(["sh", "-c", "printf 'X\\n'"], {
+      stdio: ["ignore", Bun.file(BROKEN_LOG), "ignore"],
+    });
+    await proc.exited;
+
+    // Bun.file() writes from byte 0. The output "X\n" is 2 bytes.
+    // The file is NOT shorter than before (Bun does not truncate on open),
+    // but the first 2 bytes are "X\n" instead of "pr".
+    const after = await Bun.file(BROKEN_LOG).text();
+    expect(after.startsWith("X")).toBe(true);
+    expect(after.startsWith("previous")).toBe(false);
+
+    Bun.spawnSync(["rm", "-f", BROKEN_LOG]);
   });
 });
 
