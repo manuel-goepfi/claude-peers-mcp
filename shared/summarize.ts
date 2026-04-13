@@ -20,6 +20,11 @@ export function generateSummary(context: {
   recent_files?: string[];
 }): string | null {
   const project = basename(context.git_root || context.cwd);
+  // Return null rather than an empty string when the path resolves to something
+  // basename() can't extract (e.g. "/" or ""). Callers use `if (summary)` so
+  // both null and "" would be treated as absent, but the return type says
+  // `string | null` — honor it literally.
+  if (!project) return null;
   const parts = [project];
 
   if (context.git_branch && context.git_branch !== "main" && context.git_branch !== "master") {

@@ -197,6 +197,78 @@ describe("F1+F2 broker schema migrations", () => {
   });
 });
 
+// --- F3 post-review: handleListPeers scope filter SQL-level tests ---
+//
+// The live integration suite only exercises scope: "machine". These tests
+// cover the directory / repo filters at the SQL level so they run fast and
+// without a broker subprocess.
+
+describe("handleListPeers scope filters", () => {
+  let db: Database;
+
+  beforeAll(() => {
+    db = new Database(":memory:");
+    db.run(`
+      CREATE TABLE peers (
+        id TEXT PRIMARY KEY,
+        pid INTEGER NOT NULL,
+        cwd TEXT NOT NULL,
+        git_root TEXT,
+        tty TEXT,
+        summary TEXT NOT NULL DEFAULT '',
+        registered_at TEXT NOT NULL,
+        last_seen TEXT NOT NULL
+      )
+    `);
+    const now = new Date().toISOString();
+    const insert = db.prepare(
+      "INSERT INTO peers (id, pid, cwd, git_root, summary, registered_at, last_seen) VALUES (?, ?, ?, ?, ?, ?, ?)"
+    );
+    insert.run("peer-A", 1, "/home/a", "/home/a", "", now, now);
+    insert.run("peer-B", 2, "/home/b", "/home/b", "", now, now);
+    insert.run("peer-C", 3, "/home/a/sub", "/home/a", "", now, now); // same git_root as A
+    insert.run("peer-D", 4, "/home/d", null, "", now, now); // no git_root
+  });
+
+  afterAll(() => db.close());
+
+  // Replicate the broker's prepared statements for filtering
+  function byDirectory(cwd: string) {
+    return db.query("SELECT id FROM peers WHERE cwd = ?").all(cwd) as { id: string }[];
+  }
+  function byGitRoot(git_root: string) {
+    return db.query("SELECT id FROM peers WHERE git_root = ?").all(git_root) as { id: string }[];
+  }
+
+  test("directory scope matches exact cwd only", () => {
+    const r = byDirectory("/home/a");
+    expect(r.map((p) => p.id)).toEqual(["peer-A"]);
+  });
+
+  test("directory scope on subdirectory does NOT match parent", () => {
+    const r = byDirectory("/home/a/sub");
+    expect(r.map((p) => p.id)).toEqual(["peer-C"]);
+  });
+
+  test("repo scope matches all peers sharing a git_root", () => {
+    const r = byGitRoot("/home/a");
+    const ids = r.map((p) => p.id).sort();
+    expect(ids).toEqual(["peer-A", "peer-C"]);
+  });
+
+  test("repo scope with unknown git_root returns empty", () => {
+    const r = byGitRoot("/nonexistent");
+    expect(r.length).toBe(0);
+  });
+
+  test("repo scope when caller has null git_root falls back to directory scope", () => {
+    // The broker's logic: if body.git_root is null, fall through to
+    // selectPeersByDirectory(body.cwd). We test both prongs of that fallback.
+    const r = byDirectory("/home/d"); // peer-D has null git_root
+    expect(r.map((p) => p.id)).toEqual(["peer-D"]);
+  });
+});
+
 // --- Type contract tests ---
 
 describe("F1+F2 type contracts", () => {
@@ -451,13 +523,17 @@ describe("F1+F2 live broker integration", () => {
       stderr: "ignore",
     });
 
-    // Wait for broker to start
+    // Wait for broker to start — fail fast with a clear message if it doesn't
+    let brokerAlive = false;
     for (let i = 0; i < 30; i++) {
       try {
         const res = await fetch(`${brokerUrl}/health`, { signal: AbortSignal.timeout(500) });
-        if (res.ok) break;
+        if (res.ok) { brokerAlive = true; break; }
       } catch {}
       await new Promise((r) => setTimeout(r, 200));
+    }
+    if (!brokerAlive) {
+      throw new Error(`Test broker failed to start on ${brokerUrl} within 6 seconds`);
     }
   });
 
@@ -622,6 +698,12 @@ describe("generateSummary (deterministic git-based)", () => {
 
   test("empty recent_files array does not add separator", () => {
     expect(generateSummary({ cwd: "/", git_root: "/proj", recent_files: [] })).toBe("proj");
+  });
+
+  test("returns null when path resolves to empty basename", () => {
+    // basename("/") === "" — honor the `string | null` return type literally.
+    expect(generateSummary({ cwd: "/", git_root: null })).toBeNull();
+    expect(generateSummary({ cwd: "", git_root: null })).toBeNull();
   });
 
   test("regression guard: function is synchronous, not async", () => {

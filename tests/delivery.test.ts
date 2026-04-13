@@ -161,6 +161,67 @@ describe("Local buffer cap behavior", () => {
     expect(BUFFER_CAP).toBe(10000);
     expect(BUFFER_CAP).toBeGreaterThanOrEqual(200 * 50);
   });
+
+  // F1 post-review: symmetric coverage for the confirmedDeliveredIds prune.
+  // Off-by-one or wrong-half eviction would cause re-display of delivered messages.
+  test("confirmedDeliveredIds prune evicts oldest, retains newest (FIFO)", () => {
+    const DEDUP_CAP = 5000;
+    const DEDUP_DRAIN_TO = 2500;
+    const confirmed = new Set<number>();
+    for (let i = 0; i < 5001; i++) confirmed.add(i);
+
+    if (confirmed.size > DEDUP_CAP) {
+      const arr = [...confirmed];
+      const toRemove = arr.slice(0, arr.length - DEDUP_DRAIN_TO);
+      for (const id of toRemove) confirmed.delete(id);
+    }
+
+    expect(confirmed.size).toBe(DEDUP_DRAIN_TO);
+    // Oldest (smallest) IDs evicted
+    expect(confirmed.has(0)).toBe(false);
+    expect(confirmed.has(2499)).toBe(false);
+    // Newest (largest) IDs retained
+    expect(confirmed.has(2501)).toBe(true);
+    expect(confirmed.has(5000)).toBe(true);
+  });
+
+  test("confirmedDeliveredIds prune does not fire below cap", () => {
+    const DEDUP_CAP = 5000;
+    const confirmed = new Set<number>();
+    for (let i = 0; i < 4999; i++) confirmed.add(i);
+    if (confirmed.size > DEDUP_CAP) throw new Error("should not fire");
+    expect(confirmed.size).toBe(4999);
+  });
+
+  // F2 post-review: after overflow prune, localBufferIds must be rebuilt
+  // from the surviving buffer — stale IDs would block re-delivery of messages
+  // the broker still has as undelivered.
+  test("overflow prune rebuilds localBufferIds from survivors only", () => {
+    const buffer: { id: number }[] = Array.from({ length: 11000 }, (_, i) => ({ id: i }));
+    const localBufferIds = new Set<number>(buffer.map((m) => m.id));
+    const confirmedDelivered = new Set<number>();
+
+    if (buffer.length > BUFFER_CAP) {
+      const removed = buffer.splice(0, buffer.length - BUFFER_DRAIN_TO);
+      for (const m of removed) confirmedDelivered.add(m.id);
+      // Replicate the rebuild logic from server.ts main()
+      localBufferIds.clear();
+      for (const m of buffer) localBufferIds.add(m.id);
+    }
+
+    expect(buffer.length).toBe(BUFFER_DRAIN_TO);
+    expect(localBufferIds.size).toBe(BUFFER_DRAIN_TO);
+    // Pruned IDs MUST NOT be in localBufferIds (else poll would block re-delivery)
+    expect(localBufferIds.has(0)).toBe(false);
+    expect(localBufferIds.has(5999)).toBe(false);
+    // Survivor IDs ARE in localBufferIds
+    expect(localBufferIds.has(6000)).toBe(true);
+    expect(localBufferIds.has(10999)).toBe(true);
+    // And they're in confirmedDelivered (pruned path)
+    expect(confirmedDelivered.has(0)).toBe(true);
+    expect(confirmedDelivered.has(5999)).toBe(true);
+    expect(confirmedDelivered.has(6000)).toBe(false);
+  });
 });
 
 // --- drainPendingMessages dedup filter behavior ---
@@ -374,12 +435,16 @@ describe("Live broker delivery features", () => {
       stderr: "ignore",
     });
 
+    let brokerAlive = false;
     for (let i = 0; i < 30; i++) {
       try {
         const res = await fetch(`${brokerUrl}/health`, { signal: AbortSignal.timeout(500) });
-        if (res.ok) break;
+        if (res.ok) { brokerAlive = true; break; }
       } catch {}
       await new Promise((r) => setTimeout(r, 200));
+    }
+    if (!brokerAlive) {
+      throw new Error(`Test broker failed to start on ${brokerUrl} within 6 seconds`);
     }
   });
 
