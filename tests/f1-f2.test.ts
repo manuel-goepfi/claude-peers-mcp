@@ -9,6 +9,7 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { Database } from "bun:sqlite";
 import type { Peer, RegisterRequest } from "../shared/types.ts";
+import { parseTmuxPanes, parsePsTree } from "../shared/tmux.ts";
 
 // --- Broker-level tests (schema + registration + queries) ---
 
@@ -255,69 +256,63 @@ describe("F1+F2 type contracts", () => {
 // --- detectTmuxPane unit tests ---
 
 describe("F2 detectTmuxPane parsing logic", () => {
-  // Test the parsing logic that detectTmuxPane uses internally.
-  // We can't call detectTmuxPane directly from tests (it shells out),
-  // so we test the parsing algorithm in isolation.
+  // parseTmuxPanes is now exported from server.ts so tests use the SAME
+  // function the production code does. Eliminates the test-helper duplication
+  // bug where tests passed against an out-of-date copy of the parser.
 
-  function parseTmuxOutput(output: string): Map<number, { session: string; window_index: string; window_name: string }> {
-    const paneMap = new Map<number, { session: string; window_index: string; window_name: string }>();
-    for (const line of output.trim().split("\n")) {
-      const parts = line.trim().split(" ");
-      if (parts.length >= 4) {
-        const pid = parseInt(parts[0]!, 10);
-        if (!isNaN(pid)) {
-          paneMap.set(pid, {
-            session: parts[1]!,
-            window_index: parts[2]!,
-            window_name: parts.slice(3).join(" "),
-          });
-        }
-      }
-    }
-    return paneMap;
-  }
+  test("parses standard tab-delimited tmux list-panes output", () => {
+    const output = `12345\tmain\t0\tbash
+67890\tdev\t1\tvim
+11111\tmgt\t2\tclaude code`;
 
-  test("parses standard tmux list-panes output", () => {
-    const output = `12345 main 0 bash
-67890 dev 1 vim
-11111 mgt 2 claude code`;
-
-    const map = parseTmuxOutput(output);
+    const map = parseTmuxPanes(output);
     expect(map.size).toBe(3);
     expect(map.get(12345)).toEqual({ session: "main", window_index: "0", window_name: "bash" });
     expect(map.get(67890)).toEqual({ session: "dev", window_index: "1", window_name: "vim" });
-    // Window name with space preserved
     expect(map.get(11111)).toEqual({ session: "mgt", window_index: "2", window_name: "claude code" });
   });
 
+  test("session name with spaces parses correctly (regression for split-on-space bug)", () => {
+    const output = "12345\tmy session name\t0\tbash";
+    const map = parseTmuxPanes(output);
+    expect(map.size).toBe(1);
+    expect(map.get(12345)).toEqual({ session: "my session name", window_index: "0", window_name: "bash" });
+  });
+
+  test("window name with multiple spaces preserved", () => {
+    const output = "12345\tdev\t3\tvim some file.txt";
+    const map = parseTmuxPanes(output);
+    expect(map.get(12345)?.window_name).toBe("vim some file.txt");
+  });
+
   test("handles empty output", () => {
-    const map = parseTmuxOutput("");
+    const map = parseTmuxPanes("");
     expect(map.size).toBe(0);
   });
 
   test("handles single pane", () => {
-    const output = "2505121 4 0 bash";
-    const map = parseTmuxOutput(output);
+    const output = "2505121\t4\t0\tbash";
+    const map = parseTmuxPanes(output);
     expect(map.size).toBe(1);
     expect(map.get(2505121)).toEqual({ session: "4", window_index: "0", window_name: "bash" });
   });
 
   test("skips malformed lines (too few fields)", () => {
-    const output = `12345 main 0 bash
+    const output = `12345\tmain\t0\tbash
 bad line
-67890 dev 1 vim`;
+67890\tdev\t1\tvim`;
 
-    const map = parseTmuxOutput(output);
+    const map = parseTmuxPanes(output);
     expect(map.size).toBe(2);
     expect(map.has(12345)).toBe(true);
     expect(map.has(67890)).toBe(true);
   });
 
   test("skips lines with non-numeric pid", () => {
-    const output = `notapid main 0 bash
-12345 dev 1 vim`;
+    const output = `notapid\tmain\t0\tbash
+12345\tdev\t1\tvim`;
 
-    const map = parseTmuxOutput(output);
+    const map = parseTmuxPanes(output);
     expect(map.size).toBe(1);
     expect(map.has(12345)).toBe(true);
   });
@@ -383,6 +378,57 @@ bad line
     }
 
     expect(result).toBeNull();
+  });
+});
+
+describe("F2 parsePsTree (process tree parsing)", () => {
+  test("parses standard ps -eo pid,ppid output with header", () => {
+    const output = `  PID  PPID
+    1     0
+  100     1
+  200   100
+  300   200`;
+    const tree = parsePsTree(output);
+    expect(tree.size).toBe(4);
+    expect(tree.get(1)).toBe(0);
+    expect(tree.get(100)).toBe(1);
+    expect(tree.get(200)).toBe(100);
+    expect(tree.get(300)).toBe(200);
+  });
+
+  test("ancestry walk via parsePsTree-built map", () => {
+    const tree = parsePsTree(`  PID  PPID
+   10     1
+   20    10
+   30    20
+   40    30`);
+    let pid = 40;
+    const path: number[] = [];
+    for (let i = 0; i < 20; i++) {
+      path.push(pid);
+      const parent = tree.get(pid);
+      if (parent === undefined || parent <= 1) break;
+      pid = parent;
+    }
+    expect(path).toEqual([40, 30, 20, 10]);
+  });
+
+  test("handles empty output", () => {
+    expect(parsePsTree("").size).toBe(0);
+  });
+
+  test("skips header-only output", () => {
+    expect(parsePsTree("  PID  PPID").size).toBe(0);
+  });
+
+  test("skips malformed lines", () => {
+    const tree = parsePsTree(`  PID  PPID
+   10    1
+not a row
+   20    10`);
+    expect(tree.size).toBe(2);
+    expect(tree.has(10)).toBe(true);
+    expect(tree.has(20)).toBe(true);
   });
 });
 

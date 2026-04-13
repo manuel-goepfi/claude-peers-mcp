@@ -75,6 +75,9 @@ export interface PollMessagesResponse {
 }
 
 export interface AckMessagesRequest {
-  peer_id: PeerId;
+  // Renamed from `peer_id` to `id` for consistency with sibling request types
+  // (HeartbeatRequest, SetSummaryRequest, PollMessagesRequest all use `id`).
+  id: PeerId;
+  // Non-empty list of message IDs to acknowledge as delivered to this peer.
   ids: number[];
 }

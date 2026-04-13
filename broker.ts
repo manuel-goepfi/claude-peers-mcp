@@ -69,8 +69,14 @@ const migrationColumns = [
 for (const col of migrationColumns) {
   try {
     db.run(`ALTER TABLE peers ADD COLUMN ${col.name} ${col.type}`);
-  } catch {
-    // Column already exists — safe to ignore
+  } catch (e) {
+    // ONLY swallow "duplicate column name" errors (the idempotent re-run case).
+    // Disk full, permission denied, corruption, etc. should crash loudly so the
+    // broker doesn't silently start with a half-migrated schema.
+    const msg = e instanceof Error ? e.message : String(e);
+    if (!msg.includes("duplicate column name")) {
+      throw e;
+    }
   }
 }
 
@@ -132,10 +138,6 @@ const insertMessage = db.prepare(`
 
 const selectUndelivered = db.prepare(`
   SELECT * FROM messages WHERE to_id = ? AND delivered = 0 ORDER BY sent_at ASC
-`);
-
-const markDelivered = db.prepare(`
-  UPDATE messages SET delivered = 1 WHERE id = ?
 `);
 
 const markDeliveredScoped = db.prepare(`
@@ -238,7 +240,7 @@ function handleAckMessages(body: AckMessagesRequest): { ok: boolean; acked: numb
   const acked = db.transaction(() => {
     let count = 0;
     for (const id of body.ids) {
-      const result = markDeliveredScoped.run(id, body.peer_id);
+      const result = markDeliveredScoped.run(id, body.id);
       count += result.changes;
     }
     return count;

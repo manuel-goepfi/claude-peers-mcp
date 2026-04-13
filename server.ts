@@ -19,6 +19,7 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import { openSync, statSync, existsSync } from "node:fs";
 import type {
   PeerId,
   Peer,
@@ -31,6 +32,7 @@ import {
   getGitBranch,
   getRecentFiles,
 } from "./shared/summarize.ts";
+import { parseTmuxPanes, parsePsTree, type TmuxPaneInfo } from "./shared/tmux.ts";
 
 // --- Configuration ---
 
@@ -66,15 +68,20 @@ async function isBrokerAlive(): Promise<boolean> {
   }
 }
 
-async function rotateBrokerLogIfLarge(): Promise<void> {
+function rotateBrokerLogIfLarge(): void {
   try {
-    const file = Bun.file(BROKER_LOG);
-    if ((await file.exists()) && file.size > BROKER_LOG_MAX_BYTES) {
-      // Move current log to .old, overwriting any previous .old
-      Bun.spawnSync(["mv", "-f", BROKER_LOG, `${BROKER_LOG}.old`]);
+    if (existsSync(BROKER_LOG)) {
+      // Use fresh statSync — Bun.file().size is cached at file-handle creation
+      // and does not refresh after .exists() resolves.
+      const size = statSync(BROKER_LOG).size;
+      if (size > BROKER_LOG_MAX_BYTES) {
+        // Move current log to .old, overwriting any previous .old
+        Bun.spawnSync(["mv", "-f", BROKER_LOG, `${BROKER_LOG}.old`]);
+      }
     }
-  } catch {
-    // Best-effort rotation — never block broker startup
+  } catch (e) {
+    // Best-effort rotation — never block broker startup, but surface the error
+    log(`Log rotation failed (non-blocking): ${e instanceof Error ? e.message : String(e)}`);
   }
 }
 
@@ -84,12 +91,16 @@ async function ensureBroker(): Promise<void> {
     return;
   }
 
-  await rotateBrokerLogIfLarge();
+  rotateBrokerLogIfLarge();
   log(`Starting broker daemon (log: ${BROKER_LOG})...`);
+  // Open the log file in APPEND mode and pass the raw fd to spawn stdio.
+  // CRITICAL: Bun.file() as spawn stdio writes from byte 0 (overwrite-in-place),
+  // NOT append — that corrupts the log on every restart and prevents file growth,
+  // so the rotation guard above never fires. fs.openSync(path, 'a') is the only
+  // way to get true append semantics for a child process stderr sink.
+  const logFd = openSync(BROKER_LOG, "a");
   const proc = Bun.spawn(["bun", BROKER_SCRIPT], {
-    // Redirect stderr to a log file instead of inheriting — inheriting causes
-    // SIGPIPE to kill the broker when Claude Code closes the MCP server's pipe.
-    stdio: ["ignore", "ignore", Bun.file(BROKER_LOG)],
+    stdio: ["ignore", "ignore", logFd],
   });
 
   // Unref so this process can exit without waiting for the broker
@@ -149,57 +160,45 @@ function getTty(): string | null {
 }
 
 // --- F2: Process-ancestry tmux detection ---
-
-interface TmuxPaneInfo {
-  session: string;
-  window_index: string;
-  window_name: string;
-}
+// Pure parsing helpers live in shared/tmux.ts so tests can import them without
+// triggering this file's top-level main() side effects.
 
 async function detectTmuxPane(): Promise<TmuxPaneInfo | null> {
   try {
-    // 1. Get all tmux panes with their pane_pid
+    // 1. Get all tmux panes with their pane_pid.
+    // Tab delimiter so session and window names with spaces parse correctly.
     const listProc = Bun.spawn(
-      ["tmux", "list-panes", "-a", "-F", "#{pane_pid} #{session_name} #{window_index} #{window_name}"],
+      ["tmux", "list-panes", "-a", "-F", "#{pane_pid}\t#{session_name}\t#{window_index}\t#{window_name}"],
       { stdout: "pipe", stderr: "ignore" }
     );
     const listText = await new Response(listProc.stdout).text();
     const listCode = await listProc.exited;
     if (listCode !== 0) return null;
 
-    // 2. Parse into a map keyed by pane_pid
-    const paneMap = new Map<number, TmuxPaneInfo>();
-    for (const line of listText.trim().split("\n")) {
-      const parts = line.trim().split(" ");
-      if (parts.length >= 4) {
-        const pid = parseInt(parts[0]!, 10);
-        if (!isNaN(pid)) {
-          paneMap.set(pid, {
-            session: parts[1]!,
-            window_index: parts[2]!,
-            window_name: parts.slice(3).join(" "),
-          });
-        }
-      }
-    }
-
+    const paneMap = parseTmuxPanes(listText);
     if (paneMap.size === 0) return null;
 
-    // 3. Walk upward from process.ppid
+    // 2. Snapshot the entire process tree in a single `ps` call instead of one
+    //    spawnSync per ancestor step — 20 sync subprocess spawns add ~100ms+ to
+    //    broker startup and slow down macOS where ps is heavyweight.
+    const psProc = Bun.spawnSync(["ps", "-eo", "pid,ppid"]);
+    if (psProc.exitCode !== 0) return null;
+    const ppidMap = parsePsTree(new TextDecoder().decode(psProc.stdout));
+
+    // 3. Walk upward from process.ppid (the MCP server itself is never a tmux
+    //    pane; its parent or further ancestor will be).
     let currentPid = process.ppid;
     for (let i = 0; i < 20; i++) {
       if (paneMap.has(currentPid)) {
         return paneMap.get(currentPid)!;
       }
-      // Get parent of currentPid
-      const psProc = Bun.spawnSync(["ps", "-o", "ppid=", "-p", String(currentPid)]);
-      const ppidStr = new TextDecoder().decode(psProc.stdout).trim();
-      const parentPid = parseInt(ppidStr, 10);
-      if (isNaN(parentPid) || parentPid <= 1) break;
+      const parentPid = ppidMap.get(currentPid);
+      if (parentPid === undefined || parentPid <= 1) break;
       currentPid = parentPid;
     }
-  } catch {
-    // tmux not installed or not running — graceful failure
+  } catch (e) {
+    // Most commonly: tmux not installed. But also surfaces parsing/walk bugs.
+    log(`detectTmuxPane: ${e instanceof Error ? e.message : String(e)}`);
   }
   return null;
 }
@@ -236,13 +235,22 @@ async function drainPendingMessages(): Promise<string | null> {
   if (unseen.length === 0) return null;
 
   const ids = unseen.map((m) => m.id);
+  let ackOk = false;
   try {
-    await brokerFetch("/ack-messages", { peer_id: myId, ids });
-  } catch {
-    // Old broker without /ack-messages — degrade gracefully
+    await brokerFetch("/ack-messages", { id: myId, ids });
+    ackOk = true;
+  } catch (e) {
+    // Either old broker without /ack-messages endpoint OR transient network failure.
+    // Either way: surface in log so silent ack drops are observable.
+    log(`drainPendingMessages: ack failed — ${e instanceof Error ? e.message : String(e)}`);
   }
 
-  for (const id of ids) confirmedDeliveredIds.add(id);
+  // Only add to local dedup if the broker confirmed the ack. Otherwise leave the
+  // IDs unconfirmed so the next poll cycle can retry — the messages still appear
+  // in the tool response below, so Claude sees them exactly once per session.
+  if (ackOk) {
+    for (const id of ids) confirmedDeliveredIds.add(id);
+  }
 
   const lines = unseen.map((m) => `From ${m.from_id} (${m.sent_at}):\n${m.text}`);
   return `\n\n---\n${unseen.length} pending peer message(s):\n\n${lines.join("\n\n---\n\n")}`;
@@ -331,7 +339,7 @@ const TOOLS = [
   {
     name: "find_peer",
     description:
-      "Find Claude Code instances by human-readable name (set via CLAUDE_PEER_NAME env var) or tmux session. Returns matching peer IDs.",
+      "Find Claude Code instances by human-readable name (set via CLAUDE_PEER_NAME env var) and/or tmux session. If both name and tmux are provided, both must match (AND semantics). Returns matching peer IDs across all peers on this machine.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -341,7 +349,7 @@ const TOOLS = [
         },
         tmux: {
           type: "string" as const,
-          description: "Match against tmux session name",
+          description: "Exact match on the peer's tmux session name",
         },
       },
     },
@@ -567,15 +575,21 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           };
         }
 
-        // Explicitly ack all messages we're returning
+        // Explicitly ack all messages we're returning, then add to local dedup
+        // ONLY if the ack succeeded — otherwise leave them unconfirmed so the
+        // next poll cycle can retry.
         const ids = allMessages.map((m) => m.id);
+        let ackOk = false;
         try {
-          await brokerFetch("/ack-messages", { peer_id: myId, ids });
-        } catch {
-          // Old broker — degrade gracefully
+          await brokerFetch("/ack-messages", { id: myId, ids });
+          ackOk = true;
+        } catch (e) {
+          log(`check_messages: ack failed — ${e instanceof Error ? e.message : String(e)}`);
         }
 
-        for (const id of ids) confirmedDeliveredIds.add(id);
+        if (ackOk) {
+          for (const id of ids) confirmedDeliveredIds.add(id);
+        }
 
         const lines = allMessages.map(
           (m) => `From ${m.from_id} (${m.sent_at}):\n${m.text}`
@@ -788,15 +802,23 @@ async function main() {
     }
   }, HEARTBEAT_INTERVAL_MS);
 
-  // 8. Prune confirmedDeliveredIds and localMessageBuffer periodically
-  // Caps raised from upstream PR #25 defaults (1000/200) to (5000/1000) to
-  // reduce the data-loss window in heavy-peer sessions. The localMessageBuffer
-  // overflow path acks-and-drops undelivered messages — only triggered if no
-  // tool call drains the buffer for several minutes.
+  // 8. Prune confirmedDeliveredIds and localMessageBuffer periodically.
+  //
+  // Caps reference: upstream PR #25 used DEDUP_CAP=1000 / BUFFER_CAP=200.
+  // Fork raises to DEDUP_CAP=5000 / BUFFER_CAP=10000 to make overflow practically
+  // unreachable. At 1 message/sec sustained without ANY tool call, that is ~3
+  // hours of pure inbound before the buffer overflows.
+  //
+  // Overflow handling change from upstream: we DO NOT ack pruned messages to
+  // the broker. Upstream's behavior was silent data loss (broker thinks delivered,
+  // Claude never saw them). Our behavior: drop from local buffer + add to local
+  // dedup (preventing infinite re-poll loop), but leave broker state untouched
+  // so a fresh session restart will re-deliver. Surfaces as a loud ERROR log so
+  // operators can act if it ever fires.
   const DEDUP_CAP = 5000;
   const DEDUP_DRAIN_TO = 2500;
-  const BUFFER_CAP = 1000;
-  const BUFFER_DRAIN_TO = 500;
+  const BUFFER_CAP = 10000;
+  const BUFFER_DRAIN_TO = 5000;
   const pruneTimer = setInterval(() => {
     if (confirmedDeliveredIds.size > DEDUP_CAP) {
       const arr = [...confirmedDeliveredIds];
@@ -805,14 +827,13 @@ async function main() {
     }
     if (localMessageBuffer.length > BUFFER_CAP) {
       const removed = localMessageBuffer.splice(0, localMessageBuffer.length - BUFFER_DRAIN_TO);
-      const removedIds = removed.map((m) => m.id);
-      for (const id of removedIds) confirmedDeliveredIds.add(id);
-      if (myId) {
-        brokerFetch("/ack-messages", { peer_id: myId, ids: removedIds }).catch(() => {});
-      }
+      // Add to local dedup so the next poll cycle does not infinitely re-buffer
+      // the same messages. We deliberately do NOT ack the broker — the messages
+      // remain server-side as undelivered, so a fresh session can re-deliver.
+      for (const m of removed) confirmedDeliveredIds.add(m.id);
       localBufferIds.clear();
       for (const m of localMessageBuffer) localBufferIds.add(m.id);
-      log(`WARNING: Pruned ${removed.length} undelivered messages from local buffer (overflow at ${BUFFER_CAP})`);
+      log(`ERROR: localMessageBuffer overflow — dropped ${removed.length} messages from local buffer (cap=${BUFFER_CAP}). Messages remain UNACKED at broker; restart this peer to re-deliver. This indicates the peer was idle for hours while receiving heavy traffic.`);
     }
   }, 60_000);
 

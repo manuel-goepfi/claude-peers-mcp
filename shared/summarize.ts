@@ -1,11 +1,17 @@
 /**
- * Generate a 1-2 sentence summary of what a Claude Code instance is likely
- * working on, based on its working directory and git context.
+ * Generate a 1-2 sentence summary of what a Claude Code instance is working on.
  *
- * Uses Anthropic's Claude Haiku for cheap, fast inference.
- * Requires ANTHROPIC_API_KEY environment variable.
- * Falls back gracefully if unavailable.
+ * Pure function — derives the summary deterministically from git context.
+ * No network calls, no API keys, no failure modes. Free.
+ *
+ * Replaces the previous Anthropic API integration (PR #25-era code that called
+ * Claude Haiku for the same purpose). The AI version added an external dependency,
+ * a billing surface, a CWD/git-branch privacy leak to api.anthropic.com, and a
+ * silent-failure path on bad API responses — all for a 1-line label that doesn't
+ * need intelligence.
  */
+
+import { basename } from "node:path";
 
 export async function generateSummary(context: {
   cwd: string;
@@ -13,56 +19,21 @@ export async function generateSummary(context: {
   git_branch?: string | null;
   recent_files?: string[];
 }): Promise<string | null> {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) {
-    return null;
+  const project = basename(context.git_root || context.cwd);
+  const parts = [project];
+
+  if (context.git_branch && context.git_branch !== "main" && context.git_branch !== "master") {
+    parts.push(`(${context.git_branch})`);
   }
 
-  const parts = [`Working directory: ${context.cwd}`];
-  if (context.git_root) {
-    parts.push(`Git repo root: ${context.git_root}`);
-  }
-  if (context.git_branch) {
-    parts.push(`Branch: ${context.git_branch}`);
-  }
   if (context.recent_files && context.recent_files.length > 0) {
-    parts.push(`Recently modified files: ${context.recent_files.join(", ")}`);
-  }
-
-  try {
-    const res = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: "claude-haiku-4-5-20250414",
-        system:
-          "You generate brief summaries of what a developer is working on based on their project context. Respond with exactly 1-2 sentences, no more. Be specific about the project name and likely task.",
-        messages: [
-          {
-            role: "user",
-            content: `Based on this context, what is this developer likely working on?\n\n${parts.join("\n")}`,
-          },
-        ],
-        max_tokens: 100,
-      }),
-      signal: AbortSignal.timeout(5000),
-    });
-
-    if (!res.ok) {
-      return null;
+    parts.push(`— editing ${context.recent_files[0]}`);
+    if (context.recent_files.length > 1) {
+      parts.push(`+${context.recent_files.length - 1}`);
     }
-
-    const data = (await res.json()) as {
-      content: Array<{ text: string }>;
-    };
-    return data.content[0]?.text?.trim() ?? null;
-  } catch {
-    return null;
   }
+
+  return parts.join(" ");
 }
 
 /**
