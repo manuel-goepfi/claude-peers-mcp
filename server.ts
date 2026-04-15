@@ -481,6 +481,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       const scope = (args as { scope: string }).scope as "machine" | "directory" | "repo";
       try {
         const peers = await brokerFetch<Peer[]>("/list-peers", {
+          // `id` carries the auth claim (broker S6 — exclude_id is no
+          // longer accepted as identity); `exclude_id` filters self out
+          // of results.
+          id: myId,
           scope,
           cwd: myCwd,
           git_root: myGitRoot,
@@ -610,6 +614,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
       try {
         const allPeers = await brokerFetch<Peer[]>("/list-peers", {
+          id: myId,
           scope: "machine" as const,
           cwd: myCwd,
           git_root: myGitRoot,
@@ -735,6 +740,7 @@ async function pollAndPushMessages() {
     let peerCache: Peer[] | null = null;
     try {
       peerCache = await brokerFetch<Peer[]>("/list-peers", {
+        id: myId,
         scope: "machine",
         cwd: myCwd,
         git_root: myGitRoot,
