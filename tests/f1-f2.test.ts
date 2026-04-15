@@ -542,13 +542,25 @@ describe("F1+F2 live broker integration", () => {
     Bun.spawnSync(["rm", "-f", TEST_DB]);
   });
 
+  // S2: token-aware test fetch (mirrors delivery.test.ts).
+  const tokens = new Map<string, string>();
   async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    const b = body as Record<string, unknown> | undefined;
+    const claimedId = (b?.id as string | undefined) ?? (b?.from_id as string | undefined);
+    if (claimedId && tokens.has(claimedId)) {
+      headers["X-Peer-Token"] = tokens.get(claimedId)!;
+    }
     const res = await fetch(`${brokerUrl}${path}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify(body),
     });
-    return res.json() as Promise<T>;
+    const json = (await res.json()) as Record<string, unknown>;
+    if (path === "/register" && json.id && json.token) {
+      tokens.set(json.id as string, json.token as string);
+    }
+    return json as T;
   }
 
   test("F1: register with name, retrieve via list_peers", async () => {
@@ -566,7 +578,7 @@ describe("F1+F2 live broker integration", () => {
 
     expect(reg.id).toBeTruthy();
 
-    const peers = await brokerFetch<Peer[]>("/list-peers", {
+    const peers = await brokerFetch<Peer[]>("/list-peers", { id: reg.id,
       scope: "machine",
       cwd: "/",
       git_root: null,
@@ -590,7 +602,7 @@ describe("F1+F2 live broker integration", () => {
       summary: "",
     });
 
-    const peers = await brokerFetch<Peer[]>("/list-peers", {
+    const peers = await brokerFetch<Peer[]>("/list-peers", { id: reg.id,
       scope: "machine",
       cwd: "/",
       git_root: null,
@@ -614,7 +626,7 @@ describe("F1+F2 live broker integration", () => {
       summary: "arch work",
     });
 
-    const peers = await brokerFetch<Peer[]>("/list-peers", {
+    const peers = await brokerFetch<Peer[]>("/list-peers", { id: reg.id,
       scope: "machine",
       cwd: "/",
       git_root: null,
@@ -640,7 +652,7 @@ describe("F1+F2 live broker integration", () => {
       summary: "",
     });
 
-    const peers = await brokerFetch<Peer[]>("/list-peers", {
+    const peers = await brokerFetch<Peer[]>("/list-peers", { id: reg.id,
       scope: "machine",
       cwd: "/",
       git_root: null,

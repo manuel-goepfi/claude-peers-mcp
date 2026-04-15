@@ -453,13 +453,26 @@ describe("Live broker delivery features", () => {
     Bun.spawnSync(["rm", "-f", TEST_DB]);
   });
 
+  // S2: tests now cooperate with token auth. Maintain a per-peer-id token
+  // cache so callers don't have to thread the token through every test.
+  const tokens = new Map<string, string>();
   async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    const b = body as Record<string, unknown> | undefined;
+    const claimedId = (b?.id as string | undefined) ?? (b?.from_id as string | undefined);
+    if (claimedId && tokens.has(claimedId)) {
+      headers["X-Peer-Token"] = tokens.get(claimedId)!;
+    }
     const res = await fetch(`${brokerUrl}${path}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify(body),
     });
-    return res.json() as Promise<T>;
+    const json = (await res.json()) as Record<string, unknown>;
+    if (path === "/register" && json.id && json.token) {
+      tokens.set(json.id as string, json.token as string);
+    }
+    return json as T;
   }
 
   test("/ack-messages endpoint exists and returns ok", async () => {

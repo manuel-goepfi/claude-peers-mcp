@@ -41,6 +41,9 @@ export interface RegisterRequest {
 
 export interface RegisterResponse {
   id: PeerId;
+  // S2: per-peer auth token returned at registration. Required as
+  // X-Peer-Token header on every subsequent broker call.
+  token: string;
 }
 
 export interface HeartbeatRequest {
