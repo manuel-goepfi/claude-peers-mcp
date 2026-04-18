@@ -55,6 +55,12 @@ export interface SetSummaryRequest {
   summary: string;
 }
 
+export interface SetNameRequest {
+  id: PeerId;
+  // Empty string clears the name.
+  name: string;
+}
+
 export interface ListPeersRequest {
   scope: "machine" | "directory" | "repo";
   // The requesting peer's context (used for filtering)
@@ -67,6 +73,16 @@ export interface SendMessageRequest {
   from_id: PeerId;
   to_id: PeerId;
   text: string;
+}
+
+// /broadcast-message — fanout send by scope. At least one filter is required
+// to avoid unbounded global broadcast. Filters AND together.
+export interface BroadcastRequest {
+  from_id: PeerId;
+  text: string;
+  tmux_session?: string | null;
+  git_root?: string | null;
+  name_like?: string | null;     // case-insensitive substring on peer name
 }
 
 export interface PollMessagesRequest {
@@ -83,4 +99,8 @@ export interface AckMessagesRequest {
   id: PeerId;
   // Non-empty list of message IDs to acknowledge as delivered to this peer.
   ids: number[];
+  // Delivery-path label forwarded to the broker latency log ("piggyback" via
+  // tool-response drain, or "check_messages" via explicit poll). Optional for
+  // backward compat with older servers; broker logs "unknown" when absent.
+  via?: string;
 }

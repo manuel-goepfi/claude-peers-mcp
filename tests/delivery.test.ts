@@ -426,14 +426,30 @@ describe("Live broker delivery features", () => {
   const brokerUrl = `http://127.0.0.1:${BROKER_PORT}`;
   const TEST_DB = "/tmp/claude-peers-test-delivery.db";
 
+  const brokerStderrChunks: string[] = [];
   beforeAll(async () => {
     Bun.spawnSync(["rm", "-f", TEST_DB]);
 
     brokerProc = Bun.spawn(["bun", "/home/manzo/claude-peers-mcp/broker.ts"], {
       env: { ...process.env, CLAUDE_PEERS_PORT: String(BROKER_PORT), CLAUDE_PEERS_DB: TEST_DB },
       stdout: "ignore",
-      stderr: "ignore",
+      stderr: "pipe",
     });
+    // Capture stderr so latency-log-format assertions can grep the log lines
+    // the broker emits on every successful ack. Non-blocking — discards if
+    // the reader can't keep up (tests only assert on the tail).
+    (async () => {
+      const decoder = new TextDecoder();
+      if (!brokerProc.stderr || typeof brokerProc.stderr === "number") return;
+      const reader = (brokerProc.stderr as ReadableStream<Uint8Array>).getReader();
+      try {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          if (value) brokerStderrChunks.push(decoder.decode(value));
+        }
+      } catch {}
+    })();
 
     let brokerAlive = false;
     for (let i = 0; i < 30; i++) {
@@ -600,5 +616,764 @@ describe("Live broker delivery features", () => {
     // Clean up the long-lived child processes
     childA.kill();
     childB.kill();
+  });
+
+  // /poll-by-pid: PID-authenticated drain used by the UserPromptSubmit hook.
+  // Bypasses X-Peer-Token auth — caller_pid + same-UID is the auth.
+  async function rawPost(path: string, body: unknown): Promise<{ status: number; json: Record<string, unknown> }> {
+    const res = await fetch(`${brokerUrl}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const json = (await res.json()) as Record<string, unknown>;
+    return { status: res.status, json };
+  }
+
+  test("/poll-by-pid: returns undelivered mail and atomically acks", async () => {
+    const child = Bun.spawn(["sleep", "60"]);
+    const peer = await brokerFetch<{ id: string }>("/register", {
+      pid: child.pid, cwd: "/pbp-1", git_root: null, tty: null, name: "pbp-1",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
+    });
+    await brokerFetch("/send-message", { from_id: peer.id, to_id: peer.id, text: "hello" });
+
+    const { status, json } = await rawPost("/poll-by-pid", { pid: child.pid, caller_pid: process.pid });
+    expect(status).toBe(200);
+    expect(json.peer_id).toBe(peer.id);
+    const msgs = json.messages as { id: number; text: string }[];
+    expect(msgs.length).toBeGreaterThanOrEqual(1);
+    expect(msgs[0]!.text).toBe("hello");
+    expect(json.acked).toBe(msgs.length);
+
+    // Poll again via authed path — messages should now be marked delivered.
+    const poll2 = await brokerFetch<{ messages: unknown[] }>("/poll-messages", { id: peer.id });
+    expect(poll2.messages.length).toBe(0);
+
+    // F5: delivered_at must be populated so latency telemetry isn't silently
+    // broken by a future refactor that drops the nowIso UPDATE arg. Open a
+    // read-only handle to the broker's DB — WAL mode allows concurrent reads.
+    const ro = new Database(TEST_DB, { readonly: true });
+    const row = ro.query("SELECT delivered, delivered_at FROM messages WHERE id = ?").get(msgs[0]!.id) as
+      { delivered: number; delivered_at: string | null };
+    ro.close();
+    expect(row.delivered).toBe(1);
+    expect(row.delivered_at).not.toBeNull();
+    expect(typeof row.delivered_at).toBe("string");
+    child.kill();
+  });
+
+  test("/poll-by-pid: unknown pid returns empty without error", async () => {
+    // Pick a likely-unused PID — 0 is reserved, broker treats pid <= 1 as invalid.
+    // Use a real alive PID (our own) that isn't registered as a peer.
+    const { status, json } = await rawPost("/poll-by-pid", { pid: 999999, caller_pid: process.pid });
+    // Alive-check on pid 999999 likely fails, but the endpoint treats "no peer with this pid"
+    // as empty result (ok:true, messages:[]). Liveness check is done on caller_pid only.
+    expect(status).toBe(200);
+    expect(json.peer_id).toBe("");
+    expect(json.messages).toEqual([]);
+    expect(json.acked).toBe(0);
+  });
+
+  test("/poll-by-pid: cross-peer isolation (pid A drain does not leak peer B's mail)", async () => {
+    const childA = Bun.spawn(["sleep", "60"]);
+    const childB = Bun.spawn(["sleep", "60"]);
+    const peerA = await brokerFetch<{ id: string }>("/register", {
+      pid: childA.pid, cwd: "/pbp-A", git_root: null, tty: null, name: "pbp-A",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
+    });
+    const peerB = await brokerFetch<{ id: string }>("/register", {
+      pid: childB.pid, cwd: "/pbp-B", git_root: null, tty: null, name: "pbp-B",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
+    });
+    await brokerFetch("/send-message", { from_id: peerA.id, to_id: peerB.id, text: "for B only" });
+    // F4: also queue mail for peer A so drainA's UPDATE path actually runs.
+    // Without this, drainA has an empty messages array and the UPDATE loop
+    // never fires — a scope-loss regression (removing `to_id = ?` from the
+    // UPDATE WHERE clause) would not be caught.
+    await brokerFetch("/send-message", { from_id: peerB.id, to_id: peerA.id, text: "for A only" });
+
+    // Drain via peerA's pid — should return ONLY A's message, not B's.
+    const drainA = await rawPost("/poll-by-pid", { pid: childA.pid, caller_pid: process.pid });
+    expect(drainA.status).toBe(200);
+    expect(drainA.json.peer_id).toBe(peerA.id);
+    const aMsgs = drainA.json.messages as { text: string }[];
+    expect(aMsgs.length).toBe(1);
+    expect(aMsgs[0]!.text).toBe("for A only");
+
+    // Scope-loss guard: if markDeliveredScoped lost `AND to_id = ?`, peer B's
+    // message would have been collaterally marked delivered by drainA's
+    // UPDATE and the next assertion would fail.
+    const peekB = await brokerFetch<{ messages: { text: string }[] }>("/poll-messages", { id: peerB.id });
+    expect(peekB.messages.length).toBe(1);
+    expect(peekB.messages[0]!.text).toBe("for B only");
+
+    // Drain via peerB's pid — returns B's message.
+    const drainB = await rawPost("/poll-by-pid", { pid: childB.pid, caller_pid: process.pid });
+    expect(drainB.status).toBe(200);
+    expect(drainB.json.peer_id).toBe(peerB.id);
+    expect((drainB.json.messages as unknown[]).length).toBe(1);
+    childA.kill();
+    childB.kill();
+  });
+
+  test("/poll-by-pid: rejects invalid pid", async () => {
+    const { status, json } = await rawPost("/poll-by-pid", { pid: 0, caller_pid: process.pid });
+    expect(status).toBe(400);
+    expect(typeof json.error).toBe("string");
+  });
+
+  test("/poll-by-pid: emits canonical latency log line on ack", async () => {
+    // Telemetry contract: the broker must log each acked delivery with the
+    // exact format `[broker] deliver id=<N> from=<id> to=<id> via=<path>
+    // latency_ms=<N>`. This is the grep target for the latency dashboard
+    // and the `via=` label splits the three delivery paths (piggyback,
+    // check_messages, poll-by-pid). If any field name drifts, ops grep breaks.
+    const child = Bun.spawn(["sleep", "60"]);
+    const peer = await brokerFetch<{ id: string }>("/register", {
+      pid: child.pid, cwd: "/log-fmt", git_root: null, tty: null, name: "log-fmt",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
+    });
+    await brokerFetch("/send-message", { from_id: peer.id, to_id: peer.id, text: "log-format probe" });
+
+    // Drain via the hook path and capture the resulting log line.
+    const before = brokerStderrChunks.length;
+    await rawPost("/poll-by-pid", { pid: child.pid, caller_pid: process.pid });
+    // Small wait for stderr pipe to flush the console.error line.
+    await new Promise((r) => setTimeout(r, 150));
+    const newLogs = brokerStderrChunks.slice(before).join("");
+
+    // Assert the full canonical format (id, from, to, via=poll-by-pid, latency_ms).
+    // Any regression dropping one of these fields will fail grep.
+    expect(newLogs).toMatch(/\[broker\] deliver id=\d+ from=\S+ to=\S+ via=poll-by-pid latency_ms=\d+/);
+    child.kill();
+  });
+
+  test("/poll-by-pid: rejects dead caller_pid (same-UID check fails)", async () => {
+    // Spawn + immediately kill so PID was valid but is now dead.
+    const dead = Bun.spawn(["true"]);
+    await dead.exited;
+    const { status, json } = await rawPost("/poll-by-pid", { pid: process.pid, caller_pid: dead.pid });
+    // Accept any 4xx — the specific code (403 vs 400) depends on verifyPidUid
+    // return-path and may drift as that function evolves. The assertion that
+    // matters is "non-200, with an error string".
+    expect(status).toBeGreaterThanOrEqual(400);
+    expect(status).toBeLessThan(500);
+    expect(typeof json.error).toBe("string");
+  });
+
+  // --- Delivery confirmation tests (#2 workflow improvement) ---------------
+
+  test("send_message returns message id in response", async () => {
+    const childS = Bun.spawn(["sleep", "60"]);
+    const childT = Bun.spawn(["sleep", "60"]);
+    const sender = await brokerFetch<{ id: string }>("/register", {
+      pid: childS.pid, cwd: "/dc-s", git_root: null, tty: null, name: "s",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
+    });
+    const target = await brokerFetch<{ id: string }>("/register", {
+      pid: childT.pid, cwd: "/dc-t", git_root: null, tty: null, name: "t",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
+    });
+    const send = await brokerFetch<{ ok: boolean; id?: number }>("/send-message", {
+      from_id: sender.id, to_id: target.id, text: "hello",
+    });
+    expect(send.ok).toBe(true);
+    expect(typeof send.id).toBe("number");
+    expect(send.id).toBeGreaterThan(0);
+    childS.kill(); childT.kill();
+  });
+
+  test("message-status: undelivered message returns delivered=false, delivered_at=null", async () => {
+    const childS = Bun.spawn(["sleep", "60"]);
+    const childT = Bun.spawn(["sleep", "60"]);
+    const sender = await brokerFetch<{ id: string }>("/register", {
+      pid: childS.pid, cwd: "/ms1-s", git_root: null, tty: null, name: "s",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
+    });
+    const target = await brokerFetch<{ id: string }>("/register", {
+      pid: childT.pid, cwd: "/ms1-t", git_root: null, tty: null, name: "t",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
+    });
+    const send = await brokerFetch<{ id: number }>("/send-message", {
+      from_id: sender.id, to_id: target.id, text: "pending",
+    });
+    const status = await brokerFetch<{ ok: boolean; statuses: { id: number; delivered: boolean; delivered_at: string | null }[] }>(
+      "/message-status", { id: sender.id, ids: [send.id] }
+    );
+    expect(status.ok).toBe(true);
+    expect(status.statuses[0]!.id).toBe(send.id);
+    expect(status.statuses[0]!.delivered).toBe(false);
+    expect(status.statuses[0]!.delivered_at).toBeNull();
+    childS.kill(); childT.kill();
+  });
+
+  test("message-status: after ack, delivered=true + delivered_at populated", async () => {
+    const childS = Bun.spawn(["sleep", "60"]);
+    const childT = Bun.spawn(["sleep", "60"]);
+    const sender = await brokerFetch<{ id: string }>("/register", {
+      pid: childS.pid, cwd: "/ms2-s", git_root: null, tty: null, name: "s",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
+    });
+    const target = await brokerFetch<{ id: string }>("/register", {
+      pid: childT.pid, cwd: "/ms2-t", git_root: null, tty: null, name: "t",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
+    });
+    const send = await brokerFetch<{ id: number }>("/send-message", {
+      from_id: sender.id, to_id: target.id, text: "will be acked",
+    });
+    // Drain via /poll-by-pid (atomic ack) to mark it delivered.
+    await rawPost("/poll-by-pid", { pid: childT.pid, caller_pid: process.pid });
+
+    const status = await brokerFetch<{ ok: boolean; statuses: { delivered: boolean; delivered_at: string | null }[] }>(
+      "/message-status", { id: sender.id, ids: [send.id] }
+    );
+    expect(status.statuses[0]!.delivered).toBe(true);
+    expect(typeof status.statuses[0]!.delivered_at).toBe("string");
+    childS.kill(); childT.kill();
+  });
+
+  test("message-status: another peer cannot read my message's status", async () => {
+    const childA = Bun.spawn(["sleep", "60"]);
+    const childB = Bun.spawn(["sleep", "60"]);
+    const childT = Bun.spawn(["sleep", "60"]);
+    const a = await brokerFetch<{ id: string }>("/register", {
+      pid: childA.pid, cwd: "/ms3-a", git_root: null, tty: null, name: "a",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
+    });
+    const b = await brokerFetch<{ id: string }>("/register", {
+      pid: childB.pid, cwd: "/ms3-b", git_root: null, tty: null, name: "b",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
+    });
+    const target = await brokerFetch<{ id: string }>("/register", {
+      pid: childT.pid, cwd: "/ms3-t", git_root: null, tty: null, name: "t",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
+    });
+    const aSend = await brokerFetch<{ id: number }>("/send-message", {
+      from_id: a.id, to_id: target.id, text: "a's secret",
+    });
+    // Peer b queries status of peer a's message id — should NOT get the
+    // real status (sender-scoped lookup returns empty for non-owner).
+    const status = await brokerFetch<{ statuses: { id: number; delivered: boolean; delivered_at: string | null }[] }>(
+      "/message-status", { id: b.id, ids: [aSend.id] }
+    );
+    expect(status.statuses[0]!.id).toBe(aSend.id);
+    expect(status.statuses[0]!.delivered).toBe(false);
+    expect(status.statuses[0]!.delivered_at).toBeNull();
+    childA.kill(); childB.kill(); childT.kill();
+  });
+
+  // --- Broadcast tests (#5 workflow improvement) --------------------------
+  // /broadcast-message fanout by scope filter. Insertion via the authed
+  // brokerFetch so rate-limit + token auth cover this path too.
+
+  test("broadcast: tmux_session fanout delivers to all matching peers", async () => {
+    const childA = Bun.spawn(["sleep", "60"]);
+    const childB = Bun.spawn(["sleep", "60"]);
+    const childC = Bun.spawn(["sleep", "60"]);
+    const childSender = Bun.spawn(["sleep", "60"]);
+    const a = await brokerFetch<{ id: string }>("/register", {
+      pid: childA.pid, cwd: "/bc1", git_root: null, tty: null, name: "a",
+      tmux_session: "bcast1", tmux_window_index: "0", tmux_window_name: "claude", summary: "",
+    });
+    const b = await brokerFetch<{ id: string }>("/register", {
+      pid: childB.pid, cwd: "/bc2", git_root: null, tty: null, name: "b",
+      tmux_session: "bcast1", tmux_window_index: "1", tmux_window_name: "claude", summary: "",
+    });
+    const c = await brokerFetch<{ id: string }>("/register", {
+      pid: childC.pid, cwd: "/bc3", git_root: null, tty: null, name: "c",
+      tmux_session: "bcast-other", tmux_window_index: "0", tmux_window_name: "claude", summary: "",
+    });
+    const sender = await brokerFetch<{ id: string }>("/register", {
+      pid: childSender.pid, cwd: "/bc-sender", git_root: null, tty: null, name: "sender",
+      tmux_session: "bcast-sender", tmux_window_index: "0", tmux_window_name: "claude", summary: "",
+    });
+
+    const result = await brokerFetch<{ ok: boolean; sent: number }>("/broadcast-message", {
+      from_id: sender.id, text: "hello bcast1", tmux_session: "bcast1",
+    });
+    expect(result.ok).toBe(true);
+    expect(result.sent).toBe(2);
+
+    // Verify a and b got it, c did not
+    const pollA = await brokerFetch<{ messages: unknown[] }>("/poll-messages", { id: a.id });
+    const pollB = await brokerFetch<{ messages: unknown[] }>("/poll-messages", { id: b.id });
+    const pollC = await brokerFetch<{ messages: unknown[] }>("/poll-messages", { id: c.id });
+    expect(pollA.messages.length).toBe(1);
+    expect(pollB.messages.length).toBe(1);
+    expect(pollC.messages.length).toBe(0);
+    childA.kill(); childB.kill(); childC.kill(); childSender.kill();
+  });
+
+  test("broadcast: excludes the sender even if sender matches the scope", async () => {
+    const childA = Bun.spawn(["sleep", "60"]);
+    const childSender = Bun.spawn(["sleep", "60"]);
+    const a = await brokerFetch<{ id: string }>("/register", {
+      pid: childA.pid, cwd: "/bc-self-a", git_root: null, tty: null, name: "a",
+      tmux_session: "bcast2", tmux_window_index: "0", tmux_window_name: "claude", summary: "",
+    });
+    const sender = await brokerFetch<{ id: string }>("/register", {
+      pid: childSender.pid, cwd: "/bc-self-s", git_root: null, tty: null, name: "sender",
+      // Sender in the SAME scope as the target
+      tmux_session: "bcast2", tmux_window_index: "1", tmux_window_name: "claude", summary: "",
+    });
+    const result = await brokerFetch<{ ok: boolean; sent: number }>("/broadcast-message", {
+      from_id: sender.id, text: "hello bcast2", tmux_session: "bcast2",
+    });
+    expect(result.sent).toBe(1);  // only peer a, not sender itself
+    const pollSelf = await brokerFetch<{ messages: unknown[] }>("/poll-messages", { id: sender.id });
+    expect(pollSelf.messages.length).toBe(0);
+    const pollA = await brokerFetch<{ messages: unknown[] }>("/poll-messages", { id: a.id });
+    expect(pollA.messages.length).toBe(1);
+    childA.kill(); childSender.kill();
+  });
+
+  test("broadcast: rejects unfiltered call (no scope)", async () => {
+    const child = Bun.spawn(["sleep", "60"]);
+    const sender = await brokerFetch<{ id: string }>("/register", {
+      pid: child.pid, cwd: "/bc-unfilt", git_root: null, tty: null, name: "s",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
+    });
+    const result = await brokerFetch<{ ok: boolean; sent: number; error?: string }>("/broadcast-message", {
+      from_id: sender.id, text: "no scope",
+    });
+    expect(result.ok).toBe(false);
+    expect(result.sent).toBe(0);
+    expect(typeof result.error).toBe("string");
+    expect(result.error).toMatch(/scope filter/i);
+    child.kill();
+  });
+
+  test("broadcast: name_like is case-insensitive substring", async () => {
+    const childA = Bun.spawn(["sleep", "60"]);
+    const childB = Bun.spawn(["sleep", "60"]);
+    const childC = Bun.spawn(["sleep", "60"]);
+    const childSender = Bun.spawn(["sleep", "60"]);
+    const a = await brokerFetch<{ id: string }>("/register", {
+      pid: childA.pid, cwd: "/bc-nl-a", git_root: null, tty: null,
+      name: "reviewer.1", tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
+    });
+    const b = await brokerFetch<{ id: string }>("/register", {
+      pid: childB.pid, cwd: "/bc-nl-b", git_root: null, tty: null,
+      name: "REVIEWER.2", tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
+    });
+    const c = await brokerFetch<{ id: string }>("/register", {
+      pid: childC.pid, cwd: "/bc-nl-c", git_root: null, tty: null,
+      name: "coder.1", tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
+    });
+    const sender = await brokerFetch<{ id: string }>("/register", {
+      pid: childSender.pid, cwd: "/bc-nl-s", git_root: null, tty: null, name: "s",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
+    });
+    const result = await brokerFetch<{ ok: boolean; sent: number }>("/broadcast-message", {
+      from_id: sender.id, text: "reviewers only", name_like: "review",
+    });
+    expect(result.sent).toBe(2);  // a + b, not c
+    const pollA = await brokerFetch<{ messages: unknown[] }>("/poll-messages", { id: a.id });
+    const pollB = await brokerFetch<{ messages: unknown[] }>("/poll-messages", { id: b.id });
+    const pollC = await brokerFetch<{ messages: unknown[] }>("/poll-messages", { id: c.id });
+    expect(pollA.messages.length).toBe(1);
+    expect(pollB.messages.length).toBe(1);
+    expect(pollC.messages.length).toBe(0);
+    childA.kill(); childB.kill(); childC.kill(); childSender.kill();
+  });
+
+  test("broadcast: size cap enforced (>32KB text)", async () => {
+    const child = Bun.spawn(["sleep", "60"]);
+    const sender = await brokerFetch<{ id: string }>("/register", {
+      pid: child.pid, cwd: "/bc-cap", git_root: null, tty: null, name: "s",
+      tmux_session: "bcast-cap", tmux_window_index: "0", tmux_window_name: "claude", summary: "",
+    });
+    const big = "x".repeat(33 * 1024);
+    const result = await brokerFetch<{ ok: boolean; sent: number; error?: string }>("/broadcast-message", {
+      from_id: sender.id, text: big, tmux_session: "bcast-cap",
+    });
+    expect(result.ok).toBe(false);
+    expect(result.sent).toBe(0);
+    expect(typeof result.error).toBe("string");
+    expect(result.error).toMatch(/exceeds/i);
+    child.kill();
+  });
+
+  // --- Rehydration tests (#7 workflow improvement) ------------------------
+  // When a peer dies and relaunches in the same tmux pane, the new
+  // registration inherits the old peer's ID so orphaned mail is recoverable.
+
+  test("rehydration: new peer in same tmux location inherits dead peer's ID", async () => {
+    const dead = Bun.spawn(["sleep", "60"]);
+    const a = await brokerFetch<{ id: string }>("/register", {
+      pid: dead.pid, cwd: "/rehydrate-1", git_root: null, tty: null,
+      name: "a", tmux_session: "rh1", tmux_window_index: "0",
+      tmux_window_name: "claude", summary: "",
+    });
+    dead.kill();
+    await dead.exited;
+
+    const fresh = Bun.spawn(["sleep", "60"]);
+    const b = await brokerFetch<{ id: string }>("/register", {
+      pid: fresh.pid, cwd: "/rehydrate-1", git_root: null, tty: null,
+      name: "b-new", tmux_session: "rh1", tmux_window_index: "0",
+      tmux_window_name: "claude", summary: "",
+    });
+    expect(b.id).toBe(a.id);
+    fresh.kill();
+  });
+
+  test("rehydration: undelivered mail survives re-registration", async () => {
+    const sender = Bun.spawn(["sleep", "60"]);
+    const dead = Bun.spawn(["sleep", "60"]);
+    const s = await brokerFetch<{ id: string }>("/register", {
+      pid: sender.pid, cwd: "/rehydrate-2-sender", git_root: null, tty: null,
+      name: "sender", tmux_session: null, tmux_window_index: null,
+      tmux_window_name: null, summary: "",
+    });
+    const a = await brokerFetch<{ id: string }>("/register", {
+      pid: dead.pid, cwd: "/rehydrate-2", git_root: null, tty: null,
+      name: "a", tmux_session: "rh2", tmux_window_index: "1",
+      tmux_window_name: "claude", summary: "",
+    });
+    await brokerFetch("/send-message", {
+      from_id: s.id, to_id: a.id, text: "survive my death",
+    });
+    dead.kill();
+    await dead.exited;
+
+    const fresh = Bun.spawn(["sleep", "60"]);
+    await brokerFetch("/register", {
+      pid: fresh.pid, cwd: "/rehydrate-2", git_root: null, tty: null,
+      name: "b-new", tmux_session: "rh2", tmux_window_index: "1",
+      tmux_window_name: "claude", summary: "",
+    });
+    // Drain via /poll-by-pid — should see the mail addressed to the
+    // inherited ID (a.id), proving rehydration restored the inbox.
+    const { json } = await rawPost("/poll-by-pid", {
+      pid: fresh.pid, caller_pid: process.pid,
+    });
+    expect(json.peer_id).toBe(a.id);
+    const msgs = json.messages as { text: string }[];
+    expect(msgs.length).toBe(1);
+    expect(msgs[0]!.text).toBe("survive my death");
+    sender.kill();
+    fresh.kill();
+  });
+
+  test("rehydration: different tmux pane does NOT inherit", async () => {
+    const dead = Bun.spawn(["sleep", "60"]);
+    const a = await brokerFetch<{ id: string }>("/register", {
+      pid: dead.pid, cwd: "/rehydrate-3", git_root: null, tty: null,
+      name: "a", tmux_session: "rh3", tmux_window_index: "0",
+      tmux_window_name: "claude", summary: "",
+    });
+    dead.kill();
+    await dead.exited;
+
+    // Relaunch at a DIFFERENT pane index — should NOT inherit.
+    const fresh = Bun.spawn(["sleep", "60"]);
+    const b = await brokerFetch<{ id: string }>("/register", {
+      pid: fresh.pid, cwd: "/rehydrate-3", git_root: null, tty: null,
+      name: "b-new", tmux_session: "rh3", tmux_window_index: "1",
+      tmux_window_name: "claude", summary: "",
+    });
+    expect(b.id).not.toBe(a.id);
+    fresh.kill();
+  });
+
+  test("rehydration: stale peer (>1h last_seen) does NOT inherit", async () => {
+    const dead = Bun.spawn(["sleep", "60"]);
+    const a = await brokerFetch<{ id: string }>("/register", {
+      pid: dead.pid, cwd: "/rehydrate-4", git_root: null, tty: null,
+      name: "a", tmux_session: "rh4", tmux_window_index: "0",
+      tmux_window_name: "claude", summary: "",
+    });
+    dead.kill();
+    await dead.exited;
+
+    // Backdate last_seen so the candidate is older than the 1h window.
+    // Requires a read-write DB handle; WAL allows one writer.
+    const rw = new Database(TEST_DB);
+    rw.run(
+      "UPDATE peers SET last_seen = ? WHERE id = ?",
+      [new Date(Date.now() - 2 * 3600_000).toISOString(), a.id]
+    );
+    rw.close();
+
+    const fresh = Bun.spawn(["sleep", "60"]);
+    const b = await brokerFetch<{ id: string }>("/register", {
+      pid: fresh.pid, cwd: "/rehydrate-4", git_root: null, tty: null,
+      name: "b-new", tmux_session: "rh4", tmux_window_index: "0",
+      tmux_window_name: "claude", summary: "",
+    });
+    expect(b.id).not.toBe(a.id);
+    fresh.kill();
+  });
+
+  test("rehydration: live peer is NOT displaced", async () => {
+    const alive = Bun.spawn(["sleep", "60"]);
+    const a = await brokerFetch<{ id: string }>("/register", {
+      pid: alive.pid, cwd: "/rehydrate-5", git_root: null, tty: null,
+      name: "a", tmux_session: "rh5", tmux_window_index: "0",
+      tmux_window_name: "claude", summary: "",
+    });
+
+    // Register a "clone" with the same location tuple but a different live
+    // PID. The original peer is ALIVE — rehydration must skip it, and the
+    // new peer gets a fresh ID. Both live side-by-side.
+    const clone = Bun.spawn(["sleep", "60"]);
+    const b = await brokerFetch<{ id: string }>("/register", {
+      pid: clone.pid, cwd: "/rehydrate-5", git_root: null, tty: null,
+      name: "b", tmux_session: "rh5", tmux_window_index: "0",
+      tmux_window_name: "claude", summary: "",
+    });
+    expect(b.id).not.toBe(a.id);
+    alive.kill();
+    clone.kill();
+  });
+
+  // --- M4: Most-recent dead candidate wins rehydration --------------------
+  test("rehydration: most-recent dead candidate wins when multiple match", async () => {
+    // Register two peers at the same tmux location with different last_seen,
+    // kill both, then register a fresh peer — should inherit the MORE RECENT
+    // one's ID (ORDER BY last_seen DESC). Protects against accidental ASC flip.
+    const old = Bun.spawn(["sleep", "60"]);
+    const recent = Bun.spawn(["sleep", "60"]);
+    const oldPeer = await brokerFetch<{ id: string }>("/register", {
+      pid: old.pid, cwd: "/rehydrate-m4", git_root: null, tty: null,
+      name: "old", tmux_session: "rh-m4", tmux_window_index: "0",
+      tmux_window_name: "claude", summary: "",
+    });
+    const recentPeer = await brokerFetch<{ id: string }>("/register", {
+      pid: recent.pid, cwd: "/rehydrate-m4", git_root: null, tty: null,
+      name: "recent", tmux_session: "rh-m4", tmux_window_index: "0",
+      tmux_window_name: "claude", summary: "",
+    });
+    // Wait to guarantee distinguishable last_seen timestamps between the two.
+    await new Promise((r) => setTimeout(r, 50));
+    // Backdate the older peer so "recent" is clearly the most-recent dead slot.
+    const rw = new Database(TEST_DB);
+    rw.run(
+      "UPDATE peers SET last_seen = ? WHERE id = ?",
+      [new Date(Date.now() - 1000).toISOString(), oldPeer.id]
+    );
+    rw.close();
+    old.kill();
+    recent.kill();
+    await old.exited;
+    await recent.exited;
+
+    const fresh = Bun.spawn(["sleep", "60"]);
+    const newPeer = await brokerFetch<{ id: string }>("/register", {
+      pid: fresh.pid, cwd: "/rehydrate-m4", git_root: null, tty: null,
+      name: "fresh", tmux_session: "rh-m4", tmux_window_index: "0",
+      tmux_window_name: "claude", summary: "",
+    });
+    // Must inherit the MORE RECENT dead slot, not the older one.
+    expect(newPeer.id).toBe(recentPeer.id);
+    expect(newPeer.id).not.toBe(oldPeer.id);
+    fresh.kill();
+  });
+
+  // --- M5: Own-PID re-register does NOT trigger rehydrate branch ----------
+  test("rehydration: re-register with same pid + same location does NOT rehydrate", async () => {
+    // When a peer's own PID re-registers (e.g., after broker restart), the
+    // existing PID-dedup path should handle it — rehydration is for DIFFERENT
+    // pids inheriting a dead slot. This test guards against a regression where
+    // the rehydrate query returns the peer's OWN current row and tries to
+    // inherit from itself.
+    const p = Bun.spawn(["sleep", "60"]);
+    const first = await brokerFetch<{ id: string }>("/register", {
+      pid: p.pid, cwd: "/rehydrate-m5", git_root: null, tty: null,
+      name: "self", tmux_session: "rh-m5", tmux_window_index: "0",
+      tmux_window_name: "claude", summary: "",
+    });
+    // Re-register with the same pid AND same location. Expected behavior:
+    // the existing-PID dedup deletes the old row, a FRESH id is generated,
+    // no rehydration occurs (the query excludes `pid = body.pid`).
+    const second = await brokerFetch<{ id: string }>("/register", {
+      pid: p.pid, cwd: "/rehydrate-m5", git_root: null, tty: null,
+      name: "self-again", tmux_session: "rh-m5", tmux_window_index: "0",
+      tmux_window_name: "claude", summary: "",
+    });
+    expect(second.id).not.toBe(first.id);  // fresh id, not inherited
+    // Exactly one row for this pid
+    const ro = new Database(TEST_DB, { readonly: true });
+    const count = (ro.query("SELECT COUNT(*) AS n FROM peers WHERE pid = ?").get(p.pid) as { n: number }).n;
+    ro.close();
+    expect(count).toBe(1);
+    p.kill();
+  });
+
+  // --- M3: Broadcast filter combinations (git_root only, tmux+name_like) --
+  test("broadcast: git_root-only filter matches peers in that repo", async () => {
+    const a = Bun.spawn(["sleep", "60"]);
+    const b = Bun.spawn(["sleep", "60"]);
+    const s = Bun.spawn(["sleep", "60"]);
+    const peerA = await brokerFetch<{ id: string }>("/register", {
+      pid: a.pid, cwd: "/git-a", git_root: "/home/proj-X", tty: null, name: "a",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
+    });
+    const peerB = await brokerFetch<{ id: string }>("/register", {
+      pid: b.pid, cwd: "/git-b", git_root: "/home/proj-Y", tty: null, name: "b",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
+    });
+    const sender = await brokerFetch<{ id: string }>("/register", {
+      pid: s.pid, cwd: "/git-s", git_root: "/home/proj-X", tty: null, name: "s",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
+    });
+    const result = await brokerFetch<{ ok: boolean; sent: number }>("/broadcast-message", {
+      from_id: sender.id, text: "proj-X repo only", git_root: "/home/proj-X",
+    });
+    expect(result.sent).toBe(1);  // only peerA (sender excluded even though same repo)
+    const pA = await brokerFetch<{ messages: unknown[] }>("/poll-messages", { id: peerA.id });
+    const pB = await brokerFetch<{ messages: unknown[] }>("/poll-messages", { id: peerB.id });
+    expect(pA.messages.length).toBe(1);
+    expect(pB.messages.length).toBe(0);
+    a.kill(); b.kill(); s.kill();
+  });
+
+  test("broadcast: tmux + name_like filters AND together (intersection)", async () => {
+    const match = Bun.spawn(["sleep", "60"]);
+    const onlyTmux = Bun.spawn(["sleep", "60"]);
+    const onlyName = Bun.spawn(["sleep", "60"]);
+    const s = Bun.spawn(["sleep", "60"]);
+    const mPeer = await brokerFetch<{ id: string }>("/register", {
+      pid: match.pid, cwd: "/m", git_root: null, tty: null,
+      name: "reviewer.m", tmux_session: "review-tmux", tmux_window_index: "0",
+      tmux_window_name: "claude", summary: "",
+    });
+    const tPeer = await brokerFetch<{ id: string }>("/register", {
+      pid: onlyTmux.pid, cwd: "/t", git_root: null, tty: null,
+      name: "coder.t", tmux_session: "review-tmux", tmux_window_index: "1",
+      tmux_window_name: "claude", summary: "",
+    });
+    const nPeer = await brokerFetch<{ id: string }>("/register", {
+      pid: onlyName.pid, cwd: "/n", git_root: null, tty: null,
+      name: "reviewer.n", tmux_session: "other-tmux", tmux_window_index: "0",
+      tmux_window_name: "claude", summary: "",
+    });
+    const sender = await brokerFetch<{ id: string }>("/register", {
+      pid: s.pid, cwd: "/s", git_root: null, tty: null, name: "sender",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
+    });
+    const result = await brokerFetch<{ ok: boolean; sent: number }>("/broadcast-message", {
+      from_id: sender.id, text: "intersect",
+      tmux_session: "review-tmux", name_like: "review",
+    });
+    expect(result.sent).toBe(1);  // only match peer (AND semantics)
+    const pM = await brokerFetch<{ messages: unknown[] }>("/poll-messages", { id: mPeer.id });
+    const pT = await brokerFetch<{ messages: unknown[] }>("/poll-messages", { id: tPeer.id });
+    const pN = await brokerFetch<{ messages: unknown[] }>("/poll-messages", { id: nPeer.id });
+    expect(pM.messages.length).toBe(1);
+    expect(pT.messages.length).toBe(0);
+    expect(pN.messages.length).toBe(0);
+    match.kill(); onlyTmux.kill(); onlyName.kill(); s.kill();
+  });
+
+  // --- B1 regression: name_like wildcards are escaped ---------------------
+  test("broadcast: name_like='%' is escaped, not treated as SQL wildcard", async () => {
+    // Without the ESCAPE clause, name_like='%' would LIKE-match every named
+    // peer (bypass the "scope filter required" guard). Current code escapes
+    // the % to literal and also rejects length < 2 — so this single-char
+    // filter must return length-guard error, not a match-all broadcast.
+    const s = Bun.spawn(["sleep", "60"]);
+    const sender = await brokerFetch<{ id: string }>("/register", {
+      pid: s.pid, cwd: "/b1", git_root: null, tty: null, name: "s",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
+    });
+    // Single wildcard char → rejected by length guard (<2)
+    const r1 = await brokerFetch<{ ok: boolean; sent: number; error?: string }>(
+      "/broadcast-message", { from_id: sender.id, text: "x", name_like: "%" });
+    expect(r1.ok).toBe(false);
+    expect(r1.error).toMatch(/at least 2 characters|non-wildcard/i);
+    // Two wildcard chars → rejected by non-wildcard-content guard
+    const r2 = await brokerFetch<{ ok: boolean; sent: number; error?: string }>(
+      "/broadcast-message", { from_id: sender.id, text: "x", name_like: "%%" });
+    expect(r2.ok).toBe(false);
+    expect(r2.error).toMatch(/non-wildcard/i);
+    s.kill();
+  });
+
+  // --- B2 regression: broadcast fanout charges msg-bucket proportionally --
+  test("broadcast: fanout of N targets charges N message-bucket slots", async () => {
+    // Send message-bucket to near-full via sequential /send-message, then
+    // attempt a broadcast that would fanout more than the remaining budget.
+    // The handler must reject WITHOUT inserting (proportional rate charge).
+    // Use small target count + small budget headroom for test speed.
+    const receivers: ReturnType<typeof Bun.spawn>[] = [];
+    const receiverIds: string[] = [];
+    for (let i = 0; i < 4; i++) {
+      const proc = Bun.spawn(["sleep", "60"]);
+      receivers.push(proc);
+      const p = await brokerFetch<{ id: string }>("/register", {
+        pid: proc.pid, cwd: `/b2-r${i}`, git_root: null, tty: null,
+        name: `r${i}`, tmux_session: "b2-tmux", tmux_window_index: String(i),
+        tmux_window_name: "claude", summary: "",
+      });
+      receiverIds.push(p.id);
+    }
+    const s = Bun.spawn(["sleep", "60"]);
+    const sender = await brokerFetch<{ id: string }>("/register", {
+      pid: s.pid, cwd: "/b2-s", git_root: null, tty: null, name: "s",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
+    });
+    // Burn the sender's msg-bucket to 58/60 with sequential sends.
+    for (let i = 0; i < 58; i++) {
+      await brokerFetch("/send-message", {
+        from_id: sender.id, to_id: receiverIds[0], text: "fill" + i,
+      });
+    }
+    // Attempt broadcast to 4 receivers → needs 4 slots, only 2 remain → reject.
+    const broadcastResult = await brokerFetch<{ ok: boolean; sent: number; error?: string }>(
+      "/broadcast-message",
+      { from_id: sender.id, text: "should be rejected", tmux_session: "b2-tmux" }
+    );
+    expect(broadcastResult.ok).toBe(false);
+    expect(broadcastResult.sent).toBe(0);
+    expect(broadcastResult.error).toMatch(/quota|rate/i);
+    // Verify NO messages were inserted for the broadcast (atomic reject).
+    const rw = new Database(TEST_DB, { readonly: true });
+    const broadcastCount = (rw.query(
+      "SELECT COUNT(*) AS n FROM messages WHERE text = ?"
+    ).get("should be rejected") as { n: number }).n;
+    rw.close();
+    expect(broadcastCount).toBe(0);
+    receivers.forEach((p) => p.kill());
+    s.kill();
+  });
+
+  // --- M1: Concurrent /message-status during the 2s send_message wait -----
+  test("message-status: concurrent drain during sender's wait window", async () => {
+    // Simulates the race: sender fires send_message → 2s sleep before
+    // polling status. During that window, recipient drains via /poll-by-pid.
+    // Sender's subsequent /message-status call must correctly reflect
+    // delivered=true + delivered_at populated.
+    const senderProc = Bun.spawn(["sleep", "60"]);
+    const recvProc = Bun.spawn(["sleep", "60"]);
+    const sender = await brokerFetch<{ id: string }>("/register", {
+      pid: senderProc.pid, cwd: "/m1-s", git_root: null, tty: null, name: "s",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
+    });
+    const recv = await brokerFetch<{ id: string }>("/register", {
+      pid: recvProc.pid, cwd: "/m1-r", git_root: null, tty: null, name: "r",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
+    });
+    const send = await brokerFetch<{ id: number }>("/send-message", {
+      from_id: sender.id, to_id: recv.id, text: "race probe",
+    });
+
+    // Kick off concurrent drain at t=50ms, meanwhile wait 200ms then query status.
+    const drainPromise = (async () => {
+      await new Promise((r) => setTimeout(r, 50));
+      await rawPost("/poll-by-pid", { pid: recvProc.pid, caller_pid: process.pid });
+    })();
+    await new Promise((r) => setTimeout(r, 200));
+    const statusPromise = brokerFetch<{
+      ok: boolean; statuses: { delivered: boolean; delivered_at: string | null }[];
+    }>("/message-status", { id: sender.id, ids: [send.id] });
+    await Promise.all([drainPromise, statusPromise]);
+    const status = await statusPromise;
+    expect(status.statuses[0]!.delivered).toBe(true);
+    expect(typeof status.statuses[0]!.delivered_at).toBe("string");
+    senderProc.kill();
+    recvProc.kill();
   });
 });

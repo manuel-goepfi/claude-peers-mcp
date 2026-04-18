@@ -17,6 +17,8 @@ import type {
   RegisterResponse,
   HeartbeatRequest,
   SetSummaryRequest,
+  SetNameRequest,
+  BroadcastRequest,
   ListPeersRequest,
   SendMessageRequest,
   PollMessagesRequest,
@@ -48,13 +50,20 @@ if (PORT < 1 || PORT > 65535 || Number.isNaN(PORT)) {
 // --- S5: limits ---
 const MAX_MSG_BYTES = 32 * 1024;       // 32 KB per message body
 const MAX_SUMMARY_BYTES = 1024;        // 1 KB per summary
+const MAX_NAME_BYTES = 128;            // 128 B per peer name
 const MAX_REQ_BYTES = 64 * 1024;       // 64 KB per HTTP request body
 const RATE_WINDOW_MS = 60_000;         // 1-minute rolling window
 const RATE_MAX_MSGS = 60;              // max messages sent per peer per window
 const RATE_MAX_REQS = 600;             // max broker requests per peer per window (10/s avg)
+const MAX_BROADCAST_TARGETS = RATE_MAX_MSGS; // hard cap = 60 — ties fanout to per-minute msg quota
 
 // --- S7: ghost reaping ---
 const PEER_GHOST_AFTER_MS = 90_000;    // peer with no heartbeat in 90s = ghost
+
+// --- Rehydration: when a peer dies and re-launches in the same tmux pane,
+// inherit its ID so orphaned mail (addressed to the old ID) surfaces. Window
+// is (last_seen age) < REHYDRATE_WINDOW_MS AND PID no longer alive.
+const REHYDRATE_WINDOW_MS = 3600_000;  // 1h
 const MY_UID = process.getuid?.() ?? -1;
 
 // M3: warn loudly if we can't enforce S3 (non-Linux dev environment).
@@ -117,6 +126,22 @@ for (const col of migrationColumns) {
   }
 }
 
+// Messages-table migrations: delivered_at populated by /ack-messages, used
+// to compute queue→deliver latency for the idle-peer delivery investigation.
+const messageMigrationColumns = [
+  { name: "delivered_at", type: "TEXT" },
+];
+for (const col of messageMigrationColumns) {
+  try {
+    db.run(`ALTER TABLE messages ADD COLUMN ${col.name} ${col.type}`);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (!msg.includes("duplicate column name")) {
+      throw e;
+    }
+  }
+}
+
 // Clean up stale peers (PIDs that no longer exist) on startup, and free
 // their rate-limit buckets (M2 — was leaking on long-running brokers).
 function cleanStalePeers() {
@@ -159,6 +184,10 @@ const updateSummary = db.prepare(`
   UPDATE peers SET summary = ? WHERE id = ?
 `);
 
+const updateName = db.prepare(`
+  UPDATE peers SET name = ? WHERE id = ?
+`);
+
 const deletePeer = db.prepare(`
   DELETE FROM peers WHERE id = ?
 `);
@@ -185,7 +214,58 @@ const selectUndelivered = db.prepare(`
 `);
 
 const markDeliveredScoped = db.prepare(`
-  UPDATE messages SET delivered = 1 WHERE id = ? AND to_id = ?
+  UPDATE messages SET delivered = 1, delivered_at = ? WHERE id = ? AND to_id = ?
+`);
+
+// Companion lookup for latency telemetry: reads sent_at + from_id BEFORE
+// the ack marks the row delivered, so we can log queue→ack ms per message.
+const selectMsgForLatency = db.prepare(`
+  SELECT from_id, sent_at FROM messages WHERE id = ? AND to_id = ?
+`);
+
+// /poll-by-pid: resolves an MCP server PID to its peer row. Used by the
+// UserPromptSubmit hook to drain the inbox without holding the peer's auth
+// token (which lives in the MCP server's memory only). Security model:
+// caller_pid is verified same-UID via verifyPidUid, and loopback-only bind
+// means the attacker boundary is already "other user on this machine".
+const selectPeerIdByPid = db.prepare(`
+  SELECT id FROM peers WHERE pid = ?
+`);
+
+// Rehydration candidate lookup. Matches the tmux location tuple + cwd of the
+// incoming register, limited to the most recent 3 candidates so the liveness
+// check loop terminates quickly. Excludes the caller's own PID — a live peer
+// re-registering its own session is a legitimate case handled by the existing
+// PID-dedup path, not rehydration.
+const selectRehydrateCandidates = db.prepare(`
+  SELECT id, pid, last_seen FROM peers
+  WHERE tmux_session = ? AND tmux_window_index = ? AND tmux_window_name = ?
+    AND cwd = ? AND pid != ?
+  ORDER BY last_seen DESC LIMIT 3
+`);
+
+// Broadcast target-selection. Each filter is optional; NULL means "don't
+// filter on this field." Always excludes the sender. Filters AND together —
+// e.g. tmux_session='rag' AND name_like='reviewer' matches peers in rag
+// whose name contains "reviewer" (case-insensitive).
+//
+// LIKE metacharacters in name_like: escaped in the caller (handleBroadcast)
+// with ESCAPE '\'. Without this, a caller passing name_like='%' bypasses
+// the "at least one scope filter" guard (the % becomes a SQL wildcard
+// matching everything, defeating the scope requirement).
+const selectBroadcastTargets = db.prepare(`
+  SELECT id FROM peers
+  WHERE id != ?
+    AND (? IS NULL OR tmux_session = ?)
+    AND (? IS NULL OR git_root = ?)
+    AND (? IS NULL OR lower(COALESCE(name,'')) LIKE '%' || lower(?) || '%' ESCAPE '\\')
+`);
+
+// /message-status: sender-scoped status lookup. Only the ORIGINAL sender
+// can read a message's delivery state — otherwise a peer could enumerate
+// another peer's message history by guessing ids.
+const selectMessageStatus = db.prepare(`
+  SELECT id, delivered, delivered_at FROM messages WHERE id = ? AND from_id = ?
 `);
 
 // --- Generate peer ID ---
@@ -322,12 +402,50 @@ function handleRegister(body: RegisterRequest): RegisterResult {
     return { ok: false, status: 413, error: `summary exceeds ${MAX_SUMMARY_BYTES} bytes` };
   }
 
-  const id = generateId();
-  const token = generateToken();
   const now = new Date().toISOString();
+  const token = generateToken();
 
+  // Rehydration: if a recently-dead peer occupied the same tmux location
+  // (session + window + pane + cwd), inherit its ID so mail addressed to it
+  // surfaces to this new session. Matched on the full location tuple to
+  // prevent cross-pane identity leakage.
+  let inheritedId: string | null = null;
+  if (body.tmux_session && body.tmux_window_index !== null && body.tmux_window_index !== undefined && body.tmux_window_name) {
+    const candidates = selectRehydrateCandidates.all(
+      body.tmux_session,
+      body.tmux_window_index,
+      body.tmux_window_name,
+      body.cwd,
+      body.pid
+    ) as { id: string; pid: number; last_seen: string }[];
+    for (const c of candidates) {
+      const ageMs = Date.now() - new Date(c.last_seen).getTime();
+      if (ageMs > REHYDRATE_WINDOW_MS) continue;
+      // Skip if the candidate's PID is still alive OR owned by a different UID
+      // (EPERM path — PID got recycled to a non-us process). Only ESRCH ("No
+      // such process") means the slot is genuinely dead and inheritable.
+      try {
+        process.kill(c.pid, 0);
+        continue; // alive — skip
+      } catch (e) {
+        const code = (e as { code?: string } | undefined)?.code;
+        if (code === "EPERM") continue; // alive-under-different-uid — don't inherit
+        // ESRCH or undefined → dead → inherit (fall through)
+      }
+      inheritedId = c.id;
+      deletePeer.run(c.id);
+      buckets.delete(c.id);
+      console.error(`[broker] rehydrate: new pid=${body.pid} inherits id=${c.id} from dead pid=${c.pid} (age_ms=${ageMs})`);
+      break;
+    }
+  }
+
+  const id = inheritedId ?? generateId();
+
+  // Existing PID-dedup: a live peer re-registering must replace its own row.
+  // Guarded against clobbering the inherited row we just re-created above.
   const existing = db.query("SELECT id FROM peers WHERE pid = ?").get(body.pid) as { id: string } | null;
-  if (existing) {
+  if (existing && existing.id !== id) {
     deletePeer.run(existing.id);
     buckets.delete(existing.id);
   }
@@ -342,6 +460,12 @@ function handleHeartbeat(body: HeartbeatRequest): void {
 
 function handleSetSummary(body: SetSummaryRequest): void {
   updateSummary.run(body.summary, body.id);
+}
+
+function handleSetName(body: SetNameRequest): void {
+  // Empty string clears the name (stored as NULL for join-friendliness
+  // with list_peers output which treats null as "unnamed").
+  updateName.run(body.name.length > 0 ? body.name : null, body.id);
 }
 
 function handleListPeers(body: ListPeersRequest): Peer[] {
@@ -391,15 +515,100 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
   });
 }
 
-function handleSendMessage(authedFromId: string, body: SendMessageRequest): { ok: boolean; error?: string } {
+function handleSendMessage(authedFromId: string, body: SendMessageRequest): { ok: boolean; id?: number; error?: string } {
   // S6: from_id is ALWAYS the authenticated peer — body.from_id is ignored.
   // S5: payload size cap.
   if (typeof body.text !== "string") return { ok: false, error: "text must be string" };
   if (utf8Bytes(body.text) > MAX_MSG_BYTES) return { ok: false, error: `text exceeds ${MAX_MSG_BYTES} bytes` };
   const target = db.query("SELECT id FROM peers WHERE id = ?").get(body.to_id) as { id: string } | null;
   if (!target) return { ok: false, error: `Peer ${body.to_id} not found` };
-  insertMessage.run(authedFromId, body.to_id, body.text, new Date().toISOString());
-  return { ok: true };
+  const result = insertMessage.run(authedFromId, body.to_id, body.text, new Date().toISOString());
+  return { ok: true, id: Number(result.lastInsertRowid) };
+}
+
+// /message-status: sender-scoped lookup of delivered/delivered_at for a
+// message the sender previously inserted. Returns one entry per requested
+// id, or { delivered: false, delivered_at: null } for ids that don't
+// match an owned row (never leaks across senders).
+function handleMessageStatus(authedFromId: string, body: { ids: number[] }):
+  { ok: boolean; statuses: { id: number; delivered: boolean; delivered_at: string | null }[] } {
+  if (!Array.isArray(body.ids)) return { ok: true, statuses: [] };
+  const statuses = body.ids.map((id) => {
+    const row = selectMessageStatus.get(id, authedFromId) as
+      { id: number; delivered: number; delivered_at: string | null } | null;
+    return row
+      ? { id: row.id, delivered: row.delivered === 1, delivered_at: row.delivered_at }
+      : { id, delivered: false, delivered_at: null };
+  });
+  return { ok: true, statuses };
+}
+
+// /broadcast-message: fanout send by scope. Requires at least one scope
+// filter (tmux_session | git_root | name_like) so a compromised peer can't
+// use it for unbounded global blast. Inserts one row per target inside a
+// transaction; no at-broker ack behavior differs from single /send-message.
+function handleBroadcast(authedFromId: string, body: BroadcastRequest): { ok: boolean; sent: number; error?: string } {
+  if (typeof body.text !== "string") return { ok: false, sent: 0, error: "text must be string" };
+  if (utf8Bytes(body.text) > MAX_MSG_BYTES) return { ok: false, sent: 0, error: `text exceeds ${MAX_MSG_BYTES} bytes` };
+
+  const tmuxFilter = typeof body.tmux_session === "string" && body.tmux_session.length > 0 ? body.tmux_session : null;
+  const gitFilter = typeof body.git_root === "string" && body.git_root.length > 0 ? body.git_root : null;
+  const nameFilterRaw = typeof body.name_like === "string" && body.name_like.length > 0 ? body.name_like : null;
+  if (!tmuxFilter && !gitFilter && !nameFilterRaw) {
+    return { ok: false, sent: 0, error: "at least one scope filter required (tmux_session, git_root, or name_like)" };
+  }
+
+  // SEC: name_like must be a real substring, not a SQL wildcard. Reject bare
+  // wildcards and require length >= 2 so `name_like='%'` can't sneak past the
+  // "scope filter required" guard to match every named peer.
+  let nameFilter: string | null = nameFilterRaw;
+  if (nameFilter !== null) {
+    if (nameFilter.length < 2) {
+      return { ok: false, sent: 0, error: "name_like must be at least 2 characters" };
+    }
+    // Escape SQL LIKE metacharacters (% _ \) so they're treated as literals
+    // inside the bind parameter. Prepared statement uses ESCAPE '\'.
+    nameFilter = nameFilter.replace(/[\\%_]/g, "\\$&");
+    // After escaping, reject if the remaining non-metachar content is empty.
+    if (nameFilter.replace(/\\./g, "").length === 0) {
+      return { ok: false, sent: 0, error: "name_like must contain non-wildcard characters" };
+    }
+  }
+
+  const targets = selectBroadcastTargets.all(
+    authedFromId,
+    tmuxFilter, tmuxFilter,
+    gitFilter, gitFilter,
+    nameFilter, nameFilter
+  ) as { id: string }[];
+
+  // Enforce fanout cap — prevents /broadcast-message from inserting more
+  // rows than the per-minute message quota would allow in single-sends.
+  if (targets.length > MAX_BROADCAST_TARGETS) {
+    return { ok: false, sent: 0, error: `broadcast scope matched ${targets.length} peers — exceeds cap of ${MAX_BROADCAST_TARGETS}. Narrow your filters.` };
+  }
+
+  // Charge N-1 additional message-bucket slots (the route handler already
+  // ticked 1 at entry). If this would exceed the quota, reject WITHOUT
+  // inserting so the sender can't burst past their rate limit via fanout.
+  // Note: first tick has already been consumed upstream; we simulate the
+  // remaining N-1 by calling rateCheck in isMessage=true mode.
+  for (let i = 0; i < targets.length - 1; i++) {
+    const limited = rateCheck(authedFromId, true);
+    if (limited) {
+      return { ok: false, sent: 0, error: `broadcast would exceed per-minute message quota (${limited})` };
+    }
+  }
+
+  const now = new Date().toISOString();
+  let sent = 0;
+  db.transaction(() => {
+    for (const t of targets) {
+      insertMessage.run(authedFromId, t.id, body.text, now);
+      sent++;
+    }
+  })();
+  return { ok: true, sent };
 }
 
 function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
@@ -409,10 +618,21 @@ function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
 }
 
 function handleAckMessages(body: AckMessagesRequest): { ok: boolean; acked: number } {
+  const nowIso = new Date().toISOString();
+  const nowMs = Date.now();
+  const via = typeof body.via === "string" && body.via.length > 0 ? body.via : "unknown";
   const acked = db.transaction(() => {
     let count = 0;
     for (const id of body.ids) {
-      const result = markDeliveredScoped.run(id, body.id);
+      // Read sent_at BEFORE the UPDATE so we can log the queue→ack latency.
+      // Row is null if id doesn't belong to this peer — scoped UPDATE below
+      // will also return changes=0 in that case, so we skip the log line.
+      const row = selectMsgForLatency.get(id, body.id) as { from_id: string; sent_at: string } | null;
+      const result = markDeliveredScoped.run(nowIso, id, body.id);
+      if (result.changes > 0 && row) {
+        const latencyMs = nowMs - new Date(row.sent_at).getTime();
+        console.error(`[broker] deliver id=${id} from=${row.from_id} to=${body.id} via=${via} latency_ms=${latencyMs}`);
+      }
       count += result.changes;
     }
     return count;
@@ -422,6 +642,59 @@ function handleAckMessages(body: AckMessagesRequest): { ok: boolean; acked: numb
 
 function handleUnregister(body: { id: string }): void {
   deletePeer.run(body.id);
+}
+
+// /poll-by-pid: unauthenticated-by-token, PID-authenticated drain path used
+// by the UserPromptSubmit hook to surface pending peer mail without having
+// the MCP server's in-memory auth token. Atomically fetches undelivered
+// messages for the peer whose row has pid=<target_pid>, marks them
+// delivered, and returns them. Caller proves same-UID via verifyPidUid.
+function handlePollByPid(body: { pid: number; caller_pid: number }): {
+  ok: boolean;
+  error?: string;
+  status?: number;
+  peer_id?: string;
+  messages?: Message[];
+  acked?: number;
+} {
+  if (!Number.isInteger(body.pid) || body.pid <= 1) {
+    return { ok: false, status: 400, error: "invalid pid" };
+  }
+  if (!Number.isInteger(body.caller_pid) || body.caller_pid <= 1) {
+    return { ok: false, status: 400, error: "invalid caller_pid" };
+  }
+  // Same-UID enforcement: caller must be running as the broker's UID.
+  const callerErr = verifyPidUid(body.caller_pid);
+  if (callerErr) return { ok: false, status: 403, error: `caller rejected: ${callerErr}` };
+
+  const peerRow = selectPeerIdByPid.get(body.pid) as { id: string } | null;
+  if (!peerRow) return { ok: true, peer_id: "", messages: [], acked: 0 };
+
+  // Atomically fetch + mark delivered + log latency (matches handleAckMessages).
+  // Concurrent-drain safety: the SELECT happens before the transaction begins,
+  // so two concurrent /poll-by-pid calls for the same peer can each fetch the
+  // same undelivered rows. Only one's UPDATE will change delivered (0→1); the
+  // other's UPDATE returns changes=0. Return ONLY the rows THIS call actually
+  // acked so the wire response matches broker state (no duplicate delivery).
+  const nowIso = new Date().toISOString();
+  const nowMs = Date.now();
+  const fetched = selectUndelivered.all(peerRow.id) as Message[];
+  const ackedMessages: Message[] = [];
+  const acked = db.transaction(() => {
+    let count = 0;
+    for (const m of fetched) {
+      const result = markDeliveredScoped.run(nowIso, m.id, peerRow.id);
+      if (result.changes > 0) {
+        ackedMessages.push(m);
+        const latencyMs = nowMs - new Date(m.sent_at).getTime();
+        console.error(`[broker] deliver id=${m.id} from=${m.from_id} to=${peerRow.id} via=poll-by-pid latency_ms=${latencyMs}`);
+        count++;
+      }
+    }
+    return count;
+  })();
+
+  return { ok: true, peer_id: peerRow.id, messages: ackedMessages, acked };
 }
 
 // --- HTTP Server ---
@@ -466,6 +739,27 @@ const server = Bun.serve({
         return Response.json(result.value);
       }
 
+      // /poll-by-pid: PID-authenticated alternate drain path for the hook
+      // (no X-Peer-Token header — caller_pid + same-UID check is the auth).
+      // Rate-limit bucket keyed by caller_pid string.
+      if (path === "/poll-by-pid") {
+        const rawPid = Number(body.pid);
+        const rawCallerPid = Number(body.caller_pid);
+        const rlKey = `pid:${Number.isFinite(rawCallerPid) ? rawCallerPid : "invalid"}`;
+        const limited = rateCheck(rlKey, false);
+        if (limited) {
+          return new Response(JSON.stringify({ error: limited }), {
+            status: 429,
+            headers: { "Content-Type": "application/json", "Retry-After": String(Math.ceil(RATE_WINDOW_MS / 1000)) },
+          });
+        }
+        const res = handlePollByPid({ pid: rawPid, caller_pid: rawCallerPid });
+        if (!res.ok) {
+          return Response.json({ error: res.error }, { status: res.status ?? 400 });
+        }
+        return Response.json({ peer_id: res.peer_id, messages: res.messages, acked: res.acked });
+      }
+
       // S2/S6: authenticate every other route. The peer ID comes from the
       // token lookup; the body's `id`/`from_id` is overwritten.
       // H2: do NOT include `exclude_id` in the chain — it is "id to exclude
@@ -480,7 +774,7 @@ const server = Bun.serve({
       // client-side HEARTBEAT_INTERVAL_MS, and 429-ing it would cascade into
       // ghost-reaping a perfectly healthy peer.
       if (path !== "/heartbeat") {
-        const limited = rateCheck(auth.id, path === "/send-message");
+        const limited = rateCheck(auth.id, path === "/send-message" || path === "/broadcast-message");
         if (limited) {
           return new Response(JSON.stringify({ error: limited }), {
             status: 429,
@@ -501,6 +795,14 @@ const server = Bun.serve({
           handleSetSummary({ id: auth.id, summary });
           return Response.json({ ok: true });
         }
+        case "/set-name": {
+          const name = String(body.name ?? "");
+          if (utf8Bytes(name) > MAX_NAME_BYTES) {
+            return Response.json({ error: `name exceeds ${MAX_NAME_BYTES} bytes` }, { status: 413 });
+          }
+          handleSetName({ id: auth.id, name });
+          return Response.json({ ok: true });
+        }
         case "/list-peers":
           // Pass body through as-is; server.ts sets exclude_id explicitly when
           // it wants self-exclusion, but tests and ad-hoc callers may want to
@@ -508,10 +810,18 @@ const server = Bun.serve({
           return Response.json(handleListPeers(body as unknown as ListPeersRequest));
         case "/send-message":
           return Response.json(handleSendMessage(auth.id, body as unknown as SendMessageRequest));
+        case "/broadcast-message":
+          return Response.json(handleBroadcast(auth.id, body as unknown as BroadcastRequest));
+        case "/message-status":
+          return Response.json(handleMessageStatus(auth.id, { ids: (body.ids as number[]) ?? [] }));
         case "/poll-messages":
           return Response.json(handlePollMessages({ id: auth.id }));
         case "/ack-messages":
-          return Response.json(handleAckMessages({ id: auth.id, ids: (body.ids as number[]) ?? [] }));
+          return Response.json(handleAckMessages({
+            id: auth.id,
+            ids: (body.ids as number[]) ?? [],
+            via: typeof body.via === "string" ? body.via : undefined,
+          }));
         case "/unregister":
           handleUnregister({ id: auth.id });
           buckets.delete(auth.id);
