@@ -10,7 +10,8 @@
  */
 
 import { Database } from "bun:sqlite";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync, renameSync, chmodSync } from "node:fs";
+import { timingSafeEqual } from "node:crypto";
 // L6: top-level node:fs import (was inline require() in verifyPidUid hot path).
 import type {
   RegisterRequest,
@@ -59,6 +60,13 @@ const MAX_BROADCAST_TARGETS = RATE_MAX_MSGS; // hard cap = 60 — ties fanout to
 
 // --- S7: ghost reaping ---
 const PEER_GHOST_AFTER_MS = 90_000;    // peer with no heartbeat in 90s = ghost
+
+// --- AP-063: bridge auth ---
+// File-backed bridge token for the Mission Control Hub bridge daemon.
+// Re-minted on every broker startup; daemon re-reads on EBADTOKEN.
+// Loopback-only bind means filesystem ACLs (chmod 0600) are the auth boundary.
+const BRIDGE_TOKEN_FILE = process.env.CLAUDE_PEERS_BRIDGE_TOKEN_FILE ?? `${process.env.HOME}/.claude-peers-bridge.token`;
+const BRIDGE_RATE_KEY = "__bridge__";  // dedicated rate-limit bucket
 
 // --- Rehydration: when a peer dies and re-launches in the same tmux pane,
 // inherit its ID so orphaned mail (addressed to the old ID) surfaces. Window
@@ -268,6 +276,14 @@ const selectMessageStatus = db.prepare(`
   SELECT id, delivered, delivered_at FROM messages WHERE id = ? AND from_id = ?
 `);
 
+// AP-063: bridge cursor read. Returns ALL messages with id > cursor, regardless
+// of delivery state — the bridge is an observer, not a recipient. Bridge tokens
+// are file-backed and loopback-only; this is intentionally bypass-the-peer-model.
+const selectMessagesSinceId = db.prepare(`
+  SELECT id, from_id, to_id, text, sent_at, delivered FROM messages
+  WHERE id > ? ORDER BY id ASC LIMIT ?
+`);
+
 // --- Generate peer ID ---
 
 function generateId(): string {
@@ -287,6 +303,27 @@ function generateToken(): string {
   const buf = new Uint8Array(24);
   crypto.getRandomValues(buf);
   return Buffer.from(buf).toString("base64url");
+}
+
+// AP-063: bridge token — 32 random bytes, file-backed at chmod 0600. Minted
+// once per broker process; daemon reads from BRIDGE_TOKEN_FILE on startup
+// and on every 401 response (handles broker restart).
+function mintBridgeToken(): string {
+  const buf = new Uint8Array(32);
+  crypto.getRandomValues(buf);
+  return Buffer.from(buf).toString("base64url");
+}
+const BRIDGE_TOKEN = mintBridgeToken();
+try {
+  // Atomic write: tmp + chmod + rename. Avoids partial-token race during read.
+  const tmp = `${BRIDGE_TOKEN_FILE}.tmp`;
+  writeFileSync(tmp, BRIDGE_TOKEN, { mode: 0o600 });
+  chmodSync(tmp, 0o600);  // belt-and-braces: writeFileSync mode is umask-affected
+  renameSync(tmp, BRIDGE_TOKEN_FILE);
+  console.error(`[broker] bridge token written to ${BRIDGE_TOKEN_FILE}`);
+} catch (e) {
+  console.error(`[broker] FATAL: cannot write bridge token to ${BRIDGE_TOKEN_FILE}:`, e);
+  process.exit(2);
 }
 
 // S3: verify the claimed PID is alive and owned by this broker's UID.
@@ -325,6 +362,24 @@ function verifyPidUid(pid: number): string | null {
     return `proc read failed: ${msg}`;
   }
   return null;
+}
+
+// AP-063: bridge auth via Authorization: Bearer. Constant-time compare to
+// prevent timing attacks. Distinct from authPeer (X-Peer-Token) so a leaked
+// peer token cannot reach bridge endpoints and vice versa.
+function authBridge(req: Request, path: string): { ok: true } | { ok: false; status: number; error: string } {
+  const hdr = req.headers.get("authorization");
+  if (!hdr || !hdr.startsWith("Bearer ")) {
+    console.error(`[broker] bridge auth fail on ${path}: missing Bearer`);
+    return { ok: false, status: 401, error: "missing bridge token" };
+  }
+  const presented = Buffer.from(hdr.slice(7));
+  const expected = Buffer.from(BRIDGE_TOKEN);
+  if (presented.length !== expected.length || !timingSafeEqual(presented, expected)) {
+    console.error(`[broker] bridge auth fail on ${path}: invalid token`);
+    return { ok: false, status: 401, error: "invalid bridge token" };
+  }
+  return { ok: true };
 }
 
 // S2/S6: resolve `X-Peer-Token` header to an authenticated peer row. The
@@ -709,6 +764,27 @@ const server = Bun.serve({
     if (req.method !== "POST") {
       if (path === "/health") {
         return Response.json({ status: "ok", peers: (selectAllPeers.all() as Peer[]).length });
+      }
+      // AP-063: bridge cursor read. Bridge daemon polls this every 2s.
+      if (path === "/messages-since-id") {
+        const auth = authBridge(req, path);
+        if (!auth.ok) return Response.json({ error: auth.error }, { status: auth.status });
+        const limited = rateCheck(BRIDGE_RATE_KEY, false);
+        if (limited) {
+          return new Response(JSON.stringify({ error: limited }), {
+            status: 429,
+            headers: { "Content-Type": "application/json", "Retry-After": String(Math.ceil(RATE_WINDOW_MS / 1000)) },
+          });
+        }
+        const sinceRaw = url.searchParams.get("since");
+        const limitRaw = url.searchParams.get("limit");
+        const sinceParsed = parseInt(sinceRaw ?? "0", 10);
+        const since = Number.isFinite(sinceParsed) && sinceParsed >= 0 ? sinceParsed : 0;
+        const limitParsed = parseInt(limitRaw ?? "100", 10);
+        const limit = Number.isFinite(limitParsed) && limitParsed >= 1 && limitParsed <= 1000 ? limitParsed : 100;
+        const rows = selectMessagesSinceId.all(since, limit) as Array<{ id: number; from_id: string; to_id: string; text: string; sent_at: string; delivered: number }>;
+        const cursor = rows.length > 0 ? Math.max(...rows.map((r) => r.id)) : since;
+        return Response.json({ messages: rows, cursor, limit, count: rows.length });
       }
       return new Response("claude-peers broker", { status: 200 });
     }
