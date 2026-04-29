@@ -457,6 +457,19 @@ function handleRegister(body: RegisterRequest): RegisterResult {
     return { ok: false, status: 413, error: `summary exceeds ${MAX_SUMMARY_BYTES} bytes` };
   }
 
+  // Bound the name at registration too — /set-name enforces MAX_NAME_BYTES at
+  // line 876-878 but /register previously didn't, so a peer could register a
+  // 10MB name and DoS list_peers output. Also rejects non-string types so the
+  // suffix-walk template literal can't stringify objects to "[object Object]".
+  if (body.name !== undefined && body.name !== null) {
+    if (typeof body.name !== "string") {
+      return { ok: false, status: 400, error: "name must be a string" };
+    }
+    if (utf8Bytes(body.name) > MAX_NAME_BYTES) {
+      return { ok: false, status: 413, error: `name exceeds ${MAX_NAME_BYTES} bytes` };
+    }
+  }
+
   const now = new Date().toISOString();
   const token = generateToken();
 
@@ -505,7 +518,17 @@ function handleRegister(body: RegisterRequest): RegisterResult {
     buckets.delete(existing.id);
   }
 
-  insertPeer.run(id, body.pid, body.cwd, body.git_root, body.tty, body.name ?? null, body.tmux_session ?? null, body.tmux_window_index ?? null, body.tmux_window_name ?? null, body.summary, now, now, token);
+  // Name de-dupe: if another live peer already holds this name, auto-suffix
+  // with #2, #3, … so every peer has a unique display name. See
+  // disambiguateName() — defends against env-var inheritance to child Claude
+  // processes (e.g. headless sub-Claudes spawning with parent's
+  // CLAUDE_PEER_NAME) and any caller that forgets to uniquify.
+  const requestedName = body.name ?? null;
+  const finalName = disambiguateName(requestedName, id);
+  if (requestedName && finalName !== requestedName) {
+    console.error(`[broker] name dedup: pid=${body.pid} requested="${requestedName}" got="${finalName}" (collision)`);
+  }
+  insertPeer.run(id, body.pid, body.cwd, body.git_root, body.tty, finalName, body.tmux_session ?? null, body.tmux_window_index ?? null, body.tmux_window_name ?? null, body.summary, now, now, token);
   return { ok: true, value: { id, token } };
 }
 
@@ -517,10 +540,60 @@ function handleSetSummary(body: SetSummaryRequest): void {
   updateSummary.run(body.summary, body.id);
 }
 
-function handleSetName(body: SetNameRequest): void {
+// Returns the actual stored name so the caller (server.ts /set-name dispatch)
+// can report it back to the peer — otherwise a peer that asked for "obs" but
+// got "obs#2" never learns its real handle.
+function handleSetName(body: SetNameRequest): string | null {
   // Empty string clears the name (stored as NULL for join-friendliness
   // with list_peers output which treats null as "unnamed").
-  updateName.run(body.name.length > 0 ? body.name : null, body.id);
+  const desired = body.name.length > 0 ? body.name : null;
+  const final = disambiguateName(desired, body.id);
+  updateName.run(final, body.id);
+  return final;
+}
+
+// Auto-suffix on name collision. If another LIVE peer already holds `rawName`
+// (or `rawName#2`, `#3`, …), append the lowest free `#N` (≥ 2) so every peer
+// has a unique display name. Dead peers (reaper hasn't fired yet) do not
+// block — we check PID liveness inline (same shape as cleanStalePeers
+// 155-169 and the rehydrate path 482-489). Excludes selfId so a peer
+// re-registering its own row keeps its name. SQLite TEXT and JS Set are both
+// case-sensitive — comparison is consistent.
+//
+// Concurrency: handleRegister is synchronous and bun:sqlite operations are
+// synchronous, so within one broker process the SELECT here and the INSERT
+// in handleRegister run in one JS turn with no await boundary — atomic by
+// virtue of the event loop, no transaction needed. If the broker ever moves
+// to multi-process / async sqlite, wrap this in db.transaction(...).
+function disambiguateName(rawName: string | null, selfId: string): string | null {
+  if (!rawName) return null;
+  const rows = db.query(
+    "SELECT pid, name FROM peers WHERE name IS NOT NULL AND id != ?"
+  ).all(selfId) as { pid: number; name: string }[];
+  const liveNames = new Set(
+    rows.filter(r => isPidAlive(r.pid)).map(r => r.name)
+  );
+  if (!liveNames.has(rawName)) return rawName;
+  let n = 2;
+  while (liveNames.has(`${rawName}#${n}`)) n++;
+  return `${rawName}#${n}`;
+}
+
+// Distinguishes ESRCH ("dead") from EPERM ("alive, owned by different UID")
+// — without this, EPERM collapses to "dead" and a foreign live process's
+// name would be reusable. Same logic as the rehydrate path (482-489); the
+// existing cleanStalePeers (155-167) has the pre-existing bare-catch defect
+// and could be hardened the same way in a follow-up.
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    const code = (e as { code?: string } | undefined)?.code;
+    // EPERM → process exists, owned by another UID — treat as alive
+    // (don't reuse its name). ESRCH or undefined → genuinely dead.
+    return code === "EPERM";
+  }
 }
 
 function handleListPeers(body: ListPeersRequest): Peer[] {
@@ -876,8 +949,11 @@ const server = Bun.serve({
           if (utf8Bytes(name) > MAX_NAME_BYTES) {
             return Response.json({ error: `name exceeds ${MAX_NAME_BYTES} bytes` }, { status: 413 });
           }
-          handleSetName({ id: auth.id, name });
-          return Response.json({ ok: true });
+          // Return the actual stored name — may differ from `name` if dedup
+          // suffixed it. Caller decides whether to surface the suffix to the
+          // user; broker doesn't silently change identity behind their back.
+          const stored = handleSetName({ id: auth.id, name });
+          return Response.json({ ok: true, name: stored });
         }
         case "/list-peers":
           // Pass body through as-is; server.ts sets exclude_id explicitly when
