@@ -44,6 +44,11 @@ export interface RegisterResponse {
   // S2: per-peer auth token returned at registration. Required as
   // X-Peer-Token header on every subsequent broker call.
   token: string;
+  // Resolved name after dedup. Differs from request.name when another live
+  // peer already held the requested name — broker auto-suffixes #2/#3/...
+  // Caller compares request.name vs response.name to detect collision and
+  // surface the truth to operator (status bar, @peer_label, log).
+  name: string | null;
 }
 
 export interface HeartbeatRequest {

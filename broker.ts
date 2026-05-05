@@ -529,7 +529,7 @@ function handleRegister(body: RegisterRequest): RegisterResult {
     console.error(`[broker] name dedup: pid=${body.pid} requested="${requestedName}" got="${finalName}" (collision)`);
   }
   insertPeer.run(id, body.pid, body.cwd, body.git_root, body.tty, finalName, body.tmux_session ?? null, body.tmux_window_index ?? null, body.tmux_window_name ?? null, body.summary, now, now, token);
-  return { ok: true, value: { id, token } };
+  return { ok: true, value: { id, token, name: finalName } };
 }
 
 function handleHeartbeat(body: HeartbeatRequest): void {
