@@ -152,12 +152,16 @@ for (const col of messageMigrationColumns) {
 
 // Clean up stale peers (PIDs that no longer exist) on startup, and free
 // their rate-limit buckets (M2 — was leaking on long-running brokers).
+//
+// Uses isPidAlive (defined later in this module — function declarations are
+// hoisted) for EPERM-aware liveness: a PID owned by a different UID returns
+// EPERM from kill(0), which the previous bare-catch incorrectly classified
+// as "dead" and would clobber the row. ESRCH ("no such process") is the only
+// signal for genuinely dead and reapable.
 function cleanStalePeers() {
   const peers = db.query("SELECT id, pid FROM peers").all() as { id: string; pid: number }[];
   for (const peer of peers) {
-    try {
-      process.kill(peer.pid, 0);
-    } catch {
+    if (!isPidAlive(peer.pid)) {
       db.run("DELETE FROM peers WHERE id = ?", [peer.id]);
       db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [peer.id]);
       // M2: drop the bucket so it doesn't outlive the peer indefinitely.
@@ -581,9 +585,9 @@ function disambiguateName(rawName: string | null, selfId: string): string | null
 
 // Distinguishes ESRCH ("dead") from EPERM ("alive, owned by different UID")
 // — without this, EPERM collapses to "dead" and a foreign live process's
-// name would be reusable. Same logic as the rehydrate path (482-489); the
-// existing cleanStalePeers (155-167) has the pre-existing bare-catch defect
-// and could be hardened the same way in a follow-up.
+// name would be reusable. Used by disambiguateName, the rehydrate path
+// (482-489), and cleanStalePeers (was bare-catch, hardened to use this
+// helper for symmetric EPERM handling across all liveness checks).
 function isPidAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
