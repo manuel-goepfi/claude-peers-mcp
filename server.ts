@@ -219,7 +219,10 @@ async function detectTmuxPane(): Promise<TmuxPaneInfo | null> {
     // 1. Get all tmux panes with their pane_pid.
     // Tab delimiter so session and window names with spaces parse correctly.
     const listProc = Bun.spawn(
-      ["tmux", "list-panes", "-a", "-F", "#{pane_pid}\t#{session_name}\t#{window_index}\t#{window_name}"],
+      // pane_index appended as 5th field for the CLAUDE_PEER_NAME tmux-fallback
+      // path. parseTmuxPanes treats it as optional, so older callers parsing
+      // 4-field output continue to work.
+      ["tmux", "list-panes", "-a", "-F", "#{pane_pid}\t#{session_name}\t#{window_index}\t#{window_name}\t#{pane_index}"],
       { stdout: "pipe", stderr: "ignore" }
     );
     const listText = await new Response(listProc.stdout).text();
@@ -991,8 +994,18 @@ async function main() {
   myCwd = process.cwd();
   myGitRoot = await getGitRoot(myCwd);
   const tty = getTty();
-  const peerName = process.env.CLAUDE_PEER_NAME ?? null;
   const tmuxInfo = await detectTmuxPane();
+  // CLAUDE_PEER_NAME ?? <session>.<pane>: the bashrc cc/ccc/cccr wrappers
+  // pre-export the env var, but a Claude launched via bare `claude` skips
+  // that path and would otherwise register with name=null (unfindable by
+  // name, only by id). Mirror the bashrc's #S.#P logic at the MCP layer
+  // so the floor is consistent regardless of how the session was started.
+  const envName = process.env.CLAUDE_PEER_NAME ?? null;
+  const tmuxFallbackName =
+    tmuxInfo && tmuxInfo.pane_index
+      ? `${tmuxInfo.session}.${tmuxInfo.pane_index}`
+      : null;
+  const peerName = envName ?? tmuxFallbackName;
 
   log(`CWD: ${myCwd}`);
   log(`Git root: ${myGitRoot ?? "(none)"}`);
