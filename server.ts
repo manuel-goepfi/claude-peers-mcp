@@ -257,6 +257,12 @@ async function detectTmuxPane(): Promise<TmuxPaneInfo | null> {
 // --- State ---
 
 let myId: PeerId | null = null;
+// Resolved name as registered with the broker — may differ from
+// process.env.CLAUDE_PEER_NAME when dedup suffixed it (e.g. requested
+// "manzoopsinfra.2", broker assigned "manzoopsinfra.2#2"). Used by
+// @peer_label / whoami / log breadcrumb so the operator's perception
+// layer matches broker truth.
+let myResolvedName: string | null = null;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
 
@@ -894,7 +900,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         content: [
           {
             type: "text" as const,
-            text: `Peer ID: ${myId ?? "(not registered)"}\nCWD: ${myCwd}\nGit root: ${myGitRoot ?? "(none)"}`,
+            text: `Peer ID: ${myId ?? "(not registered)"}\nName: ${myResolvedName ?? "(none)"}\nCWD: ${myCwd}\nGit root: ${myGitRoot ?? "(none)"}`,
           },
         ],
       };
@@ -1041,15 +1047,26 @@ async function main() {
   const reg = await brokerFetch<RegisterResponse>("/register", buildRegisterPayload());
   myId = reg.id;
   myToken = reg.token;
-  log(`Registered as peer ${myId} (token issued)`);
+  // reg.name may be undefined when this MCP build talks to a pre-d944bca
+  // broker that doesn't echo the resolved name yet — fall back to peerName
+  // for backwards-compat. Once the broker is rolled out, this becomes the
+  // canonical truth source.
+  myResolvedName = reg.name ?? peerName;
+  log(`Registered as peer ${myId} name=${myResolvedName ?? "(none)"} (token issued)`);
+  // Breadcrumb when broker dedup'd a colliding name. Visible in stderr +
+  // ~/.claude-peers-broker.log so operators stop seeing duplicate display.
+  if (peerName && myResolvedName && peerName !== myResolvedName) {
+    log(`note: '${peerName}' was taken; you are now '${myResolvedName}'`);
+  }
 
   // If running inside tmux, publish our identity as per-pane options so
   // pane-border-format can display the peer's name/id without extra lookups.
   // Best-effort — tmux not installed or pane resolution fails → silent skip.
   if (tmuxInfo) {
     const target = `${tmuxInfo.session}:${tmuxInfo.window_index}.${process.env.TMUX_PANE ?? ""}`;
-    // Prefer @peer_name (human label) for display; fall back to @peer_id.
-    const displayLabel = peerName || myId;
+    // Prefer the broker-resolved name (post-dedup truth) over the
+    // requested env-var name; fall back to peer_id when neither is set.
+    const displayLabel = myResolvedName || peerName || myId;
     try {
       // Use pane-id when present; fall back to session:window.pane coordinate.
       const paneTarget = process.env.TMUX_PANE
@@ -1074,7 +1091,10 @@ async function main() {
     const r = await brokerFetch<RegisterResponse>("/register", buildRegisterPayload());
     myId = r.id;
     myToken = r.token;
-    log(`Re-registered as peer ${myId} after broker auth reset`);
+    // Re-capture resolved name; the broker may have re-dedup'd if other
+    // peers came/went during the auth-reset window.
+    myResolvedName = r.name ?? peerName;
+    log(`Re-registered as peer ${myId} name=${myResolvedName ?? "(none)"} after broker auth reset`);
   };
 
   // If summary generation is still running, update it when done
