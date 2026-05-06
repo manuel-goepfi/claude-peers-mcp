@@ -117,8 +117,10 @@ const migrationColumns = [
   { name: "tmux_session", type: "TEXT" },
   { name: "tmux_window_index", type: "TEXT" },
   { name: "tmux_window_name", type: "TEXT" },
+  { name: "tmux_pane_id", type: "TEXT" },
   // S2: per-peer auth token issued at /register
   { name: "token", type: "TEXT" },
+  { name: "resolved_name", type: "TEXT" },
 ];
 for (const col of migrationColumns) {
   try {
@@ -131,6 +133,23 @@ for (const col of migrationColumns) {
     if (!msg.includes("duplicate column name")) {
       throw e;
     }
+  }
+}
+
+// One-time compatibility backfill for rows written before name/resolved_name
+// split. Old brokers stored broker-deduped values like codex.2#4 directly in
+// `name`; restore `name` to the operator label and preserve the old value as
+// `resolved_name`. Only strip labels ending in .N#M so legitimate custom names
+// containing # are left alone.
+const backfillPeerIdentity = db.prepare(`
+  UPDATE peers SET name = ?, resolved_name = ? WHERE id = ?
+`);
+for (const row of db.query("SELECT id, name, resolved_name FROM peers WHERE name IS NOT NULL").all() as { id: string; name: string; resolved_name: string | null }[]) {
+  const resolved = row.resolved_name ?? row.name;
+  const operatorMatch = row.name.match(/^(.+\.[0-9]+)#[0-9]+$/);
+  const operatorName = operatorMatch ? operatorMatch[1]! : row.name;
+  if (operatorName !== row.name || row.resolved_name === null) {
+    backfillPeerIdentity.run(operatorName, resolved, row.id);
   }
 }
 
@@ -180,8 +199,8 @@ setInterval(cleanStalePeers, 30_000);
 // --- Prepared statements ---
 
 const insertPeer = db.prepare(`
-  INSERT INTO peers (id, pid, cwd, git_root, tty, name, tmux_session, tmux_window_index, tmux_window_name, summary, registered_at, last_seen, token)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO peers (id, pid, cwd, git_root, tty, name, resolved_name, tmux_session, tmux_window_index, tmux_window_name, tmux_pane_id, summary, registered_at, last_seen, token)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const selectPeerByToken = db.prepare(`
@@ -197,7 +216,7 @@ const updateSummary = db.prepare(`
 `);
 
 const updateName = db.prepare(`
-  UPDATE peers SET name = ? WHERE id = ?
+  UPDATE peers SET name = ?, resolved_name = ? WHERE id = ?
 `);
 
 const deletePeer = db.prepare(`
@@ -251,7 +270,11 @@ const selectPeerIdByPid = db.prepare(`
 // PID-dedup path, not rehydration.
 const selectRehydrateCandidates = db.prepare(`
   SELECT id, pid, last_seen FROM peers
-  WHERE tmux_session = ? AND tmux_window_index = ? AND tmux_window_name = ?
+  WHERE tmux_session = ?
+    AND (
+      (? IS NOT NULL AND tmux_pane_id = ?)
+      OR (? IS NULL AND tmux_window_index = ? AND tmux_window_name = ?)
+    )
     AND cwd = ? AND pid != ?
   ORDER BY last_seen DESC LIMIT 3
 `);
@@ -485,6 +508,9 @@ function handleRegister(body: RegisterRequest): RegisterResult {
   if (body.tmux_session && body.tmux_window_index !== null && body.tmux_window_index !== undefined && body.tmux_window_name) {
     const candidates = selectRehydrateCandidates.all(
       body.tmux_session,
+      body.tmux_pane_id ?? null,
+      body.tmux_pane_id ?? null,
+      body.tmux_pane_id ?? null,
       body.tmux_window_index,
       body.tmux_window_name,
       body.cwd,
@@ -522,18 +548,15 @@ function handleRegister(body: RegisterRequest): RegisterResult {
     buckets.delete(existing.id);
   }
 
-  // Name de-dupe: if another live peer already holds this name, auto-suffix
-  // with #2, #3, … so every peer has a unique display name. See
-  // disambiguateName() — defends against env-var inheritance to child Claude
-  // processes (e.g. headless sub-Claudes spawning with parent's
-  // CLAUDE_PEER_NAME) and any caller that forgets to uniquify.
+  // Runtime-name de-dupe: keep the operator-facing name unchanged, but assign
+  // a broker-unique resolved_name for diagnostics and exact process identity.
   const requestedName = body.name ?? null;
   const finalName = disambiguateName(requestedName, id);
   if (requestedName && finalName !== requestedName) {
-    console.error(`[broker] name dedup: pid=${body.pid} requested="${requestedName}" got="${finalName}" (collision)`);
+    console.error(`[broker] name dedup: pid=${body.pid} requested="${requestedName}" resolved="${finalName}" (collision)`);
   }
-  insertPeer.run(id, body.pid, body.cwd, body.git_root, body.tty, finalName, body.tmux_session ?? null, body.tmux_window_index ?? null, body.tmux_window_name ?? null, body.summary, now, now, token);
-  return { ok: true, value: { id, token, name: finalName } };
+  insertPeer.run(id, body.pid, body.cwd, body.git_root, body.tty, requestedName, finalName, body.tmux_session ?? null, body.tmux_window_index ?? null, body.tmux_window_name ?? null, body.tmux_pane_id ?? null, body.summary, now, now, token);
+  return { ok: true, value: { id, token, name: requestedName, resolved_name: finalName } };
 }
 
 function handleHeartbeat(body: HeartbeatRequest): void {
@@ -547,13 +570,13 @@ function handleSetSummary(body: SetSummaryRequest): void {
 // Returns the actual stored name so the caller (server.ts /set-name dispatch)
 // can report it back to the peer — otherwise a peer that asked for "obs" but
 // got "obs#2" never learns its real handle.
-function handleSetName(body: SetNameRequest): string | null {
+function handleSetName(body: SetNameRequest): { name: string | null; resolved_name: string | null } {
   // Empty string clears the name (stored as NULL for join-friendliness
   // with list_peers output which treats null as "unnamed").
   const desired = body.name.length > 0 ? body.name : null;
   const final = disambiguateName(desired, body.id);
-  updateName.run(final, body.id);
-  return final;
+  updateName.run(desired, final, body.id);
+  return { name: desired, resolved_name: final };
 }
 
 // Auto-suffix on name collision. If another LIVE peer already holds `rawName`
@@ -572,7 +595,7 @@ function handleSetName(body: SetNameRequest): string | null {
 function disambiguateName(rawName: string | null, selfId: string): string | null {
   if (!rawName) return null;
   const rows = db.query(
-    "SELECT pid, name FROM peers WHERE name IS NOT NULL AND id != ?"
+    "SELECT pid, COALESCE(resolved_name, name) AS name FROM peers WHERE COALESCE(resolved_name, name) IS NOT NULL AND id != ?"
   ).all(selfId) as { pid: number; name: string }[];
   const liveNames = new Set(
     rows.filter(r => isPidAlive(r.pid)).map(r => r.name)
@@ -598,6 +621,42 @@ function isPidAlive(pid: number): boolean {
     // (don't reuse its name). ESRCH or undefined → genuinely dead.
     return code === "EPERM";
   }
+}
+
+function activePeerKey(peer: Peer): string {
+  if (peer.tmux_session && peer.tmux_pane_id) return `pane:${peer.tmux_session}:${peer.tmux_pane_id}`;
+  if (peer.tty) return `tty:${peer.tty}`;
+  return `id:${peer.id}`;
+}
+
+function liveAndFreshPeers(peers: Peer[]): Peer[] {
+  const now = Date.now();
+  return peers.filter((p) => {
+    if (!isPidAlive(p.pid)) {
+      deletePeer.run(p.id);
+      buckets.delete(p.id);
+      return false;
+    }
+    const age = now - new Date(p.last_seen).getTime();
+    if (age > PEER_GHOST_AFTER_MS) {
+      deletePeer.run(p.id);
+      buckets.delete(p.id);
+      return false;
+    }
+    return true;
+  });
+}
+
+function activeOnly(peers: Peer[]): Peer[] {
+  const byKey = new Map<string, Peer>();
+  for (const peer of peers) {
+    const key = activePeerKey(peer);
+    const prior = byKey.get(key);
+    if (!prior || new Date(peer.last_seen).getTime() >= new Date(prior.last_seen).getTime()) {
+      byKey.set(key, peer);
+    }
+  }
+  return [...byKey.values()];
 }
 
 function handleListPeers(body: ListPeersRequest): Peer[] {
@@ -627,24 +686,8 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
     peers = peers.filter((p) => p.id !== body.exclude_id);
   }
 
-  // S7: drop dead PIDs AND ghosts (no heartbeat in PEER_GHOST_AFTER_MS).
-  const now = Date.now();
-  return peers.filter((p) => {
-    try {
-      process.kill(p.pid, 0);
-    } catch {
-      deletePeer.run(p.id);
-      buckets.delete(p.id);
-      return false;
-    }
-    const age = now - new Date(p.last_seen).getTime();
-    if (age > PEER_GHOST_AFTER_MS) {
-      deletePeer.run(p.id);
-      buckets.delete(p.id);
-      return false;
-    }
-    return true;
-  });
+  const live = liveAndFreshPeers(peers);
+  return body.include_inactive ? live : activeOnly(live);
 }
 
 function handleSendMessage(authedFromId: string, body: SendMessageRequest): { ok: boolean; id?: number; error?: string } {
@@ -714,10 +757,13 @@ function handleBroadcast(authedFromId: string, body: BroadcastRequest): { ok: bo
     nameFilter, nameFilter
   ) as { id: string }[];
 
+  const activeIds = new Set(activeOnly(liveAndFreshPeers(selectAllPeers.all() as Peer[])).map((p) => p.id));
+  const activeTargets = targets.filter((t) => activeIds.has(t.id));
+
   // Enforce fanout cap — prevents /broadcast-message from inserting more
   // rows than the per-minute message quota would allow in single-sends.
-  if (targets.length > MAX_BROADCAST_TARGETS) {
-    return { ok: false, sent: 0, error: `broadcast scope matched ${targets.length} peers — exceeds cap of ${MAX_BROADCAST_TARGETS}. Narrow your filters.` };
+  if (activeTargets.length > MAX_BROADCAST_TARGETS) {
+    return { ok: false, sent: 0, error: `broadcast scope matched ${activeTargets.length} peers — exceeds cap of ${MAX_BROADCAST_TARGETS}. Narrow your filters.` };
   }
 
   // Charge N-1 additional message-bucket slots (the route handler already
@@ -725,7 +771,7 @@ function handleBroadcast(authedFromId: string, body: BroadcastRequest): { ok: bo
   // inserting so the sender can't burst past their rate limit via fanout.
   // Note: first tick has already been consumed upstream; we simulate the
   // remaining N-1 by calling rateCheck in isMessage=true mode.
-  for (let i = 0; i < targets.length - 1; i++) {
+  for (let i = 0; i < activeTargets.length - 1; i++) {
     const limited = rateCheck(authedFromId, true);
     if (limited) {
       return { ok: false, sent: 0, error: `broadcast would exceed per-minute message quota (${limited})` };
@@ -735,7 +781,7 @@ function handleBroadcast(authedFromId: string, body: BroadcastRequest): { ok: bo
   const now = new Date().toISOString();
   let sent = 0;
   db.transaction(() => {
-    for (const t of targets) {
+    for (const t of activeTargets) {
       insertMessage.run(authedFromId, t.id, body.text, now);
       sent++;
     }
@@ -953,11 +999,10 @@ const server = Bun.serve({
           if (utf8Bytes(name) > MAX_NAME_BYTES) {
             return Response.json({ error: `name exceeds ${MAX_NAME_BYTES} bytes` }, { status: 413 });
           }
-          // Return the actual stored name — may differ from `name` if dedup
-          // suffixed it. Caller decides whether to surface the suffix to the
-          // user; broker doesn't silently change identity behind their back.
+          // Return the operator-facing stored name. Runtime dedup is exposed
+          // separately as resolved_name via /register and /list-peers.
           const stored = handleSetName({ id: auth.id, name });
-          return Response.json({ ok: true, name: stored });
+          return Response.json({ ok: true, name: stored.name, resolved_name: stored.resolved_name });
         }
         case "/list-peers":
           // Pass body through as-is; server.ts sets exclude_id explicitly when

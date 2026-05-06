@@ -14,15 +14,16 @@ export interface TmuxPaneInfo {
   // `#{pane_index}` (5th tab-separated field). Stays undefined for
   // legacy 4-field input so old tests / callers don't break.
   pane_index?: string;
+  pane_id?: string;
 }
 
 /**
- * Parse output of `tmux list-panes -a -F "#{pane_pid}\t#{session_name}\t#{window_index}\t#{window_name}[\t#{pane_index}]"`.
+ * Parse output of `tmux list-panes -a -F "#{pane_pid}\t#{session_name}\t#{window_index}\t#{window_name}[\t#{pane_index}\t#{pane_id}]"`.
  * Returns a Map keyed by pane_pid for O(1) ancestry lookups.
  *
  * Tab-delimited (NOT space-delimited) so session names and window names with
  * spaces are preserved. Skips malformed lines and lines with non-numeric pids.
- * The 5th field (pane_index) is optional and populated only when the upstream
+ * The 5th and 6th fields (pane_index, pane_id) are optional and populated only when the upstream
  * format string requested it — used by the tmux-derived peer-name fallback in
  * server.ts when CLAUDE_PEER_NAME isn't set.
  */
@@ -40,6 +41,9 @@ export function parseTmuxPanes(output: string): Map<number, TmuxPaneInfo> {
         };
         if (parts.length >= 5 && parts[4]!.length > 0) {
           info.pane_index = parts[4]!;
+        }
+        if (parts.length >= 6 && parts[5]!.length > 0) {
+          info.pane_id = parts[5]!;
         }
         paneMap.set(pid, info);
       }

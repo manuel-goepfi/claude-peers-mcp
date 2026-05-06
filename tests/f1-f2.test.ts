@@ -41,6 +41,8 @@ describe("F1+F2 broker schema migrations", () => {
       { name: "tmux_session", type: "TEXT" },
       { name: "tmux_window_index", type: "TEXT" },
       { name: "tmux_window_name", type: "TEXT" },
+      { name: "tmux_pane_id", type: "TEXT" },
+      { name: "resolved_name", type: "TEXT" },
     ];
     for (const col of migrationColumns) {
       try {
@@ -55,13 +57,39 @@ describe("F1+F2 broker schema migrations", () => {
     db.close();
   });
 
-  test("migration adds 4 new columns", () => {
+  test("migration adds peer identity columns", () => {
     const info = db.prepare("PRAGMA table_info(peers)").all() as Array<{ name: string }>;
     const colNames = info.map((c) => c.name);
     expect(colNames).toContain("name");
     expect(colNames).toContain("tmux_session");
     expect(colNames).toContain("tmux_window_index");
     expect(colNames).toContain("tmux_window_name");
+    expect(colNames).toContain("tmux_pane_id");
+    expect(colNames).toContain("resolved_name");
+  });
+
+  test("identity backfill restores operator labels from old deduped names", () => {
+    const local = new Database(":memory:");
+    local.run("CREATE TABLE peers (id TEXT PRIMARY KEY, pid INTEGER NOT NULL, name TEXT, resolved_name TEXT)");
+    local.run("INSERT INTO peers (id, pid, name, resolved_name) VALUES ('a', 1, 'codex.2#4', NULL)");
+    local.run("INSERT INTO peers (id, pid, name, resolved_name) VALUES ('b', 2, 'custom#name', NULL)");
+
+    const update = local.prepare("UPDATE peers SET name = ?, resolved_name = ? WHERE id = ?");
+    const rows = local.query("SELECT id, name, resolved_name FROM peers WHERE name IS NOT NULL").all() as { id: string; name: string; resolved_name: string | null }[];
+    for (const row of rows) {
+      const resolved = row.resolved_name ?? row.name;
+      const operatorMatch = row.name.match(/^(.+\.[0-9]+)#[0-9]+$/);
+      const operatorName = operatorMatch ? operatorMatch[1]! : row.name;
+      if (operatorName !== row.name || row.resolved_name === null) update.run(operatorName, resolved, row.id);
+    }
+
+    const a = local.query("SELECT name, resolved_name FROM peers WHERE id = 'a'").get() as { name: string; resolved_name: string };
+    const b = local.query("SELECT name, resolved_name FROM peers WHERE id = 'b'").get() as { name: string; resolved_name: string };
+    expect(a.name).toBe("codex.2");
+    expect(a.resolved_name).toBe("codex.2#4");
+    expect(b.name).toBe("custom#name");
+    expect(b.resolved_name).toBe("custom#name");
+    local.close();
   });
 
   test("migrations are idempotent (re-running does not error)", () => {
@@ -70,6 +98,8 @@ describe("F1+F2 broker schema migrations", () => {
       { name: "tmux_session", type: "TEXT" },
       { name: "tmux_window_index", type: "TEXT" },
       { name: "tmux_window_name", type: "TEXT" },
+      { name: "tmux_pane_id", type: "TEXT" },
+      { name: "resolved_name", type: "TEXT" },
     ];
     // Run again — should not throw
     for (const col of migrationColumns) {
@@ -282,10 +312,12 @@ describe("F1+F2 type contracts", () => {
       tmux_session: "dev",
       tmux_window_index: "0",
       tmux_window_name: "main",
+      tmux_pane_id: "%1",
       summary: "test",
     };
     expect(req.name).toBe("test-peer");
     expect(req.tmux_session).toBe("dev");
+    expect(req.tmux_pane_id).toBe("%1");
   });
 
   test("RegisterRequest accepts null F1+F2 fields (backward compat)", () => {
@@ -315,6 +347,8 @@ describe("F1+F2 type contracts", () => {
       tmux_session: "mgt",
       tmux_window_index: "2",
       tmux_window_name: "build",
+      tmux_pane_id: "%2",
+      resolved_name: "barry#2",
       summary: "",
       registered_at: "",
       last_seen: "",
@@ -323,6 +357,8 @@ describe("F1+F2 type contracts", () => {
     expect(peer.tmux_session).toBe("mgt");
     expect(peer.tmux_window_index).toBe("2");
     expect(peer.tmux_window_name).toBe("build");
+    expect(peer.tmux_pane_id).toBe("%2");
+    expect(peer.resolved_name).toBe("barry#2");
   });
 });
 
@@ -637,6 +673,35 @@ describe("F1+F2 live broker integration", () => {
     expect(found!.tmux_session).toBe("dev");
     expect(found!.tmux_window_index).toBe("3");
     expect(found!.tmux_window_name).toBe("architect");
+  });
+
+  test("F2: duplicate operator names keep unique resolved names but list active seat once", async () => {
+    const childA = Bun.spawn(["sleep", "60"]);
+    const childB = Bun.spawn(["sleep", "60"]);
+    try {
+      const first = await brokerFetch<{ id: string; name: string | null; resolved_name: string | null }>("/register", {
+        pid: childA.pid, cwd: "/dup", git_root: null, tty: "pts/dup", name: "codex.2",
+        tmux_session: "codex", tmux_window_index: "1", tmux_window_name: "node", tmux_pane_id: "%200", summary: "",
+      });
+      const second = await brokerFetch<{ id: string; name: string | null; resolved_name: string | null }>("/register", {
+        pid: childB.pid, cwd: "/dup", git_root: null, tty: "pts/dup", name: "codex.2",
+        tmux_session: "codex", tmux_window_index: "1", tmux_window_name: "node", tmux_pane_id: "%200", summary: "",
+      });
+
+      expect(first.name).toBe("codex.2");
+      expect(first.resolved_name).toBe("codex.2");
+      expect(second.name).toBe("codex.2");
+      expect(second.resolved_name).toBe("codex.2#2");
+
+      const active = await brokerFetch<Peer[]>("/list-peers", { id: second.id, scope: "machine", cwd: "/", git_root: null });
+      const diagnostic = await brokerFetch<Peer[]>("/list-peers", { id: second.id, scope: "machine", cwd: "/", git_root: null, include_inactive: true });
+      expect(active.filter((p) => p.name === "codex.2")).toHaveLength(1);
+      expect(diagnostic.filter((p) => p.name === "codex.2")).toHaveLength(2);
+      expect(diagnostic.map((p) => p.resolved_name).sort()).toContain("codex.2#2");
+    } finally {
+      childA.kill();
+      childB.kill();
+    }
   });
 
   test("F2: register outside tmux (null fields)", async () => {

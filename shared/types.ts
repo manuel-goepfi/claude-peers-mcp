@@ -7,10 +7,14 @@ export interface Peer {
   cwd: string;
   git_root: string | null;
   tty: string | null;
+  // Operator-facing seat label. This is stable for humans and is NOT deduped.
   name: string | null;
+  // Broker-unique runtime label. May be suffixed when duplicate instances exist.
+  resolved_name: string | null;
   tmux_session: string | null;
   tmux_window_index: string | null;
   tmux_window_name: string | null;
+  tmux_pane_id: string | null;
   summary: string;
   registered_at: string; // ISO timestamp
   last_seen: string; // ISO timestamp
@@ -32,10 +36,12 @@ export interface RegisterRequest {
   cwd: string;
   git_root: string | null;
   tty: string | null;
+  // Operator-facing seat label. This is stable for humans and is NOT deduped.
   name: string | null;
   tmux_session: string | null;
   tmux_window_index: string | null;
   tmux_window_name: string | null;
+  tmux_pane_id?: string | null;
   summary: string;
 }
 
@@ -44,11 +50,11 @@ export interface RegisterResponse {
   // S2: per-peer auth token returned at registration. Required as
   // X-Peer-Token header on every subsequent broker call.
   token: string;
-  // Resolved name after dedup. Differs from request.name when another live
-  // peer already held the requested name — broker auto-suffixes #2/#3/...
-  // Caller compares request.name vs response.name to detect collision and
-  // surface the truth to operator (status bar, @peer_label, log).
+  // Operator-facing seat label. This remains the requested name.
   name: string | null;
+  // Broker-unique runtime label after dedup. Debug/transport metadata only;
+  // human-facing surfaces should prefer `name`.
+  resolved_name: string | null;
 }
 
 export interface HeartbeatRequest {
@@ -72,6 +78,9 @@ export interface ListPeersRequest {
   cwd: string;
   git_root: string | null;
   exclude_id?: PeerId;
+  // Default false: collapse duplicate/superseded instances and return the
+  // active peer per operator seat. True exposes diagnostic raw rows.
+  include_inactive?: boolean;
 }
 
 export interface SendMessageRequest {

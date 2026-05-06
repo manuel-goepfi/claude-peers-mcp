@@ -37,6 +37,13 @@ describe("parseTmuxPanes — pane_index fallback support", () => {
     expect(b.pane_index).toBe("3");
   });
 
+  test("populates pane_id when 6-field format is used", () => {
+    const out = "12345\tmysess\t1\twindow-name\t2\t%42";
+    const pane = parseTmuxPanes(out).get(12345)!;
+    expect(pane.pane_index).toBe("2");
+    expect(pane.pane_id).toBe("%42");
+  });
+
   test("leaves pane_index undefined when 4-field legacy format is used", () => {
     // Backwards-compat regression guard: 4-field callers (the original
     // detectTmuxPane format string before the C3 patch) must keep working.

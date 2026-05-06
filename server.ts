@@ -222,7 +222,7 @@ async function detectTmuxPane(): Promise<TmuxPaneInfo | null> {
       // pane_index appended as 5th field for the CLAUDE_PEER_NAME tmux-fallback
       // path. parseTmuxPanes treats it as optional, so older callers parsing
       // 4-field output continue to work.
-      ["tmux", "list-panes", "-a", "-F", "#{pane_pid}\t#{session_name}\t#{window_index}\t#{window_name}\t#{pane_index}"],
+      ["tmux", "list-panes", "-a", "-F", "#{pane_pid}\t#{session_name}\t#{window_index}\t#{window_name}\t#{pane_index}\t#{pane_id}"],
       { stdout: "pipe", stderr: "ignore" }
     );
     const listText = await new Response(listProc.stdout).text();
@@ -260,11 +260,11 @@ async function detectTmuxPane(): Promise<TmuxPaneInfo | null> {
 // --- State ---
 
 let myId: PeerId | null = null;
-// Resolved name as registered with the broker — may differ from
-// process.env.CLAUDE_PEER_NAME when dedup suffixed it (e.g. requested
-// "manzoopsinfra.2", broker assigned "manzoopsinfra.2#2"). Used by
-// @peer_label / whoami / log breadcrumb so the operator's perception
-// layer matches broker truth.
+// Operator-facing seat label. This is what Manzo sees in tmux and says when
+// routing by intent (e.g. "codex.2"). It must not be replaced by broker dedup.
+let myOperatorName: string | null = null;
+// Broker-unique runtime label. This may be suffixed (e.g. "codex.2#4") and is
+// debug/transport metadata only.
 let myResolvedName: string | null = null;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
@@ -579,6 +579,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           cwd: myCwd,
           git_root: myGitRoot,
           exclude_id: myId,
+          include_inactive: false,
         });
 
         const pending = await drainPendingMessages();
@@ -601,6 +602,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             `CWD: ${p.cwd}`,
           ];
           if (p.name) parts.push(`Name: ${p.name}`);
+          if (p.resolved_name && p.resolved_name !== p.name) parts.push(`Resolved: ${p.resolved_name}`);
           if (p.git_root) parts.push(`Repo: ${p.git_root}`);
           if (p.tty) parts.push(`TTY: ${p.tty}`);
           if (p.tmux_session) parts.push(`Tmux: ${p.tmux_session}:${p.tmux_window_index}:${p.tmux_window_name}`);
@@ -777,10 +779,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         };
       }
       try {
-        await brokerFetch("/set-name", { id: myId, name: newName });
+        const res = await brokerFetch<{ ok: boolean; name: string | null; resolved_name: string | null }>("/set-name", { id: myId, name: newName });
+        myOperatorName = res.name ?? null;
+        myResolvedName = res.resolved_name ?? res.name ?? null;
         // Update tmux pane label so the border reflects the new name live.
         if (process.env.TMUX_PANE) {
-          const newLabel = newName || myId;
+          const newLabel = myOperatorName || myId;
           Bun.spawnSync(["tmux", "set-option", "-p", "-t", process.env.TMUX_PANE, "@peer_label", newLabel], {
             stdout: "ignore", stderr: "ignore",
           });
@@ -816,6 +820,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           scope: "machine" as const,
           cwd: myCwd,
           git_root: myGitRoot,
+          include_inactive: false,
         });
         const matches = allPeers.filter((p) => {
           if (findName && p.name !== findName) return false;
@@ -828,7 +833,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             content: [{ type: "text" as const, text: `No peers found matching${findName ? ` name="${findName}"` : ""}${findTmux ? ` tmux="${findTmux}"` : ""}${pending ?? ""}` }],
           };
         }
-        const lines = matches.map((p) => `${p.id}${p.name ? ` (${p.name})` : ""}${p.tmux_session ? ` [tmux ${p.tmux_session}:${p.tmux_window_name}]` : ""}`);
+        const lines = matches.map((p) => {
+          const resolved = p.resolved_name && p.resolved_name !== p.name ? ` resolved=${p.resolved_name}` : "";
+          return `${p.id}${p.name ? ` (${p.name})` : ""}${resolved}${p.tmux_session ? ` [tmux ${p.tmux_session}:${p.tmux_window_name}]` : ""}`;
+        });
         return {
           content: [{ type: "text" as const, text: `Found ${matches.length} peer(s):\n${lines.join("\n")}${pending ?? ""}` }],
         };
@@ -903,7 +911,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         content: [
           {
             type: "text" as const,
-            text: `Peer ID: ${myId ?? "(not registered)"}\nName: ${myResolvedName ?? "(none)"}\nCWD: ${myCwd}\nGit root: ${myGitRoot ?? "(none)"}`,
+            text: `Peer ID: ${myId ?? "(not registered)"}\nOperator name: ${myOperatorName ?? "(none)"}\nResolved name: ${myResolvedName ?? "(none)"}\nCWD: ${myCwd}\nGit root: ${myGitRoot ?? "(none)"}`,
           },
         ],
       };
@@ -1054,22 +1062,20 @@ async function main() {
     tmux_session: tmuxInfo?.session ?? null,
     tmux_window_index: tmuxInfo?.window_index ?? null,
     tmux_window_name: tmuxInfo?.window_name ?? null,
+    tmux_pane_id: tmuxInfo?.pane_id ?? (process.env.TMUX_PANE ?? null),
     summary: initialSummary,
   });
 
   const reg = await brokerFetch<RegisterResponse>("/register", buildRegisterPayload());
   myId = reg.id;
   myToken = reg.token;
-  // reg.name may be undefined when this MCP build talks to a pre-d944bca
-  // broker that doesn't echo the resolved name yet — fall back to peerName
-  // for backwards-compat. Once the broker is rolled out, this becomes the
-  // canonical truth source.
-  myResolvedName = reg.name ?? peerName;
-  log(`Registered as peer ${myId} name=${myResolvedName ?? "(none)"} (token issued)`);
-  // Breadcrumb when broker dedup'd a colliding name. Visible in stderr +
-  // ~/.claude-peers-broker.log so operators stop seeing duplicate display.
+  myOperatorName = reg.name ?? peerName;
+  myResolvedName = reg.resolved_name ?? reg.name ?? peerName;
+  log(`Registered as peer ${myId} name=${myOperatorName ?? "(none)"} resolved=${myResolvedName ?? "(none)"} (token issued)`);
+  // Breadcrumb when broker dedup'd a colliding runtime name. Visible in stderr
+  // + ~/.claude-peers-broker.log, but not promoted to the operator label.
   if (peerName && myResolvedName && peerName !== myResolvedName) {
-    log(`note: '${peerName}' was taken; you are now '${myResolvedName}'`);
+    log(`note: '${peerName}' has duplicate MCP instances; runtime label is '${myResolvedName}'`);
   }
 
   // If running inside tmux, publish our identity as per-pane options so
@@ -1077,9 +1083,7 @@ async function main() {
   // Best-effort — tmux not installed or pane resolution fails → silent skip.
   if (tmuxInfo) {
     const target = `${tmuxInfo.session}:${tmuxInfo.window_index}.${process.env.TMUX_PANE ?? ""}`;
-    // Prefer the broker-resolved name (post-dedup truth) over the
-    // requested env-var name; fall back to peer_id when neither is set.
-    const displayLabel = myResolvedName || peerName || myId;
+    const displayLabel = myOperatorName || peerName || myId;
     try {
       // Use pane-id when present; fall back to session:window.pane coordinate.
       const paneTarget = process.env.TMUX_PANE
@@ -1088,10 +1092,16 @@ async function main() {
       Bun.spawnSync(["tmux", "set-option", "-p", "-t", paneTarget, "@peer_id", myId], {
         stdout: "ignore", stderr: "ignore",
       });
+      Bun.spawnSync(["tmux", "set-option", "-p", "-t", paneTarget, "@operator_label", displayLabel], {
+        stdout: "ignore", stderr: "ignore",
+      });
       Bun.spawnSync(["tmux", "set-option", "-p", "-t", paneTarget, "@peer_label", displayLabel], {
         stdout: "ignore", stderr: "ignore",
       });
-      log(`tmux pane labeled: @peer_id=${myId} @peer_label=${displayLabel} (target=${paneTarget})`);
+      Bun.spawnSync(["tmux", "set-option", "-p", "-t", paneTarget, "@peer_resolved_name", myResolvedName ?? ""], {
+        stdout: "ignore", stderr: "ignore",
+      });
+      log(`tmux pane labeled: @peer_id=${myId} @operator_label=${displayLabel} @peer_resolved_name=${myResolvedName ?? ""} (target=${paneTarget})`);
     } catch (e) {
       log(`tmux set-option failed (non-critical): ${errMsg(e)} (target=${target})`);
     }
@@ -1104,10 +1114,11 @@ async function main() {
     const r = await brokerFetch<RegisterResponse>("/register", buildRegisterPayload());
     myId = r.id;
     myToken = r.token;
-    // Re-capture resolved name; the broker may have re-dedup'd if other
+    // Re-capture both identity layers; the broker may have re-dedup'd if other
     // peers came/went during the auth-reset window.
-    myResolvedName = r.name ?? peerName;
-    log(`Re-registered as peer ${myId} name=${myResolvedName ?? "(none)"} after broker auth reset`);
+    myOperatorName = r.name ?? peerName;
+    myResolvedName = r.resolved_name ?? r.name ?? peerName;
+    log(`Re-registered as peer ${myId} name=${myOperatorName ?? "(none)"} resolved=${myResolvedName ?? "(none)"} after broker auth reset`);
   };
 
   // If summary generation is still running, update it when done
