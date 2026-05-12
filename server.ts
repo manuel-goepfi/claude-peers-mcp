@@ -38,7 +38,7 @@ import {
   getGitBranch,
   getRecentFiles,
 } from "./shared/summarize.ts";
-import { parseTmuxPanes, parsePsTree, type TmuxPaneInfo } from "./shared/tmux.ts";
+import { parseTmuxPanes, parsePsTree, composeTmuxFromEnv, type TmuxPaneInfo } from "./shared/tmux.ts";
 
 // --- Configuration ---
 
@@ -1002,7 +1002,23 @@ async function main() {
   myCwd = process.cwd();
   myGitRoot = await getGitRoot(myCwd);
   const tty = getTty();
-  const tmuxInfo = await detectTmuxPane();
+  let tmuxInfo = await detectTmuxPane();
+  // Fix B (2026-05-12): if the live ancestry walk found nothing, fall back to
+  // CLAUDE_PEER_TMUX_* env hints exported by the cc/ccc/cccr/cc2 bashrc
+  // wrappers. This handles bg-job workers spawned under `claude daemon run`
+  // whose own $TMUX is empty (daemon strips it) but whose launching shell
+  // was inside tmux. The env hints carry session/window/pane_id but NOT
+  // pane_index — see composeTmuxFromEnv() comments for why.
+  if (!tmuxInfo) {
+    const envHint = composeTmuxFromEnv(process.env);
+    if (envHint) {
+      tmuxInfo = envHint;
+      // Note: window_index / window_name / pane_id may be undefined when only
+      // SESSION was exported. Render with nullish fallback so the log stays
+      // grep-friendly ("session:::") rather than "session:undefined:undefined".
+      log(`Tmux (env hint): ${envHint.session}:${envHint.window_index ?? ""}:${envHint.window_name ?? ""}`);
+    }
+  }
   // CLAUDE_PEER_NAME ?? <session>.<pane>: the bashrc cc/ccc/cccr wrappers
   // pre-export the env var, but a Claude launched via bare `claude` skips
   // that path and would otherwise register with name=null (unfindable by
@@ -1019,7 +1035,7 @@ async function main() {
   log(`Git root: ${myGitRoot ?? "(none)"}`);
   log(`TTY: ${tty ?? "(unknown)"}`);
   if (peerName) log(`Peer name: ${peerName}`);
-  if (tmuxInfo) log(`Tmux: ${tmuxInfo.session}:${tmuxInfo.window_index}:${tmuxInfo.window_name}`);
+  if (tmuxInfo) log(`Tmux: ${tmuxInfo.session}:${tmuxInfo.window_index ?? ""}:${tmuxInfo.window_name ?? ""}`);
 
   // 3. Generate initial summary via gpt-5.4-nano (non-blocking, best-effort)
   let initialSummary = "";
@@ -1045,9 +1061,13 @@ async function main() {
   // Wait briefly for summary, but don't block startup
   await Promise.race([summaryPromise, new Promise((r) => setTimeout(r, 3000))]);
 
-  // Prepend tmux tag to summary if detected
+  // Prepend tmux tag to summary if detected. window_name is now optional
+  // (Fix B env-hint path may not populate it) — fall back to session-only
+  // when missing to avoid a trailing-colon "[tmux rag:]" eyesore.
   if (tmuxInfo && initialSummary) {
-    initialSummary = `[tmux ${tmuxInfo.session}:${tmuxInfo.window_name}] ${initialSummary}`;
+    initialSummary = tmuxInfo.window_name
+      ? `[tmux ${tmuxInfo.session}:${tmuxInfo.window_name}] ${initialSummary}`
+      : `[tmux ${tmuxInfo.session}] ${initialSummary}`;
   }
 
   // 4. Register with broker (and define the re-register closure so 401
@@ -1081,7 +1101,13 @@ async function main() {
   // If running inside tmux, publish our identity as per-pane options so
   // pane-border-format can display the peer's name/id without extra lookups.
   // Best-effort — tmux not installed or pane resolution fails → silent skip.
-  if (tmuxInfo) {
+  // Fix B: env-hint-only peers (bg-job workers) are NOT attached to a tmux
+  // server, so `tmux set-option` calls would either fail or target the wrong
+  // pane on a same-name session. Gate the publish block on real $TMUX so it
+  // only fires for live-walk peers. Env-hint peers still get their tmux_*
+  // fields registered with the broker — they just don't try to write back
+  // into tmux from a process that isn't attached to it.
+  if (tmuxInfo && process.env.TMUX && tmuxInfo.window_index) {
     const target = `${tmuxInfo.session}:${tmuxInfo.window_index}.${process.env.TMUX_PANE ?? ""}`;
     const displayLabel = myOperatorName || peerName || myId;
     try {
@@ -1125,9 +1151,12 @@ async function main() {
   if (!initialSummary) {
     summaryPromise.then(async () => {
       if (initialSummary && myId) {
-        // Prepend tmux tag to late summary
+        // Prepend tmux tag to late summary. Mirrors the early-summary block
+        // above (Fix B: window_name may be undefined on env-hint paths).
         if (tmuxInfo) {
-          initialSummary = `[tmux ${tmuxInfo.session}:${tmuxInfo.window_name}] ${initialSummary}`;
+          initialSummary = tmuxInfo.window_name
+            ? `[tmux ${tmuxInfo.session}:${tmuxInfo.window_name}] ${initialSummary}`
+            : `[tmux ${tmuxInfo.session}] ${initialSummary}`;
         }
         try {
           await brokerFetch("/set-summary", { id: myId, summary: initialSummary });
