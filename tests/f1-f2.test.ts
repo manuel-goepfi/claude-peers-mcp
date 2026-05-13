@@ -342,6 +342,7 @@ describe("F1+F2 type contracts", () => {
       pid: 1,
       cwd: "/",
       git_root: null,
+      absolute_git_dir: null,
       tty: null,
       name: "barry",
       tmux_session: "mgt",

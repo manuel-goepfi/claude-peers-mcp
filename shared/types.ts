@@ -6,6 +6,13 @@ export interface Peer {
   pid: number;
   cwd: string;
   git_root: string | null;
+  // Single-primitive identity for worktree-aware peer discovery. From
+  // `git rev-parse --absolute-git-dir`: returns /repo/.git from main repo OR
+  // /repo/.git/worktrees/<name> from a worktree. Broker derives
+  // repo_common_root (for scope=repo clustering) and worktree_path lazily.
+  // Null when cwd is not in a git repo. Migration adds this column;
+  // pre-migration rows have NULL and fall back to git_root for scope matching.
+  absolute_git_dir: string | null;
   tty: string | null;
   // Operator-facing seat label. This is stable for humans and is NOT deduped.
   name: string | null;
@@ -35,6 +42,10 @@ export interface RegisterRequest {
   pid: number;
   cwd: string;
   git_root: string | null;
+  // From `git rev-parse --absolute-git-dir` — see Peer.absolute_git_dir.
+  // Optional for back-compat with older servers that don't send it; broker
+  // stores NULL and falls back to git_root for scope=repo matching.
+  absolute_git_dir?: string | null;
   tty: string | null;
   // Operator-facing seat label. This is stable for humans and is NOT deduped.
   name: string | null;
@@ -77,10 +88,23 @@ export interface ListPeersRequest {
   // The requesting peer's context (used for filtering)
   cwd: string;
   git_root: string | null;
+  // Optional: caller's `git rev-parse --absolute-git-dir`. When present AND
+  // scope=repo, broker derives repo_common_root from this primitive and
+  // matches against other peers' derived value (worktree-aware clustering).
+  // Falls back to git_root equality when absent.
+  absolute_git_dir?: string | null;
   exclude_id?: PeerId;
   // Default false: collapse duplicate/superseded instances and return the
   // active peer per operator seat. True exposes diagnostic raw rows.
   include_inactive?: boolean;
+  // R6.2: when true, restrict results to peers with a non-null tmux_session
+  // (operator-facing seats). Default false (no filter) — many legitimate
+  // operator sessions run bare claude outside tmux (Konsole, VSCode, IDE).
+  has_tmux?: boolean;
+  // R3: case-insensitive substring match on peer.name. Mirrors the
+  // BroadcastRequest.name_like semantics (broker.ts:739-749) — escapes SQL
+  // LIKE metachars, requires length >= 2, rejects bare wildcards.
+  name_like?: string | null;
 }
 
 export interface SendMessageRequest {

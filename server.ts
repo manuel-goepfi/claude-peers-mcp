@@ -193,6 +193,55 @@ async function getGitRoot(cwd: string): Promise<string | null> {
   return null;
 }
 
+// R1: single-primitive identity for worktree-aware peer discovery.
+//
+// From the cwd's perspective, `git rev-parse --absolute-git-dir` returns:
+//   - main repo:  /repo/.git
+//   - worktree:   /repo/.git/worktrees/<name>
+//
+// Storing this primitive lets the broker derive both views lazily:
+//   - repo_common_root (for scope=repo clustering): strip the
+//     /worktrees/<name> suffix if present, then dirname
+//   - worktree_path: read /repo/.git/worktrees/<name>/gitdir (a text file
+//     containing the absolute worktree checkout path)
+//
+// Returns null when cwd is not in a git repo OR when the cwd is inside a
+// bare repo (--is-bare-repository true). Bare repos don't have a working
+// tree to cluster on; treating them as repo-less avoids the naïve dirname
+// of "." pointing to the wrong directory.
+async function getAbsoluteGitDir(cwd: string): Promise<string | null> {
+  try {
+    // Short-circuit on bare repos: --is-bare-repository returns "true" or
+    // "false" via stdout. Bare repos = no clustering identity.
+    const bareProc = Bun.spawn(["git", "rev-parse", "--is-bare-repository"], {
+      cwd,
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+    const bareText = await new Response(bareProc.stdout).text();
+    const bareCode = await bareProc.exited;
+    if (bareCode === 0 && bareText.trim() === "true") {
+      return null;
+    }
+    // Resolve the gitdir absolutely. --git-common-dir can be relative
+    // (returns ".git" from main repo cwd) — prefer --absolute-git-dir which
+    // is always an absolute path regardless of main-repo vs worktree.
+    const proc = Bun.spawn(["git", "rev-parse", "--absolute-git-dir"], {
+      cwd,
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+    const text = await new Response(proc.stdout).text();
+    const code = await proc.exited;
+    if (code === 0) {
+      return text.trim();
+    }
+  } catch (e) {
+    log(`getAbsoluteGitDir: spawn failed — ${errMsg(e)}`);
+  }
+  return null;
+}
+
 function getTty(): string | null {
   try {
     // Try to get the parent's tty from the process tree
@@ -268,6 +317,11 @@ let myOperatorName: string | null = null;
 let myResolvedName: string | null = null;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
+// R1: single-primitive worktree-aware identity. See getAbsoluteGitDir() for
+// the resolution contract. Captured at startup alongside myGitRoot; sent on
+// every /register and /list-peers payload so the broker can derive
+// repo_common_root for scope=repo clustering across worktrees.
+let myAbsoluteGitDir: string | null = null;
 
 // Local buffer for messages fetched by the poll loop, awaiting delivery
 // via piggyback (drainPendingMessages) or check_messages.
@@ -302,6 +356,42 @@ const confirmedDeliveredIds = new Set<number>();
 // dedup add prevents re-display from this session. On session restart the
 // dedup set is gone and any still-undelivered broker rows will re-deliver,
 // which is the safety net.
+
+// R6.1: detect Task-tool subagent context.
+//
+// The Task tool spawns a child Claude Code process which spawns this MCP
+// server. Both inherit the parent operator's env, including CLAUDE_PEER_NAME.
+// Without disambiguation, every Task spawn registers under the operator's
+// name (e.g. "rag.2") and broker dedup gives suffixed runtime labels like
+// "rag.2#5", "rag.2#11" — polluting find_peer({name: "rag.2"}) to return
+// 10+ matches when only one operator-facing seat exists.
+//
+// Discriminator: the MCP server's grandparent (parent of parent) is `claude`.
+//   - Operator session:  shell -> claude -> server.ts   (grandparent = shell)
+//   - Task subagent:     claude -> claude -> server.ts  (grandparent = claude)
+//
+// Returns false on any platform/ps failure — better to over-register under
+// the operator's name than to false-positive on a bare shell launch.
+function isTaskSubagent(): boolean {
+  try {
+    const myParent = process.ppid; // = the claude process that spawned us
+    if (!myParent || myParent <= 1) return false;
+    // Walk one step up to claude's own parent.
+    const ppidProc = Bun.spawnSync(["ps", "-o", "ppid=", "-p", String(myParent)]);
+    if (ppidProc.exitCode !== 0) return false;
+    const grandparentPid = parseInt(new TextDecoder().decode(ppidProc.stdout).trim(), 10);
+    if (!grandparentPid || grandparentPid <= 1) return false;
+    const commProc = Bun.spawnSync(["ps", "-o", "comm=", "-p", String(grandparentPid)]);
+    if (commProc.exitCode !== 0) return false;
+    const comm = new TextDecoder().decode(commProc.stdout).trim();
+    // `comm` is the basename of the executable. Match both `claude` and an
+    // absolute-path comm like `/usr/local/bin/claude` (older ps versions).
+    return comm === "claude" || comm.endsWith("/claude");
+  } catch {
+    return false;
+  }
+}
+
 async function ackAndDedup(ids: number[], context: string): Promise<void> {
   if (!myId || ids.length === 0) return;
   try {
@@ -437,7 +527,12 @@ const TOOLS = [
           type: "string" as const,
           enum: ["machine", "directory", "repo"],
           description:
-            'Scope of peer discovery. "machine" = all instances on this computer. "directory" = same working directory. "repo" = same git repository (including worktrees or subdirectories).',
+            'Scope of peer discovery. "machine" = all instances on this computer. "directory" = same working directory. "repo" = same git repository (including worktrees: peers launched in main repo OR in any worktree of the same repo cluster together).',
+        },
+        has_tmux: {
+          type: "boolean" as const,
+          description:
+            "Optional. When true, restrict results to peers with an attached tmux session (typically operator-facing seats). Default false (no filter) — many legitimate operator sessions run outside tmux (Konsole, VSCode integrated terminal, IDE-embedded Claude Code). Useful in tmux-heavy fleets to exclude Task-subagent spawns and headless daemons.",
         },
       },
       required: ["scope"],
@@ -522,17 +617,25 @@ const TOOLS = [
   {
     name: "find_peer",
     description:
-      "Find Claude Code instances by human-readable name (set via CLAUDE_PEER_NAME env var) and/or tmux session. If both name and tmux are provided, both must match (AND semantics). Returns matching peer IDs across all peers on this machine.",
+      "Find Claude Code instances by human-readable name (set via CLAUDE_PEER_NAME env var), tmux session, name substring, and/or tmux presence. All provided filters AND together. Returns matching peer IDs across all peers on this machine. Task-subagent spawns are suffixed `.task.<pid>` (per WT-08 R6.1) so exact-name match returns only the operator-facing seat.",
     inputSchema: {
       type: "object" as const,
       properties: {
         name: {
           type: "string" as const,
-          description: "Exact match on the peer's CLAUDE_PEER_NAME",
+          description: "Exact match on the peer's CLAUDE_PEER_NAME (the operator-facing seat label, not the broker-deduped resolved_name).",
         },
         tmux: {
           type: "string" as const,
           description: "Exact match on the peer's tmux session name",
+        },
+        name_like: {
+          type: "string" as const,
+          description: "Case-insensitive substring match on peer name. Minimum 2 chars. Use to surface Task-subagent spawns alongside their operator seat (e.g. name_like='rag.2' returns 'rag.2' plus 'rag.2.task.12345', 'rag.2.task.67890', etc.). SQL-LIKE metachars are escaped; bare wildcards rejected.",
+        },
+        has_tmux: {
+          type: "boolean" as const,
+          description: "Optional. When true, restrict results to peers with an attached tmux session. Default false (no filter).",
         },
       },
     },
@@ -569,6 +672,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   switch (name) {
     case "list_peers": {
       const scope = (args as { scope: string }).scope as "machine" | "directory" | "repo";
+      const hasTmux = (args as { has_tmux?: boolean }).has_tmux === true;
       try {
         const peers = await brokerFetch<Peer[]>("/list-peers", {
           // `id` carries the auth claim (broker S6 — exclude_id is no
@@ -578,8 +682,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           scope,
           cwd: myCwd,
           git_root: myGitRoot,
+          // R1: forward our absolute_git_dir so broker can derive
+          // repo_common_root for scope=repo worktree-aware clustering.
+          absolute_git_dir: myAbsoluteGitDir,
           exclude_id: myId,
           include_inactive: false,
+          // R6.2: broker-side tmux filter (faster than client-side because it
+          // avoids over-fetching when the fleet has many Task-subagent peers).
+          has_tmux: hasTmux,
         });
 
         const pending = await drainPendingMessages();
@@ -807,10 +917,24 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     case "find_peer": {
-      const { name: findName, tmux: findTmux } = args as { name?: string; tmux?: string };
-      if (!findName && !findTmux) {
+      const {
+        name: findName,
+        tmux: findTmux,
+        name_like: findNameLike,
+        has_tmux: findHasTmux,
+      } = args as { name?: string; tmux?: string; name_like?: string; has_tmux?: boolean };
+      // R3: require at least one identity filter (name | tmux | name_like).
+      // has_tmux alone is too broad — it'd return every operator seat on the
+      // machine. Document the requirement explicitly.
+      if (!findName && !findTmux && !findNameLike) {
         return {
-          content: [{ type: "text" as const, text: "Provide at least one of: name, tmux" }],
+          content: [{ type: "text" as const, text: "Provide at least one of: name, tmux, name_like" }],
+          isError: true,
+        };
+      }
+      if (findNameLike !== undefined && findNameLike.length < 2) {
+        return {
+          content: [{ type: "text" as const, text: "name_like must be at least 2 characters" }],
           isError: true,
         };
       }
@@ -820,11 +944,29 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           scope: "machine" as const,
           cwd: myCwd,
           git_root: myGitRoot,
+          // R1: forward absolute_git_dir for parity with list_peers (broker
+          // doesn't need it for scope=machine, but the field is now part of
+          // the canonical /list-peers payload shape).
+          absolute_git_dir: myAbsoluteGitDir,
           include_inactive: false,
+          // R6.2: broker-side has_tmux filter when requested. Default false.
+          has_tmux: findHasTmux === true,
+          // R3: broker-side name_like substring filter when provided. The
+          // server handler ALSO filters by name_like below as a back-compat
+          // guard (older brokers without R3 support ignore the field).
+          name_like: findNameLike ?? null,
         });
+        // R3 back-compat: re-apply name_like client-side in case the broker
+        // doesn't yet support the filter. Cheap (small result set after
+        // broker scope+exclude); guards against partial-rollout state.
+        const findNameLikeLower = findNameLike?.toLowerCase();
         const matches = allPeers.filter((p) => {
           if (findName && p.name !== findName) return false;
           if (findTmux && p.tmux_session !== findTmux) return false;
+          if (findHasTmux === true && !p.tmux_session) return false;
+          if (findNameLikeLower) {
+            if (!p.name || !p.name.toLowerCase().includes(findNameLikeLower)) return false;
+          }
           return true;
         });
         const pending = await drainPendingMessages();
@@ -951,6 +1093,7 @@ async function pollAndPushMessages() {
         scope: "machine",
         cwd: myCwd,
         git_root: myGitRoot,
+        absolute_git_dir: myAbsoluteGitDir,
       });
     } catch {
       // Non-critical — channel push proceeds without sender context
@@ -1001,6 +1144,7 @@ async function main() {
   // 2. Gather context
   myCwd = process.cwd();
   myGitRoot = await getGitRoot(myCwd);
+  myAbsoluteGitDir = await getAbsoluteGitDir(myCwd);
   const tty = getTty();
   let tmuxInfo = await detectTmuxPane();
   // Fix B (2026-05-12): if the live ancestry walk found nothing, fall back to
@@ -1029,10 +1173,20 @@ async function main() {
     tmuxInfo && tmuxInfo.pane_index
       ? `${tmuxInfo.session}.${tmuxInfo.pane_index}`
       : null;
-  const peerName = envName ?? tmuxFallbackName;
+  // R6.1: when the env-inherited name came from an operator parent's
+  // CLAUDE_PEER_NAME AND there's no tmux ancestry AND grandparent is claude,
+  // we're a Task subagent. Append .task.${pid} so find_peer({name: envName})
+  // returns the operator seat ONLY. Operator-facing bare-claude sessions
+  // (grandparent is a shell) are unaffected and keep envName as-is.
+  let peerName: string | null = envName ?? tmuxFallbackName;
+  if (envName && !tmuxInfo && isTaskSubagent()) {
+    peerName = `${envName}.task.${process.pid}`;
+    log(`Task subagent detected — peer name suffixed: ${peerName}`);
+  }
 
   log(`CWD: ${myCwd}`);
   log(`Git root: ${myGitRoot ?? "(none)"}`);
+  log(`Absolute git dir: ${myAbsoluteGitDir ?? "(none)"}`);
   log(`TTY: ${tty ?? "(unknown)"}`);
   if (peerName) log(`Peer name: ${peerName}`);
   if (tmuxInfo) log(`Tmux: ${tmuxInfo.session}:${tmuxInfo.window_index ?? ""}:${tmuxInfo.window_name ?? ""}`);
@@ -1077,6 +1231,7 @@ async function main() {
     pid: process.pid,
     cwd: myCwd,
     git_root: myGitRoot,
+    absolute_git_dir: myAbsoluteGitDir,
     tty,
     name: peerName,
     tmux_session: tmuxInfo?.session ?? null,
