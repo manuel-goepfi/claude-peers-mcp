@@ -121,6 +121,7 @@ const migrationColumns = [
   // S2: per-peer auth token issued at /register
   { name: "token", type: "TEXT" },
   { name: "resolved_name", type: "TEXT" },
+  { name: "absolute_git_dir", type: "TEXT" },
 ];
 for (const col of migrationColumns) {
   try {
@@ -199,8 +200,8 @@ setInterval(cleanStalePeers, 30_000);
 // --- Prepared statements ---
 
 const insertPeer = db.prepare(`
-  INSERT INTO peers (id, pid, cwd, git_root, tty, name, resolved_name, tmux_session, tmux_window_index, tmux_window_name, tmux_pane_id, summary, registered_at, last_seen, token)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO peers (id, pid, cwd, git_root, absolute_git_dir, tty, name, resolved_name, tmux_session, tmux_window_index, tmux_window_name, tmux_pane_id, summary, registered_at, last_seen, token)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const selectPeerByToken = db.prepare(`
@@ -555,7 +556,7 @@ function handleRegister(body: RegisterRequest): RegisterResult {
   if (requestedName && finalName !== requestedName) {
     console.error(`[broker] name dedup: pid=${body.pid} requested="${requestedName}" resolved="${finalName}" (collision)`);
   }
-  insertPeer.run(id, body.pid, body.cwd, body.git_root, body.tty, requestedName, finalName, body.tmux_session ?? null, body.tmux_window_index ?? null, body.tmux_window_name ?? null, body.tmux_pane_id ?? null, body.summary, now, now, token);
+  insertPeer.run(id, body.pid, body.cwd, body.git_root, body.absolute_git_dir ?? null, body.tty, requestedName, finalName, body.tmux_session ?? null, body.tmux_window_index ?? null, body.tmux_window_name ?? null, body.tmux_pane_id ?? null, body.summary, now, now, token);
   return { ok: true, value: { id, token, name: requestedName, resolved_name: finalName } };
 }
 
@@ -659,6 +660,17 @@ function activeOnly(peers: Peer[]): Peer[] {
   return [...byKey.values()];
 }
 
+// R1: derive the shared repo root from absolute_git_dir.
+//   /repo/.git              -> /repo
+//   /repo/.git/worktrees/X  -> /repo
+function deriveRepoCommonRoot(absoluteGitDir: string | null): string | null {
+  if (!absoluteGitDir) return null;
+  const stripped = absoluteGitDir.replace(/\/worktrees\/[^/]+\/?$/, "");
+  if (!stripped.endsWith("/.git") && stripped !== ".git") return null;
+  const repoRoot = stripped.replace(/\/?\.git$/, "");
+  return repoRoot || null;
+}
+
 function handleListPeers(body: ListPeersRequest): Peer[] {
   let peers: Peer[];
 
@@ -669,14 +681,24 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
     case "directory":
       peers = selectPeersByDirectory.all(body.cwd) as Peer[];
       break;
-    case "repo":
-      if (body.git_root) {
+    case "repo": {
+      const callerRepoRoot = deriveRepoCommonRoot(body.absolute_git_dir ?? null);
+      if (callerRepoRoot) {
+        const all = selectAllPeers.all() as Peer[];
+        peers = all.filter((p) => {
+          const peerRoot = deriveRepoCommonRoot(p.absolute_git_dir);
+          if (peerRoot) return peerRoot === callerRepoRoot;
+          // Back-compat: peer pre-A.1 has NULL absolute_git_dir — fall back
+          // to git_root equality with caller's stored git_root.
+          return body.git_root !== null && p.git_root === body.git_root;
+        });
+      } else if (body.git_root) {
         peers = selectPeersByGitRoot.all(body.git_root) as Peer[];
       } else {
-        // No git root, fall back to directory
         peers = selectPeersByDirectory.all(body.cwd) as Peer[];
       }
       break;
+    }
     default:
       peers = selectAllPeers.all() as Peer[];
   }
@@ -684,6 +706,18 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
   // Exclude the requesting peer
   if (body.exclude_id) {
     peers = peers.filter((p) => p.id !== body.exclude_id);
+  }
+
+  // R6.2
+  if (body.has_tmux === true) {
+    peers = peers.filter((p) => p.tmux_session !== null && p.tmux_session !== "");
+  }
+
+  // R3 — JS substring post-SELECT filter. Mirrors handleBroadcast at
+  // broker.ts:739-749 (min 2 chars).
+  if (body.name_like && body.name_like.length >= 2) {
+    const lower = body.name_like.toLowerCase();
+    peers = peers.filter((p) => p.name !== null && p.name.toLowerCase().includes(lower));
   }
 
   const live = liveAndFreshPeers(peers);
