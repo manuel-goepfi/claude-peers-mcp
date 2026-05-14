@@ -446,6 +446,42 @@ function normalizeText(text: string): string {
     .replace(CONTROL_CHAR_RE, "")
     .replace(PEER_MSG_TAG_RE, "[REDACTED-PEER-MSG-TAG]");
 }
+/**
+ * #11 (2026-05-14): Resolve the peer name from the launch environment.
+ *
+ * Fallback chain:
+ *   1. CLAUDE_PEER_NAME env var (operator-set or wrapper-injected — bashrc
+ *      cc/ccc/cccr wrappers pre-export this).
+ *   2. Tmux session.pane_index (when launched inside tmux — historic default).
+ *   3. observer-${pid} (PID-based final fallback — closes the spec §1.5
+ *      follow-up #2 "no env, no tmux → name=null" gap. Before this, a
+ *      bare-claude session with no env and no tmux registered with name=null
+ *      and was unfindable by name, only by id).
+ *
+ * R6.1 overlay: when env-inherited name came from an operator parent's
+ * CLAUDE_PEER_NAME AND there's no tmux ancestry AND grandparent is claude,
+ * the session is a Task subagent — append .task.${pid} so find_peer({name})
+ * returns the operator seat ONLY. Operator-facing bare-claude sessions
+ * (grandparent is a shell) are unaffected.
+ *
+ * Pure function: takes pre-computed isTaskSubagent boolean rather than
+ * calling it directly so tests can stub the result deterministically.
+ * Mirrored by tests/phase-b-11-name-fallback.test.ts.
+ */
+export function resolvePeerName(
+  envName: string | null,
+  tmuxFallbackName: string | null,
+  isTaskSubagentResult: boolean,
+  pid: number,
+): string {
+  const observerFallback = `observer-${pid}`;
+  let peerName = envName ?? tmuxFallbackName ?? observerFallback;
+  if (envName && !tmuxFallbackName && isTaskSubagentResult) {
+    peerName = `${envName}.task.${pid}`;
+  }
+  return peerName;
+}
+
 export function frameUntrusted(fromId: string, sentAt: string, text: string): string {
   const safe = text.replace(ENVELOPE_TAG_RE, "[REDACTED-ENVELOPE-TAG]");
   return `<untrusted-peer-message from="${attrEscape(fromId)}" sent_at="${attrEscape(sentAt)}">
@@ -1163,24 +1199,19 @@ async function main() {
       log(`Tmux (env hint): ${envHint.session}:${envHint.window_index ?? ""}:${envHint.window_name ?? ""}`);
     }
   }
-  // CLAUDE_PEER_NAME ?? <session>.<pane>: the bashrc cc/ccc/cccr wrappers
-  // pre-export the env var, but a Claude launched via bare `claude` skips
-  // that path and would otherwise register with name=null (unfindable by
-  // name, only by id). Mirror the bashrc's #S.#P logic at the MCP layer
-  // so the floor is consistent regardless of how the session was started.
+  // Name fallback resolution: env → tmux pane → observer-${pid} (final
+  // fallback closes the historic name=null gap for bare-claude sessions
+  // with no env AND no tmux). Single call to isTaskSubagent() — result
+  // passed to the pure resolvePeerName for testability + reused for the
+  // log line below. See resolvePeerName docstring for full rationale.
   const envName = process.env.CLAUDE_PEER_NAME ?? null;
   const tmuxFallbackName =
     tmuxInfo && tmuxInfo.pane_index
       ? `${tmuxInfo.session}.${tmuxInfo.pane_index}`
       : null;
-  // R6.1: when the env-inherited name came from an operator parent's
-  // CLAUDE_PEER_NAME AND there's no tmux ancestry AND grandparent is claude,
-  // we're a Task subagent. Append .task.${pid} so find_peer({name: envName})
-  // returns the operator seat ONLY. Operator-facing bare-claude sessions
-  // (grandparent is a shell) are unaffected and keep envName as-is.
-  let peerName: string | null = envName ?? tmuxFallbackName;
-  if (envName && !tmuxInfo && isTaskSubagent()) {
-    peerName = `${envName}.task.${process.pid}`;
+  const isSubagent = isTaskSubagent();
+  const peerName: string = resolvePeerName(envName, tmuxFallbackName, isSubagent, process.pid);
+  if (envName && !tmuxFallbackName && isSubagent) {
     log(`Task subagent detected — peer name suffixed: ${peerName}`);
   }
 
