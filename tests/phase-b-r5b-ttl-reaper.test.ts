@@ -346,3 +346,48 @@ describe("Phase B R5(b) — SQL side effects (M1 integration; :memory: DB)", () 
     expect(buckets.has("dead-but-fresh")).toBe(false);
   });
 });
+
+// D3 (per bmad-code-review Edge Case Hunter 2026-05-14): cold-start grace
+// regression sentinel. The reaper used to fire immediately at module init;
+// after R5(b) added the TTL gate, that became dangerous (operator session
+// with stale last_seen → mail loss on broker restart). The fix wraps both
+// the first reap and the periodic schedule kickoff in a 60s setTimeout.
+// This block is a SENTINEL — it asserts the production source still carries
+// the grace pattern. If a future refactor accidentally restores immediate
+// reap at module init, this test fails first. Time-mocking the actual
+// scheduler is out of scope (bun:test has no built-in fake-timer; would
+// need vitest's vi.useFakeTimers); the source-grep sentinel is the
+// pragmatic stopgap until the broker.ts module-extraction follow-up
+// (task #7) lets us import the scheduler function for direct testing.
+describe("Phase B D3 — cold-start grace schedule (source-grep sentinel)", () => {
+  test("broker.ts uses setTimeout to defer first reap by COLD_START_GRACE_MS=60_000", async () => {
+    const source = await Bun.file(`${import.meta.dir}/../broker.ts`).text();
+
+    // The grace constant must exist with the documented value.
+    expect(source).toMatch(/COLD_START_GRACE_MS\s*=\s*60_000/);
+
+    // The grace must wrap BOTH the first cleanStalePeers() call AND the
+    // setInterval kickoff inside one setTimeout body. A naïve fix that only
+    // delays the first call (leaves setInterval at module init) would still
+    // fire the reaper at T+30s, defeating the grace.
+    expect(source).toMatch(
+      /setTimeout\(\s*\(\s*\)\s*=>\s*\{[\s\S]*?cleanStalePeers\(\)[\s\S]*?setInterval\(\s*cleanStalePeers\s*,\s*30_000\s*\)[\s\S]*?\}\s*,\s*COLD_START_GRACE_MS\s*\)/,
+    );
+  });
+
+  test("broker.ts has NO top-level immediate cleanStalePeers() call at module init", async () => {
+    const source = await Bun.file(`${import.meta.dir}/../broker.ts`).text();
+
+    // Carve out the slice from end-of-cleanStalePeers-function to the next
+    // major section marker so we only check module-init scope.
+    const beforePreparedStatements = source.split("// --- Prepared statements ---")[0] ?? "";
+    const moduleInitSlice = beforePreparedStatements.split("function cleanStalePeers()")[1] ?? "";
+
+    // A bare `cleanStalePeers();` call at column 0 (no indent → not inside
+    // a callback) at module-init scope is the anti-pattern this test guards
+    // against. Inside the setTimeout body it's indented, so the column-0
+    // anchor catches the regression.
+    const bareCalls = moduleInitSlice.match(/^cleanStalePeers\(\);$/gm) ?? [];
+    expect(bareCalls.length).toBe(0);
+  });
+});

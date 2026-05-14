@@ -208,10 +208,25 @@ function cleanStalePeers() {
   }
 }
 
-cleanStalePeers();
-
-// Periodically clean stale peers (every 30s)
-setInterval(cleanStalePeers, 30_000);
+// D3 cold-start grace (2026-05-14): defer the first reap AND the periodic
+// schedule kickoff by 60s after broker startup. Without this delay, an
+// operator-facing session whose `bun` is alive but whose `last_seen` is stale
+// at boot (e.g., a session parked on a long task across a broker bounce, a
+// redeploy, or a host reboot) would be reaped by the new TTL gate (R5(b))
+// before it can re-heartbeat — wiping its undelivered-mail queue.
+//
+// Trade-off: PID-dead peers from before the restart linger up to 60s longer
+// than under the old immediate-reap behavior. Acceptable — they were already
+// dead, and the on-demand `liveAndFreshPeers` (used by handleListPeers /
+// handleBroadcast) still applies the full predicate from the first request.
+//
+// Mirrored by tests/phase-b-r5b-ttl-reaper.test.ts describe block 7 (sentinel).
+const COLD_START_GRACE_MS = 60_000;
+setTimeout(() => {
+  cleanStalePeers();
+  // Periodically clean stale peers (every 30s) AFTER the grace expires.
+  setInterval(cleanStalePeers, 30_000);
+}, COLD_START_GRACE_MS);
 
 // --- Prepared statements ---
 
