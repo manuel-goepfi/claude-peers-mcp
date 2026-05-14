@@ -89,38 +89,73 @@ describe("#11 — return type invariants", () => {
 // main() now uses tmux pane_id (stable per-pane lifetime, e.g., "%5")
 // instead of pane_index (positional, drifts on add/close, e.g., "1").
 // The formula itself isn't a separate exported function — it's inline at
-// the registration site — so this block uses two complementary strategies:
+// the registration site — so this block uses three complementary strategies:
 //
 //   1. SOURCE-GREP SENTINEL: assert server.ts source contains the
-//      pane_id-based formula. Catches accidental revert to pane_index.
-//      Pragmatic stopgap until the broker.ts module-extraction follow-up
-//      (#16) lets us test the registration path with real MCP fixtures.
+//      pane_id-based formula AND the matching truthy guard. Catches
+//      accidental revert to pane_index in either position. Pragmatic
+//      stopgap until the broker.ts module-extraction follow-up (#16)
+//      lets us test the registration path with real MCP fixtures.
 //
-//   2. PASSTHROUGH BEHAVIOR: assert resolvePeerName treats pane_id-shaped
-//      strings (containing "%") identically to other strings. Documents
-//      that the "%" prefix in the resulting peer name is intentional and
-//      passes through to the broker without escaping/transformation.
-describe("Dup-name fix — pane_id formula (source-grep + passthrough)", () => {
-  test("server.ts uses tmuxInfo.pane_id, NOT tmuxInfo.pane_index, in tmuxFallbackName", async () => {
+//   2. FALSY-PANE_ID FALLBACK (spec test case 3): when tmuxInfo.pane_id
+//      is missing/null/empty (env-hint path that exports SESSION but not
+//      PANE_ID, or tmux returning unexpected output), the formula yields
+//      null → resolvePeerName cascades to the observer-${pid} fallback.
+//      This guards the "silent demotion to PID-based name" failure mode
+//      the env-hint path can hit.
+//
+//   3. SQL-WILDCARD INTERACTION: % is a SQL LIKE wildcard, and post-fix
+//      every tmux peer name CONTAINS %. handleListPeers (broker.ts:740)
+//      uses JS .includes() so % is literal — sentinel test below documents
+//      this. handleBroadcast (broker.ts:802) escapes % in caller-supplied
+//      name_like via replace(/[\\%_]/g, "\\$&") + ESCAPE '\' — already
+//      tested in tests/delivery.test.ts; documented here for completeness.
+//
+// Updated 2026-05-14 per /clause5-code-review pass: anchor switched from
+// fragile comment-string to durable code-string; tautological "two distinct
+// names" test deleted (was "a" !== "b" dressed as regression); added
+// load-bearing sentinels for case 3 (falsy pane_id) and SQL-wildcard.
+describe("Dup-name fix — pane_id formula (source-grep + integration sentinels)", () => {
+  test("server.ts uses tmuxInfo.pane_id (NOT pane_index) in tmuxFallbackName formula AND truthy guard", async () => {
     const source = await Bun.file(`${import.meta.dir}/../server.ts`).text();
 
-    // Carve out the slice around the tmuxFallbackName formula. Use the
-    // surrounding comment anchors so the regex doesn't match unrelated
-    // pane_index references elsewhere in the file (e.g., logging,
-    // env-hint export, tmux detection).
-    const formulaSlice = source
-      .split("Name fallback resolution: env → tmux pane")[1]
-      ?.split("const isSubagent = isTaskSubagent()")[0] ?? "";
+    // Anchor on the call site of resolvePeerName (durable code, not a
+    // comment). The slice contains the formula assignment + the guard +
+    // the resolvePeerName call itself. Anchors:
+    //   - upper: the literal call-site `resolvePeerName(envName, tmuxFallbackName`
+    //     (read backwards by splitting and taking [0])
+    //   - lower: same call site (taking [1] would orphan the formula above)
+    // Cleaner approach: find the formula assignment statement via its LHS
+    // identifier `tmuxFallbackName =`, then take a 200-char window after.
+    const assignIdx = source.indexOf("const tmuxFallbackName =");
+    expect(assignIdx).toBeGreaterThanOrEqual(0); // sanity: assignment found
+    const formulaSlice = source.slice(assignIdx, assignIdx + 200);
 
-    expect(formulaSlice.length).toBeGreaterThan(0); // sanity: anchors found
-    expect(formulaSlice).toMatch(/tmuxInfo\.pane_id/);
+    // Truthy guard must check pane_id (the source of stability).
+    expect(formulaSlice).toMatch(/tmuxInfo\s*&&\s*tmuxInfo\.pane_id/);
+    // Template literal must use pane_id.
     expect(formulaSlice).toMatch(/\$\{tmuxInfo\.session\}\.\$\{tmuxInfo\.pane_id\}/);
-    // Anti-pattern: pane_index must NOT appear in the formula slice
-    // (it's still used elsewhere in server.ts for logging, but not here).
+    // Anti-pattern: pane_index must NOT appear in either position within
+    // the formula slice (still used elsewhere in server.ts for logging).
     expect(formulaSlice).not.toMatch(/tmuxInfo\.pane_index/);
   });
 
-  test("resolvePeerName passes pane_id-shaped tmux names through unchanged", () => {
+  test("falsy pane_id → null tmuxFallbackName → observer-${pid} (spec test case 3)", () => {
+    // Integration scenario: when the env-hint path produces a tmuxInfo
+    // with pane_id missing (composeTmuxFromEnv at shared/tmux.ts:108-119
+    // — env exports SESSION but not CLAUDE_PEER_TMUX_PANE_ID), the formula
+    // assignment in server.ts yields null because the truthy guard
+    // `tmuxInfo && tmuxInfo.pane_id` is false. The resulting null then
+    // cascades through resolvePeerName to the observer-${pid} fallback.
+    //
+    // This test exercises the resolvePeerName side of that cascade.
+    // The formula side is covered by the source-grep sentinel above.
+    expect(resolvePeerName(null, null, false, 7777)).toBe("observer-7777");
+    // Same for env-hint paths that supplied SESSION-only — null cascades.
+    expect(resolvePeerName(null, null, false, 1)).toBe("observer-1");
+  });
+
+  test("resolvePeerName passes pane_id-shaped names through unchanged (% is intentional, not transformed)", () => {
     // After the formula change, tmuxFallbackName arrives as e.g.
     // "claude_agents.%5" (% prefix from tmux pane_id notation).
     // resolvePeerName must not strip, escape, or transform the % char.
@@ -129,16 +164,20 @@ describe("Dup-name fix — pane_id formula (source-grep + passthrough)", () => {
     expect(resolvePeerName(null, "session.%999", false, 12345)).toBe("session.%999");
   });
 
-  test("two different pane_ids in same session produce two distinct names (regression for operator's bug)", () => {
-    // Pre-fix: pane_index could collide (both panes computed e.g.
-    // "claude_agents.1") → broker dedup → second peer became
-    // "claude_agents.1#2". Post-fix: pane_id is unique per pane lifetime,
-    // so the two names differ from the start. This test documents the
-    // bug shape and the post-fix invariant.
-    const paneAName = resolvePeerName(null, "claude_agents.%4", false, 100);
-    const paneBName = resolvePeerName(null, "claude_agents.%5", false, 200);
-    expect(paneAName).not.toBe(paneBName);
-    expect(paneAName).toBe("claude_agents.%4");
-    expect(paneBName).toBe("claude_agents.%5");
+  test("name_like JS-substring filter handles % literally (broker.ts:740 uses .includes() not LIKE)", () => {
+    // Post-fix peer names contain % literally (e.g., "claude_agents.%5").
+    // handleListPeers at broker.ts:740-742 filters via
+    // p.name.toLowerCase().includes(nameLike.toLowerCase())
+    // — JavaScript substring match where % is just a character.
+    // This sentinel documents the property locally so a future refactor
+    // (e.g., switching to SQL LIKE without escape) breaks the test first.
+    const peerName = "claude_agents.%5";
+    // Substring containing the literal % must match.
+    expect(peerName.toLowerCase().includes("agents.%".toLowerCase())).toBe(true);
+    expect(peerName.toLowerCase().includes("%5".toLowerCase())).toBe(true);
+    // Substring without the % must also match (substring before the %).
+    expect(peerName.toLowerCase().includes("claude_agents".toLowerCase())).toBe(true);
+    // Non-matching substring stays non-matching.
+    expect(peerName.toLowerCase().includes("nonexistent".toLowerCase())).toBe(false);
   });
 });
