@@ -170,18 +170,34 @@ for (const col of messageMigrationColumns) {
   }
 }
 
-// Clean up stale peers (PIDs that no longer exist) on startup, and free
-// their rate-limit buckets (M2 — was leaking on long-running brokers).
+// Clean up stale peers on startup, and free their rate-limit buckets
+// (M2 — was leaking on long-running brokers).
 //
-// Uses isPidAlive (defined later in this module — function declarations are
-// hoisted) for EPERM-aware liveness: a PID owned by a different UID returns
-// EPERM from kill(0), which the previous bare-catch incorrectly classified
-// as "dead" and would clobber the row. ESRCH ("no such process") is the only
-// signal for genuinely dead and reapable.
+// R5(b) — Phase B: applies the same predicate as liveAndFreshPeers (the
+// on-demand check used by handleListPeers/handleBroadcast). Two reap
+// conditions, either sufficient:
+//   1. PID is dead (kill(pid,0) returns ESRCH) — original behavior.
+//   2. last_seen older than PEER_GHOST_AFTER_MS — catches PID-alive zombies
+//      (a `bun server.ts` whose parent claude session died but bun lingered).
+// NaN guard: a malformed last_seen string fails parsing → only the PID gate
+// can reap it, never the TTL gate. Mirrored by tests/phase-b-r5b-ttl-reaper.test.ts.
+//
+// isPidAlive is EPERM-aware (PID owned by different UID returns EPERM →
+// treated as alive). ESRCH ("no such process") is the only dead signal.
 function cleanStalePeers() {
-  const peers = db.query("SELECT id, pid FROM peers").all() as { id: string; pid: number }[];
+  const peers = db.query("SELECT id, pid, last_seen FROM peers").all() as { id: string; pid: number; last_seen: string }[];
+  const now = Date.now();
   for (const peer of peers) {
+    let reapable = false;
     if (!isPidAlive(peer.pid)) {
+      reapable = true;
+    } else {
+      const lastSeenMs = new Date(peer.last_seen).getTime();
+      if (!Number.isNaN(lastSeenMs) && now - lastSeenMs > PEER_GHOST_AFTER_MS) {
+        reapable = true;
+      }
+    }
+    if (reapable) {
       db.run("DELETE FROM peers WHERE id = ?", [peer.id]);
       db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [peer.id]);
       // M2: drop the bucket so it doesn't outlive the peer indefinitely.
