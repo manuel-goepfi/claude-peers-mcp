@@ -170,42 +170,18 @@ for (const col of messageMigrationColumns) {
   }
 }
 
-// Clean up stale peers on startup, and free their rate-limit buckets
-// (M2 — was leaking on long-running brokers).
+// Periodic stale-peer sweep. D2 (2026-05-14): collapsed to a thin delegate
+// over liveAndFreshPeers (the single source of truth for the reap predicate
+// + side effects). Previously cleanStalePeers and liveAndFreshPeers carried
+// duplicate predicates that could drift; the D2 refactor (per bmad-code-review
+// Code Simplifier Option B) moved the undelivered-messages cleanup into
+// liveAndFreshPeers so both call sites reach the same end state.
 //
-// R5(b) — Phase B: applies the same predicate as liveAndFreshPeers (the
-// on-demand check used by handleListPeers/handleBroadcast). Two reap
-// conditions, either sufficient:
-//   1. PID is dead (kill(pid,0) returns ESRCH) — original behavior.
-//   2. last_seen older than PEER_GHOST_AFTER_MS — catches PID-alive zombies
-//      (a `bun server.ts` whose parent claude session died but bun lingered).
-// NaN guard: a malformed last_seen string fails parsing → only the PID gate
-// can reap it, never the TTL gate. Mirrored by tests/phase-b-r5b-ttl-reaper.test.ts.
-//
-// isPidAlive is EPERM-aware (PID owned by different UID returns EPERM →
-// treated as alive). ESRCH ("no such process") is the only dead signal.
+// The discard return is intentional — the side effects (DELETE rows, DELETE
+// undelivered messages, bucket cleanup) are what the periodic sweep needs;
+// the returned "live" list is unused here.
 function cleanStalePeers() {
-  const peers = db.query("SELECT id, pid, last_seen FROM peers").all() as { id: string; pid: number; last_seen: string }[];
-  const now = Date.now();
-  for (const peer of peers) {
-    let reapable = false;
-    if (!isPidAlive(peer.pid)) {
-      reapable = true;
-    } else {
-      const lastSeenMs = new Date(peer.last_seen).getTime();
-      if (!Number.isNaN(lastSeenMs) && now - lastSeenMs > PEER_GHOST_AFTER_MS) {
-        reapable = true;
-      }
-    }
-    if (reapable) {
-      db.run("DELETE FROM peers WHERE id = ?", [peer.id]);
-      db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [peer.id]);
-      // M2: drop the bucket so it doesn't outlive the peer indefinitely.
-      // Forward-declared at module scope; safe to reference here because the
-      // sweep runs after broker initialization.
-      try { (globalThis as { __cpBuckets?: Map<string, unknown> }).__cpBuckets?.delete(peer.id); } catch {}
-    }
-  }
+  liveAndFreshPeers(selectAllPeers.all() as Peer[]);
 }
 
 // D3 cold-start grace (2026-05-14): defer the first reap AND the periodic
@@ -661,17 +637,34 @@ function activePeerKey(peer: Peer): string {
   return `id:${peer.id}`;
 }
 
+// Single source of truth for "is this peer reapable, and if so, what cleanup
+// fires?" Called by handleListPeers and handleBroadcast (per-request hot
+// path) and by cleanStalePeers (periodic sweep). Two reap conditions, either
+// sufficient: PID dead (ESRCH) OR last_seen older than PEER_GHOST_AFTER_MS.
+//
+// D2 (2026-05-14): undelivered-messages cleanup moved here from the old
+// cleanStalePeers as part of the Code Simplifier Option B collapse. The
+// semantic invariant — "if a peer is being reaped, its undelivered mail is
+// unreachable" — holds on every reap path, so it's correct to clean up
+// undelivered mail at the same moment as the peer row, regardless of which
+// call site triggered the reap. Trade-off: list_peers / broadcast HTTP
+// handlers now do one extra DELETE per reaped peer they encounter. Reaps
+// are rare; cost is microseconds.
 function liveAndFreshPeers(peers: Peer[]): Peer[] {
   const now = Date.now();
   return peers.filter((p) => {
+    let reap = false;
     if (!isPidAlive(p.pid)) {
-      deletePeer.run(p.id);
-      buckets.delete(p.id);
-      return false;
+      reap = true;
+    } else {
+      const lastSeenMs = new Date(p.last_seen).getTime();
+      if (!Number.isNaN(lastSeenMs) && now - lastSeenMs > PEER_GHOST_AFTER_MS) {
+        reap = true;
+      }
     }
-    const age = now - new Date(p.last_seen).getTime();
-    if (age > PEER_GHOST_AFTER_MS) {
+    if (reap) {
       deletePeer.run(p.id);
+      db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [p.id]);
       buckets.delete(p.id);
       return false;
     }
