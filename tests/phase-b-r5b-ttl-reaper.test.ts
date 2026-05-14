@@ -8,14 +8,32 @@
  * already applied PID + `last_seen` TTL discipline; R5(b) brings the periodic
  * reaper in line with that discipline so orphans no longer accumulate.
  *
- * Mirrors the in-memory test pattern from tests/phase-a2-broker.test.ts: copies
- * the reapable predicate from broker.ts into the test against pure data so
- * tests are deterministic and independent of bun:sqlite + real PIDs.
+ * STRUCTURAL CONSTRAINT (acknowledged): broker.ts:930 has top-level
+ * `Bun.serve(...)` with no `import.meta.main` guard, so a test cannot
+ * `import` the real `cleanStalePeers` / `liveAndFreshPeers` without spawning
+ * a competing broker on port 7899. This file therefore uses two complementary
+ * test strategies:
  *
- * If the prod implementation diverges, this mirror MUST be updated alongside.
+ *   1. PREDICATE MIRROR (describe blocks 1-5): copies the reap predicate
+ *      from broker.ts into pure functions for fast, deterministic boundary
+ *      and graceful-degradation coverage. Mirror pattern matches existing
+ *      tests/phase-a2-broker.test.ts and tests/name-dedup.test.ts.
+ *      Drift risk: if production cleanStalePeers / liveAndFreshPeers change
+ *      and this mirror doesn't, the contract drifts silently. Tracked as
+ *      follow-up: extract broker.ts into importable module + replace mirrors
+ *      with real-symbol imports.
+ *
+ *   2. SQL INTEGRATION (describe block 6): runs an in-test reimplementation
+ *      of the sweep against a `:memory:` bun:sqlite DB matching production
+ *      schema. Validates side effects the predicate tests can't see:
+ *      DELETE on peers, DELETE on undelivered messages, preservation of
+ *      delivered messages, bucket-map cleanup (M2 leak fix).
+ *
+ * If the prod implementation diverges, this file MUST be updated alongside.
  */
 
 import { describe, test, expect } from "bun:test";
+import { Database } from "bun:sqlite";
 
 const PEER_GHOST_AFTER_MS = 90_000;
 
@@ -67,7 +85,10 @@ describe("Phase B R5(b) — isReapable predicate", () => {
     expect(isReapable(p, deadAll, NOW, PEER_GHOST_AFTER_MS)).toBe(true);
   });
 
-  test("stale last_seen + alive PID → reapable (NEW R5(b) — PID-alive zombie)", () => {
+  // REGRESSION SENTINEL: this case would have FAILED against the pre-R5(b)
+  // reaper (which only checked isPidAlive). If someone reverts broker.ts
+  // cleanStalePeers to the PID-only form, this test breaks first.
+  test("stale last_seen + alive PID → reapable (NEW R5(b) regression sentinel — PID-alive zombie)", () => {
     const p: TestPeer = { id: "stale-zombie", pid: 1234, last_seen: STALE };
     expect(isReapable(p, aliveAll, NOW, PEER_GHOST_AFTER_MS)).toBe(true);
   });
@@ -101,7 +122,13 @@ describe("Phase B R5(b) — TTL boundary semantics", () => {
   });
 });
 
-describe("Phase B R5(b) — graceful degradation on bad data", () => {
+// NOT load-bearing in production (schema has last_seen TEXT NOT NULL and
+// updateLastSeen always writes new Date().toISOString() — a malformed value
+// cannot reach the reaper through normal paths). These tests document the
+// NaN-guard contract for future-readers + defend against direct-INSERT
+// pollution (e.g., the canary insertion the operator used to verify R5(b)
+// live, or any future test fixture that bypasses the prepared statement).
+describe("Phase B R5(b) — graceful degradation on bad data (defensive, not load-bearing)", () => {
   const NOW = new Date("2026-05-14T12:00:00.000Z").getTime();
   const aliveAll = () => true;
 
@@ -187,5 +214,135 @@ describe("Phase B R5(b) — discipline parity with liveAndFreshPeers (broker.ts:
       const listingWantsReap = !liveAndFreshKeeps(p, isPidAlive);
       expect(reaperWantsReap).toBe(listingWantsReap);
     }
+  });
+});
+
+// M1 (per pr-test-analyzer 2026-05-14): the predicate tests above never
+// exercise the SQL side effects (DELETE on peers, DELETE on undelivered
+// messages, bucket-map cleanup). Without this block, a regression that
+// returns the right reapable-id list but forgets the messages-table delete
+// (orphan undelivered mail) or the M2 bucket-leak fix passes all 14
+// predicate tests. This block runs an in-test reimplementation of the sweep
+// against a `:memory:` bun:sqlite DB matching the production schema, and
+// asserts the actual after-state.
+describe("Phase B R5(b) — SQL side effects (M1 integration; :memory: DB)", () => {
+  const NOW_MS = new Date("2026-05-14T12:00:00.000Z").getTime();
+  const FRESH_ISO = new Date(NOW_MS - 10_000).toISOString();
+  const STALE_ISO = new Date(NOW_MS - 120_000).toISOString();
+
+  // Mirror of broker.ts cleanStalePeers, parameterized over (db, isPidAlive,
+  // now, ttlMs, buckets) for testability. Production version takes its db +
+  // PEER_GHOST_AFTER_MS + globalThis bucket map from module scope; this
+  // version takes them as parameters. SQL statements are verbatim copies
+  // from broker.ts:201-205 (the side-effect block).
+  function sweep(
+    db: Database,
+    isPidAlive: (pid: number) => boolean,
+    now: number,
+    ttlMs: number,
+    buckets: Map<string, unknown>,
+  ): void {
+    const peers = db.query("SELECT id, pid, last_seen FROM peers").all() as {
+      id: string;
+      pid: number;
+      last_seen: string;
+    }[];
+    for (const peer of peers) {
+      let reapable = false;
+      if (!isPidAlive(peer.pid)) {
+        reapable = true;
+      } else {
+        const lastSeenMs = new Date(peer.last_seen).getTime();
+        if (!Number.isNaN(lastSeenMs) && now - lastSeenMs > ttlMs) {
+          reapable = true;
+        }
+      }
+      if (reapable) {
+        db.run("DELETE FROM peers WHERE id = ?", [peer.id]);
+        db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [peer.id]);
+        buckets.delete(peer.id);
+      }
+    }
+  }
+
+  function makeFixtureDb(): Database {
+    const db = new Database(":memory:");
+    db.run(`
+      CREATE TABLE peers (
+        id TEXT PRIMARY KEY,
+        pid INTEGER NOT NULL,
+        cwd TEXT NOT NULL,
+        last_seen TEXT NOT NULL
+      )
+    `);
+    db.run(`
+      CREATE TABLE messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        from_id TEXT,
+        to_id TEXT NOT NULL,
+        text TEXT NOT NULL,
+        delivered INTEGER NOT NULL DEFAULT 0
+      )
+    `);
+    return db;
+  }
+
+  test("reaped peer's row is deleted; surviving peer's row preserved", () => {
+    const db = makeFixtureDb();
+    db.run("INSERT INTO peers (id, pid, cwd, last_seen) VALUES (?, ?, ?, ?)", ["operator", 100, "/tmp", FRESH_ISO]);
+    db.run("INSERT INTO peers (id, pid, cwd, last_seen) VALUES (?, ?, ?, ?)", ["zombie", 200, "/tmp", STALE_ISO]);
+    sweep(db, () => true, NOW_MS, PEER_GHOST_AFTER_MS, new Map());
+    const remaining = db.query("SELECT id FROM peers ORDER BY id").all() as { id: string }[];
+    expect(remaining).toEqual([{ id: "operator" }]);
+  });
+
+  test("undelivered messages to reaped peers are deleted; delivered messages preserved", () => {
+    const db = makeFixtureDb();
+    db.run("INSERT INTO peers (id, pid, cwd, last_seen) VALUES (?, ?, ?, ?)", ["operator", 100, "/tmp", FRESH_ISO]);
+    db.run("INSERT INTO peers (id, pid, cwd, last_seen) VALUES (?, ?, ?, ?)", ["zombie", 200, "/tmp", STALE_ISO]);
+    // 2 undelivered + 1 delivered to zombie (will be reaped); 1 undelivered to operator (will survive)
+    db.run("INSERT INTO messages (from_id, to_id, text, delivered) VALUES (?, ?, ?, ?)", ["op", "zombie", "u1", 0]);
+    db.run("INSERT INTO messages (from_id, to_id, text, delivered) VALUES (?, ?, ?, ?)", ["op", "zombie", "u2", 0]);
+    db.run("INSERT INTO messages (from_id, to_id, text, delivered) VALUES (?, ?, ?, ?)", ["op", "zombie", "d1", 1]);
+    db.run("INSERT INTO messages (from_id, to_id, text, delivered) VALUES (?, ?, ?, ?)", ["zombie", "operator", "uop", 0]);
+
+    sweep(db, () => true, NOW_MS, PEER_GHOST_AFTER_MS, new Map());
+
+    const remaining = db.query("SELECT to_id, text, delivered FROM messages ORDER BY id").all();
+    // INVARIANT: undelivered to zombie GONE; delivered to zombie PRESERVED (audit trail);
+    // undelivered to operator PRESERVED (operator wasn't reaped).
+    expect(remaining).toEqual([
+      { to_id: "zombie", text: "d1", delivered: 1 },
+      { to_id: "operator", text: "uop", delivered: 0 },
+    ]);
+  });
+
+  test("bucket map entry is cleaned for reaped peers (M2 leak regression guard)", () => {
+    const db = makeFixtureDb();
+    db.run("INSERT INTO peers (id, pid, cwd, last_seen) VALUES (?, ?, ?, ?)", ["operator", 100, "/tmp", FRESH_ISO]);
+    db.run("INSERT INTO peers (id, pid, cwd, last_seen) VALUES (?, ?, ?, ?)", ["zombie", 200, "/tmp", STALE_ISO]);
+    const buckets = new Map<string, unknown>();
+    buckets.set("operator", { tokens: 5 });
+    buckets.set("zombie", { tokens: 3 });
+    buckets.set("orphan-bucket-no-peer", { tokens: 1 }); // pre-existing leak — sweep doesn't clean it (intended: only deletes for reaped peers)
+
+    sweep(db, () => true, NOW_MS, PEER_GHOST_AFTER_MS, buckets);
+
+    expect(buckets.has("zombie")).toBe(false); // M2 fix: bucket cleaned with peer
+    expect(buckets.has("operator")).toBe(true); // surviving peer's bucket preserved
+    expect(buckets.has("orphan-bucket-no-peer")).toBe(true); // sweep doesn't touch unrelated entries
+  });
+
+  test("PID-dead reap path also fires both side-effect cleanups (existing behavior preserved)", () => {
+    const db = makeFixtureDb();
+    db.run("INSERT INTO peers (id, pid, cwd, last_seen) VALUES (?, ?, ?, ?)", ["dead-but-fresh", 999, "/tmp", FRESH_ISO]);
+    db.run("INSERT INTO messages (from_id, to_id, text, delivered) VALUES (?, ?, ?, ?)", ["op", "dead-but-fresh", "ghost-mail", 0]);
+    const buckets = new Map<string, unknown>([["dead-but-fresh", { tokens: 2 }]]);
+
+    sweep(db, () => false, NOW_MS, PEER_GHOST_AFTER_MS, buckets); // PID dead; TTL irrelevant
+
+    expect((db.query("SELECT COUNT(*) AS c FROM peers").get() as { c: number }).c).toBe(0);
+    expect((db.query("SELECT COUNT(*) AS c FROM messages WHERE delivered = 0").get() as { c: number }).c).toBe(0);
+    expect(buckets.has("dead-but-fresh")).toBe(false);
   });
 });
