@@ -84,3 +84,61 @@ describe("#11 — return type invariants", () => {
     expect(resolvePeerName(null, null, false, 1)).toBe("observer-1");
   });
 });
+
+// Dup-name fix (2026-05-14): the tmuxFallbackName formula in server.ts
+// main() now uses tmux pane_id (stable per-pane lifetime, e.g., "%5")
+// instead of pane_index (positional, drifts on add/close, e.g., "1").
+// The formula itself isn't a separate exported function — it's inline at
+// the registration site — so this block uses two complementary strategies:
+//
+//   1. SOURCE-GREP SENTINEL: assert server.ts source contains the
+//      pane_id-based formula. Catches accidental revert to pane_index.
+//      Pragmatic stopgap until the broker.ts module-extraction follow-up
+//      (#16) lets us test the registration path with real MCP fixtures.
+//
+//   2. PASSTHROUGH BEHAVIOR: assert resolvePeerName treats pane_id-shaped
+//      strings (containing "%") identically to other strings. Documents
+//      that the "%" prefix in the resulting peer name is intentional and
+//      passes through to the broker without escaping/transformation.
+describe("Dup-name fix — pane_id formula (source-grep + passthrough)", () => {
+  test("server.ts uses tmuxInfo.pane_id, NOT tmuxInfo.pane_index, in tmuxFallbackName", async () => {
+    const source = await Bun.file(`${import.meta.dir}/../server.ts`).text();
+
+    // Carve out the slice around the tmuxFallbackName formula. Use the
+    // surrounding comment anchors so the regex doesn't match unrelated
+    // pane_index references elsewhere in the file (e.g., logging,
+    // env-hint export, tmux detection).
+    const formulaSlice = source
+      .split("Name fallback resolution: env → tmux pane")[1]
+      ?.split("const isSubagent = isTaskSubagent()")[0] ?? "";
+
+    expect(formulaSlice.length).toBeGreaterThan(0); // sanity: anchors found
+    expect(formulaSlice).toMatch(/tmuxInfo\.pane_id/);
+    expect(formulaSlice).toMatch(/\$\{tmuxInfo\.session\}\.\$\{tmuxInfo\.pane_id\}/);
+    // Anti-pattern: pane_index must NOT appear in the formula slice
+    // (it's still used elsewhere in server.ts for logging, but not here).
+    expect(formulaSlice).not.toMatch(/tmuxInfo\.pane_index/);
+  });
+
+  test("resolvePeerName passes pane_id-shaped tmux names through unchanged", () => {
+    // After the formula change, tmuxFallbackName arrives as e.g.
+    // "claude_agents.%5" (% prefix from tmux pane_id notation).
+    // resolvePeerName must not strip, escape, or transform the % char.
+    expect(resolvePeerName(null, "claude_agents.%5", false, 12345)).toBe("claude_agents.%5");
+    expect(resolvePeerName(null, "infra.%6", false, 12345)).toBe("infra.%6");
+    expect(resolvePeerName(null, "session.%999", false, 12345)).toBe("session.%999");
+  });
+
+  test("two different pane_ids in same session produce two distinct names (regression for operator's bug)", () => {
+    // Pre-fix: pane_index could collide (both panes computed e.g.
+    // "claude_agents.1") → broker dedup → second peer became
+    // "claude_agents.1#2". Post-fix: pane_id is unique per pane lifetime,
+    // so the two names differ from the start. This test documents the
+    // bug shape and the post-fix invariant.
+    const paneAName = resolvePeerName(null, "claude_agents.%4", false, 100);
+    const paneBName = resolvePeerName(null, "claude_agents.%5", false, 200);
+    expect(paneAName).not.toBe(paneBName);
+    expect(paneAName).toBe("claude_agents.%4");
+    expect(paneBName).toBe("claude_agents.%5");
+  });
+});

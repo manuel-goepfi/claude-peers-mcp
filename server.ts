@@ -1204,10 +1204,22 @@ async function main() {
   // with no env AND no tmux). Single call to isTaskSubagent() — result
   // passed to the pure resolvePeerName for testability + reused for the
   // log line below. See resolvePeerName docstring for full rationale.
+  //
+  // Dup-name fix (2026-05-14): tmux fallback uses pane_id (e.g., "%5"),
+  // NOT pane_index (e.g., "1"). pane_index is positional and shifts when
+  // panes are added/closed, causing two physically-different panes to
+  // compute the same `${session}.${pane_index}` string and collide at
+  // the broker (forcing a "#2" dedup suffix). pane_id is stable per-pane
+  // for the life of the tmux server — never reused, never shifts —
+  // making `${session}.${pane_id}` unique by construction. The "%"
+  // prefix in the resulting name (e.g., "claude_agents.%5") is
+  // informative: it signals the name is a stable pane identifier, not
+  // a positional index, and matches the notation `tmux list-panes`
+  // shows for pane_id.
   const envName = process.env.CLAUDE_PEER_NAME ?? null;
   const tmuxFallbackName =
-    tmuxInfo && tmuxInfo.pane_index
-      ? `${tmuxInfo.session}.${tmuxInfo.pane_index}`
+    tmuxInfo && tmuxInfo.pane_id
+      ? `${tmuxInfo.session}.${tmuxInfo.pane_id}`
       : null;
   const isSubagent = isTaskSubagent();
   const peerName: string = resolvePeerName(envName, tmuxFallbackName, isSubagent, process.pid);
