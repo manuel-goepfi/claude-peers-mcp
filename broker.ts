@@ -28,6 +28,13 @@ import type {
   Peer,
   Message,
 } from "./shared/types.ts";
+// #7 narrow (2026-05-14): predicate + TTL constant extracted to shared/
+// so tests can import the real symbol without spawning broker.ts (which
+// has top-level Bun.serve at line ~930 — module import would conflict
+// on port 7899). Full broker.ts module-extraction is a separate larger
+// follow-up; this narrow extraction unlocks load-bearing test mirrors
+// for the reap predicate without touching the broker's startup shape.
+import { isReapable, PEER_GHOST_AFTER_MS } from "./shared/reaper.ts";
 
 const PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const DB_PATH = process.env.CLAUDE_PEERS_DB ?? `${process.env.HOME}/.claude-peers.db`;
@@ -59,7 +66,7 @@ const RATE_MAX_REQS = 600;             // max broker requests per peer per windo
 const MAX_BROADCAST_TARGETS = RATE_MAX_MSGS; // hard cap = 60 — ties fanout to per-minute msg quota
 
 // --- S7: ghost reaping ---
-const PEER_GHOST_AFTER_MS = 90_000;    // peer with no heartbeat in 90s = ghost
+// PEER_GHOST_AFTER_MS now imported from ./shared/reaper.ts (#7 narrow).
 
 // --- AP-063: bridge auth ---
 // File-backed bridge token for the Mission Control Hub bridge daemon.
@@ -653,16 +660,7 @@ function activePeerKey(peer: Peer): string {
 function liveAndFreshPeers(peers: Peer[]): Peer[] {
   const now = Date.now();
   return peers.filter((p) => {
-    let reap = false;
-    if (!isPidAlive(p.pid)) {
-      reap = true;
-    } else {
-      const lastSeenMs = new Date(p.last_seen).getTime();
-      if (!Number.isNaN(lastSeenMs) && now - lastSeenMs > PEER_GHOST_AFTER_MS) {
-        reap = true;
-      }
-    }
-    if (reap) {
+    if (isReapable(p, isPidAlive, now, PEER_GHOST_AFTER_MS)) {
       deletePeer.run(p.id);
       db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [p.id]);
       buckets.delete(p.id);

@@ -19,31 +19,33 @@
  * module init, so live peers can re-heartbeat after a broker restart before
  * the TTL gate fires. Sentinel test in describe block 6.
  *
- * STRUCTURAL CONSTRAINT (acknowledged): broker.ts:930 has top-level
- * `Bun.serve(...)` with no `import.meta.main` guard, so a test cannot
- * `import` the real `cleanStalePeers` / `liveAndFreshPeers` without spawning
- * a competing broker on port 7899. This file therefore uses three complementary
- * test strategies:
+ * STRUCTURAL CONSTRAINT (partially mitigated by #7 narrow): broker.ts:930
+ * has top-level `Bun.serve(...)` with no `import.meta.main` guard, so a test
+ * cannot `import` the real `cleanStalePeers` / `liveAndFreshPeers` without
+ * spawning a competing broker on port 7899. The #7 narrow refactor extracted
+ * the reap predicate (`isReapable`) and TTL constant into `shared/reaper.ts`
+ * — a side-effect-free module — so the predicate tests CAN now import the
+ * real symbol. The full broker module-extraction (#7 wide) remains a
+ * follow-up. This file uses three complementary test strategies:
  *
- *   1. PREDICATE MIRROR (describe blocks 1-4): copies the reap predicate
- *      from broker.ts into pure functions for fast, deterministic boundary
- *      and graceful-degradation coverage. Mirror pattern matches existing
- *      tests/phase-a2-broker.test.ts and tests/name-dedup.test.ts.
- *      Drift risk: if production liveAndFreshPeers changes and this mirror
- *      doesn't, the contract drifts silently. Tracked as follow-up: extract
- *      broker.ts into importable module + replace mirrors with real-symbol
- *      imports (task #7 in operator session log).
+ *   1. PREDICATE TESTS (describe blocks 1-4): import the REAL `isReapable`
+ *      from shared/reaper.ts and exercise its truth table, boundary
+ *      semantics, and graceful-degradation paths. POST-#7 narrow these
+ *      tests are load-bearing — they cover production code, not a mirror.
  *
- *   2. SQL INTEGRATION (describe block 5): runs an in-test reimplementation
- *      of liveAndFreshPeers against a `:memory:` bun:sqlite DB matching
- *      production schema. Validates side effects the predicate tests can't
- *      see: DELETE on peers, DELETE on undelivered messages, preservation
- *      of delivered messages, bucket-map cleanup (M2 leak fix).
+ *   2. SQL INTEGRATION (describe block 5): mirrors the full liveAndFreshPeers
+ *      sweep (predicate + DELETE side effects) against a `:memory:`
+ *      bun:sqlite DB. The mirror is necessary because broker.ts can't be
+ *      imported; the predicate inside the mirror calls the same imported
+ *      `isReapable` via the same logic, so drift on the predicate side
+ *      surfaces in both this block AND the predicate blocks above.
+ *      Validates: DELETE on peers, DELETE on undelivered messages,
+ *      preservation of delivered messages, bucket-map cleanup (M2 leak).
  *
  *   3. SOURCE-GREP SENTINEL (describe block 6): asserts the production
  *      source still carries the D3 cold-start grace pattern. Pragmatic
- *      stopgap until the broker.ts module-extraction follow-up lets us
- *      test the scheduler with time mocks.
+ *      stopgap until the broker.ts module-extraction follow-up (#7 wide)
+ *      lets us test the scheduler with time mocks.
  *
  * Spec mapping reconciliation (D1, 2026-05-14): this work is §2.6 Lifecycle
  * hardening (aligning the periodic reaper with the on-demand
@@ -58,26 +60,14 @@
 
 import { describe, test, expect } from "bun:test";
 import { Database } from "bun:sqlite";
-
-const PEER_GHOST_AFTER_MS = 90_000;
+// #7 narrow (2026-05-14): import the REAL predicate + TTL constant from
+// shared/reaper, not a local mirror. broker.ts itself still can't be
+// imported (top-level Bun.serve at line ~930), but the predicate was
+// hoisted into a side-effect-free shared module specifically so the
+// predicate tests below test load-bearing prod code, not a copy.
+import { isReapable, PEER_GHOST_AFTER_MS } from "../shared/reaper";
 
 type TestPeer = { id: string; pid: number; last_seen: string };
-
-// Mirror of broker.ts cleanStalePeers reapable-predicate (post-R5(b)).
-// Pure function: takes a peer + an isPidAlive callback (so tests can stub
-// liveness deterministically) + a `now` clock + the TTL constant.
-function isReapable(
-  peer: TestPeer,
-  isPidAlive: (pid: number) => boolean,
-  now: number,
-  ttlMs: number,
-): boolean {
-  if (!isPidAlive(peer.pid)) return true;
-  const lastSeenMs = new Date(peer.last_seen).getTime();
-  if (Number.isNaN(lastSeenMs)) return false; // graceful: invalid timestamp not auto-reaped
-  const age = now - lastSeenMs;
-  return age > ttlMs;
-}
 
 // Mirror of broker.ts cleanStalePeers full sweep — returns the IDs that would
 // be reaped. Side-effect-free for testing.
