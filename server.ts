@@ -452,8 +452,11 @@ function normalizeText(text: string): string {
  * Fallback chain:
  *   1. CLAUDE_PEER_NAME env var (operator-set or wrapper-injected — bashrc
  *      cc/ccc/cccr wrappers pre-export this).
- *   2. Tmux session.pane_index (when launched inside tmux — historic default).
- *   3. observer-${pid} (PID-based final fallback — closes the spec §1.5
+ *   2. Tmux operator label (`session.N`) read from @operator_label/@peer_label,
+ *      or allocated from pane_index when the pane has no human label yet.
+ *   3. Tmux pane-id fallback (`session.%N`) only when no human label can be
+ *      resolved.
+ *   4. observer-${pid} (PID-based final fallback — closes the spec §1.5
  *      follow-up #2 "no env, no tmux → name=null" gap. Before this, a
  *      bare-claude session with no env and no tmux registered with name=null
  *      and was unfindable by name, only by id).
@@ -480,6 +483,99 @@ export function resolvePeerName(
     peerName = `${envName}.task.${pid}`;
   }
   return peerName;
+}
+
+function cleanTmuxOptionValue(value: string | null): string | null {
+  const trimmed = value?.trim() ?? "";
+  return trimmed ? trimmed : null;
+}
+
+export function stripResolvedNameSuffix(label: string): string {
+  return label.replace(/#[0-9]+$/, "");
+}
+
+export function isHumanOperatorLabel(label: string | null, session: string): label is string {
+  if (!label) return false;
+  const base = stripResolvedNameSuffix(label.trim());
+  if (!base.startsWith(`${session}.`)) return false;
+  return /^[0-9]+$/.test(base.slice(session.length + 1));
+}
+
+export function chooseOperatorLabel(session: string, paneIndex: string | undefined, usedLabels: Iterable<string>): string {
+  const used = new Set<string>();
+  for (const label of usedLabels) {
+    if (isHumanOperatorLabel(label, session)) used.add(stripResolvedNameSuffix(label.trim()));
+  }
+
+  if (paneIndex && /^[0-9]+$/.test(paneIndex)) {
+    const paneIndexLabel = `${session}.${paneIndex}`;
+    if (!used.has(paneIndexLabel)) return paneIndexLabel;
+  }
+
+  for (let n = 1; ; n++) {
+    const candidate = `${session}.${n}`;
+    if (!used.has(candidate)) return candidate;
+  }
+}
+
+function runTmux(args: string[]): string | null {
+  try {
+    const result = Bun.spawnSync(["tmux", ...args], { stderr: "ignore" });
+    if (result.exitCode !== 0) return null;
+    return new TextDecoder().decode(result.stdout).trim();
+  } catch {
+    return null;
+  }
+}
+
+function readTmuxPaneOption(target: string, optionName: string): string | null {
+  return cleanTmuxOptionValue(runTmux(["show-options", "-p", "-t", target, "-v", optionName]));
+}
+
+function setTmuxPaneOption(target: string, optionName: string, value: string): void {
+  try {
+    Bun.spawnSync(["tmux", "set-option", "-p", "-t", target, optionName, value], {
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+  } catch {
+    // Best-effort label publishing only; registration still works without it.
+  }
+}
+
+function readUsedOperatorLabels(session: string, currentPaneId: string): string[] {
+  const out = runTmux(["list-panes", "-t", session, "-F", "#{pane_id}\t#{@operator_label}\t#{@peer_label}"]);
+  if (!out) return [];
+
+  const labels: string[] = [];
+  for (const line of out.split("\n")) {
+    const [paneId, operatorLabel, peerLabel] = line.split("\t");
+    if (!paneId || paneId === currentPaneId) continue;
+    const label = cleanTmuxOptionValue(operatorLabel) ?? cleanTmuxOptionValue(peerLabel);
+    if (label) labels.push(label);
+  }
+  return labels;
+}
+
+function resolveTmuxOperatorLabel(tmuxInfo: TmuxPaneInfo | null): string | null {
+  if (!tmuxInfo?.session || !tmuxInfo.pane_id) return null;
+
+  const paneTarget = tmuxInfo.pane_id;
+  const existing =
+    cleanTmuxOptionValue(readTmuxPaneOption(paneTarget, "@operator_label")) ??
+    cleanTmuxOptionValue(readTmuxPaneOption(paneTarget, "@peer_label"));
+  if (isHumanOperatorLabel(existing, tmuxInfo.session)) {
+    return stripResolvedNameSuffix(existing.trim());
+  }
+
+  const label = chooseOperatorLabel(
+    tmuxInfo.session,
+    tmuxInfo.pane_index,
+    readUsedOperatorLabels(tmuxInfo.session, tmuxInfo.pane_id),
+  );
+  setTmuxPaneOption(paneTarget, "@operator_label", label);
+  setTmuxPaneOption(paneTarget, "@peer_label", label);
+  return label;
 }
 
 export function frameUntrusted(fromId: string, sentAt: string, text: string): string {
@@ -1205,22 +1301,17 @@ async function main() {
   // passed to the pure resolvePeerName for testability + reused for the
   // log line below. See resolvePeerName docstring for full rationale.
   //
-  // Dup-name fix (2026-05-14): tmux fallback uses pane_id (e.g., "%5"),
-  // NOT pane_index (e.g., "1"). pane_index is positional and shifts when
-  // panes are added/closed, causing two physically-different panes to
-  // compute the same `${session}.${pane_index}` string and collide at
-  // the broker (forcing a "#2" dedup suffix). pane_id is stable per-pane
-  // for the life of the tmux server — never reused, never shifts —
-  // making `${session}.${pane_id}` unique by construction. The "%"
-  // prefix in the resulting name (e.g., "claude_agents.%5") is
-  // informative: it signals the name is a stable pane identifier, not
-  // a positional index, and matches the notation `tmux list-panes`
-  // shows for pane_id.
+  // Human operator names should match the tmux top-bar label (`infra.2`,
+  // `codex.2`, etc.) so `find_peer({ name })` follows what the operator sees.
+  // The stable tmux pane_id still travels separately as `tmux_pane_id`; it is
+  // not the operator-facing name unless all human-label resolution fails.
   const envName = process.env.CLAUDE_PEER_NAME ?? null;
+  const tmuxOperatorLabel = envName ? null : resolveTmuxOperatorLabel(tmuxInfo);
   const tmuxFallbackName =
-    tmuxInfo && tmuxInfo.pane_id
+    tmuxOperatorLabel ??
+    (tmuxInfo && tmuxInfo.pane_id
       ? `${tmuxInfo.session}.${tmuxInfo.pane_id}`
-      : null;
+      : null);
   const isSubagent = isTaskSubagent();
   const peerName: string = resolvePeerName(envName, tmuxFallbackName, isSubagent, process.pid);
   if (envName && !tmuxFallbackName && isSubagent) {
@@ -1313,18 +1404,10 @@ async function main() {
       const paneTarget = process.env.TMUX_PANE
         ? process.env.TMUX_PANE
         : `${tmuxInfo.session}:${tmuxInfo.window_index}`;
-      Bun.spawnSync(["tmux", "set-option", "-p", "-t", paneTarget, "@peer_id", myId], {
-        stdout: "ignore", stderr: "ignore",
-      });
-      Bun.spawnSync(["tmux", "set-option", "-p", "-t", paneTarget, "@operator_label", displayLabel], {
-        stdout: "ignore", stderr: "ignore",
-      });
-      Bun.spawnSync(["tmux", "set-option", "-p", "-t", paneTarget, "@peer_label", displayLabel], {
-        stdout: "ignore", stderr: "ignore",
-      });
-      Bun.spawnSync(["tmux", "set-option", "-p", "-t", paneTarget, "@peer_resolved_name", myResolvedName ?? ""], {
-        stdout: "ignore", stderr: "ignore",
-      });
+      setTmuxPaneOption(paneTarget, "@peer_id", myId);
+      setTmuxPaneOption(paneTarget, "@operator_label", displayLabel);
+      setTmuxPaneOption(paneTarget, "@peer_label", displayLabel);
+      setTmuxPaneOption(paneTarget, "@peer_resolved_name", myResolvedName ?? "");
       log(`tmux pane labeled: @peer_id=${myId} @operator_label=${displayLabel} @peer_resolved_name=${myResolvedName ?? ""} (target=${paneTarget})`);
     } catch (e) {
       log(`tmux set-option failed (non-critical): ${errMsg(e)} (target=${target})`);

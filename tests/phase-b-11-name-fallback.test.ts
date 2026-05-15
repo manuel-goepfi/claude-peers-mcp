@@ -17,7 +17,12 @@
  */
 
 import { describe, test, expect } from "bun:test";
-import { resolvePeerName } from "../server";
+import {
+  chooseOperatorLabel,
+  isHumanOperatorLabel,
+  resolvePeerName,
+  stripResolvedNameSuffix,
+} from "../server";
 
 describe("#11 — resolvePeerName fallback chain", () => {
   const PID = 12345;
@@ -85,59 +90,22 @@ describe("#11 — return type invariants", () => {
   });
 });
 
-// Dup-name fix (2026-05-14): the tmuxFallbackName formula in server.ts
-// main() now uses tmux pane_id (stable per-pane lifetime, e.g., "%5")
-// instead of pane_index (positional, drifts on add/close, e.g., "1").
-// The formula itself isn't a separate exported function — it's inline at
-// the registration site — so this block uses three complementary strategies:
-//
-//   1. SOURCE-GREP SENTINEL: assert server.ts source contains the
-//      pane_id-based formula AND the matching truthy guard. Catches
-//      accidental revert to pane_index in either position. Pragmatic
-//      stopgap until the broker.ts module-extraction follow-up (#16)
-//      lets us test the registration path with real MCP fixtures.
-//
-//   2. FALSY-PANE_ID FALLBACK (spec test case 3): when tmuxInfo.pane_id
-//      is missing/null/empty (env-hint path that exports SESSION but not
-//      PANE_ID, or tmux returning unexpected output), the formula yields
-//      null → resolvePeerName cascades to the observer-${pid} fallback.
-//      This guards the "silent demotion to PID-based name" failure mode
-//      the env-hint path can hit.
-//
-//   3. SQL-WILDCARD INTERACTION: % is a SQL LIKE wildcard, and post-fix
-//      every tmux peer name CONTAINS %. handleListPeers (broker.ts:740)
-//      uses JS .includes() so % is literal — sentinel test below documents
-//      this. handleBroadcast (broker.ts:802) escapes % in caller-supplied
-//      name_like via replace(/[\\%_]/g, "\\$&") + ESCAPE '\' — already
-//      tested in tests/delivery.test.ts; documented here for completeness.
-//
-// Updated 2026-05-14 per /clause5-code-review pass: anchor switched from
-// fragile comment-string to durable code-string; tautological "two distinct
-// names" test deleted (was "a" !== "b" dressed as regression); added
-// load-bearing sentinels for case 3 (falsy pane_id) and SQL-wildcard.
-describe("Dup-name fix — pane_id formula (source-grep + integration sentinels)", () => {
-  test("server.ts uses tmuxInfo.pane_id (NOT pane_index) in tmuxFallbackName formula AND truthy guard", async () => {
+// Operator-label regression (2026-05-15): operator-facing peer names must
+// match the tmux top bar (`session.N`). `pane_id` remains stable metadata and
+// the last fallback, but must not displace the human label used by find_peer().
+describe("Operator-label fallback — human name first, pane_id metadata last", () => {
+  test("server.ts resolves a human tmux operator label before pane_id fallback", async () => {
     const source = await Bun.file(`${import.meta.dir}/../server.ts`).text();
 
-    // Anchor on the call site of resolvePeerName (durable code, not a
-    // comment). The slice contains the formula assignment + the guard +
-    // the resolvePeerName call itself. Anchors:
-    //   - upper: the literal call-site `resolvePeerName(envName, tmuxFallbackName`
-    //     (read backwards by splitting and taking [0])
-    //   - lower: same call site (taking [1] would orphan the formula above)
-    // Cleaner approach: find the formula assignment statement via its LHS
-    // identifier `tmuxFallbackName =`, then take a 200-char window after.
-    const assignIdx = source.indexOf("const tmuxFallbackName =");
-    expect(assignIdx).toBeGreaterThanOrEqual(0); // sanity: assignment found
-    const formulaSlice = source.slice(assignIdx, assignIdx + 200);
+    const labelIdx = source.indexOf("const tmuxOperatorLabel =");
+    expect(labelIdx).toBeGreaterThanOrEqual(0);
+    const formulaSlice = source.slice(labelIdx, labelIdx + 360);
 
-    // Truthy guard must check pane_id (the source of stability).
-    expect(formulaSlice).toMatch(/tmuxInfo\s*&&\s*tmuxInfo\.pane_id/);
-    // Template literal must use pane_id.
+    expect(formulaSlice).toMatch(/resolveTmuxOperatorLabel\(tmuxInfo\)/);
+    expect(formulaSlice).toMatch(/tmuxOperatorLabel\s*\?\?/);
+    // pane_id remains only as the last fallback/metadata-derived address,
+    // not as the first operator-facing name.
     expect(formulaSlice).toMatch(/\$\{tmuxInfo\.session\}\.\$\{tmuxInfo\.pane_id\}/);
-    // Anti-pattern: pane_index must NOT appear in either position within
-    // the formula slice (still used elsewhere in server.ts for logging).
-    expect(formulaSlice).not.toMatch(/tmuxInfo\.pane_index/);
   });
 
   test("falsy pane_id → null tmuxFallbackName → observer-${pid} (spec test case 3)", () => {
@@ -155,29 +123,35 @@ describe("Dup-name fix — pane_id formula (source-grep + integration sentinels)
     expect(resolvePeerName(null, null, false, 1)).toBe("observer-1");
   });
 
-  test("resolvePeerName passes pane_id-shaped names through unchanged (% is intentional, not transformed)", () => {
-    // After the formula change, tmuxFallbackName arrives as e.g.
-    // "claude_agents.%5" (% prefix from tmux pane_id notation).
-    // resolvePeerName must not strip, escape, or transform the % char.
+  test("resolvePeerName still passes pane_id-shaped final fallback names through unchanged", () => {
+    // pane_id names are allowed only as the final no-human-label fallback.
+    // resolvePeerName must not strip, escape, or transform the % char there.
     expect(resolvePeerName(null, "claude_agents.%5", false, 12345)).toBe("claude_agents.%5");
     expect(resolvePeerName(null, "infra.%6", false, 12345)).toBe("infra.%6");
     expect(resolvePeerName(null, "session.%999", false, 12345)).toBe("session.%999");
   });
 
-  test("name_like JS-substring filter handles % literally (broker.ts:740 uses .includes() not LIKE)", () => {
-    // Post-fix peer names contain % literally (e.g., "claude_agents.%5").
-    // handleListPeers at broker.ts:740-742 filters via
-    // p.name.toLowerCase().includes(nameLike.toLowerCase())
-    // — JavaScript substring match where % is just a character.
-    // This sentinel documents the property locally so a future refactor
-    // (e.g., switching to SQL LIKE without escape) breaks the test first.
-    const peerName = "claude_agents.%5";
-    // Substring containing the literal % must match.
-    expect(peerName.toLowerCase().includes("agents.%".toLowerCase())).toBe(true);
-    expect(peerName.toLowerCase().includes("%5".toLowerCase())).toBe(true);
-    // Substring without the % must also match (substring before the %).
-    expect(peerName.toLowerCase().includes("claude_agents".toLowerCase())).toBe(true);
-    // Non-matching substring stays non-matching.
-    expect(peerName.toLowerCase().includes("nonexistent".toLowerCase())).toBe(false);
+  test("operator labels accept session.N and reject pane-id names", () => {
+    expect(isHumanOperatorLabel("infra.2", "infra")).toBe(true);
+    expect(isHumanOperatorLabel("infra.2#4", "infra")).toBe(true);
+    expect(isHumanOperatorLabel("infra.%24", "infra")).toBe(false);
+    expect(isHumanOperatorLabel("marketing.2", "infra")).toBe(false);
+  });
+
+  test("operator-label allocation prefers pane_index when it is free", () => {
+    expect(chooseOperatorLabel("infra", "2", ["infra.1", "infra.3"])).toBe("infra.2");
+  });
+
+  test("operator-label allocation falls back to the lowest free session.N", () => {
+    expect(chooseOperatorLabel("infra", "2", ["infra.1", "infra.2", "infra.2#4"])).toBe("infra.3");
+  });
+
+  test("operator-label allocation ignores pane-id-shaped broker fallbacks as human seats", () => {
+    expect(chooseOperatorLabel("infra", "2", ["infra.%19", "infra.%24"])).toBe("infra.2");
+  });
+
+  test("resolved-name suffix stripping is limited to broker numeric suffixes", () => {
+    expect(stripResolvedNameSuffix("infra.2#4")).toBe("infra.2");
+    expect(stripResolvedNameSuffix("custom#name")).toBe("custom#name");
   });
 });
