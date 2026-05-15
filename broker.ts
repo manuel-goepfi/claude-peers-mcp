@@ -22,9 +22,16 @@ import type {
   BroadcastRequest,
   ListPeersRequest,
   SendMessageRequest,
+  SendMessageResponse,
   PollMessagesRequest,
   PollMessagesResponse,
   AckMessagesRequest,
+  ClaimByPidRequest,
+  ClaimByPidResponse,
+  AckByPidRequest,
+  HookHeartbeatByPidRequest,
+  ClientType,
+  ReceiverMode,
   Peer,
   Message,
 } from "./shared/types.ts";
@@ -64,6 +71,9 @@ const RATE_WINDOW_MS = 60_000;         // 1-minute rolling window
 const RATE_MAX_MSGS = 60;              // max messages sent per peer per window
 const RATE_MAX_REQS = 600;             // max broker requests per peer per window (10/s avg)
 const MAX_BROADCAST_TARGETS = RATE_MAX_MSGS; // hard cap = 60 — ties fanout to per-minute msg quota
+const CLAIM_TTL_MS = 30_000;
+const CLAIM_MAX_MESSAGES = 25;
+const CLAIM_MAX_BYTES = 64 * 1024;
 
 // --- S7: ghost reaping ---
 // PEER_GHOST_AFTER_MS now imported from ./shared/reaper.ts (#7 narrow).
@@ -129,6 +139,11 @@ const migrationColumns = [
   { name: "token", type: "TEXT" },
   { name: "resolved_name", type: "TEXT" },
   { name: "absolute_git_dir", type: "TEXT" },
+  { name: "client_type", type: "TEXT NOT NULL DEFAULT 'unknown'" },
+  { name: "receiver_mode", type: "TEXT NOT NULL DEFAULT 'unknown'" },
+  { name: "last_hook_seen_at", type: "TEXT" },
+  { name: "last_drain_at", type: "TEXT" },
+  { name: "last_drain_error", type: "TEXT" },
 ];
 for (const col of migrationColumns) {
   try {
@@ -165,6 +180,8 @@ for (const row of db.query("SELECT id, name, resolved_name FROM peers WHERE name
 // to compute queue→deliver latency for the idle-peer delivery investigation.
 const messageMigrationColumns = [
   { name: "delivered_at", type: "TEXT" },
+  { name: "claimed_by", type: "TEXT" },
+  { name: "claimed_at", type: "TEXT" },
 ];
 for (const col of messageMigrationColumns) {
   try {
@@ -214,8 +231,8 @@ setTimeout(() => {
 // --- Prepared statements ---
 
 const insertPeer = db.prepare(`
-  INSERT INTO peers (id, pid, cwd, git_root, absolute_git_dir, tty, name, resolved_name, tmux_session, tmux_window_index, tmux_window_name, tmux_pane_id, summary, registered_at, last_seen, token)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO peers (id, pid, cwd, git_root, absolute_git_dir, tty, name, resolved_name, tmux_session, tmux_window_index, tmux_window_name, tmux_pane_id, client_type, receiver_mode, summary, registered_at, last_seen, token)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const selectPeerByToken = db.prepare(`
@@ -224,6 +241,27 @@ const selectPeerByToken = db.prepare(`
 
 const updateLastSeen = db.prepare(`
   UPDATE peers SET last_seen = ? WHERE id = ?
+`);
+
+const updateHeartbeatSeen = db.prepare(`
+  UPDATE peers
+  SET last_seen = ?,
+      client_type = ?,
+      receiver_mode = CASE
+        WHEN receiver_mode = 'codex-hook' AND ? = 'manual-drain' THEN receiver_mode
+        ELSE ?
+      END
+  WHERE id = ?
+`);
+
+const updateReceiverHealth = db.prepare(`
+  UPDATE peers
+  SET client_type = 'codex',
+      receiver_mode = ?,
+      last_hook_seen_at = ?,
+      last_drain_at = COALESCE(?, last_drain_at),
+      last_drain_error = ?
+  WHERE id = ?
 `);
 
 const updateSummary = db.prepare(`
@@ -256,11 +294,19 @@ const insertMessage = db.prepare(`
 `);
 
 const selectUndelivered = db.prepare(`
-  SELECT * FROM messages WHERE to_id = ? AND delivered = 0 ORDER BY sent_at ASC
+  SELECT * FROM messages
+  WHERE to_id = ? AND delivered = 0
+    AND (claimed_at IS NULL OR claimed_at < ?)
+  ORDER BY sent_at ASC
 `);
 
 const markDeliveredScoped = db.prepare(`
-  UPDATE messages SET delivered = 1, delivered_at = ? WHERE id = ? AND to_id = ?
+  UPDATE messages SET delivered = 1, delivered_at = ?, claimed_by = NULL, claimed_at = NULL WHERE id = ? AND to_id = ?
+`);
+
+const markDeliveredClaimedScoped = db.prepare(`
+  UPDATE messages SET delivered = 1, delivered_at = ?, claimed_by = NULL, claimed_at = NULL
+  WHERE id = ? AND to_id = ? AND claimed_by = ?
 `);
 
 // Companion lookup for latency telemetry: reads sent_at + from_id BEFORE
@@ -276,6 +322,13 @@ const selectMsgForLatency = db.prepare(`
 // means the attacker boundary is already "other user on this machine".
 const selectPeerIdByPid = db.prepare(`
   SELECT id FROM peers WHERE pid = ?
+`);
+
+const claimMessage = db.prepare(`
+  UPDATE messages
+  SET claimed_by = ?, claimed_at = ?
+  WHERE id = ? AND to_id = ? AND delivered = 0
+    AND (claimed_at IS NULL OR claimed_at < ?)
 `);
 
 // Rehydration candidate lookup. Matches the tmux location tuple + cwd of the
@@ -481,6 +534,37 @@ function reqStrict(s: unknown): string {
   return typeof s === "string" ? s : "";
 }
 
+function validClientType(value: unknown): ClientType {
+  return value === "claude" || value === "codex" || value === "unknown" ? value : "unknown";
+}
+
+function validReceiverMode(value: unknown, clientType: ClientType): ReceiverMode {
+  if (clientType === "claude") return "claude-channel";
+  if (clientType === "codex") {
+    return value === "codex-hook" || value === "manual-drain" ? value : "manual-drain";
+  }
+  return "unknown";
+}
+
+function initialReceiverModeFromRegistration(value: unknown, clientType: ClientType): ReceiverMode {
+  const mode = validReceiverMode(value, clientType);
+  return clientType === "codex" && mode === "codex-hook" ? "manual-drain" : mode;
+}
+
+function claimCutoffIso(nowMs = Date.now()): string {
+  return new Date(nowMs - CLAIM_TTL_MS).toISOString();
+}
+
+function selectAvailableMessages(peerId: string): Message[] {
+  return selectUndelivered.all(peerId, claimCutoffIso()) as Message[];
+}
+
+function generateDrainId(peerId: string): string {
+  const buf = new Uint8Array(12);
+  crypto.getRandomValues(buf);
+  return `drain:${peerId}:${Date.now()}:${Buffer.from(buf).toString("base64url")}`;
+}
+
 // --- Request handlers ---
 
 // L3: tagged-union return so the discriminator is unambiguous and future
@@ -567,15 +651,32 @@ function handleRegister(body: RegisterRequest): RegisterResult {
   // a broker-unique resolved_name for diagnostics and exact process identity.
   const requestedName = body.name ?? null;
   const finalName = disambiguateName(requestedName, id);
+  const clientType = validClientType(body.client_type);
+  const receiverMode = initialReceiverModeFromRegistration(body.receiver_mode, clientType);
   if (requestedName && finalName !== requestedName) {
     console.error(`[broker] name dedup: pid=${body.pid} requested="${requestedName}" resolved="${finalName}" (collision)`);
   }
-  insertPeer.run(id, body.pid, body.cwd, body.git_root, body.absolute_git_dir ?? null, body.tty, requestedName, finalName, body.tmux_session ?? null, body.tmux_window_index ?? null, body.tmux_window_name ?? null, body.tmux_pane_id ?? null, body.summary, now, now, token);
-  return { ok: true, value: { id, token, name: requestedName, resolved_name: finalName } };
+  insertPeer.run(id, body.pid, body.cwd, body.git_root, body.absolute_git_dir ?? null, body.tty, requestedName, finalName, body.tmux_session ?? null, body.tmux_window_index ?? null, body.tmux_window_name ?? null, body.tmux_pane_id ?? null, clientType, receiverMode, body.summary, now, now, token);
+  return { ok: true, value: { id, token, name: requestedName, resolved_name: finalName, client_type: clientType, receiver_mode: receiverMode } };
 }
 
 function handleHeartbeat(body: HeartbeatRequest): void {
-  updateLastSeen.run(new Date().toISOString(), body.id);
+  const now = new Date().toISOString();
+  if (body.client_type || body.receiver_mode) {
+    const current = db.query("SELECT client_type, receiver_mode FROM peers WHERE id = ?").get(body.id) as {
+      client_type: ClientType | null;
+      receiver_mode: ReceiverMode | null;
+    } | null;
+    const clientType = body.client_type
+      ? validClientType(body.client_type)
+      : validClientType(current?.client_type);
+    const receiverMode = body.receiver_mode
+      ? initialReceiverModeFromRegistration(body.receiver_mode, clientType)
+      : validReceiverMode(current?.receiver_mode, clientType);
+    updateHeartbeatSeen.run(now, clientType, receiverMode, receiverMode, body.id);
+    return;
+  }
+  updateLastSeen.run(now, body.id);
 }
 
 function handleSetSummary(body: SetSummaryRequest): void {
@@ -746,15 +847,33 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
   return body.include_inactive ? live : activeOnly(live);
 }
 
-function handleSendMessage(authedFromId: string, body: SendMessageRequest): { ok: boolean; id?: number; error?: string } {
+function handleSendMessage(authedFromId: string, body: SendMessageRequest): SendMessageResponse {
   // S6: from_id is ALWAYS the authenticated peer — body.from_id is ignored.
   // S5: payload size cap.
   if (typeof body.text !== "string") return { ok: false, error: "text must be string" };
   if (utf8Bytes(body.text) > MAX_MSG_BYTES) return { ok: false, error: `text exceeds ${MAX_MSG_BYTES} bytes` };
-  const target = db.query("SELECT id FROM peers WHERE id = ?").get(body.to_id) as { id: string } | null;
+  const target = db.query("SELECT id, client_type, receiver_mode, last_hook_seen_at, last_drain_error, last_seen FROM peers WHERE id = ?").get(body.to_id) as {
+    id: string;
+    client_type: ClientType | null;
+    receiver_mode: ReceiverMode | null;
+    last_hook_seen_at: string | null;
+    last_drain_error: string | null;
+    last_seen: string | null;
+  } | null;
   if (!target) return { ok: false, error: `Peer ${body.to_id} not found` };
   const result = insertMessage.run(authedFromId, body.to_id, body.text, new Date().toISOString());
-  return { ok: true, id: Number(result.lastInsertRowid) };
+  return {
+    ok: true,
+    id: Number(result.lastInsertRowid),
+    target: {
+      id: target.id,
+      client_type: validClientType(target.client_type),
+      receiver_mode: validReceiverMode(target.receiver_mode, validClientType(target.client_type)),
+      last_hook_seen_at: target.last_hook_seen_at,
+      last_drain_error: target.last_drain_error,
+      last_seen: target.last_seen,
+    },
+  };
 }
 
 // /message-status: sender-scoped lookup of delivered/delivered_at for a
@@ -846,7 +965,7 @@ function handleBroadcast(authedFromId: string, body: BroadcastRequest): { ok: bo
 }
 
 function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
-  const messages = selectUndelivered.all(body.id) as Message[];
+  const messages = selectAvailableMessages(body.id);
   // Read-only: caller must explicitly ack via /ack-messages
   return { messages };
 }
@@ -878,6 +997,118 @@ function handleUnregister(body: { id: string }): void {
   deletePeer.run(body.id);
 }
 
+function resolvePidPeer(pid: number): { ok: true; id: string } | { ok: false; peer_id?: string; status?: number; error?: string } {
+  if (!Number.isInteger(pid) || pid <= 1) {
+    return { ok: false, status: 400, error: "invalid pid" };
+  }
+  const peerRow = selectPeerIdByPid.get(pid) as { id: string } | null;
+  if (!peerRow) return { ok: false, peer_id: "" };
+  return { ok: true, id: peerRow.id };
+}
+
+function authPidDrain(pid: number, callerPid: number): { ok: true; id: string } | { ok: false; status: number; error: string; peer_id?: string } {
+  if (!Number.isInteger(callerPid) || callerPid <= 1) {
+    return { ok: false, status: 400, error: "invalid caller_pid" };
+  }
+  const callerErr = verifyPidUid(callerPid);
+  if (callerErr) return { ok: false, status: 403, error: `caller rejected: ${callerErr}` };
+  const resolved = resolvePidPeer(pid);
+  if (!resolved.ok) {
+    return { ok: false, status: resolved.status ?? 404, error: resolved.error ?? "peer not found", peer_id: resolved.peer_id };
+  }
+  const targetErr = verifyPidUid(pid);
+  if (targetErr) return { ok: false, status: 403, error: `target rejected: ${targetErr}` };
+  return { ok: true, id: resolved.id };
+}
+
+function handleHookHeartbeatByPid(body: HookHeartbeatByPidRequest): { ok: boolean; peer_id?: string; error?: string; status?: number } {
+  const auth = authPidDrain(Number(body.pid), Number(body.caller_pid));
+  if (!auth.ok) {
+    return { ok: false, status: auth.status, error: auth.error };
+  }
+  const now = new Date().toISOString();
+  const status = body.status === "error" ? "error" : "ok";
+  updateReceiverHealth.run(
+    "codex-hook",
+    now,
+    typeof body.drained === "number" && body.drained > 0 ? now : null,
+    status === "error" ? String(body.error ?? "unknown hook error").slice(0, 512) : null,
+    auth.id
+  );
+  return { ok: true, peer_id: auth.id };
+}
+
+function handleClaimByPid(body: ClaimByPidRequest): ClaimByPidResponse {
+  const auth = authPidDrain(Number(body.pid), Number(body.caller_pid));
+  if (!auth.ok) {
+    return { ok: false, status: auth.status, error: auth.error };
+  }
+
+  const limitRaw = Number(body.limit ?? CLAIM_MAX_MESSAGES);
+  const limit = Number.isFinite(limitRaw) && limitRaw > 0
+    ? Math.min(Math.floor(limitRaw), CLAIM_MAX_MESSAGES)
+    : CLAIM_MAX_MESSAGES;
+  const maxBytesRaw = Number(body.max_bytes ?? CLAIM_MAX_BYTES);
+  const maxBytes = Number.isFinite(maxBytesRaw) && maxBytesRaw > 0
+    ? Math.min(Math.floor(maxBytesRaw), CLAIM_MAX_BYTES)
+    : CLAIM_MAX_BYTES;
+  const drainId = typeof body.drain_id === "string" && body.drain_id.length > 0
+    ? body.drain_id.slice(0, 160)
+    : generateDrainId(auth.id);
+  const now = new Date().toISOString();
+  const cutoff = claimCutoffIso();
+
+  const claimedMessages: Message[] = [];
+  db.transaction(() => {
+    const candidates = selectUndelivered.all(auth.id, cutoff) as Message[];
+    let bytes = 0;
+    for (const m of candidates) {
+      if (claimedMessages.length >= limit) break;
+      const nextBytes = utf8Bytes(m.text);
+      if (bytes + nextBytes > maxBytes) break;
+      const result = claimMessage.run(drainId, now, m.id, auth.id, cutoff);
+      if (result.changes > 0) {
+        claimedMessages.push(m);
+        bytes += nextBytes;
+      }
+    }
+  })();
+
+  updateReceiverHealth.run("codex-hook", now, null, null, auth.id);
+  return { ok: true, peer_id: auth.id, drain_id: drainId, messages: claimedMessages };
+}
+
+function handleAckByPid(body: AckByPidRequest): { ok: boolean; peer_id?: string; acked?: number; error?: string; status?: number } {
+  const auth = authPidDrain(Number(body.pid), Number(body.caller_pid));
+  if (!auth.ok) {
+    return { ok: false, status: auth.status, error: auth.error };
+  }
+  const drainId = typeof body.drain_id === "string" ? body.drain_id : "";
+  if (!drainId) return { ok: false, status: 400, error: "missing drain_id" };
+  const ids = Array.isArray(body.ids) ? body.ids.filter((id) => Number.isInteger(id)) : [];
+  const nowIso = new Date().toISOString();
+  const nowMs = Date.now();
+  const via = typeof body.via === "string" && body.via.length > 0 ? body.via : "hook";
+  const acked = db.transaction(() => {
+    let count = 0;
+    for (const id of ids) {
+      const row = selectMsgForLatency.get(id, auth.id) as { from_id: string; sent_at: string } | null;
+      const result = markDeliveredClaimedScoped.run(nowIso, id, auth.id, drainId);
+      if (result.changes > 0 && row) {
+        const latencyMs = nowMs - new Date(row.sent_at).getTime();
+        console.error(`[broker] deliver id=${id} from=${row.from_id} to=${auth.id} via=${via} latency_ms=${latencyMs}`);
+      }
+      count += result.changes;
+    }
+    return count;
+  })();
+  const drainError = ids.length > 0 && acked !== ids.length
+    ? `ack mismatch: requested ${ids.length}, acked ${acked}`
+    : null;
+  updateReceiverHealth.run("codex-hook", nowIso, acked > 0 ? nowIso : null, drainError, auth.id);
+  return { ok: true, peer_id: auth.id, acked };
+}
+
 // /poll-by-pid: unauthenticated-by-token, PID-authenticated drain path used
 // by the UserPromptSubmit hook to surface pending peer mail without having
 // the MCP server's in-memory auth token. Atomically fetches undelivered
@@ -891,18 +1122,11 @@ function handlePollByPid(body: { pid: number; caller_pid: number }): {
   messages?: Message[];
   acked?: number;
 } {
-  if (!Number.isInteger(body.pid) || body.pid <= 1) {
-    return { ok: false, status: 400, error: "invalid pid" };
+  const auth = authPidDrain(body.pid, body.caller_pid);
+  if (!auth.ok) {
+    if (auth.peer_id === "") return { ok: true, peer_id: "", messages: [], acked: 0 };
+    return { ok: false, status: auth.status, error: auth.error };
   }
-  if (!Number.isInteger(body.caller_pid) || body.caller_pid <= 1) {
-    return { ok: false, status: 400, error: "invalid caller_pid" };
-  }
-  // Same-UID enforcement: caller must be running as the broker's UID.
-  const callerErr = verifyPidUid(body.caller_pid);
-  if (callerErr) return { ok: false, status: 403, error: `caller rejected: ${callerErr}` };
-
-  const peerRow = selectPeerIdByPid.get(body.pid) as { id: string } | null;
-  if (!peerRow) return { ok: true, peer_id: "", messages: [], acked: 0 };
 
   // Atomically fetch + mark delivered + log latency (matches handleAckMessages).
   // Concurrent-drain safety: the SELECT happens before the transaction begins,
@@ -912,23 +1136,23 @@ function handlePollByPid(body: { pid: number; caller_pid: number }): {
   // acked so the wire response matches broker state (no duplicate delivery).
   const nowIso = new Date().toISOString();
   const nowMs = Date.now();
-  const fetched = selectUndelivered.all(peerRow.id) as Message[];
+  const fetched = selectAvailableMessages(auth.id);
   const ackedMessages: Message[] = [];
   const acked = db.transaction(() => {
     let count = 0;
     for (const m of fetched) {
-      const result = markDeliveredScoped.run(nowIso, m.id, peerRow.id);
+      const result = markDeliveredScoped.run(nowIso, m.id, auth.id);
       if (result.changes > 0) {
         ackedMessages.push(m);
         const latencyMs = nowMs - new Date(m.sent_at).getTime();
-        console.error(`[broker] deliver id=${m.id} from=${m.from_id} to=${peerRow.id} via=poll-by-pid latency_ms=${latencyMs}`);
+        console.error(`[broker] deliver id=${m.id} from=${m.from_id} to=${auth.id} via=poll-by-pid latency_ms=${latencyMs}`);
         count++;
       }
     }
     return count;
   })();
 
-  return { ok: true, peer_id: peerRow.id, messages: ackedMessages, acked };
+  return { ok: true, peer_id: auth.id, messages: ackedMessages, acked };
 }
 
 // --- HTTP Server ---
@@ -1015,6 +1239,31 @@ const server = Bun.serve({
         return Response.json({ peer_id: res.peer_id, messages: res.messages, acked: res.acked });
       }
 
+      if (path === "/claim-by-pid" || path === "/ack-by-pid" || path === "/hook-heartbeat-by-pid") {
+        const rawCallerPid = Number(body.caller_pid);
+        const rlKey = `pid:${Number.isFinite(rawCallerPid) ? rawCallerPid : "invalid"}`;
+        const limited = rateCheck(rlKey, false);
+        if (limited) {
+          return new Response(JSON.stringify({ error: limited }), {
+            status: 429,
+            headers: { "Content-Type": "application/json", "Retry-After": String(Math.ceil(RATE_WINDOW_MS / 1000)) },
+          });
+        }
+        if (path === "/claim-by-pid") {
+          const res = handleClaimByPid(body as unknown as ClaimByPidRequest);
+          if (!res.ok) return Response.json({ error: res.error }, { status: res.status ?? 400 });
+          return Response.json({ peer_id: res.peer_id, drain_id: res.drain_id, messages: res.messages });
+        }
+        if (path === "/ack-by-pid") {
+          const res = handleAckByPid(body as unknown as AckByPidRequest);
+          if (!res.ok) return Response.json({ error: res.error }, { status: res.status ?? 400 });
+          return Response.json({ peer_id: res.peer_id, acked: res.acked });
+        }
+        const res = handleHookHeartbeatByPid(body as unknown as HookHeartbeatByPidRequest);
+        if (!res.ok) return Response.json({ error: res.error }, { status: res.status ?? 400 });
+        return Response.json({ ok: true, peer_id: res.peer_id });
+      }
+
       // S2/S6: authenticate every other route. The peer ID comes from the
       // token lookup; the body's `id`/`from_id` is overwritten.
       // H2: do NOT include `exclude_id` in the chain — it is "id to exclude
@@ -1040,7 +1289,21 @@ const server = Bun.serve({
 
       switch (path) {
         case "/heartbeat":
-          handleHeartbeat({ id: auth.id });
+          {
+            const heartbeat: HeartbeatRequest = { id: auth.id };
+            if (body.client_type === "claude" || body.client_type === "codex" || body.client_type === "unknown") {
+              heartbeat.client_type = body.client_type;
+            }
+            if (
+              body.receiver_mode === "claude-channel" ||
+              body.receiver_mode === "codex-hook" ||
+              body.receiver_mode === "manual-drain" ||
+              body.receiver_mode === "unknown"
+            ) {
+              heartbeat.receiver_mode = body.receiver_mode;
+            }
+            handleHeartbeat(heartbeat);
+          }
           return Response.json({ ok: true });
         case "/set-summary": {
           const summary = String(body.summary ?? "");

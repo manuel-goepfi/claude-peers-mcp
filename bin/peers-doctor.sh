@@ -98,6 +98,25 @@ if [[ -n "$MY_MCP" ]]; then
   else
     fail "/poll-by-pid returned ${STATUS:-no-response}" "check broker + rebuild (bun install) + restart"
   fi
+
+  CLAIM_RESP=$(curl -s -m 2 -w '\n%{http_code}' -X POST http://127.0.0.1:7899/claim-by-pid \
+    -H 'Content-Type: application/json' \
+    -d "{\"pid\":${MY_MCP},\"caller_pid\":$$,\"drain_id\":\"doctor-$$\"}" 2>/dev/null)
+  CLAIM_BODY=$(printf '%s\n' "$CLAIM_RESP" | sed '$d')
+  CLAIM_STATUS=$(printf '%s\n' "$CLAIM_RESP" | tail -n1)
+  if [[ "$CLAIM_STATUS" == "200" && "$CLAIM_BODY" =~ \"peer_id\":\"[^\"]+\" ]]; then
+    ok "/claim-by-pid responds 200 for safe Codex hook drain"
+  else
+    fail "/claim-by-pid returned ${CLAIM_STATUS:-no-response}" "restart broker so the Codex hook endpoints are available"
+  fi
+fi
+
+# 7b. Codex hook surface
+CODEX_HOOK="$HOME/claude-peers-mcp/hooks/codex-drain-peer-inbox.sh"
+if [[ -x "$CODEX_HOOK" ]]; then
+  ok "Codex inbox hook executable"
+else
+  warn "Codex inbox hook not executable at $CODEX_HOOK" "chmod +x $CODEX_HOOK or reinstall fork"
 fi
 
 # 8. latency log has recent entries

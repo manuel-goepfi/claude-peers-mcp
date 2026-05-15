@@ -1,5 +1,7 @@
 // Unique ID for each Claude Code instance (generated on registration)
 export type PeerId = string;
+export type ClientType = "claude" | "codex" | "unknown";
+export type ReceiverMode = "claude-channel" | "codex-hook" | "manual-drain" | "unknown";
 
 export interface Peer {
   id: PeerId;
@@ -22,6 +24,11 @@ export interface Peer {
   tmux_window_index: string | null;
   tmux_window_name: string | null;
   tmux_pane_id: string | null;
+  client_type?: ClientType;
+  receiver_mode?: ReceiverMode;
+  last_hook_seen_at: string | null;
+  last_drain_at: string | null;
+  last_drain_error: string | null;
   summary: string;
   registered_at: string; // ISO timestamp
   last_seen: string; // ISO timestamp
@@ -53,6 +60,8 @@ export interface RegisterRequest {
   tmux_window_index: string | null;
   tmux_window_name: string | null;
   tmux_pane_id?: string | null;
+  client_type?: ClientType;
+  receiver_mode?: ReceiverMode;
   summary: string;
 }
 
@@ -66,10 +75,14 @@ export interface RegisterResponse {
   // Broker-unique runtime label after dedup. Debug/transport metadata only;
   // human-facing surfaces should prefer `name`.
   resolved_name: string | null;
+  client_type: ClientType;
+  receiver_mode: ReceiverMode;
 }
 
 export interface HeartbeatRequest {
   id: PeerId;
+  client_type?: ClientType;
+  receiver_mode?: ReceiverMode;
 }
 
 export interface SetSummaryRequest {
@@ -113,6 +126,20 @@ export interface SendMessageRequest {
   text: string;
 }
 
+export interface SendMessageResponse {
+  ok: boolean;
+  id?: number;
+  error?: string;
+  target?: {
+    id: PeerId;
+    client_type: ClientType;
+    receiver_mode: ReceiverMode;
+    last_hook_seen_at: string | null;
+    last_drain_error: string | null;
+    last_seen: string | null;
+  };
+}
+
 // /broadcast-message — fanout send by scope. At least one filter is required
 // to avoid unbounded global broadcast. Filters AND together.
 export interface BroadcastRequest {
@@ -141,4 +168,37 @@ export interface AckMessagesRequest {
   // tool-response drain, or "check_messages" via explicit poll). Optional for
   // backward compat with older servers; broker logs "unknown" when absent.
   via?: string;
+}
+
+export interface ClaimByPidRequest {
+  pid: number;
+  caller_pid: number;
+  drain_id?: string;
+  limit?: number;
+  max_bytes?: number;
+}
+
+export interface ClaimByPidResponse {
+  ok: boolean;
+  error?: string;
+  status?: number;
+  peer_id?: string;
+  drain_id?: string;
+  messages?: Message[];
+}
+
+export interface AckByPidRequest {
+  pid: number;
+  caller_pid: number;
+  drain_id: string;
+  ids: number[];
+  via?: string;
+}
+
+export interface HookHeartbeatByPidRequest {
+  pid: number;
+  caller_pid: number;
+  status?: "ok" | "error";
+  drained?: number;
+  error?: string;
 }
