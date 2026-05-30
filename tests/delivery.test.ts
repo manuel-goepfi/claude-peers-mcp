@@ -767,6 +767,73 @@ describe("Live broker delivery features", () => {
     child.kill();
   });
 
+  // Regression: Claude peers must record drain telemetry on /poll-by-pid.
+  // The codex updateReceiverHealth path never runs for a claude client, so
+  // before the fix last_hook_seen_at/last_drain_at stayed NULL forever and the
+  // fleet's drain state was unobservable from the DB. A peer registered with no
+  // client_type defaults to "claude" (claude-channel). This test would have
+  // failed (both columns NULL) prior to adding updateClaudeDrainHealth.
+  test("/poll-by-pid: writes last_hook_seen_at + last_drain_at for a claude peer", async () => {
+    const child = spawnSleep();
+    const peer = await brokerFetch<{ id: string; client_type: string }>("/register", {
+      pid: child.pid, cwd: "/pbp-tel", git_root: null, tty: null, name: "pbp-tel",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null,
+      client_type: "claude", summary: "",
+    });
+    // Confirm the precondition: this is a claude peer (the path codex telemetry
+    // skips). A real Claude session sends client_type:"claude" at register
+    // (shared/client.ts:44); a peer that omits it defaults to "unknown".
+    expect(peer.client_type).toBe("claude");
+
+    await brokerFetch("/send-message", { from_id: peer.id, to_id: peer.id, text: "drain-me" });
+
+    const ro = new Database(TEST_DB, { readonly: true });
+
+    // Before any poll, telemetry is NULL (clean baseline).
+    const before = ro.query(
+      "SELECT last_hook_seen_at, last_drain_at, client_type FROM peers WHERE id = ?"
+    ).get(peer.id) as { last_hook_seen_at: string | null; last_drain_at: string | null; client_type: string };
+    expect(before.last_hook_seen_at).toBeNull();
+    expect(before.last_drain_at).toBeNull();
+
+    // The hook drains via /poll-by-pid, acking 1 message.
+    const { json } = await rawPost("/poll-by-pid", { pid: child.pid, caller_pid: process.pid });
+    expect(json.acked).toBe(1);
+
+    // After: hook_seen recorded (poll happened) AND drain_at recorded (mail acked).
+    const after = ro.query(
+      "SELECT last_hook_seen_at, last_drain_at, client_type FROM peers WHERE id = ?"
+    ).get(peer.id) as { last_hook_seen_at: string | null; last_drain_at: string | null; client_type: string };
+    expect(after.last_hook_seen_at).not.toBeNull();
+    expect(after.last_drain_at).not.toBeNull();
+    // The fix must NOT mutate client_type (scoped UPDATE; codex peers untouched).
+    expect(after.client_type).toBe("claude");
+    ro.close();
+    child.kill();
+  });
+
+  // Companion: an empty poll (no mail) still records last_hook_seen_at (the hook
+  // ran) but leaves last_drain_at NULL (nothing acked). Guards the COALESCE arm.
+  test("/poll-by-pid: empty drain records hook_seen but not drain_at", async () => {
+    const child = spawnSleep();
+    const peer = await brokerFetch<{ id: string }>("/register", {
+      pid: child.pid, cwd: "/pbp-empty", git_root: null, tty: null, name: "pbp-empty",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null,
+      client_type: "claude", summary: "",
+    });
+    const { json } = await rawPost("/poll-by-pid", { pid: child.pid, caller_pid: process.pid });
+    expect(json.acked).toBe(0);
+
+    const ro = new Database(TEST_DB, { readonly: true });
+    const row = ro.query(
+      "SELECT last_hook_seen_at, last_drain_at FROM peers WHERE id = ?"
+    ).get(peer.id) as { last_hook_seen_at: string | null; last_drain_at: string | null };
+    ro.close();
+    expect(row.last_hook_seen_at).not.toBeNull();
+    expect(row.last_drain_at).toBeNull();
+    child.kill();
+  });
+
   test("/poll-by-pid: unknown pid returns empty without error", async () => {
     // Pick a likely-unused PID — 0 is reserved, broker treats pid <= 1 as invalid.
     // Use a real alive PID (our own) that isn't registered as a peer.

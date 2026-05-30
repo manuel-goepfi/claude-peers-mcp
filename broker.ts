@@ -256,12 +256,21 @@ const updateHeartbeatSeen = db.prepare(`
 
 const updateReceiverHealth = db.prepare(`
   UPDATE peers
-  SET client_type = 'codex',
-      receiver_mode = ?,
+  SET receiver_mode = ?,
       last_hook_seen_at = ?,
       last_drain_at = COALESCE(?, last_drain_at),
       last_drain_error = ?
   WHERE id = ?
+`);
+
+// Claude /poll-by-pid drain telemetry. Touches ONLY the two health columns so
+// it cannot overwrite client_type or receiver_mode for any peer. Scoped to
+// client_type='claude' so a stray PID collision can never corrupt a codex row.
+const updateClaudeDrainHealth = db.prepare(`
+  UPDATE peers
+  SET last_hook_seen_at = ?,
+      last_drain_at = COALESCE(?, last_drain_at)
+  WHERE id = ? AND client_type = 'claude'
 `);
 
 const updateSummary = db.prepare(`
@@ -1151,6 +1160,12 @@ function handlePollByPid(body: { pid: number; caller_pid: number }): {
     }
     return count;
   })();
+
+  // Record drain health for Claude peers — the codex updateReceiverHealth path
+  // never runs for them, so without this their last_hook_seen_at/last_drain_at
+  // stay NULL and the fleet's drain state is unobservable. nowIso always (the
+  // hook polled); last_drain_at only when mail was acked (mirrors codex ack).
+  updateClaudeDrainHealth.run(nowIso, acked > 0 ? nowIso : null, auth.id);
 
   return { ok: true, peer_id: auth.id, messages: ackedMessages, acked };
 }
