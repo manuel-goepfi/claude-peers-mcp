@@ -40,6 +40,15 @@ describe("client detection", () => {
     expect(detectClientFromProcessChain(30, processes, {})).toBe("gemini");
   });
 
+  test("detects Gemini when the CLI is launched through Node", () => {
+    const processes = table([
+      { pid: 30, ppid: 20, comm: "bun", args: "bun /home/manzo/claude-peers-mcp/server.ts" },
+      { pid: 20, ppid: 10, comm: "node", args: "node /usr/local/lib/node_modules/@google/gemini-cli/dist/gemini.js" },
+      { pid: 10, ppid: 1, comm: "bash", args: "bash" },
+    ]);
+    expect(detectClientFromProcessChain(30, processes, {})).toBe("gemini");
+  });
+
   test("unknown fallback maps to unknown receiver mode", () => {
     const processes = table([{ pid: 20, ppid: 1, comm: "bash", args: "bash" }]);
     expect(detectClientFromProcessChain(20, processes, {})).toBe("unknown");
@@ -83,6 +92,16 @@ describe("client detection", () => {
   test("Gemini hook process name is not mistaken for the Gemini CLI ancestor", () => {
     const processes = new Map([
       [10, { pid: 10, ppid: 1, comm: "gemini", args: "gemini" }],
+      [20, { pid: 20, ppid: 10, comm: "bun", args: "bun /home/manzo/claude-peers-mcp/server.ts" }],
+      [30, { pid: 30, ppid: 10, comm: "bash", args: "bash /home/manzo/claude-peers-mcp/hooks/gemini-drain-peer-inbox.sh" }],
+    ]);
+    const pid = findMcpPidFromTable(processes, 30, "/repo", (candidate) => candidate === 20 ? "/repo" : "/other", "gemini");
+    expect(pid).toBe(20);
+  });
+
+  test("Gemini hook discovers the MCP server when the CLI ancestor is a Node shim", () => {
+    const processes = new Map([
+      [10, { pid: 10, ppid: 1, comm: "node", args: "node /usr/local/lib/node_modules/@google/gemini-cli/dist/gemini.js" }],
       [20, { pid: 20, ppid: 10, comm: "bun", args: "bun /home/manzo/claude-peers-mcp/server.ts" }],
       [30, { pid: 30, ppid: 10, comm: "bash", args: "bash /home/manzo/claude-peers-mcp/hooks/gemini-drain-peer-inbox.sh" }],
     ]);

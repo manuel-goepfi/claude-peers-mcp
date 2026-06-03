@@ -54,14 +54,28 @@ function commandName(value: string): string {
   return value.trim().split(/\s+/)[0]?.toLowerCase().replace(/^.*\//, "") ?? "";
 }
 
+function argTokens(value: string): string[] {
+  return value.trim().split(/\s+/).filter(Boolean);
+}
+
 function isClientCommand(name: string, clientType: Extract<ClientType, "codex" | "gemini">): boolean {
   return name === clientType || name.startsWith(`${clientType}-`);
+}
+
+function hasGeminiCliLauncher(args: string): boolean {
+  return argTokens(args).some((token) => {
+    const normalized = token.replace(/^['"]|['"]$/g, "").toLowerCase();
+    const base = normalized.replace(/^.*\//, "");
+    return normalized.includes("@google/gemini-cli/") || base === "gemini.js" || base === "gemini-cli.js";
+  });
 }
 
 function isClientProcess(row: ProcRow, clientType = CLIENT_TYPE): boolean {
   const comm = commandName(row.comm);
   const firstArg = commandName(row.args);
-  return isClientCommand(comm, clientType) || isClientCommand(firstArg, clientType);
+  if (isClientCommand(comm, clientType) || isClientCommand(firstArg, clientType)) return true;
+  return clientType === "gemini" && (comm === "node" || comm === "bun" || comm === "npx") &&
+    hasGeminiCliLauncher(row.args);
 }
 
 function isPeersServer(row: ProcRow): boolean {

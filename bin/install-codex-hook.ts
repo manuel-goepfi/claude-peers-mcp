@@ -7,7 +7,9 @@ const hooksPath = `${repo}/.codex/hooks.json`;
 const hookScript = resolve(import.meta.dir, "../hooks/codex-drain-peer-inbox.sh");
 const shellQuote = (value: string): string => `'${value.replace(/'/g, "'\\''")}'`;
 const command = `/usr/bin/env bash ${shellQuote(hookScript)}`;
+const name = "claude-peers-codex-inbox";
 const entry = {
+  name,
   type: "command",
   command,
   timeout: 10,
@@ -18,6 +20,11 @@ type HookFile = {
   hooks?: Record<string, Array<{ hooks?: Array<Record<string, unknown>>; [key: string]: unknown }>>;
 };
 
+function isPeerInboxHook(hook: Record<string, unknown>): boolean {
+  return hook.name === name || hook.command === command ||
+    (typeof hook.command === "string" && hook.command.includes("codex-drain-peer-inbox.sh"));
+}
+
 function readExisting(): HookFile {
   if (!existsSync(hooksPath)) return { hooks: {} };
   return JSON.parse(readFileSync(hooksPath, "utf8")) as HookFile;
@@ -26,13 +33,25 @@ function readExisting(): HookFile {
 const doc = readExisting();
 doc.hooks ??= {};
 doc.hooks.UserPromptSubmit ??= [];
-let bucket = doc.hooks.UserPromptSubmit.find((item) => Array.isArray(item.hooks) && item.hooks.some((h) => h.command === command));
+let bucket = doc.hooks.UserPromptSubmit.find((item) => Array.isArray(item.hooks) && item.hooks.some(isPeerInboxHook));
 if (!bucket) {
   bucket = { hooks: [] };
   doc.hooks.UserPromptSubmit.push(bucket);
 }
-bucket.hooks ??= [];
-if (!bucket.hooks.some((h) => h.command === command)) {
+let replaced = false;
+for (const item of doc.hooks.UserPromptSubmit) {
+  if (!Array.isArray(item.hooks)) continue;
+  item.hooks = item.hooks.flatMap((hook) => {
+    if (!isPeerInboxHook(hook)) return [hook];
+    if (item === bucket && !replaced) {
+      replaced = true;
+      return [entry];
+    }
+    return [];
+  });
+}
+if (!replaced) {
+  bucket.hooks ??= [];
   bucket.hooks.push(entry);
 }
 

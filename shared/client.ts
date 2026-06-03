@@ -17,6 +17,22 @@ function normalizedClient(value: string | undefined): ClientType | null {
   return null;
 }
 
+function commandName(value: string): string {
+  return value.trim().split(/\s+/)[0]?.toLowerCase().replace(/^.*\//, "") ?? "";
+}
+
+function argTokens(value: string): string[] {
+  return value.trim().split(/\s+/).filter(Boolean);
+}
+
+function hasGeminiCliLauncher(args: string): boolean {
+  return argTokens(args).some((token) => {
+    const normalized = token.replace(/^['"]|['"]$/g, "").toLowerCase();
+    const base = normalized.replace(/^.*\//, "");
+    return normalized.includes("@google/gemini-cli/") || base === "gemini.js" || base === "gemini-cli.js";
+  });
+}
+
 export function detectClientFromProcessChain(
   startPid: number,
   processes: Map<number, ProcessInfo>,
@@ -29,14 +45,15 @@ export function detectClientFromProcessChain(
   for (let i = 0; i < 30; i++) {
     const p = processes.get(current);
     if (!p) break;
-    const comm = p.comm.toLowerCase().replace(/^.*\//, "");
+    const comm = commandName(p.comm);
     if (comm === "codex" || comm.startsWith("codex-")) return "codex";
     if (comm === "gemini" || comm.startsWith("gemini-")) return "gemini";
     if (comm === "claude") return "claude";
-    const firstArg = p.args.trim().split(/\s+/)[0]?.toLowerCase().replace(/^.*\//, "") ?? "";
+    const firstArg = commandName(p.args);
     if (firstArg === "codex" || firstArg.startsWith("codex-")) return "codex";
     if (firstArg === "gemini" || firstArg.startsWith("gemini-")) return "gemini";
     if (firstArg === "claude") return "claude";
+    if ((comm === "node" || comm === "bun" || comm === "npx") && hasGeminiCliLauncher(p.args)) return "gemini";
     if (p.ppid <= 1 || p.ppid === current) break;
     current = p.ppid;
   }
