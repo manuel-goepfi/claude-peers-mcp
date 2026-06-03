@@ -246,9 +246,14 @@ const updateLastSeen = db.prepare(`
 const updateHeartbeatSeen = db.prepare(`
   UPDATE peers
   SET last_seen = ?,
-      client_type = ?,
+      client_type = CASE
+        WHEN ? = 'unknown' THEN client_type
+        ELSE ?
+      END,
       receiver_mode = CASE
+        WHEN ? = 'unknown' THEN receiver_mode
         WHEN receiver_mode = 'codex-hook' AND ? = 'manual-drain' THEN receiver_mode
+        WHEN receiver_mode = 'gemini-hook' AND ? = 'manual-drain' THEN receiver_mode
         ELSE ?
       END
   WHERE id = ?
@@ -256,7 +261,8 @@ const updateHeartbeatSeen = db.prepare(`
 
 const updateReceiverHealth = db.prepare(`
   UPDATE peers
-  SET receiver_mode = ?,
+  SET client_type = ?,
+      receiver_mode = ?,
       last_hook_seen_at = ?,
       last_drain_at = COALESCE(?, last_drain_at),
       last_drain_error = ?
@@ -544,7 +550,7 @@ function reqStrict(s: unknown): string {
 }
 
 function validClientType(value: unknown): ClientType {
-  return value === "claude" || value === "codex" || value === "unknown" ? value : "unknown";
+  return value === "claude" || value === "codex" || value === "gemini" || value === "unknown" ? value : "unknown";
 }
 
 function validReceiverMode(value: unknown, clientType: ClientType): ReceiverMode {
@@ -552,12 +558,39 @@ function validReceiverMode(value: unknown, clientType: ClientType): ReceiverMode
   if (clientType === "codex") {
     return value === "codex-hook" || value === "manual-drain" ? value : "manual-drain";
   }
+  if (clientType === "gemini") {
+    return value === "gemini-hook" || value === "manual-drain" ? value : "manual-drain";
+  }
   return "unknown";
 }
 
 function initialReceiverModeFromRegistration(value: unknown, clientType: ClientType): ReceiverMode {
   const mode = validReceiverMode(value, clientType);
-  return clientType === "codex" && mode === "codex-hook" ? "manual-drain" : mode;
+  if ((clientType === "codex" && mode === "codex-hook") || (clientType === "gemini" && mode === "gemini-hook")) {
+    return "manual-drain";
+  }
+  return mode;
+}
+
+function hookMetadata(peerId: string, body: { client_type?: ClientType; receiver_mode?: ReceiverMode }): { clientType: ClientType; receiverMode: ReceiverMode } {
+  const explicitClient = validClientType(body.client_type);
+  if (explicitClient !== "unknown") {
+    return { clientType: explicitClient, receiverMode: validReceiverMode(body.receiver_mode, explicitClient) };
+  }
+  if (body.receiver_mode === "gemini-hook") return { clientType: "gemini", receiverMode: "gemini-hook" };
+  if (body.receiver_mode === "codex-hook") return { clientType: "codex", receiverMode: "codex-hook" };
+  const current = db.query("SELECT client_type, receiver_mode FROM peers WHERE id = ?").get(peerId) as {
+    client_type: ClientType | null;
+    receiver_mode: ReceiverMode | null;
+  } | null;
+  const currentClient = validClientType(current?.client_type);
+  if (currentClient === "claude") {
+    return { clientType: "claude", receiverMode: validReceiverMode(current?.receiver_mode, "claude") };
+  }
+  if (currentClient === "gemini") {
+    return { clientType: "gemini", receiverMode: "gemini-hook" };
+  }
+  return { clientType: "codex", receiverMode: "codex-hook" };
 }
 
 function claimCutoffIso(nowMs = Date.now()): string {
@@ -682,7 +715,7 @@ function handleHeartbeat(body: HeartbeatRequest): void {
     const receiverMode = body.receiver_mode
       ? initialReceiverModeFromRegistration(body.receiver_mode, clientType)
       : validReceiverMode(current?.receiver_mode, clientType);
-    updateHeartbeatSeen.run(now, clientType, receiverMode, receiverMode, body.id);
+    updateHeartbeatSeen.run(now, clientType, clientType, receiverMode, receiverMode, receiverMode, receiverMode, body.id);
     return;
   }
   updateLastSeen.run(now, body.id);
@@ -1037,8 +1070,10 @@ function handleHookHeartbeatByPid(body: HookHeartbeatByPidRequest): { ok: boolea
   }
   const now = new Date().toISOString();
   const status = body.status === "error" ? "error" : "ok";
+  const { clientType, receiverMode } = hookMetadata(auth.id, body);
   updateReceiverHealth.run(
-    "codex-hook",
+    clientType,
+    receiverMode,
     now,
     typeof body.drained === "number" && body.drained > 0 ? now : null,
     status === "error" ? String(body.error ?? "unknown hook error").slice(0, 512) : null,
@@ -1052,6 +1087,7 @@ function handleClaimByPid(body: ClaimByPidRequest): ClaimByPidResponse {
   if (!auth.ok) {
     return { ok: false, status: auth.status, error: auth.error };
   }
+  const { clientType, receiverMode } = hookMetadata(auth.id, body);
 
   const limitRaw = Number(body.limit ?? CLAIM_MAX_MESSAGES);
   const limit = Number.isFinite(limitRaw) && limitRaw > 0
@@ -1083,7 +1119,7 @@ function handleClaimByPid(body: ClaimByPidRequest): ClaimByPidResponse {
     }
   })();
 
-  updateReceiverHealth.run("codex-hook", now, null, null, auth.id);
+  updateReceiverHealth.run(clientType, receiverMode, now, null, null, auth.id);
   return { ok: true, peer_id: auth.id, drain_id: drainId, messages: claimedMessages };
 }
 
@@ -1092,6 +1128,7 @@ function handleAckByPid(body: AckByPidRequest): { ok: boolean; peer_id?: string;
   if (!auth.ok) {
     return { ok: false, status: auth.status, error: auth.error };
   }
+  const { clientType, receiverMode } = hookMetadata(auth.id, body);
   const drainId = typeof body.drain_id === "string" ? body.drain_id : "";
   if (!drainId) return { ok: false, status: 400, error: "missing drain_id" };
   const ids = Array.isArray(body.ids) ? body.ids.filter((id) => Number.isInteger(id)) : [];
@@ -1114,7 +1151,7 @@ function handleAckByPid(body: AckByPidRequest): { ok: boolean; peer_id?: string;
   const drainError = ids.length > 0 && acked !== ids.length
     ? `ack mismatch: requested ${ids.length}, acked ${acked}`
     : null;
-  updateReceiverHealth.run("codex-hook", nowIso, acked > 0 ? nowIso : null, drainError, auth.id);
+  updateReceiverHealth.run(clientType, receiverMode, nowIso, acked > 0 ? nowIso : null, drainError, auth.id);
   return { ok: true, peer_id: auth.id, acked };
 }
 
@@ -1306,12 +1343,13 @@ const server = Bun.serve({
         case "/heartbeat":
           {
             const heartbeat: HeartbeatRequest = { id: auth.id };
-            if (body.client_type === "claude" || body.client_type === "codex" || body.client_type === "unknown") {
+            if (body.client_type === "claude" || body.client_type === "codex" || body.client_type === "gemini" || body.client_type === "unknown") {
               heartbeat.client_type = body.client_type;
             }
             if (
               body.receiver_mode === "claude-channel" ||
               body.receiver_mode === "codex-hook" ||
+              body.receiver_mode === "gemini-hook" ||
               body.receiver_mode === "manual-drain" ||
               body.receiver_mode === "unknown"
             ) {

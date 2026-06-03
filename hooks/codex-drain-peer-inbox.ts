@@ -1,12 +1,18 @@
 #!/usr/bin/env bun
 import { readlinkSync } from "node:fs";
 import { renderInboundLine } from "../shared/render.ts";
-import type { Message } from "../shared/types.ts";
+import type { ClientType, Message, ReceiverMode } from "../shared/types.ts";
 
 const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 const MAX_MESSAGES = 25;
 const MAX_BYTES = 64 * 1024;
+const CLIENT_TYPE: Extract<ClientType, "codex" | "gemini"> =
+  process.env.CLAUDE_PEERS_CLIENT_TYPE === "gemini" ? "gemini" : "codex";
+const RECEIVER_MODE: Extract<ReceiverMode, "codex-hook" | "gemini-hook"> =
+  CLIENT_TYPE === "gemini" ? "gemini-hook" : "codex-hook";
+const HOOK_EVENT_NAME = process.env.CLAUDE_PEERS_HOOK_EVENT_NAME ??
+  (CLIENT_TYPE === "gemini" ? "BeforeAgent" : "UserPromptSubmit");
 
 interface ProcRow {
   pid: number;
@@ -23,7 +29,7 @@ interface AckByPidResponse {
 }
 
 function log(msg: string): void {
-  console.error(`[claude-peers codex-hook] ${msg}`);
+  console.error(`[claude-peers ${CLIENT_TYPE}-hook] ${msg}`);
 }
 
 function processTable(): Map<number, ProcRow> {
@@ -44,9 +50,18 @@ function processTable(): Map<number, ProcRow> {
   return table;
 }
 
-function isCodexProcess(row: ProcRow): boolean {
-  const text = `${row.comm} ${row.args}`.toLowerCase();
-  return /(^|[/\s])codex([-\s]|$)/.test(text);
+function commandName(value: string): string {
+  return value.trim().split(/\s+/)[0]?.toLowerCase().replace(/^.*\//, "") ?? "";
+}
+
+function isClientCommand(name: string, clientType: Extract<ClientType, "codex" | "gemini">): boolean {
+  return name === clientType || name.startsWith(`${clientType}-`);
+}
+
+function isClientProcess(row: ProcRow, clientType = CLIENT_TYPE): boolean {
+  const comm = commandName(row.comm);
+  const firstArg = commandName(row.args);
+  return isClientCommand(comm, clientType) || isClientCommand(firstArg, clientType);
 }
 
 function isPeersServer(row: ProcRow): boolean {
@@ -78,12 +93,12 @@ function cwdOf(pid: number): string | null {
   }
 }
 
-function findCodexAncestor(table: Map<number, ProcRow>, startPid = process.ppid): number | null {
+function findClientAncestor(table: Map<number, ProcRow>, startPid = process.ppid, clientType = CLIENT_TYPE): number | null {
   let current = startPid;
   for (let i = 0; i < 30; i++) {
     const row = table.get(current);
     if (!row) return null;
-    if (isCodexProcess(row)) return row.pid;
+    if (isClientProcess(row, clientType)) return row.pid;
     if (row.ppid <= 1 || row.ppid === row.pid) return null;
     current = row.ppid;
   }
@@ -95,11 +110,12 @@ export function findMcpPidFromTable(
   startPid: number,
   hookCwd: string,
   cwdResolver: (pid: number) => string | null = cwdOf,
+  clientType = CLIENT_TYPE,
 ): number | null {
-  const codexPid = findCodexAncestor(table, startPid);
-  if (!codexPid) return null;
+  const clientPid = findClientAncestor(table, startPid, clientType);
+  if (!clientPid) return null;
 
-  const candidates = descendants(codexPid, table)
+  const candidates = descendants(clientPid, table)
     .filter(isPeersServer)
     .filter((row) => row.pid !== process.pid);
   const cwdMatches = candidates.filter((row) => cwdResolver(row.pid) === hookCwd);
@@ -113,14 +129,14 @@ function findMcpPid(): number | null {
   if (Number.isInteger(envPid) && envPid > 1) return envPid;
 
   const table = processTable();
-  const codexPid = findCodexAncestor(table);
-  if (!codexPid) {
-    log("no Codex ancestor found");
+  const clientPid = findClientAncestor(table);
+  if (!clientPid) {
+    log(`no ${CLIENT_TYPE} ancestor found`);
     return null;
   }
 
   const hookCwd = process.cwd();
-  const candidates = descendants(codexPid, table)
+  const candidates = descendants(clientPid, table)
     .filter(isPeersServer)
     .filter((row) => row.pid !== process.pid);
   const cwdMatches = candidates.filter((row) => cwdOf(row.pid) === hookCwd);
@@ -154,6 +170,8 @@ async function heartbeat(pid: number, status: "ok" | "error", drained = 0, error
     await post("/hook-heartbeat-by-pid", {
       pid,
       caller_pid: process.pid,
+      client_type: CLIENT_TYPE,
+      receiver_mode: RECEIVER_MODE,
       status,
       drained,
       error,
@@ -170,12 +188,14 @@ async function main(): Promise<void> {
     return;
   }
 
-  const drainId = `codex-hook:${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+  const drainId = `${RECEIVER_MODE}:${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
   let claimed: { peer_id?: string; drain_id?: string; messages?: Message[] };
   try {
     claimed = await post("/claim-by-pid", {
       pid,
       caller_pid: process.pid,
+      client_type: CLIENT_TYPE,
+      receiver_mode: RECEIVER_MODE,
       drain_id: drainId,
       limit: MAX_MESSAGES,
       max_bytes: MAX_BYTES,
@@ -197,9 +217,11 @@ async function main(): Promise<void> {
     const ack = await post<AckByPidResponse>("/ack-by-pid", {
       pid,
       caller_pid: process.pid,
+      client_type: CLIENT_TYPE,
+      receiver_mode: RECEIVER_MODE,
       drain_id: claimed.drain_id,
       ids: messages.map((m) => m.id),
-      via: "codex-hook",
+      via: RECEIVER_MODE,
     });
     if (ack.acked !== messages.length) {
       throw new Error(`ack mismatch: expected ${messages.length}, got ${ack.acked ?? 0}`);
@@ -216,7 +238,7 @@ async function main(): Promise<void> {
   const context = `---\n${messages.length} pending peer message(s):\n\n${lines.join("\n\n")}`;
   const output = {
     hookSpecificOutput: {
-      hookEventName: "UserPromptSubmit",
+      hookEventName: HOOK_EVENT_NAME,
       additionalContext: context,
     },
     suppressOutput: true,

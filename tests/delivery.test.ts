@@ -422,6 +422,7 @@ describe("C1: broker log append semantics", () => {
 
 describe("Live broker delivery features", () => {
   const BROKER_PORT = 21000 + Math.floor(Math.random() * 1000);
+  const BROKER_SCRIPT = new URL("../broker.ts", import.meta.url).pathname;
   let brokerProc: ReturnType<typeof Bun.spawn>;
   const brokerUrl = `http://127.0.0.1:${BROKER_PORT}`;
   const TEST_DB = "/tmp/claude-peers-test-delivery.db";
@@ -437,7 +438,7 @@ describe("Live broker delivery features", () => {
   beforeAll(async () => {
     Bun.spawnSync(["rm", "-f", TEST_DB]);
 
-    brokerProc = Bun.spawn(["bun", "/home/manzo/claude-peers-mcp/broker.ts"], {
+    brokerProc = Bun.spawn(["bun", BROKER_SCRIPT], {
       env: { ...process.env, CLAUDE_PEERS_PORT: String(BROKER_PORT), CLAUDE_PEERS_DB: TEST_DB, CLAUDE_PEERS_BRIDGE_TOKEN_FILE: "/tmp/claude-peers-test-bridge.token" },
       stdout: "ignore",
       stderr: "pipe",
@@ -696,7 +697,7 @@ describe("Live broker delivery features", () => {
     `);
     old.close();
 
-    const proc = Bun.spawn(["bun", "/home/manzo/claude-peers-mcp/broker.ts"], {
+    const proc = Bun.spawn(["bun", BROKER_SCRIPT], {
       env: {
         ...process.env,
         CLAUDE_PEERS_PORT: String(port),
@@ -1135,6 +1136,34 @@ describe("Live broker delivery features", () => {
     child.kill();
   });
 
+  test("/hook-heartbeat-by-pid promotes Gemini peer to gemini-hook mode", async () => {
+    const child = spawnSleep();
+    const peer = await brokerFetch<{ id: string }>("/register", {
+      pid: child.pid, cwd: "/gemini-hook-heartbeat", git_root: null, tty: null, name: "gemini-hook-heartbeat",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null,
+      client_type: "gemini", receiver_mode: "manual-drain", summary: "",
+    });
+    const hb = await rawPost("/hook-heartbeat-by-pid", {
+      pid: child.pid,
+      caller_pid: process.pid,
+      client_type: "gemini",
+      receiver_mode: "gemini-hook",
+      status: "ok",
+      drained: 0,
+    });
+    expect(hb.status).toBe(200);
+
+    const peers = await brokerFetch<Array<{ id: string; client_type: string; receiver_mode: string; last_hook_seen_at: string | null }>>(
+      "/list-peers",
+      { id: peer.id, scope: "machine", cwd: "/", git_root: null, include_inactive: true }
+    );
+    const row = peers.find((p) => p.id === peer.id)!;
+    expect(row.client_type).toBe("gemini");
+    expect(row.receiver_mode).toBe("gemini-hook");
+    expect(typeof row.last_hook_seen_at).toBe("string");
+    child.kill();
+  });
+
   test("heartbeat backfills client metadata without downgrading codex-hook", async () => {
     const child = spawnSleep();
     const peer = await brokerFetch<{ id: string }>("/register", {
@@ -1163,6 +1192,59 @@ describe("Live broker delivery features", () => {
     child.kill();
   });
 
+  test("unknown heartbeat does not downgrade a proven Gemini hook receiver", async () => {
+    const child = spawnSleep();
+    const peer = await brokerFetch<{ id: string }>("/register", {
+      pid: child.pid, cwd: "/unknown-heartbeat-gemini", git_root: null, tty: null, name: "unknown-heartbeat-gemini",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null,
+      client_type: "unknown", receiver_mode: "unknown", summary: "",
+    });
+    await rawPost("/hook-heartbeat-by-pid", {
+      pid: child.pid,
+      caller_pid: process.pid,
+      client_type: "gemini",
+      receiver_mode: "gemini-hook",
+      status: "ok",
+      drained: 0,
+    });
+    await brokerFetch("/heartbeat", {
+      id: peer.id,
+      client_type: "unknown",
+      receiver_mode: "unknown",
+    });
+    const peers = await brokerFetch<Array<{ id: string; client_type: string; receiver_mode: string }>>(
+      "/list-peers",
+      { id: peer.id, scope: "machine", cwd: "/", git_root: null, include_inactive: true }
+    );
+    const row = peers.find((p) => p.id === peer.id)!;
+    expect(row.client_type).toBe("gemini");
+    expect(row.receiver_mode).toBe("gemini-hook");
+    child.kill();
+  });
+
+  test("metadata-less claim-by-pid does not rewrite a Claude receiver to Codex", async () => {
+    const child = spawnSleep();
+    const peer = await brokerFetch<{ id: string }>("/register", {
+      pid: child.pid, cwd: "/claude-claim-preserve", git_root: null, tty: null, name: "claude-claim-preserve",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null,
+      client_type: "claude", receiver_mode: "claude-channel", summary: "",
+    });
+    const claim = await rawPost("/claim-by-pid", {
+      pid: child.pid,
+      caller_pid: process.pid,
+      drain_id: "metadata-less-review-regression",
+    });
+    expect(claim.status).toBe(200);
+    const peers = await brokerFetch<Array<{ id: string; client_type: string; receiver_mode: string }>>(
+      "/list-peers",
+      { id: peer.id, scope: "machine", cwd: "/", git_root: null, include_inactive: true }
+    );
+    const row = peers.find((p) => p.id === peer.id)!;
+    expect(row.client_type).toBe("claude");
+    expect(row.receiver_mode).toBe("claude-channel");
+    child.kill();
+  });
+
   test("Codex hook script emits UserPromptSubmit additionalContext and ACKs", async () => {
     const child = spawnSleep();
     const peer = await brokerFetch<{ id: string }>("/register", {
@@ -1174,8 +1256,8 @@ describe("Live broker delivery features", () => {
       from_id: peer.id, to_id: peer.id, text: "hook-visible",
     });
 
-    const hook = Bun.spawn(["bun", "/home/manzo/claude-peers-mcp/hooks/codex-drain-peer-inbox.ts"], {
-      cwd: "/home/manzo/claude-peers-mcp",
+    const hook = Bun.spawn(["bun", new URL("../hooks/codex-drain-peer-inbox.ts", import.meta.url).pathname], {
+      cwd: new URL("..", import.meta.url).pathname,
       env: {
         ...process.env,
         CLAUDE_PEERS_PORT: String(BROKER_PORT),
@@ -1192,6 +1274,46 @@ describe("Live broker delivery features", () => {
     const json = JSON.parse(stdout) as { hookSpecificOutput: { hookEventName: string; additionalContext: string } };
     expect(json.hookSpecificOutput.hookEventName).toBe("UserPromptSubmit");
     expect(json.hookSpecificOutput.additionalContext).toContain("hook-visible");
+    expect(json.hookSpecificOutput.additionalContext).toContain("<peer-message");
+
+    const status = await brokerFetch<{ statuses: { delivered: boolean; delivered_at: string | null }[] }>(
+      "/message-status", { id: peer.id, ids: [send.id] }
+    );
+    expect(status.statuses[0]!.delivered).toBe(true);
+    expect(typeof status.statuses[0]!.delivered_at).toBe("string");
+    child.kill();
+  });
+
+  test("Gemini hook script emits BeforeAgent additionalContext and ACKs", async () => {
+    const child = spawnSleep();
+    const peer = await brokerFetch<{ id: string }>("/register", {
+      pid: child.pid, cwd: "/gemini-hook-script", git_root: null, tty: null, name: "gemini-hook-script",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null,
+      client_type: "gemini", receiver_mode: "manual-drain", summary: "",
+    });
+    const send = await brokerFetch<{ id: number }>("/send-message", {
+      from_id: peer.id, to_id: peer.id, text: "gemini-hook-visible",
+    });
+
+    const hook = Bun.spawn(["bash", new URL("../hooks/gemini-drain-peer-inbox.sh", import.meta.url).pathname], {
+      cwd: new URL("..", import.meta.url).pathname,
+      env: {
+        ...process.env,
+        CLAUDE_PEERS_ROOT: new URL("..", import.meta.url).pathname.replace(/\/$/, ""),
+        CLAUDE_PEERS_PORT: String(BROKER_PORT),
+        CLAUDE_PEERS_MCP_PID: String(child.pid),
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const stdout = await new Response(hook.stdout).text();
+    const stderr = await new Response(hook.stderr).text();
+    const code = await hook.exited;
+    expect(code).toBe(0);
+    expect(stderr).toBe("");
+    const json = JSON.parse(stdout) as { hookSpecificOutput: { hookEventName: string; additionalContext: string } };
+    expect(json.hookSpecificOutput.hookEventName).toBe("BeforeAgent");
+    expect(json.hookSpecificOutput.additionalContext).toContain("gemini-hook-visible");
     expect(json.hookSpecificOutput.additionalContext).toContain("<peer-message");
 
     const status = await brokerFetch<{ statuses: { delivered: boolean; delivered_at: string | null }[] }>(

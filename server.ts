@@ -595,7 +595,8 @@ async function drainPendingMessages(): Promise<string | null> {
 }
 
 function receiverFresh(p: Pick<Peer, "receiver_mode" | "last_hook_seen_at">): boolean {
-  if (p.receiver_mode !== "codex-hook" || !p.last_hook_seen_at) return p.receiver_mode === "claude-channel";
+  const hookMode = p.receiver_mode === "codex-hook" || p.receiver_mode === "gemini-hook";
+  if (!hookMode || !p.last_hook_seen_at) return p.receiver_mode === "claude-channel";
   return Date.now() - new Date(p.last_hook_seen_at).getTime() < 120_000;
 }
 
@@ -624,8 +625,17 @@ function sendStatusHint(target: SendMessageResponse["target"] | undefined, deliv
       ? " Still queued; Codex receiver is hook-enabled and will drain on its next prompt."
       : " Still queued; Codex hook is stale, so the receiver may need check_messages.";
   }
+  if (target.receiver_mode === "gemini-hook") {
+    const fresh = target.last_hook_seen_at && Date.now() - new Date(target.last_hook_seen_at).getTime() < 120_000;
+    return fresh
+      ? " Still queued; Gemini receiver is hook-enabled and will drain on its next prompt."
+      : " Still queued; Gemini hook is stale, so the receiver may need check_messages.";
+  }
   if (target.client_type === "codex") {
     return " Still queued; Codex receiver has no active hook yet and must use check_messages or install the Codex drain hook.";
+  }
+  if (target.client_type === "gemini") {
+    return " Still queued; Gemini receiver has no active hook yet and must use check_messages or install the Gemini drain hook.";
   }
   return " Still queued; receiver mode is unknown, so manual check_messages may be required.";
 }
@@ -648,7 +658,7 @@ const TOOLS = [
   {
     name: "list_peers",
     description:
-      "List other Claude/Codex peer instances running on this machine. Returns their ID, working directory, receiver mode, git repo, and summary.",
+      "List other Claude/Codex/Gemini peer instances running on this machine. Returns their ID, working directory, receiver mode, git repo, and summary.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -670,7 +680,7 @@ const TOOLS = [
   {
     name: "send_message",
     description:
-      "Send a message to another peer by ID. Claude peers receive via channel/piggyback; Codex peers receive on next prompt only when the Codex hook is installed, otherwise via check_messages.",
+      "Send a message to another peer by ID. Claude peers receive via MCP poll/piggyback/check paths; Codex and Gemini peers receive on next prompt only when their drain hook is installed, otherwise via check_messages.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -772,7 +782,7 @@ const TOOLS = [
   {
     name: "check_messages",
     description:
-      "Manually check for new messages from other peer instances. Required for Codex peers without an active Codex hook; fallback for Claude channel delivery.",
+      "Manually check for new messages from other peer instances. Required for Codex/Gemini peers without an active drain hook; fallback for Claude delivery.",
     inputSchema: {
       type: "object" as const,
       properties: {},
@@ -1465,11 +1475,11 @@ async function main() {
 
   // 6. Start serialized polling for inbound messages.
   //
-  // Codex uses the UserPromptSubmit hook as its receive path. Keeping the
-  // Claude poll/buffer loop enabled for Codex creates duplicate displays:
+  // Codex and Gemini use prompt-time hooks as their receive path. Keeping the
+  // Claude poll/buffer loop enabled for hook-based clients creates duplicate displays:
   // the hook can claim+ACK a message while the MCP server's local buffer still
   // holds a pre-ACK copy, then the next tool call piggybacks the stale copy.
-  // Manual check_messages remains available for Codex because it polls the
+  // Manual check_messages remains available for these clients because it polls the
   // broker directly instead of relying on this local buffer.
   let pollActive = true;
 
@@ -1479,9 +1489,9 @@ async function main() {
     if (pollActive) setTimeout(schedulePoll, POLL_INTERVAL_MS);
   }
 
-  if (myClientType === "codex") {
+  if (myClientType === "codex" || myClientType === "gemini") {
     pollActive = false;
-    log("Codex client detected — background channel poll disabled; using Codex hook/check_messages receive path");
+    log(`${myClientType} client detected — background channel poll disabled; using hook/check_messages receive path`);
   } else {
     setTimeout(schedulePoll, POLL_INTERVAL_MS);
   }

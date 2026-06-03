@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const installer = new URL("../bin/install-codex-hook.ts", import.meta.url).pathname;
-const expectedCommand = `/usr/bin/env bash ${new URL("../hooks/codex-drain-peer-inbox.sh", import.meta.url).pathname}`;
+const shellQuote = (value: string): string => `'${value.replace(/'/g, "'\\''")}'`;
+const expectedCommand = `/usr/bin/env bash ${shellQuote(new URL("../hooks/codex-drain-peer-inbox.sh", import.meta.url).pathname)}`;
 
 describe("Codex hook installer", () => {
   test("merges into existing hooks and remains idempotent", async () => {
@@ -36,11 +37,13 @@ describe("Codex hook installer", () => {
       }
 
       const doc = JSON.parse(readFileSync(hooksPath, "utf8")) as {
-        hooks: { UserPromptSubmit: Array<{ hooks: Array<{ command: string }> }> };
+        hooks: { UserPromptSubmit: Array<{ hooks: Array<{ command: string; timeout?: number }> }> };
       };
-      const commands = doc.hooks.UserPromptSubmit.flatMap((bucket) => bucket.hooks.map((hook) => hook.command));
+      const hooks = doc.hooks.UserPromptSubmit.flatMap((bucket) => bucket.hooks);
+      const commands = hooks.map((hook) => hook.command);
       expect(commands).toContain("/usr/bin/env bash existing-rule-router.sh");
       expect(commands.filter((command) => command === expectedCommand).length).toBe(1);
+      expect(hooks.find((hook) => hook.command === expectedCommand)?.timeout).toBe(10);
     } finally {
       rmSync(repo, { recursive: true, force: true });
     }

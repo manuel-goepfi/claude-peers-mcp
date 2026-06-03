@@ -1,6 +1,6 @@
 # claude-peers
 
-Let your Claude Code and Codex instances find each other and talk. When you're running 5 sessions across different projects, any peer can discover the others and send messages through a local broker.
+Let your Claude Code, Codex, and Gemini CLI instances find each other and talk. When you're running 5 sessions across different projects, any peer can discover the others and send messages through a local broker.
 
 ```
   Terminal 1 (poker-engine)          Terminal 2 (eel)
@@ -33,19 +33,13 @@ claude mcp add --scope user --transport stdio claude-peers -- bun ~/claude-peers
 
 Replace `~/claude-peers-mcp` with wherever you cloned it.
 
-### 3. Run Claude Code with the channel
+### 3. Run Claude Code
 
 ```bash
-claude --dangerously-skip-permissions --dangerously-load-development-channels server:claude-peers
+claude
 ```
 
 That's it. The broker daemon starts automatically the first time.
-
-> **Tip:** Add it to an alias so you don't have to type it every time:
->
-> ```bash
-> alias claudepeers='claude --dangerously-load-development-channels server:claude-peers'
-> ```
 
 ### 4. Open a second session and try it
 
@@ -57,13 +51,13 @@ It'll show every running instance with their working directory, git repo, and a 
 
 > Send a message to peer [id]: "what are you working on?"
 
-Claude peers receive through the Claude channel path. Codex peers receive automatically on their next prompt when the Codex hook is installed; without that hook they use `check_messages`.
+Claude peers receive through the MCP poll buffer, tool-response piggyback, `check_messages`, and the optional Claude hook/standby path. Codex and Gemini peers receive automatically on their next prompt when their hook is installed; without that hook they use `check_messages`.
 
 ## What peers can do
 
 | Tool             | What it does                                                                   |
 | ---------------- | ------------------------------------------------------------------------------ |
-| `list_peers`     | Find other Claude/Codex peers — scoped to `machine`, `directory`, or `repo`    |
+| `list_peers`     | Find other Claude/Codex/Gemini peers — scoped to `machine`, `directory`, or `repo` |
 | `send_message`   | Send a message to another peer by ID                                           |
 | `set_summary`    | Describe what you're working on (visible to other peers)                       |
 | `check_messages` | Manually check for messages (fallback and Codex-without-hook path)             |
@@ -72,14 +66,18 @@ Claude peers receive through the Claude channel path. Codex peers receive automa
 
 | Receiver | Mode shown in `list_peers` | Delivery behavior |
 | --- | --- | --- |
-| Claude Code with channel | `claude/claude-channel` | Best-effort channel push plus tool-response/check fallback |
+| Claude Code | `claude/claude-channel` | MCP poll buffer plus tool-response/check fallback; installed hooks can drain before prompts and wake standby sessions |
 | Codex with hook installed and recently run | `codex/codex-hook` | Drains pending messages into the next `UserPromptSubmit` turn |
 | Codex without hook or stale hook | `codex/manual-drain` | Message stays queued until `check_messages` or hook install |
+| Gemini with hook installed and recently run | `gemini/gemini-hook` | Drains pending messages into the next `BeforeAgent` turn |
+| Gemini without hook or stale hook | `gemini/manual-drain` | Message stays queued until `check_messages` or hook install |
 | Unknown client | `unknown/unknown` | Manual `check_messages` fallback |
 
 ## How it works
 
-A **broker daemon** runs on `localhost:7899` with a SQLite database. Each Claude Code or Codex session spawns an MCP server that registers with the broker and polls for messages every second. Inbound messages for Claude are pushed into the session via the [claude/channel](https://code.claude.com/docs/en/channels-reference) protocol. Codex does not render Claude channel notifications, so Codex uses a `UserPromptSubmit` hook that claims pending messages, emits them as additional prompt context, and ACKs the broker after writing the hook output.
+A **broker daemon** runs on `localhost:7899` with a SQLite database. Each Claude Code, Codex, or Gemini CLI session spawns an MCP server that registers with the broker. Claude sessions keep a local poll buffer and expose `check_messages`; Codex and Gemini do not have a push channel, so they use lightweight prompt hooks that claim pending messages, emit them as additional context only when mail exists, and ACK the broker after successful hook output.
+
+The broker is the only queue and delivery authority. Hooks and standby watchers are thin drain clients; they do not create a second broker or call an LLM while waiting.
 
 ```
                     ┌───────────────────────────┐
@@ -90,12 +88,12 @@ A **broker daemon** runs on `localhost:7899` with a SQLite database. Each Claude
                       MCP server A    MCP server B
                       (stdio)         (stdio)
                            │               │
-                      Claude A         Claude B / Codex B
+                      Claude A         Claude B / Codex / Gemini
 ```
 
 The broker auto-launches when the first session starts. It cleans up dead peers automatically. Everything is localhost-only.
 
-## Codex hook install
+## Prompt hook install
 
 The repo includes a Codex `UserPromptSubmit` hook at `.codex/hooks.json` for sessions launched from this repo. For another repo, install without overwriting existing hooks:
 
@@ -104,6 +102,23 @@ bun /home/manzo/claude-peers-mcp/bin/install-codex-hook.ts /path/to/repo
 ```
 
 The installer merges the hook into `.codex/hooks.json`, writes a timestamped backup if one already exists, and is idempotent.
+
+For Gemini CLI repos:
+
+```bash
+bun /home/manzo/claude-peers-mcp/bin/install-gemini-hook.ts /path/to/repo
+```
+
+The Gemini installer merges a `BeforeAgent` hook into `.gemini/settings.json`, preserves existing MCP server configuration, writes a timestamped backup when needed, and is idempotent.
+
+## Claude standby
+
+Claude Code can also use user-level hooks:
+
+- `UserPromptSubmit` drains before the next prompt.
+- `Stop` with `asyncRewake: true` can poll the broker while Claude is idle and wake the session only when mail arrives.
+
+That standby loop is token-efficient because empty polls stay outside the model. The hook emits context only after the broker returns messages.
 
 ## Auto-summary
 
@@ -136,4 +151,4 @@ bun cli.ts kill-broker       # stop the broker
 
 - [Bun](https://bun.sh)
 - Claude Code v2.1.80+
-- claude.ai login (channels require it — API key auth won't work)
+- Codex CLI or Gemini CLI for non-Claude peers

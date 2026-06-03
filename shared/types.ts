@@ -1,7 +1,7 @@
 // Unique ID for each Claude Code instance (generated on registration)
 export type PeerId = string;
-export type ClientType = "claude" | "codex" | "unknown";
-export type ReceiverMode = "claude-channel" | "codex-hook" | "manual-drain" | "unknown";
+export type ClientType = "claude" | "codex" | "gemini" | "unknown";
+export type ReceiverMode = "claude-channel" | "codex-hook" | "gemini-hook" | "manual-drain" | "unknown";
 
 export interface Peer {
   id: PeerId;
@@ -173,6 +173,8 @@ export interface AckMessagesRequest {
 export interface ClaimByPidRequest {
   pid: number;
   caller_pid: number;
+  client_type?: ClientType;
+  receiver_mode?: ReceiverMode;
   drain_id?: string;
   limit?: number;
   max_bytes?: number;
@@ -190,6 +192,8 @@ export interface ClaimByPidResponse {
 export interface AckByPidRequest {
   pid: number;
   caller_pid: number;
+  client_type?: ClientType;
+  receiver_mode?: ReceiverMode;
   drain_id: string;
   ids: number[];
   via?: string;
@@ -198,6 +202,8 @@ export interface AckByPidRequest {
 export interface HookHeartbeatByPidRequest {
   pid: number;
   caller_pid: number;
+  client_type?: ClientType;
+  receiver_mode?: ReceiverMode;
   status?: "ok" | "error";
   drained?: number;
   error?: string;

@@ -12,6 +12,7 @@ function normalizedClient(value: string | undefined): ClientType | null {
   const v = value.toLowerCase();
   if (v === "claude" || v === "claude-code") return "claude";
   if (v === "codex") return "codex";
+  if (v === "gemini" || v === "gemini-cli") return "gemini";
   if (v === "unknown") return "unknown";
   return null;
 }
@@ -30,9 +31,11 @@ export function detectClientFromProcessChain(
     if (!p) break;
     const comm = p.comm.toLowerCase().replace(/^.*\//, "");
     if (comm === "codex" || comm.startsWith("codex-")) return "codex";
+    if (comm === "gemini" || comm.startsWith("gemini-")) return "gemini";
     if (comm === "claude") return "claude";
     const firstArg = p.args.trim().split(/\s+/)[0]?.toLowerCase().replace(/^.*\//, "") ?? "";
     if (firstArg === "codex" || firstArg.startsWith("codex-")) return "codex";
+    if (firstArg === "gemini" || firstArg.startsWith("gemini-")) return "gemini";
     if (firstArg === "claude") return "claude";
     if (p.ppid <= 1 || p.ppid === current) break;
     current = p.ppid;
@@ -43,5 +46,6 @@ export function detectClientFromProcessChain(
 export function initialReceiverMode(clientType: ClientType): ReceiverMode {
   if (clientType === "claude") return "claude-channel";
   if (clientType === "codex") return "manual-drain";
+  if (clientType === "gemini") return "manual-drain";
   return "unknown";
 }

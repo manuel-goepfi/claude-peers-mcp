@@ -11,6 +11,7 @@ describe("client detection", () => {
   test("explicit override wins", () => {
     const processes = table([{ pid: 10, ppid: 1, comm: "bash", args: "bash" }]);
     expect(detectClientFromProcessChain(10, processes, { CLAUDE_PEERS_CLIENT_TYPE: "codex" })).toBe("codex");
+    expect(detectClientFromProcessChain(10, processes, { CLAUDE_PEERS_CLIENT_TYPE: "gemini" })).toBe("gemini");
   });
 
   test("detects Codex ancestor through wrappers", () => {
@@ -30,6 +31,15 @@ describe("client detection", () => {
     expect(detectClientFromProcessChain(20, processes, {})).toBe("claude");
   });
 
+  test("detects Gemini ancestor through wrappers", () => {
+    const processes = table([
+      { pid: 30, ppid: 20, comm: "bun", args: "bun /home/manzo/claude-peers-mcp/server.ts" },
+      { pid: 20, ppid: 10, comm: "node", args: "node helper" },
+      { pid: 10, ppid: 1, comm: "gemini", args: "gemini" },
+    ]);
+    expect(detectClientFromProcessChain(30, processes, {})).toBe("gemini");
+  });
+
   test("unknown fallback maps to unknown receiver mode", () => {
     const processes = table([{ pid: 20, ppid: 1, comm: "bash", args: "bash" }]);
     expect(detectClientFromProcessChain(20, processes, {})).toBe("unknown");
@@ -40,9 +50,13 @@ describe("client detection", () => {
     expect(initialReceiverMode("codex")).toBe("manual-drain");
   });
 
-  test("Codex disables the Claude background poll buffer", () => {
+  test("Gemini starts as manual drain until hook heartbeat proves capability", () => {
+    expect(initialReceiverMode("gemini")).toBe("manual-drain");
+  });
+
+  test("hook-based clients disable the Claude background poll buffer", () => {
     const src = readFileSync(new URL("../server.ts", import.meta.url), "utf8");
-    expect(src).toContain('if (myClientType === "codex")');
+    expect(src).toContain('if (myClientType === "codex" || myClientType === "gemini")');
     expect(src).toContain("background channel poll disabled");
   });
 
@@ -53,6 +67,26 @@ describe("client detection", () => {
       [30, { pid: 30, ppid: 10, comm: "bun", args: "bun hooks/codex-drain-peer-inbox.ts" }],
     ]);
     const pid = findMcpPidFromTable(processes, 10, "/repo", (candidate) => candidate === 20 ? "/repo" : "/other");
+    expect(pid).toBe(20);
+  });
+
+  test("Gemini hook discovers the MCP server from process ancestry without env PID", () => {
+    const processes = new Map([
+      [10, { pid: 10, ppid: 1, comm: "gemini", args: "gemini" }],
+      [20, { pid: 20, ppid: 10, comm: "bun", args: "bun /home/manzo/claude-peers-mcp/server.ts" }],
+      [30, { pid: 30, ppid: 10, comm: "bun", args: "bun hooks/gemini-drain-peer-inbox.sh" }],
+    ]);
+    const pid = findMcpPidFromTable(processes, 10, "/repo", (candidate) => candidate === 20 ? "/repo" : "/other", "gemini");
+    expect(pid).toBe(20);
+  });
+
+  test("Gemini hook process name is not mistaken for the Gemini CLI ancestor", () => {
+    const processes = new Map([
+      [10, { pid: 10, ppid: 1, comm: "gemini", args: "gemini" }],
+      [20, { pid: 20, ppid: 10, comm: "bun", args: "bun /home/manzo/claude-peers-mcp/server.ts" }],
+      [30, { pid: 30, ppid: 10, comm: "bash", args: "bash /home/manzo/claude-peers-mcp/hooks/gemini-drain-peer-inbox.sh" }],
+    ]);
+    const pid = findMcpPidFromTable(processes, 30, "/repo", (candidate) => candidate === 20 ? "/repo" : "/other", "gemini");
     expect(pid).toBe(20);
   });
 });

@@ -105,18 +105,25 @@ if [[ -n "$MY_MCP" ]]; then
   CLAIM_BODY=$(printf '%s\n' "$CLAIM_RESP" | sed '$d')
   CLAIM_STATUS=$(printf '%s\n' "$CLAIM_RESP" | tail -n1)
   if [[ "$CLAIM_STATUS" == "200" && "$CLAIM_BODY" =~ \"peer_id\":\"[^\"]+\" ]]; then
-    ok "/claim-by-pid responds 200 for safe Codex hook drain"
+    ok "/claim-by-pid responds 200 for safe prompt-hook drain"
   else
-    fail "/claim-by-pid returned ${CLAIM_STATUS:-no-response}" "restart broker so the Codex hook endpoints are available"
+    fail "/claim-by-pid returned ${CLAIM_STATUS:-no-response}" "restart broker so the prompt-hook endpoints are available"
   fi
 fi
 
-# 7b. Codex hook surface
+# 7b. Codex/Gemini hook surfaces
 CODEX_HOOK="$HOME/claude-peers-mcp/hooks/codex-drain-peer-inbox.sh"
 if [[ -x "$CODEX_HOOK" ]]; then
   ok "Codex inbox hook executable"
 else
   warn "Codex inbox hook not executable at $CODEX_HOOK" "chmod +x $CODEX_HOOK or reinstall fork"
+fi
+
+GEMINI_HOOK="$HOME/claude-peers-mcp/hooks/gemini-drain-peer-inbox.sh"
+if [[ -x "$GEMINI_HOOK" ]]; then
+  ok "Gemini inbox hook executable"
+else
+  warn "Gemini inbox hook not executable at $GEMINI_HOOK" "chmod +x $GEMINI_HOOK or reinstall fork"
 fi
 
 # 8. latency log has recent entries

@@ -14,6 +14,7 @@ import { readFileSync, statSync, existsSync, unlinkSync } from "node:fs";
 
 const BROKER_PORT = 7905; // not 7899 — avoid colliding with running broker
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
+const BROKER_SCRIPT = new URL("../broker.ts", import.meta.url).pathname;
 const TEST_DB = "/tmp/claude-peers-test-ap063.db";
 const TEST_TOKEN_FILE = "/tmp/.claude-peers-bridge-test-ap063.token";
 
@@ -38,7 +39,7 @@ describe("AP-063 /messages-since-id + bridge-token-file", () => {
     if (existsSync(TEST_DB)) unlinkSync(TEST_DB);
     if (existsSync(TEST_TOKEN_FILE)) unlinkSync(TEST_TOKEN_FILE);
 
-    brokerProc = Bun.spawn(["bun", "/home/manzo/claude-peers-mcp/broker.ts"], {
+    brokerProc = Bun.spawn(["bun", BROKER_SCRIPT], {
       env: {
         ...process.env,
         CLAUDE_PEERS_PORT: String(BROKER_PORT),
@@ -177,7 +178,7 @@ describe("AP-063 token regeneration on restart", () => {
     if (existsSync(TEST_TOKEN_FILE_2)) unlinkSync(TEST_TOKEN_FILE_2);
 
     // First broker run
-    const proc1 = Bun.spawn(["bun", "/home/manzo/claude-peers-mcp/broker.ts"], {
+    const proc1 = Bun.spawn(["bun", BROKER_SCRIPT], {
       env: { ...process.env, CLAUDE_PEERS_PORT: String(PORT_2), CLAUDE_PEERS_DB: TEST_DB_2, CLAUDE_PEERS_BRIDGE_TOKEN_FILE: TEST_TOKEN_FILE_2 },
       stdout: "ignore",
       stderr: "ignore",
@@ -188,7 +189,7 @@ describe("AP-063 token regeneration on restart", () => {
     await new Promise((r) => setTimeout(r, 300));
 
     // Second broker run
-    const proc2 = Bun.spawn(["bun", "/home/manzo/claude-peers-mcp/broker.ts"], {
+    const proc2 = Bun.spawn(["bun", BROKER_SCRIPT], {
       env: { ...process.env, CLAUDE_PEERS_PORT: String(PORT_2), CLAUDE_PEERS_DB: TEST_DB_2, CLAUDE_PEERS_BRIDGE_TOKEN_FILE: TEST_TOKEN_FILE_2 },
       stdout: "ignore",
       stderr: "ignore",

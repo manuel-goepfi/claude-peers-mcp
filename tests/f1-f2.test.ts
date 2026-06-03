@@ -551,6 +551,7 @@ not a row
 
 describe("F1+F2 live broker integration", () => {
   const BROKER_PORT = 17899; // Use non-standard port to avoid conflicts
+  const BROKER_SCRIPT = new URL("../broker.ts", import.meta.url).pathname;
   let brokerProc: ReturnType<typeof Bun.spawn>;
   const brokerUrl = `http://127.0.0.1:${BROKER_PORT}`;
   const TEST_DB = "/tmp/claude-peers-test-f1f2.db";
@@ -559,7 +560,7 @@ describe("F1+F2 live broker integration", () => {
     // Clean up any old test DB
     try { await Bun.write(TEST_DB, ""); Bun.spawnSync(["rm", "-f", TEST_DB]); } catch {}
 
-    brokerProc = Bun.spawn(["bun", "/home/manzo/claude-peers-mcp/broker.ts"], {
+    brokerProc = Bun.spawn(["bun", BROKER_SCRIPT], {
       env: { ...process.env, CLAUDE_PEERS_PORT: String(BROKER_PORT), CLAUDE_PEERS_DB: TEST_DB },
       stdout: "ignore",
       stderr: "ignore",

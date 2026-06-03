@@ -5,11 +5,12 @@ import { dirname, resolve } from "node:path";
 const repo = resolve(process.argv[2] ?? process.cwd());
 const hooksPath = `${repo}/.codex/hooks.json`;
 const hookScript = resolve(import.meta.dir, "../hooks/codex-drain-peer-inbox.sh");
-const command = `/usr/bin/env bash ${hookScript}`;
+const shellQuote = (value: string): string => `'${value.replace(/'/g, "'\\''")}'`;
+const command = `/usr/bin/env bash ${shellQuote(hookScript)}`;
 const entry = {
   type: "command",
   command,
-  timeout: 5,
+  timeout: 10,
   statusMessage: "Checking peer inbox",
 };
 
