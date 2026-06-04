@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { findClientPidFromTable, findHookPeerPidsFromTable, findMcpPidFromTable } from "../hooks/codex-drain-peer-inbox.ts";
 import { detectClientFromProcessChain, initialReceiverMode, type ProcessInfo } from "../shared/client.ts";
+import { registrationCwd } from "../server.ts";
 
 function table(rows: ProcessInfo[]): Map<number, ProcessInfo> {
   return new Map(rows.map((row) => [row.pid, row]));
@@ -69,6 +70,21 @@ describe("client detection", () => {
     expect(src).toContain("background channel poll disabled");
   });
 
+  test("hook-based MCP registration uses the client cwd, not the server cwd", () => {
+    const cwdReader = (pid: number) => pid === 10 ? "/home/manzo/Clause5" : null;
+
+    expect(registrationCwd("/home/manzo/claude-peers-mcp", 10, "codex", cwdReader)).toBe("/home/manzo/Clause5");
+    expect(registrationCwd("/home/manzo/claude-peers-mcp", 10, "gemini", cwdReader)).toBe("/home/manzo/Clause5");
+  });
+
+  test("non-hook clients and missing client cwd fall back safely", () => {
+    const cwdReader = () => null;
+
+    expect(registrationCwd("/home/manzo/claude-peers-mcp", 10, "claude", cwdReader)).toBe("/home/manzo/claude-peers-mcp");
+    expect(registrationCwd("/home/manzo/claude-peers-mcp", 10, "unknown", cwdReader)).toBe("/home/manzo/claude-peers-mcp");
+    expect(registrationCwd("/home/manzo/claude-peers-mcp", 10, "codex", cwdReader)).toBe("/home/manzo/claude-peers-mcp");
+  });
+
   test("Codex hook discovers the MCP server from process ancestry without env PID", () => {
     const processes = new Map([
       [10, { pid: 10, ppid: 1, comm: "codex", args: "codex" }],
@@ -97,6 +113,16 @@ describe("client detection", () => {
     ]);
     const pids = findHookPeerPidsFromTable(processes, 30, "/repo", (candidate) => candidate === 20 ? "/repo" : "/other", "codex", 20);
     expect(pids).toEqual({ primary: 10, fallback: 20 });
+  });
+
+  test("Codex hook keeps explicit env PID as fallback when discovered MCP PID differs", () => {
+    const processes = new Map([
+      [10, { pid: 10, ppid: 1, comm: "codex", args: "codex" }],
+      [20, { pid: 20, ppid: 10, comm: "bun", args: "bun /home/manzo/claude-peers-mcp/server.ts" }],
+      [30, { pid: 30, ppid: 10, comm: "bun", args: "bun hooks/codex-drain-peer-inbox.ts" }],
+    ]);
+    const pids = findHookPeerPidsFromTable(processes, 30, "/repo", (candidate) => candidate === 20 ? "/repo" : "/other", "codex", 99);
+    expect(pids).toEqual({ primary: 10, fallback: 99 });
   });
 
   test("Gemini hook discovers the MCP server from process ancestry without env PID", () => {

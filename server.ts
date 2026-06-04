@@ -19,7 +19,7 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { openSync, closeSync, statSync, existsSync } from "node:fs";
+import { openSync, closeSync, statSync, existsSync, readlinkSync } from "node:fs";
 
 // --- Tiny error formatting helper (avoids the e instanceof Error ternary
 //     repeated at every catch site) ---
@@ -252,12 +252,10 @@ async function getAbsoluteGitDir(cwd: string): Promise<string | null> {
   return null;
 }
 
-function getTty(): string | null {
+function getTty(pid = process.ppid): string | null {
   try {
-    // Try to get the parent's tty from the process tree
-    const ppid = process.ppid;
-    if (ppid) {
-      const proc = Bun.spawnSync(["ps", "-o", "tty=", "-p", String(ppid)]);
+    if (pid) {
+      const proc = Bun.spawnSync(["ps", "-o", "tty=", "-p", String(pid)]);
       const tty = new TextDecoder().decode(proc.stdout).trim();
       if (tty && tty !== "?" && tty !== "??") {
         return tty;
@@ -267,6 +265,26 @@ function getTty(): string | null {
     log(`getTty: ${errMsg(e)}`);
   }
   return null;
+}
+
+function cwdOf(pid: number): string | null {
+  try {
+    return readlinkSync(`/proc/${pid}/cwd`);
+  } catch {
+    return null;
+  }
+}
+
+export function registrationCwd(
+  processCwd: string,
+  registerPid: number,
+  clientType: ClientType,
+  cwdReader: (pid: number) => string | null = cwdOf,
+): string {
+  if (clientType === "codex" || clientType === "gemini") {
+    return cwdReader(registerPid) ?? processCwd;
+  }
+  return processCwd;
 }
 
 function processTable(): Map<number, ProcessInfo> {
@@ -1403,15 +1421,16 @@ async function main() {
   await ensureBroker();
 
   // 2. Gather context
-  myCwd = process.cwd();
-  myGitRoot = await getGitRoot(myCwd);
-  myAbsoluteGitDir = await getAbsoluteGitDir(myCwd);
+  const serverCwd = process.cwd();
   myClientType = detectClientType();
   myReceiverMode = initialReceiverMode(myClientType);
   if (myClientType === "codex" || myClientType === "gemini") {
     myRegisterPid = findClientPidFromProcessChain(process.ppid, processTable(), myClientType) ?? process.pid;
   }
-  const tty = getTty();
+  myCwd = registrationCwd(serverCwd, myRegisterPid, myClientType);
+  myGitRoot = await getGitRoot(myCwd);
+  myAbsoluteGitDir = await getAbsoluteGitDir(myCwd);
+  const tty = getTty(myRegisterPid);
   let tmuxInfo = await detectTmuxPane();
   // Fix B (2026-05-12): if the live ancestry walk found nothing, fall back to
   // CLAUDE_PEER_TMUX_* env hints exported by the cc/ccc/cccr/cc2 bashrc

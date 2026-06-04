@@ -168,7 +168,8 @@ export function findHookPeerPidsFromTable(
   const selected = cwdMatches.length > 0 ? cwdMatches : candidates;
   if (selected.length === 1) {
     const mcpPid = selected[0]!.pid;
-    return mcpPid === clientPid ? { primary: clientPid } : { primary: clientPid, fallback: mcpPid };
+    const fallbackPid = hasEnvPid && envPid !== clientPid ? envPid! : mcpPid;
+    return fallbackPid === clientPid ? { primary: clientPid } : { primary: clientPid, fallback: fallbackPid };
   }
   if (selected.length > 1 && !hasEnvPid) {
     log(`multiple claude-peers MCP candidates: ${selected.map((p) => p.pid).join(",")}`);
