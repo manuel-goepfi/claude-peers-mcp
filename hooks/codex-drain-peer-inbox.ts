@@ -153,12 +153,12 @@ export function findHookPeerPidsFromTable(
   cwdReader: (pid: number) => string | null = cwdOf,
   clientType = CLIENT_TYPE,
   envPid: number | null = null,
-): { primary: number; fallback?: number } | null {
+): { primary: number; fallbacks: number[] } | null {
   const hasEnvPid = Number.isInteger(envPid) && envPid > 1;
   const clientPid = findClientAncestor(table, startPid, clientType);
   if (!clientPid) {
     if (!hasEnvPid) log(`no ${CLIENT_TYPE} ancestor found`);
-    return hasEnvPid ? { primary: envPid! } : null;
+    return hasEnvPid ? { primary: envPid!, fallbacks: [] } : null;
   }
 
   const candidates = descendants(clientPid, table)
@@ -168,17 +168,19 @@ export function findHookPeerPidsFromTable(
   const selected = cwdMatches.length > 0 ? cwdMatches : candidates;
   if (selected.length === 1) {
     const mcpPid = selected[0]!.pid;
-    const fallbackPid = hasEnvPid && envPid !== clientPid ? envPid! : mcpPid;
-    return fallbackPid === clientPid ? { primary: clientPid } : { primary: clientPid, fallback: fallbackPid };
+    const fallbacks = [mcpPid, hasEnvPid ? envPid! : null]
+      .filter((pid): pid is number => Number.isInteger(pid) && pid > 1 && pid !== clientPid)
+      .filter((pid, index, all) => all.indexOf(pid) === index);
+    return { primary: clientPid, fallbacks };
   }
   if (selected.length > 1 && !hasEnvPid) {
     log(`multiple claude-peers MCP candidates: ${selected.map((p) => p.pid).join(",")}`);
   }
-  if (hasEnvPid && envPid !== clientPid) return { primary: clientPid, fallback: envPid };
-  return { primary: clientPid };
+  if (hasEnvPid && envPid !== clientPid) return { primary: clientPid, fallbacks: [envPid!] };
+  return { primary: clientPid, fallbacks: [] };
 }
 
-function findHookPeerPids(): { primary: number; fallback?: number } | null {
+function findHookPeerPids(): { primary: number; fallbacks: number[] } | null {
   const envPid = Number(process.env.CLAUDE_PEERS_MCP_PID ?? "");
   return findHookPeerPidsFromTable(
     processTable(),
@@ -241,27 +243,29 @@ async function main(): Promise<void> {
   }
 
   const drainId = `${RECEIVER_MODE}:${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
-  let claimed: { peer_id?: string; drain_id?: string; messages?: Message[] };
+  let claimed: { peer_id?: string; drain_id?: string; messages?: Message[] } | null = null;
   let pid = pids.primary;
-  try {
-    claimed = await claim(pid, drainId);
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    if (pids.fallback && /unknown target pid|no peer|peer not found/i.test(msg)) {
-      pid = pids.fallback;
-      try {
-        claimed = await claim(pid, drainId);
-      } catch (fallbackError) {
-        const fallbackMsg = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
-        log(`claim failed: ${fallbackMsg}`);
-        await heartbeat(pid, "error", 0, fallbackMsg);
+  const claimPids = [pids.primary, ...pids.fallbacks].filter((candidate, index, all) => all.indexOf(candidate) === index);
+  let lastClaimError = "";
+  for (const candidatePid of claimPids) {
+    pid = candidatePid;
+    try {
+      claimed = await claim(pid, drainId);
+      break;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      lastClaimError = msg;
+      if (!/unknown target pid|no peer|peer not found/i.test(msg)) {
+        log(`claim failed: ${msg}`);
+        await heartbeat(pid, "error", 0, msg);
         return;
       }
-    } else {
-      log(`claim failed: ${msg}`);
-      await heartbeat(pid, "error", 0, msg);
-      return;
     }
+  }
+  if (!claimed) {
+    log(`claim failed: ${lastClaimError}`);
+    await heartbeat(pid, "error", 0, lastClaimError);
+    return;
   }
 
   const messages = claimed.messages ?? [];

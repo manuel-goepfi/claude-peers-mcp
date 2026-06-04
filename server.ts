@@ -275,16 +275,37 @@ function cwdOf(pid: number): string | null {
   }
 }
 
+export interface RegistrationCwdResult {
+  cwd: string;
+  source: "process" | "client" | "process-fallback";
+  missingClientCwd: boolean;
+}
+
+export function registrationCwdResult(
+  processCwd: string,
+  registerPid: number,
+  clientType: ClientType,
+  cwdReader: (pid: number) => string | null = cwdOf,
+): RegistrationCwdResult {
+  if (clientType === "codex" || clientType === "gemini") {
+    const clientCwd = cwdReader(registerPid);
+    if (clientCwd) return { cwd: clientCwd, source: "client", missingClientCwd: false };
+    return { cwd: processCwd, source: "process-fallback", missingClientCwd: true };
+  }
+  return { cwd: processCwd, source: "process", missingClientCwd: false };
+}
+
 export function registrationCwd(
   processCwd: string,
   registerPid: number,
   clientType: ClientType,
   cwdReader: (pid: number) => string | null = cwdOf,
 ): string {
-  if (clientType === "codex" || clientType === "gemini") {
-    return cwdReader(registerPid) ?? processCwd;
-  }
-  return processCwd;
+  return registrationCwdResult(processCwd, registerPid, clientType, cwdReader).cwd;
+}
+
+export function registrationTtyPid(registerPid: number, clientType: ClientType, parentPid = process.ppid): number {
+  return clientType === "codex" || clientType === "gemini" ? registerPid : parentPid;
 }
 
 function processTable(): Map<number, ProcessInfo> {
@@ -1427,10 +1448,14 @@ async function main() {
   if (myClientType === "codex" || myClientType === "gemini") {
     myRegisterPid = findClientPidFromProcessChain(process.ppid, processTable(), myClientType) ?? process.pid;
   }
-  myCwd = registrationCwd(serverCwd, myRegisterPid, myClientType);
+  const cwdResult = registrationCwdResult(serverCwd, myRegisterPid, myClientType);
+  myCwd = cwdResult.cwd;
+  if (cwdResult.missingClientCwd) {
+    log(`registration cwd: unable to read /proc/${myRegisterPid}/cwd for ${myClientType}; falling back to server cwd ${serverCwd}`);
+  }
   myGitRoot = await getGitRoot(myCwd);
   myAbsoluteGitDir = await getAbsoluteGitDir(myCwd);
-  const tty = getTty(myRegisterPid);
+  const tty = getTty(registrationTtyPid(myRegisterPid, myClientType));
   let tmuxInfo = await detectTmuxPane();
   // Fix B (2026-05-12): if the live ancestry walk found nothing, fall back to
   // CLAUDE_PEER_TMUX_* env hints exported by the cc/ccc/cccr/cc2 bashrc
