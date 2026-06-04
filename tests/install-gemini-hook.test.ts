@@ -5,7 +5,8 @@ import { join } from "node:path";
 
 const installer = new URL("../bin/install-gemini-hook.ts", import.meta.url).pathname;
 const shellQuote = (value: string): string => `'${value.replace(/'/g, "'\\''")}'`;
-const expectedCommand = `/usr/bin/env bash ${shellQuote(new URL("../hooks/gemini-drain-peer-inbox.sh", import.meta.url).pathname)}`;
+const expectedDrainCommand = `/usr/bin/env bash ${shellQuote(new URL("../hooks/gemini-drain-peer-inbox.sh", import.meta.url).pathname)}`;
+const expectedRegisterCommand = `/usr/bin/env bash ${shellQuote(new URL("../hooks/gemini-register-peer-session.sh", import.meta.url).pathname)}`;
 
 describe("Gemini hook installer", () => {
   test("merges into existing settings and remains idempotent", async () => {
@@ -45,14 +46,23 @@ describe("Gemini hook installer", () => {
 
       const doc = JSON.parse(readFileSync(settingsPath, "utf8")) as {
         mcpServers: Record<string, unknown>;
-        hooks: { BeforeAgent: Array<{ hooks: Array<{ command: string; timeout?: number }> }> };
+        hooks: {
+          SessionStart: Array<{ matcher?: string; hooks: Array<{ command: string; name?: string; timeout?: number }> }>;
+          BeforeAgent: Array<{ hooks: Array<{ command: string; timeout?: number }> }>;
+        };
       };
       expect(doc.mcpServers["claude-peers"]).toBeDefined();
       const hooks = doc.hooks.BeforeAgent.flatMap((bucket) => bucket.hooks);
       const commands = hooks.map((hook) => hook.command);
       expect(commands).toContain("/usr/bin/env bash existing-gemini-context.sh");
-      expect(commands.filter((command) => command === expectedCommand).length).toBe(1);
-      expect(hooks.find((hook) => hook.command === expectedCommand)?.timeout).toBe(10000);
+      expect(commands.filter((command) => command === expectedDrainCommand).length).toBe(1);
+      expect(hooks.find((hook) => hook.command === expectedDrainCommand)?.timeout).toBe(10000);
+
+      const startupHooks = doc.hooks.SessionStart.flatMap((bucket) => bucket.hooks);
+      expect(doc.hooks.SessionStart[0]?.matcher).toBe("startup|resume");
+      expect(startupHooks.filter((hook) => hook.command === expectedRegisterCommand)).toHaveLength(1);
+      expect(startupHooks.find((hook) => hook.command === expectedRegisterCommand)?.name).toBe("claude-peers-gemini-register");
+      expect(startupHooks.find((hook) => hook.command === expectedRegisterCommand)?.timeout).toBe(10000);
     } finally {
       rmSync(repo, { recursive: true, force: true });
     }
@@ -107,8 +117,47 @@ describe("Gemini hook installer", () => {
         .flatMap((bucket) => bucket.hooks)
         .filter((hook) => hook.name === "claude-peers-gemini-inbox");
       expect(peerHooks).toHaveLength(1);
-      expect(peerHooks[0]!.command).toBe(expectedCommand);
+      expect(peerHooks[0]!.command).toBe(expectedDrainCommand);
       expect(peerHooks[0]!.timeout).toBe(10000);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  test("normalizes an existing startup-only register bucket to startup and resume", async () => {
+    const repo = mkdtempSync(join(tmpdir(), "claude-peers-gemini-install-register-"));
+    try {
+      const settingsPath = join(repo, ".gemini", "settings.json");
+      mkdirSync(join(repo, ".gemini"), { recursive: true });
+      writeFileSync(settingsPath, JSON.stringify({
+        hooks: {
+          SessionStart: [
+            {
+              matcher: "startup",
+              hooks: [
+                {
+                  name: "claude-peers-gemini-register",
+                  type: "command",
+                  command: "/usr/bin/env bash /old/hooks/gemini-register-peer-session.sh",
+                  timeout: 10000,
+                },
+              ],
+            },
+          ],
+        },
+      }, null, 2));
+
+      const proc = Bun.spawn(["bun", installer, repo], { stdout: "ignore", stderr: "pipe" });
+      const stderr = await new Response(proc.stderr).text();
+      expect(await proc.exited).toBe(0);
+      expect(stderr).toBe("");
+
+      const doc = JSON.parse(readFileSync(settingsPath, "utf8")) as {
+        hooks: { SessionStart: Array<{ matcher?: string; hooks: Array<{ command: string }> }> };
+      };
+      expect(doc.hooks.SessionStart).toHaveLength(1);
+      expect(doc.hooks.SessionStart[0]?.matcher).toBe("startup|resume");
+      expect(doc.hooks.SessionStart[0]?.hooks.map((hook) => hook.command)).toEqual([expectedRegisterCommand]);
     } finally {
       rmSync(repo, { recursive: true, force: true });
     }

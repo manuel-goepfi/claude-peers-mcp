@@ -62,6 +62,9 @@ export interface RegisterRequest {
   tmux_pane_id?: string | null;
   client_type?: ClientType;
   receiver_mode?: ReceiverMode;
+  // Hook-only metadata refreshes do not retain the returned token. When true,
+  // an existing same-PID row keeps its current token instead of rotating it.
+  preserve_token?: boolean;
   summary: string;
 }
 

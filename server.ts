@@ -37,7 +37,7 @@ import type {
   SendMessageResponse,
   TmuxPaneSnapshot,
 } from "./shared/types.ts";
-import { detectClientFromProcessChain, initialReceiverMode, type ProcessInfo } from "./shared/client.ts";
+import { detectClientFromProcessChain, findClientPidFromProcessChain, initialReceiverMode, type ProcessInfo } from "./shared/client.ts";
 import { frameUntrusted, renderInboundLine } from "./shared/render.ts";
 export { frameUntrusted, renderInboundLine } from "./shared/render.ts";
 import {
@@ -360,6 +360,7 @@ let myGitRoot: string | null = null;
 let myAbsoluteGitDir: string | null = null;
 let myClientType: ClientType = "unknown";
 let myReceiverMode: ReceiverMode = "unknown";
+let myRegisterPid = process.pid;
 
 // Local buffer for messages fetched by the poll loop, awaiting delivery
 // via piggyback (drainPendingMessages) or check_messages.
@@ -1407,6 +1408,9 @@ async function main() {
   myAbsoluteGitDir = await getAbsoluteGitDir(myCwd);
   myClientType = detectClientType();
   myReceiverMode = initialReceiverMode(myClientType);
+  if (myClientType === "codex" || myClientType === "gemini") {
+    myRegisterPid = findClientPidFromProcessChain(process.ppid, processTable(), myClientType) ?? process.pid;
+  }
   const tty = getTty();
   let tmuxInfo = await detectTmuxPane();
   // Fix B (2026-05-12): if the live ancestry walk found nothing, fall back to
@@ -1443,7 +1447,7 @@ async function main() {
       ? `${tmuxInfo.session}.${tmuxInfo.pane_id}`
       : null);
   const isSubagent = isTaskSubagent();
-  const peerName: string = resolvePeerName(envName, tmuxFallbackName, isSubagent, process.pid);
+  const peerName: string = resolvePeerName(envName, tmuxFallbackName, isSubagent, myRegisterPid);
   if (envName && !tmuxFallbackName && isSubagent) {
     log(`Task subagent detected — peer name suffixed: ${peerName}`);
   }
@@ -1453,6 +1457,7 @@ async function main() {
   log(`Absolute git dir: ${myAbsoluteGitDir ?? "(none)"}`);
   log(`Client: ${myClientType}`);
   log(`Receiver mode: ${myReceiverMode}`);
+  log(`Register PID: ${myRegisterPid}`);
   log(`TTY: ${tty ?? "(unknown)"}`);
   if (peerName) log(`Peer name: ${peerName}`);
   if (tmuxInfo) log(`Tmux: ${tmuxInfo.session}:${tmuxInfo.window_index ?? ""}:${tmuxInfo.window_name ?? ""}`);
@@ -1494,7 +1499,7 @@ async function main() {
   //    recovery in brokerFetch() can rebuild auth state without the original
   //    summary/tmux context being recomputed from scratch).
   const buildRegisterPayload = () => ({
-    pid: process.pid,
+    pid: myRegisterPid,
     cwd: myCwd,
     git_root: myGitRoot,
     absolute_git_dir: myAbsoluteGitDir,

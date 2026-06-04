@@ -68,15 +68,15 @@ Claude peers receive through the MCP poll buffer, tool-response piggyback, `chec
 | Receiver | Mode shown in `list_peers` | Delivery behavior |
 | --- | --- | --- |
 | Claude Code | `claude/claude-channel` | MCP poll buffer plus tool-response/check fallback; installed hooks can drain before prompts and wake standby sessions |
-| Codex with hook installed and recently run | `codex/codex-hook` | Drains pending messages into the next `UserPromptSubmit` turn |
+| Codex with hooks installed | `codex/codex-hook` | Registers at `SessionStart`; drains pending messages into the next `UserPromptSubmit` turn |
 | Codex without hook or stale hook | `codex/manual-drain` | Message stays queued until `check_messages` or hook install |
-| Gemini with hook installed and recently run | `gemini/gemini-hook` | Drains pending messages into the next `BeforeAgent` turn |
+| Gemini with hooks installed | `gemini/gemini-hook` | Registers at `SessionStart`; drains pending messages into the next `BeforeAgent` turn |
 | Gemini without hook or stale hook | `gemini/manual-drain` | Message stays queued until `check_messages` or hook install |
 | Unknown client | `unknown/unknown` | Manual `check_messages` fallback |
 
 ## How it works
 
-A **broker daemon** runs on `localhost:7899` with a SQLite database. Each Claude Code, Codex, or Gemini CLI session spawns an MCP server that registers with the broker. Claude sessions keep a local poll buffer and expose `check_messages`; Codex and Gemini do not have a push channel, so they use lightweight prompt hooks that claim pending messages, emit them as additional context only when mail exists, and ACK the broker after successful hook output.
+A **broker daemon** runs on `localhost:7899` with a SQLite database. Claude Code sessions register through the MCP server. Codex and Gemini can register immediately from lightweight `SessionStart` hooks, then claim pending messages from prompt/run hooks. Claude sessions keep a local poll buffer and expose `check_messages`; Codex and Gemini do not have a push channel, so their hooks emit queued mail as additional context only when a normal turn starts.
 
 The broker is the only queue and delivery authority. Hooks and standby watchers are thin drain clients; they do not create a second broker or call an LLM while waiting.
 
@@ -92,7 +92,7 @@ The broker is the only queue and delivery authority. Hooks and standby watchers 
                       Claude A         Claude B / Codex / Gemini
 ```
 
-The broker auto-launches when the first session starts. It cleans up dead peers automatically. Everything is localhost-only.
+The broker auto-launches when the first session starts. It cleans up dead peers automatically. Everything is localhost-only. Startup registration makes new Codex/Gemini sessions visible to peers without a first nudge, but it does not wake an idle model or type into tmux.
 
 ## Read-only tmux context
 
@@ -102,13 +102,13 @@ When peers are registered from tmux, claude-peers stores their tmux pane id. Use
 
 ## Prompt hook install
 
-The repo includes a Codex `UserPromptSubmit` hook at `.codex/hooks.json` for sessions launched from this repo. For another repo, install without overwriting existing hooks:
+The repo includes Codex `SessionStart` and `UserPromptSubmit` hooks at `.codex/hooks.json` for sessions launched from this repo. For another repo, install without overwriting existing hooks:
 
 ```bash
 bun /home/manzo/claude-peers-mcp/bin/install-codex-hook.ts /path/to/repo
 ```
 
-The installer merges the hook into `.codex/hooks.json`, writes a timestamped backup if one already exists, and is idempotent.
+The installer merges startup registration plus inbox drain hooks into `.codex/hooks.json`, writes a timestamped backup if one already exists, and is idempotent.
 
 For Gemini CLI repos:
 
@@ -116,7 +116,7 @@ For Gemini CLI repos:
 bun /home/manzo/claude-peers-mcp/bin/install-gemini-hook.ts /path/to/repo
 ```
 
-The Gemini installer merges a `BeforeAgent` hook into `.gemini/settings.json`, preserves existing MCP server configuration, writes a timestamped backup when needed, and is idempotent.
+The Gemini installer merges `SessionStart` registration plus `BeforeAgent` inbox drain hooks into `.gemini/settings.json`, preserves existing MCP server configuration, writes a timestamped backup when needed, and is idempotent.
 
 ## Claude standby
 

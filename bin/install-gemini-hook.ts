@@ -4,15 +4,24 @@ import { dirname, resolve } from "node:path";
 
 const repo = resolve(process.argv[2] ?? process.cwd());
 const settingsPath = `${repo}/.gemini/settings.json`;
-const hookScript = resolve(import.meta.dir, "../hooks/gemini-drain-peer-inbox.sh");
+const drainHookScript = resolve(import.meta.dir, "../hooks/gemini-drain-peer-inbox.sh");
+const registerHookScript = resolve(import.meta.dir, "../hooks/gemini-register-peer-session.sh");
 const shellQuote = (value: string): string => `'${value.replace(/'/g, "'\\''")}'`;
-const command = `/usr/bin/env bash ${shellQuote(hookScript)}`;
-const entry = {
+const drainCommand = `/usr/bin/env bash ${shellQuote(drainHookScript)}`;
+const registerCommand = `/usr/bin/env bash ${shellQuote(registerHookScript)}`;
+const drainEntry = {
   name: "claude-peers-gemini-inbox",
   type: "command",
-  command,
+  command: drainCommand,
   timeout: 10000,
   description: "Drain pending claude-peers messages before each Gemini agent turn.",
+};
+const registerEntry = {
+  name: "claude-peers-gemini-register",
+  type: "command",
+  command: registerCommand,
+  timeout: 10000,
+  description: "Register this Gemini session with claude-peers at session start.",
 };
 
 type SettingsFile = {
@@ -27,34 +36,60 @@ function readExisting(): SettingsFile {
 
 const doc = readExisting();
 doc.hooks ??= {};
-doc.hooks.BeforeAgent ??= [];
 
-let replaced = false;
-for (const bucket of doc.hooks.BeforeAgent) {
-  if (!Array.isArray(bucket.hooks)) continue;
-  const nextHooks: Array<Record<string, unknown>> = [];
-  for (const hook of bucket.hooks) {
-    if (hook.name === entry.name || hook.command === command) {
-      if (!replaced) {
-        nextHooks.push(entry);
-        replaced = true;
+function upsertHook(
+  eventName: string,
+  entry: Record<string, unknown>,
+  predicate: (hook: Record<string, unknown>) => boolean,
+  bucketDefaults: Record<string, unknown> = {},
+): void {
+  doc.hooks![eventName] ??= [];
+  let replaced = false;
+  for (const bucket of doc.hooks![eventName]!) {
+    if (!Array.isArray(bucket.hooks)) continue;
+    const nextHooks: Array<Record<string, unknown>> = [];
+    for (const hook of bucket.hooks) {
+      if (predicate(hook)) {
+        if (!replaced) {
+          Object.assign(bucket, bucketDefaults);
+          nextHooks.push(entry);
+          replaced = true;
+        }
+        continue;
       }
-      continue;
+      nextHooks.push(hook);
     }
-    nextHooks.push(hook);
+    bucket.hooks = nextHooks;
   }
-  bucket.hooks = nextHooks;
+
+  if (!replaced) {
+    let bucket = doc.hooks![eventName]!.find((item) =>
+      item.matcher === (bucketDefaults.matcher ?? "*") && Array.isArray(item.hooks)
+    );
+    if (!bucket) {
+      bucket = { ...bucketDefaults, hooks: [] };
+      doc.hooks![eventName]!.push(bucket);
+    }
+    bucket.hooks ??= [];
+    bucket.hooks.push(entry);
+  }
 }
 
-if (!replaced) {
-  let bucket = doc.hooks.BeforeAgent.find((item) => item.matcher === "*" && Array.isArray(item.hooks));
-  if (!bucket) {
-    bucket = { matcher: "*", hooks: [] };
-    doc.hooks.BeforeAgent.push(bucket);
-  }
-  bucket.hooks ??= [];
-  bucket.hooks.push(entry);
-}
+upsertHook(
+  "SessionStart",
+  registerEntry,
+  (hook) => hook.name === registerEntry.name || hook.command === registerCommand ||
+    (typeof hook.command === "string" && hook.command.includes("gemini-register-peer-session.sh")),
+  { matcher: "startup|resume" },
+);
+
+upsertHook(
+  "BeforeAgent",
+  drainEntry,
+  (hook) => hook.name === drainEntry.name || hook.command === drainCommand ||
+    (typeof hook.command === "string" && hook.command.includes("gemini-drain-peer-inbox.sh")),
+  { matcher: "*" },
+);
 
 mkdirSync(dirname(settingsPath), { recursive: true });
 if (existsSync(settingsPath)) {
@@ -65,4 +100,4 @@ if (existsSync(settingsPath)) {
 const tmp = `${settingsPath}.tmp`;
 writeFileSync(tmp, `${JSON.stringify(doc, null, 2)}\n`);
 renameSync(tmp, settingsPath);
-console.log(`installed Gemini peer inbox hook: ${settingsPath}`);
+console.log(`installed Gemini peer hooks: ${settingsPath}`);

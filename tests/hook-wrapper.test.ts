@@ -16,6 +16,12 @@ console.log(JSON.stringify({
   event: process.env.CLAUDE_PEERS_HOOK_EVENT_NAME ?? null
 }));
 `);
+  writeFileSync(join(hooksDir, "register-peer-session.ts"), `
+console.log(JSON.stringify({
+  cwd: process.cwd(),
+  client: process.env.CLAUDE_PEERS_CLIENT_TYPE ?? null
+}));
+`);
   return { root, wrapper };
 }
 
@@ -59,6 +65,48 @@ describe("hook shell wrappers", () => {
       expect(payload.cwd).toBe(root);
       expect(payload.client).toBe("gemini");
       expect(payload.event).toBe("BeforeAgent");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("Codex register wrapper resolves the startup hook relative to its own install path", async () => {
+    const { root, wrapper } = makeFakeInstall("codex-register-peer-session.sh");
+    try {
+      const proc = Bun.spawn(["bash", wrapper], {
+        cwd: root,
+        env: { PATH: process.env.PATH ?? "" },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const stdout = await new Response(proc.stdout).text();
+      const stderr = await new Response(proc.stderr).text();
+      expect(await proc.exited).toBe(0);
+      expect(stderr).toBe("");
+      const payload = JSON.parse(stdout) as { cwd: string; client: string | null };
+      expect(payload.cwd).toBe(root);
+      expect(payload.client).toBeNull();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("Gemini register wrapper resolves the startup hook relative to its own install path", async () => {
+    const { root, wrapper } = makeFakeInstall("gemini-register-peer-session.sh");
+    try {
+      const proc = Bun.spawn(["bash", wrapper], {
+        cwd: root,
+        env: { PATH: process.env.PATH ?? "" },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const stdout = await new Response(proc.stdout).text();
+      const stderr = await new Response(proc.stderr).text();
+      expect(await proc.exited).toBe(0);
+      expect(stderr).toBe("");
+      const payload = JSON.parse(stdout) as { cwd: string; client: string | null };
+      expect(payload.cwd).toBe(root);
+      expect(payload.client).toBe("gemini");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

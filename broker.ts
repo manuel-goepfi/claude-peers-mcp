@@ -235,6 +235,27 @@ const insertPeer = db.prepare(`
   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
+const updatePeerRegistration = db.prepare(`
+  UPDATE peers
+  SET pid = ?,
+      cwd = ?,
+      git_root = ?,
+      absolute_git_dir = ?,
+      tty = ?,
+      name = ?,
+      resolved_name = ?,
+      tmux_session = ?,
+      tmux_window_index = ?,
+      tmux_window_name = ?,
+      tmux_pane_id = ?,
+      client_type = ?,
+      receiver_mode = ?,
+      summary = ?,
+      last_seen = ?,
+      token = ?
+  WHERE id = ?
+`);
+
 const selectPeerByToken = db.prepare(`
   SELECT id, pid, token FROM peers WHERE id = ? AND token = ?
 `);
@@ -679,11 +700,40 @@ function handleRegister(body: RegisterRequest): RegisterResult {
     }
   }
 
-  const id = inheritedId ?? generateId();
+  const clientType = validClientType(body.client_type);
+  const existing = db.query(`
+    SELECT id, token, cwd, git_root, absolute_git_dir, tty, tmux_session,
+           tmux_window_index, tmux_window_name, tmux_pane_id, client_type,
+           receiver_mode
+    FROM peers WHERE pid = ?
+  `).get(body.pid) as {
+    id: string;
+    token: string;
+    cwd: string;
+    git_root: string | null;
+    absolute_git_dir: string | null;
+    tty: string | null;
+    tmux_session: string | null;
+    tmux_window_index: string | null;
+    tmux_window_name: string | null;
+    tmux_pane_id: string | null;
+    client_type: ClientType | null;
+    receiver_mode: ReceiverMode | null;
+  } | null;
+  const samePidRefresh = Boolean(existing && inheritedId === null &&
+    existing.cwd === body.cwd &&
+    existing.git_root === body.git_root &&
+    existing.absolute_git_dir === (body.absolute_git_dir ?? null) &&
+    existing.tty === body.tty &&
+    existing.tmux_session === (body.tmux_session ?? null) &&
+    existing.tmux_window_index === (body.tmux_window_index ?? null) &&
+    existing.tmux_window_name === (body.tmux_window_name ?? null) &&
+    existing.tmux_pane_id === (body.tmux_pane_id ?? null) &&
+    (!existing.client_type || existing.client_type === "unknown" || existing.client_type === clientType));
+  const id = inheritedId ?? (samePidRefresh ? existing!.id : null) ?? generateId();
 
   // Existing PID-dedup: a live peer re-registering must replace its own row.
   // Guarded against clobbering the inherited row we just re-created above.
-  const existing = db.query("SELECT id FROM peers WHERE pid = ?").get(body.pid) as { id: string } | null;
   if (existing && existing.id !== id) {
     deletePeer.run(existing.id);
     buckets.delete(existing.id);
@@ -693,13 +743,23 @@ function handleRegister(body: RegisterRequest): RegisterResult {
   // a broker-unique resolved_name for diagnostics and exact process identity.
   const requestedName = body.name ?? null;
   const finalName = disambiguateName(requestedName, id);
-  const clientType = validClientType(body.client_type);
-  const receiverMode = initialReceiverModeFromRegistration(body.receiver_mode, clientType);
+  let receiverMode = initialReceiverModeFromRegistration(body.receiver_mode, clientType);
+  if (existing?.id === id && receiverMode === "manual-drain") {
+    const currentMode = validReceiverMode(existing.receiver_mode, clientType);
+    if ((clientType === "codex" && currentMode === "codex-hook") || (clientType === "gemini" && currentMode === "gemini-hook")) {
+      receiverMode = currentMode;
+    }
+  }
   if (requestedName && finalName !== requestedName) {
     console.error(`[broker] name dedup: pid=${body.pid} requested="${requestedName}" resolved="${finalName}" (collision)`);
   }
-  insertPeer.run(id, body.pid, body.cwd, body.git_root, body.absolute_git_dir ?? null, body.tty, requestedName, finalName, body.tmux_session ?? null, body.tmux_window_index ?? null, body.tmux_window_name ?? null, body.tmux_pane_id ?? null, clientType, receiverMode, body.summary, now, now, token);
-  return { ok: true, value: { id, token, name: requestedName, resolved_name: finalName, client_type: clientType, receiver_mode: receiverMode } };
+  const issuedToken = existing?.id === id && body.preserve_token ? existing.token : token;
+  if (existing?.id === id) {
+    updatePeerRegistration.run(body.pid, body.cwd, body.git_root, body.absolute_git_dir ?? null, body.tty, requestedName, finalName, body.tmux_session ?? null, body.tmux_window_index ?? null, body.tmux_window_name ?? null, body.tmux_pane_id ?? null, clientType, receiverMode, body.summary, now, issuedToken, id);
+  } else {
+    insertPeer.run(id, body.pid, body.cwd, body.git_root, body.absolute_git_dir ?? null, body.tty, requestedName, finalName, body.tmux_session ?? null, body.tmux_window_index ?? null, body.tmux_window_name ?? null, body.tmux_pane_id ?? null, clientType, receiverMode, body.summary, now, now, issuedToken);
+  }
+  return { ok: true, value: { id, token: issuedToken, name: requestedName, resolved_name: finalName, client_type: clientType, receiver_mode: receiverMode } };
 }
 
 function handleHeartbeat(body: HeartbeatRequest): void {

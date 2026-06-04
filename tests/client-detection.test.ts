@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
-import { findMcpPidFromTable } from "../hooks/codex-drain-peer-inbox.ts";
+import { findClientPidFromTable, findHookPeerPidsFromTable, findMcpPidFromTable } from "../hooks/codex-drain-peer-inbox.ts";
 import { detectClientFromProcessChain, initialReceiverMode, type ProcessInfo } from "../shared/client.ts";
 
 function table(rows: ProcessInfo[]): Map<number, ProcessInfo> {
@@ -79,6 +79,26 @@ describe("client detection", () => {
     expect(pid).toBe(20);
   });
 
+  test("Codex hook prefers the CLI process as the registered peer pid", () => {
+    const processes = new Map([
+      [10, { pid: 10, ppid: 1, comm: "codex", args: "codex" }],
+      [20, { pid: 20, ppid: 10, comm: "bun", args: "bun /home/manzo/claude-peers-mcp/server.ts" }],
+      [30, { pid: 30, ppid: 10, comm: "bun", args: "bun hooks/codex-drain-peer-inbox.ts" }],
+    ]);
+    const pid = findClientPidFromTable(processes, 30, "codex");
+    expect(pid).toBe(10);
+  });
+
+  test("Codex hook uses client PID first even when legacy MCP env PID is set", () => {
+    const processes = new Map([
+      [10, { pid: 10, ppid: 1, comm: "codex", args: "codex" }],
+      [20, { pid: 20, ppid: 10, comm: "bun", args: "bun /home/manzo/claude-peers-mcp/server.ts" }],
+      [30, { pid: 30, ppid: 10, comm: "bun", args: "bun hooks/codex-drain-peer-inbox.ts" }],
+    ]);
+    const pids = findHookPeerPidsFromTable(processes, 30, "/repo", (candidate) => candidate === 20 ? "/repo" : "/other", "codex", 20);
+    expect(pids).toEqual({ primary: 10, fallback: 20 });
+  });
+
   test("Gemini hook discovers the MCP server from process ancestry without env PID", () => {
     const processes = new Map([
       [10, { pid: 10, ppid: 1, comm: "gemini", args: "gemini" }],
@@ -87,6 +107,16 @@ describe("client detection", () => {
     ]);
     const pid = findMcpPidFromTable(processes, 10, "/repo", (candidate) => candidate === 20 ? "/repo" : "/other", "gemini");
     expect(pid).toBe(20);
+  });
+
+  test("Gemini hook prefers the CLI process as the registered peer pid", () => {
+    const processes = new Map([
+      [10, { pid: 10, ppid: 1, comm: "gemini", args: "gemini" }],
+      [20, { pid: 20, ppid: 10, comm: "bun", args: "bun /home/manzo/claude-peers-mcp/server.ts" }],
+      [30, { pid: 30, ppid: 10, comm: "bash", args: "bash /home/manzo/claude-peers-mcp/hooks/gemini-drain-peer-inbox.sh" }],
+    ]);
+    const pid = findClientPidFromTable(processes, 30, "gemini");
+    expect(pid).toBe(10);
   });
 
   test("Gemini hook process name is not mistaken for the Gemini CLI ancestor", () => {

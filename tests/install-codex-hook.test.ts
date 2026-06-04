@@ -5,7 +5,8 @@ import { join } from "node:path";
 
 const installer = new URL("../bin/install-codex-hook.ts", import.meta.url).pathname;
 const shellQuote = (value: string): string => `'${value.replace(/'/g, "'\\''")}'`;
-const expectedCommand = `/usr/bin/env bash ${shellQuote(new URL("../hooks/codex-drain-peer-inbox.sh", import.meta.url).pathname)}`;
+const expectedDrainCommand = `/usr/bin/env bash ${shellQuote(new URL("../hooks/codex-drain-peer-inbox.sh", import.meta.url).pathname)}`;
+const expectedRegisterCommand = `/usr/bin/env bash ${shellQuote(new URL("../hooks/codex-register-peer-session.sh", import.meta.url).pathname)}`;
 
 describe("Codex hook installer", () => {
   test("merges into existing hooks and remains idempotent", async () => {
@@ -37,14 +38,23 @@ describe("Codex hook installer", () => {
       }
 
       const doc = JSON.parse(readFileSync(hooksPath, "utf8")) as {
-        hooks: { UserPromptSubmit: Array<{ hooks: Array<{ command: string; name?: string; timeout?: number }> }> };
+        hooks: {
+          SessionStart: Array<{ matcher?: string; hooks: Array<{ command: string; name?: string; timeout?: number }> }>;
+          UserPromptSubmit: Array<{ hooks: Array<{ command: string; name?: string; timeout?: number }> }>;
+        };
       };
       const hooks = doc.hooks.UserPromptSubmit.flatMap((bucket) => bucket.hooks);
       const commands = hooks.map((hook) => hook.command);
       expect(commands).toContain("/usr/bin/env bash existing-rule-router.sh");
-      expect(commands.filter((command) => command === expectedCommand).length).toBe(1);
-      expect(hooks.find((hook) => hook.command === expectedCommand)?.name).toBe("claude-peers-codex-inbox");
-      expect(hooks.find((hook) => hook.command === expectedCommand)?.timeout).toBe(10);
+      expect(commands.filter((command) => command === expectedDrainCommand).length).toBe(1);
+      expect(hooks.find((hook) => hook.command === expectedDrainCommand)?.name).toBe("claude-peers-codex-inbox");
+      expect(hooks.find((hook) => hook.command === expectedDrainCommand)?.timeout).toBe(10);
+
+      const startupHooks = doc.hooks.SessionStart.flatMap((bucket) => bucket.hooks);
+      expect(doc.hooks.SessionStart[0]?.matcher).toBe("startup|resume");
+      expect(startupHooks.filter((hook) => hook.command === expectedRegisterCommand)).toHaveLength(1);
+      expect(startupHooks.find((hook) => hook.command === expectedRegisterCommand)?.name).toBe("claude-peers-codex-register");
+      expect(startupHooks.find((hook) => hook.command === expectedRegisterCommand)?.timeout).toBe(10);
     } finally {
       rmSync(repo, { recursive: true, force: true });
     }
@@ -87,7 +97,7 @@ describe("Codex hook installer", () => {
                 {
                   name: "claude-peers-codex-inbox",
                   type: "command",
-                  command: expectedCommand,
+                  command: expectedDrainCommand,
                   timeout: 10,
                 },
               ],
@@ -107,9 +117,48 @@ describe("Codex hook installer", () => {
       const hooks = doc.hooks.UserPromptSubmit.flatMap((bucket) => bucket.hooks);
       const peerHooks = hooks.filter((hook) => hook.command.includes("codex-drain-peer-inbox.sh"));
       expect(peerHooks).toHaveLength(1);
-      expect(peerHooks[0]?.command).toBe(expectedCommand);
+      expect(peerHooks[0]?.command).toBe(expectedDrainCommand);
       expect(peerHooks[0]?.name).toBe("claude-peers-codex-inbox");
       expect(peerHooks[0]?.timeout).toBe(10);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  test("normalizes an existing startup-only register bucket to startup and resume", async () => {
+    const repo = mkdtempSync(join(tmpdir(), "claude-peers-install-register-"));
+    try {
+      const hooksPath = join(repo, ".codex", "hooks.json");
+      mkdirSync(join(repo, ".codex"), { recursive: true });
+      await Bun.write(hooksPath, JSON.stringify({
+        hooks: {
+          SessionStart: [
+            {
+              matcher: "startup",
+              hooks: [
+                {
+                  name: "claude-peers-codex-register",
+                  type: "command",
+                  command: "/usr/bin/env bash /old/hooks/codex-register-peer-session.sh",
+                  timeout: 10,
+                },
+              ],
+            },
+          ],
+        },
+      }, null, 2));
+
+      const proc = Bun.spawn(["bun", installer, repo], { stdout: "ignore", stderr: "pipe" });
+      const stderr = await new Response(proc.stderr).text();
+      expect(await proc.exited).toBe(0);
+      expect(stderr).toBe("");
+
+      const doc = JSON.parse(readFileSync(hooksPath, "utf8")) as {
+        hooks: { SessionStart: Array<{ matcher?: string; hooks: Array<{ command: string }> }> };
+      };
+      expect(doc.hooks.SessionStart).toHaveLength(1);
+      expect(doc.hooks.SessionStart[0]?.matcher).toBe("startup|resume");
+      expect(doc.hooks.SessionStart[0]?.hooks.map((hook) => hook.command)).toEqual([expectedRegisterCommand]);
     } finally {
       rmSync(repo, { recursive: true, force: true });
     }

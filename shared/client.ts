@@ -33,6 +33,31 @@ function hasGeminiCliLauncher(args: string): boolean {
   });
 }
 
+export function isClientProcess(row: ProcessInfo, clientType: Exclude<ClientType, "unknown">): boolean {
+  const comm = commandName(row.comm);
+  const firstArg = commandName(row.args);
+  if (clientType === "claude") return comm === "claude" || firstArg === "claude";
+  if (comm === clientType || comm.startsWith(`${clientType}-`)) return true;
+  if (firstArg === clientType || firstArg.startsWith(`${clientType}-`)) return true;
+  return clientType === "gemini" && (comm === "node" || comm === "bun" || comm === "npx") && hasGeminiCliLauncher(row.args);
+}
+
+export function findClientPidFromProcessChain(
+  startPid: number,
+  processes: Map<number, ProcessInfo>,
+  clientType: Exclude<ClientType, "unknown">,
+): number | null {
+  let current = startPid;
+  for (let i = 0; i < 30; i++) {
+    const p = processes.get(current);
+    if (!p) break;
+    if (isClientProcess(p, clientType)) return p.pid;
+    if (p.ppid <= 1 || p.ppid === current) break;
+    current = p.ppid;
+  }
+  return null;
+}
+
 export function detectClientFromProcessChain(
   startPid: number,
   processes: Map<number, ProcessInfo>,
@@ -45,15 +70,9 @@ export function detectClientFromProcessChain(
   for (let i = 0; i < 30; i++) {
     const p = processes.get(current);
     if (!p) break;
-    const comm = commandName(p.comm);
-    if (comm === "codex" || comm.startsWith("codex-")) return "codex";
-    if (comm === "gemini" || comm.startsWith("gemini-")) return "gemini";
-    if (comm === "claude") return "claude";
-    const firstArg = commandName(p.args);
-    if (firstArg === "codex" || firstArg.startsWith("codex-")) return "codex";
-    if (firstArg === "gemini" || firstArg.startsWith("gemini-")) return "gemini";
-    if (firstArg === "claude") return "claude";
-    if ((comm === "node" || comm === "bun" || comm === "npx") && hasGeminiCliLauncher(p.args)) return "gemini";
+    if (isClientProcess(p, "codex")) return "codex";
+    if (isClientProcess(p, "gemini")) return "gemini";
+    if (isClientProcess(p, "claude")) return "claude";
     if (p.ppid <= 1 || p.ppid === current) break;
     current = p.ppid;
   }

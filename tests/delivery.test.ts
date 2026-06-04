@@ -1164,6 +1164,97 @@ describe("Live broker delivery features", () => {
     child.kill();
   });
 
+  test("/register: same live PID preserves peer id and queued mail", async () => {
+    const child = spawnSleep();
+    const first = await brokerFetch<{ id: string; token: string }>("/register", {
+      pid: child.pid, cwd: "/same-pid-register", git_root: null, tty: null,
+      name: "codex-startup", tmux_session: "auto-reg", tmux_window_index: "0",
+      tmux_window_name: "codex", client_type: "codex", receiver_mode: "manual-drain", summary: "",
+    });
+    await brokerFetch("/send-message", {
+      from_id: first.id,
+      to_id: first.id,
+      text: "survives same-pid register",
+    });
+    const second = await brokerFetch<{ id: string; token: string; name: string }>("/register", {
+      pid: child.pid, cwd: "/same-pid-register", git_root: null, tty: null,
+      name: "codex-server", tmux_session: "auto-reg", tmux_window_index: "0",
+      tmux_window_name: "codex", client_type: "codex", receiver_mode: "manual-drain", summary: "server pass",
+    });
+
+    expect(second.id).toBe(first.id);
+    expect(second.token).not.toBe(first.token);
+    expect(second.name).toBe("codex-server");
+
+    const poll = await brokerFetch<{ messages: { text: string }[] }>("/poll-messages", { id: first.id });
+    expect(poll.messages.map((m) => m.text)).toContain("survives same-pid register");
+    child.kill();
+  });
+
+  test("/register: hook metadata refresh preserves an existing same-PID token", async () => {
+    const child = spawnSleep();
+    const first = await brokerFetch<{ id: string; token: string }>("/register", {
+      pid: child.pid, cwd: "/same-pid-preserve-token", git_root: null, tty: null,
+      name: "codex-server", tmux_session: "auto-reg-token", tmux_window_index: "0",
+      tmux_window_name: "codex", client_type: "codex", receiver_mode: "manual-drain", summary: "server pass",
+    });
+    const second = await brokerFetch<{ id: string; token: string }>("/register", {
+      pid: child.pid, cwd: "/same-pid-preserve-token", git_root: null, tty: null,
+      name: "codex-startup", tmux_session: "auto-reg-token", tmux_window_index: "0",
+      tmux_window_name: "codex", client_type: "codex", receiver_mode: "codex-hook", preserve_token: true,
+      summary: "startup pass",
+    });
+
+    expect(second.id).toBe(first.id);
+    expect(second.token).toBe(first.token);
+    child.kill();
+  });
+
+  test("/register: same PID with different stable identity gets a fresh peer id", async () => {
+    const child = spawnSleep();
+    const first = await brokerFetch<{ id: string }>("/register", {
+      pid: child.pid, cwd: "/pid-reuse-old", git_root: null, tty: null,
+      name: "old-session", tmux_session: "reuse", tmux_window_index: "0",
+      tmux_window_name: "old", client_type: "codex", receiver_mode: "manual-drain", summary: "",
+    });
+    const second = await brokerFetch<{ id: string }>("/register", {
+      pid: child.pid, cwd: "/pid-reuse-new", git_root: null, tty: null,
+      name: "new-session", tmux_session: "reuse", tmux_window_index: "0",
+      tmux_window_name: "new", client_type: "codex", receiver_mode: "manual-drain", summary: "",
+    });
+
+    expect(second.id).not.toBe(first.id);
+    child.kill();
+  });
+
+  test("/register: same-PID MCP refresh preserves proven hook receiver mode", async () => {
+    const child = spawnSleep();
+    const first = await brokerFetch<{ id: string }>("/register", {
+      pid: child.pid, cwd: "/same-pid-preserve-mode", git_root: null, tty: null,
+      name: "codex-startup", tmux_session: "auto-reg-mode", tmux_window_index: "0",
+      tmux_window_name: "codex", client_type: "codex", receiver_mode: "codex-hook",
+      preserve_token: true, summary: "startup pass",
+    });
+    await brokerFetch("/hook-heartbeat-by-pid", {
+      pid: child.pid,
+      caller_pid: process.pid,
+      client_type: "codex",
+      receiver_mode: "codex-hook",
+      status: "ok",
+      drained: 0,
+    });
+    const second = await brokerFetch<{ id: string; receiver_mode: string }>("/register", {
+      pid: child.pid, cwd: "/same-pid-preserve-mode", git_root: null, tty: null,
+      name: "codex-server", tmux_session: "auto-reg-mode", tmux_window_index: "0",
+      tmux_window_name: "codex", client_type: "codex", receiver_mode: "manual-drain",
+      summary: "server pass",
+    });
+
+    expect(second.id).toBe(first.id);
+    expect(second.receiver_mode).toBe("codex-hook");
+    child.kill();
+  });
+
   test("heartbeat backfills client metadata without downgrading codex-hook", async () => {
     const child = spawnSleep();
     const peer = await brokerFetch<{ id: string }>("/register", {
@@ -1748,14 +1839,15 @@ describe("Live broker delivery features", () => {
       tmux_window_name: "claude", summary: "",
     });
     // Re-register with the same pid AND same location. Expected behavior:
-    // the existing-PID dedup deletes the old row, a FRESH id is generated,
-    // no rehydration occurs (the query excludes `pid = body.pid`).
+    // the existing-PID path updates the row in place, preserving the peer ID
+    // and any queued messages; no rehydration occurs because the query excludes
+    // `pid = body.pid`.
     const second = await brokerFetch<{ id: string }>("/register", {
       pid: p.pid, cwd: "/rehydrate-m5", git_root: null, tty: null,
       name: "self-again", tmux_session: "rh-m5", tmux_window_index: "0",
       tmux_window_name: "claude", summary: "",
     });
-    expect(second.id).not.toBe(first.id);  // fresh id, not inherited
+    expect(second.id).toBe(first.id);
     // Exactly one row for this pid
     const ro = new Database(TEST_DB, { readonly: true });
     const count = (ro.query("SELECT COUNT(*) AS n FROM peers WHERE pid = ?").get(p.pid) as { n: number }).n;
