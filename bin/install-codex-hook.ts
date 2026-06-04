@@ -32,7 +32,8 @@ type HookFile = {
 
 function isPeerInboxHook(hook: Record<string, unknown>): boolean {
   return hook.name === drainName || hook.command === drainCommand ||
-    (typeof hook.command === "string" && hook.command.includes("codex-drain-peer-inbox.sh"));
+    (typeof hook.command === "string" &&
+      (hook.command.includes("codex-drain-peer-inbox.sh") || hook.command.includes("codex-drain-peer-inbox-safe.sh")));
 }
 
 function isPeerRegisterHook(hook: Record<string, unknown>): boolean {

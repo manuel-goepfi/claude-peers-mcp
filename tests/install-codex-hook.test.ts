@@ -125,6 +125,56 @@ describe("Codex hook installer", () => {
     }
   });
 
+  test("treats local safe wrapper as the same peer inbox hook", async () => {
+    const repo = mkdtempSync(join(tmpdir(), "claude-peers-install-safe-"));
+    try {
+      const hooksPath = join(repo, ".codex", "hooks.json");
+      mkdirSync(join(repo, ".codex"), { recursive: true });
+      await Bun.write(hooksPath, JSON.stringify({
+        hooks: {
+          UserPromptSubmit: [
+            {
+              hooks: [
+                {
+                  type: "command",
+                  command: "/usr/bin/env bash \"$(git rev-parse --show-toplevel)/.codex/hooks/codex-drain-peer-inbox-safe.sh\"",
+                  timeout: 10,
+                },
+              ],
+            },
+            {
+              hooks: [
+                {
+                  name: "claude-peers-codex-inbox",
+                  type: "command",
+                  command: expectedDrainCommand,
+                  timeout: 10,
+                },
+              ],
+            },
+          ],
+        },
+      }, null, 2));
+
+      const proc = Bun.spawn(["bun", installer, repo], { stdout: "ignore", stderr: "pipe" });
+      const stderr = await new Response(proc.stderr).text();
+      expect(await proc.exited).toBe(0);
+      expect(stderr).toBe("");
+
+      const doc = JSON.parse(readFileSync(hooksPath, "utf8")) as {
+        hooks: { UserPromptSubmit: Array<{ hooks: Array<{ command: string; name?: string }> }> };
+      };
+      const peerHooks = doc.hooks.UserPromptSubmit
+        .flatMap((bucket) => bucket.hooks)
+        .filter((hook) => hook.command.includes("codex-drain-peer-inbox"));
+      expect(peerHooks).toHaveLength(1);
+      expect(peerHooks[0]?.command).toBe(expectedDrainCommand);
+      expect(peerHooks[0]?.name).toBe("claude-peers-codex-inbox");
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
   test("normalizes an existing startup-only register bucket to startup and resume", async () => {
     const repo = mkdtempSync(join(tmpdir(), "claude-peers-install-register-"));
     try {
