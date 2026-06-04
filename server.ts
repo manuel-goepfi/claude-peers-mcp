@@ -35,6 +35,7 @@ import type {
   ClientType,
   ReceiverMode,
   SendMessageResponse,
+  TmuxPaneSnapshot,
 } from "./shared/types.ts";
 import { detectClientFromProcessChain, initialReceiverMode, type ProcessInfo } from "./shared/client.ts";
 import { frameUntrusted, renderInboundLine } from "./shared/render.ts";
@@ -44,7 +45,7 @@ import {
   getGitBranch,
   getRecentFiles,
 } from "./shared/summarize.ts";
-import { parseTmuxPanes, parsePsTree, composeTmuxFromEnv, type TmuxPaneInfo } from "./shared/tmux.ts";
+import { parseTmuxPanes, parsePsTree, composeTmuxFromEnv, prepareTmuxPaneText, tmuxPaneTarget, type TmuxPaneInfo } from "./shared/tmux.ts";
 
 // --- Configuration ---
 
@@ -55,6 +56,9 @@ const HEARTBEAT_INTERVAL_MS = 15_000;
 const BROKER_SCRIPT = new URL("./broker.ts", import.meta.url).pathname;
 const BROKER_LOG = `${process.env.HOME}/.claude-peers-broker.log`;
 const BROKER_LOG_MAX_BYTES = 10 * 1024 * 1024; // 10MB
+const TMUX_CAPTURE_DEFAULT_LINES = 80;
+const TMUX_CAPTURE_MAX_LINES = 200;
+const TMUX_CAPTURE_MAX_BYTES = 8 * 1024;
 
 // --- Broker communication ---
 
@@ -640,6 +644,67 @@ function sendStatusHint(target: SendMessageResponse["target"] | undefined, deliv
   return " Still queued; receiver mode is unknown, so manual check_messages may be required.";
 }
 
+function clampTmuxLineCount(value: unknown): number {
+  const parsed = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(parsed)) return TMUX_CAPTURE_DEFAULT_LINES;
+  return Math.max(1, Math.min(TMUX_CAPTURE_MAX_LINES, Math.floor(parsed)));
+}
+
+async function findPeerById(peerId: string): Promise<Peer | null> {
+  const peers = await brokerFetch<Peer[]>("/list-peers", {
+    id: myId,
+    scope: "machine" as const,
+    cwd: myCwd,
+    git_root: myGitRoot,
+    absolute_git_dir: myAbsoluteGitDir,
+    include_inactive: false,
+  });
+  return peers.find((p) => p.id === peerId) ?? null;
+}
+
+async function inspectPeerPane(peerId: string, lineCount = TMUX_CAPTURE_DEFAULT_LINES): Promise<TmuxPaneSnapshot> {
+  const peer = await findPeerById(peerId);
+  if (!peer) return { ok: false, peer_id: peerId, error: `Peer ${peerId} not found or inactive` };
+
+  const target = tmuxPaneTarget(peer);
+  if (!target) return { ok: false, peer_id: peerId, error: `Peer ${peerId} has no tmux pane metadata` };
+
+  const requestedLines = clampTmuxLineCount(lineCount);
+  const proc = Bun.spawnSync(["tmux", "capture-pane", "-p", "-t", target, "-S", `-${requestedLines}`], {
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  if (proc.exitCode !== 0) {
+    const stderr = prepareTmuxPaneText(new TextDecoder().decode(proc.stderr), 2048).text.trim();
+    return {
+      ok: false,
+      peer_id: peerId,
+      target,
+      error: stderr.length > 0 ? `tmux capture failed: ${stderr}` : `tmux capture failed with exit ${proc.exitCode}`,
+    };
+  }
+
+  const prepared = prepareTmuxPaneText(new TextDecoder().decode(proc.stdout), TMUX_CAPTURE_MAX_BYTES);
+  return {
+    ok: true,
+    peer_id: peerId,
+    target,
+    line_count: prepared.line_count,
+    byte_count: prepared.byte_count,
+    truncated: prepared.truncated,
+    text: prepared.text,
+  };
+}
+
+function formatTmuxSnapshot(snapshot: TmuxPaneSnapshot): string {
+  if (!snapshot.ok) return `Tmux context unavailable: ${snapshot.error ?? "unknown error"}`;
+  const suffix = snapshot.truncated ? " truncated" : "";
+  return [
+    `Tmux context from ${snapshot.target} (${snapshot.line_count ?? 0} line(s), ${snapshot.byte_count ?? 0} byte(s)${suffix}):`,
+    snapshot.text && snapshot.text.length > 0 ? snapshot.text : "[empty pane]",
+  ].join("\n");
+}
+
 // --- MCP Server ---
 
 const mcp = new Server(
@@ -692,8 +757,32 @@ const TOOLS = [
           type: "string" as const,
           description: "The message to send",
         },
+        include_tmux_context: {
+          type: "boolean" as const,
+          description:
+            "Optional. When true, read the target peer's tmux pane before sending and include the read-only snapshot in this tool result. This never writes to tmux or modifies the message body.",
+        },
       },
       required: ["to_id", "message"],
+    },
+  },
+  {
+    name: "inspect_peer_pane",
+    description:
+      "Read the last lines from a peer's tmux pane. Read-only: uses tmux capture-pane, never send-keys, and never writes to the target pane.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        peer_id: {
+          type: "string" as const,
+          description: "The peer ID whose tmux pane should be inspected",
+        },
+        line_count: {
+          type: "number" as const,
+          description: "Optional number of lines to capture, clamped to 1-200. Default 80.",
+        },
+      },
+      required: ["peer_id"],
     },
   },
   {
@@ -883,7 +972,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     case "send_message": {
-      const { to_id, message } = args as { to_id: string; message: string };
+      const { to_id, message, include_tmux_context } = args as {
+        to_id: string;
+        message: string;
+        include_tmux_context?: boolean;
+      };
       if (!myId) {
         return {
           content: [{ type: "text" as const, text: "Not registered with broker yet" }],
@@ -891,6 +984,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         };
       }
       try {
+        const tmuxSnapshot = include_tmux_context === true ? await inspectPeerPane(to_id) : null;
         const result = await brokerFetch<SendMessageResponse>("/send-message", {
           from_id: myId,
           to_id,
@@ -928,8 +1022,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         }
 
         const pending = await drainPendingMessages();
+        const tmuxText = tmuxSnapshot ? `\n\n${formatTmuxSnapshot(tmuxSnapshot)}` : "";
         return {
-          content: [{ type: "text" as const, text: `Message sent to peer ${to_id}.${statusLine}${pending ?? ""}` }],
+          content: [{ type: "text" as const, text: `Message sent to peer ${to_id}.${statusLine}${tmuxText}${pending ?? ""}` }],
         };
       } catch (e) {
         return {
@@ -939,6 +1034,29 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
               text: `Error sending message: ${e instanceof Error ? e.message : String(e)}`,
             },
           ],
+          isError: true,
+        };
+      }
+    }
+
+    case "inspect_peer_pane": {
+      const { peer_id, line_count } = args as { peer_id: string; line_count?: number };
+      if (!myId) {
+        return {
+          content: [{ type: "text" as const, text: "Not registered with broker yet" }],
+          isError: true,
+        };
+      }
+      try {
+        const snapshot = await inspectPeerPane(peer_id, clampTmuxLineCount(line_count));
+        const pending = await drainPendingMessages();
+        return {
+          content: [{ type: "text" as const, text: `${formatTmuxSnapshot(snapshot)}${pending ?? ""}` }],
+          isError: !snapshot.ok,
+        };
+      } catch (e) {
+        return {
+          content: [{ type: "text" as const, text: `Error inspecting tmux pane: ${errMsg(e)}` }],
           isError: true,
         };
       }

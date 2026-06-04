@@ -140,6 +140,17 @@ export interface SendMessageResponse {
   };
 }
 
+export interface TmuxPaneSnapshot {
+  ok: boolean;
+  peer_id: PeerId;
+  target?: string;
+  line_count?: number;
+  byte_count?: number;
+  truncated?: boolean;
+  text?: string;
+  error?: string;
+}
+
 // /broadcast-message — fanout send by scope. At least one filter is required
 // to avoid unbounded global broadcast. Filters AND together.
 export interface BroadcastRequest {

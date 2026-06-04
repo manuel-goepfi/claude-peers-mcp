@@ -61,6 +61,7 @@ Claude peers receive through the MCP poll buffer, tool-response piggyback, `chec
 | `send_message`   | Send a message to another peer by ID                                           |
 | `set_summary`    | Describe what you're working on (visible to other peers)                       |
 | `check_messages` | Manually check for messages (fallback and Codex-without-hook path)             |
+| `inspect_peer_pane` | Read the last lines from a peer's tmux pane without writing to it           |
 
 ## Delivery matrix
 
@@ -92,6 +93,12 @@ The broker is the only queue and delivery authority. Hooks and standby watchers 
 ```
 
 The broker auto-launches when the first session starts. It cleans up dead peers automatically. Everything is localhost-only.
+
+## Read-only tmux context
+
+When peers are registered from tmux, claude-peers stores their tmux pane id. Use `inspect_peer_pane` to read the last lines from that pane before deciding whether to interrupt or route work there. The tool is read-only: it uses `tmux capture-pane`, strips terminal control sequences, caps output to 8 KB, and never calls `send-keys`.
+
+`send_message` also accepts `include_tmux_context: true`. That captures the target pane before sending and returns the snapshot alongside the send result. The captured text is not inserted into the broker message body.
 
 ## Prompt hook install
 

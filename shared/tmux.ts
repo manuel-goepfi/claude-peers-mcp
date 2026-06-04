@@ -126,6 +126,44 @@ export function composeTmuxFromEnv(
   return info;
 }
 
+export function tmuxPaneTarget(peer: {
+  tmux_session?: string | null;
+  tmux_window_index?: string | null;
+  tmux_pane_id?: string | null;
+}): string | null {
+  if (peer.tmux_pane_id && peer.tmux_pane_id.length > 0) return peer.tmux_pane_id;
+  if (peer.tmux_session && peer.tmux_window_index) return `${peer.tmux_session}:${peer.tmux_window_index}`;
+  return null;
+}
+
+function truncateUtf8(text: string, maxBytes: number): { text: string; byte_count: number; truncated: boolean } {
+  const encoder = new TextEncoder();
+  let out = "";
+  let bytes = 0;
+  for (const ch of text) {
+    const size = encoder.encode(ch).length;
+    if (bytes + size > maxBytes) {
+      return { text: out, byte_count: bytes, truncated: true };
+    }
+    out += ch;
+    bytes += size;
+  }
+  return { text: out, byte_count: bytes, truncated: false };
+}
+
+export function prepareTmuxPaneText(
+  raw: string,
+  maxBytes: number,
+): { text: string; byte_count: number; line_count: number; truncated: boolean } {
+  const withoutAnsi = raw
+    .replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "")
+    .replace(/\x1B[@-Z\\-_]/g, "")
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g, "");
+  const limited = truncateUtf8(withoutAnsi, maxBytes);
+  const line_count = limited.text.length === 0 ? 0 : limited.text.split("\n").length;
+  return { ...limited, line_count };
+}
+
 /**
  * Parse output of `ps -eo pid,ppid` into a pid → ppid map.
  * Skips the header line; tolerates extra whitespace.
