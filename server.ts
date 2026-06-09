@@ -30,6 +30,7 @@ import type {
   PeerId,
   Peer,
   RegisterResponse,
+  HeartbeatResponse,
   PollMessagesResponse,
   Message,
   ClientType,
@@ -77,9 +78,40 @@ let reregisterInFlight: Promise<void> | null = null;
 // reregister-after-unregister "resurrection" races during shutdown.
 let shuttingDown = false;
 
+const PEER_ID_BODY_PATHS = new Set([
+  "/heartbeat",
+  "/set-summary",
+  "/set-name",
+  "/list-peers",
+  "/poll-messages",
+  "/ack-messages",
+  "/message-status",
+]);
+
+export function rewriteAuthBodyForPeer(path: string, body: unknown, oldPeerId: string | null, newPeerId: string | null): unknown {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return body;
+  const next = { ...(body as Record<string, unknown>) };
+  if (PEER_ID_BODY_PATHS.has(path) && next.id === oldPeerId) next.id = newPeerId;
+  if (next.from_id === oldPeerId) next.from_id = newPeerId;
+  if (next.exclude_id === oldPeerId) next.exclude_id = newPeerId;
+  if (next.to_id === oldPeerId) next.to_id = newPeerId;
+  if (next.selector && typeof next.selector === "object" && !Array.isArray(next.selector)) {
+    const selector = { ...(next.selector as Record<string, unknown>) };
+    if (selector.id === oldPeerId) selector.id = newPeerId;
+    next.selector = selector;
+  }
+  return next;
+}
+
+export function shouldDisableBackgroundPolling(clientType: ClientType, receiverMode: ReceiverMode): boolean {
+  return clientType === "codex" || clientType === "gemini" || receiverMode === "codex-hook" || receiverMode === "gemini-hook";
+}
+
 async function brokerFetch<T>(path: string, body: unknown, _retry = false): Promise<T> {
+  const attemptPeerId = myId;
+  const attemptToken = myToken;
   const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (myToken) headers["X-Peer-Token"] = myToken;
+  if (attemptToken) headers["X-Peer-Token"] = attemptToken;
   const res = await fetch(`${BROKER_URL}${path}`, {
     method: "POST",
     headers,
@@ -93,17 +125,17 @@ async function brokerFetch<T>(path: string, body: unknown, _retry = false): Prom
     // 401 path context — the previous code threw the raw register error, which
     // looked unrelated to the call that triggered recovery.
     log(`Broker returned 401 on ${path} — re-registering`);
-    if (!reregisterInFlight) {
+    if (myId === attemptPeerId && !reregisterInFlight) {
       reregisterInFlight = (async () => {
         try { await reregisterPeer(); } finally { reregisterInFlight = null; }
       })();
     }
     try {
-      await reregisterInFlight;
+      if (reregisterInFlight) await reregisterInFlight;
     } catch (e) {
       throw new Error(`Broker auth recovery failed during ${path}: ${e instanceof Error ? e.message : String(e)} (original request was rejected with 401)`);
     }
-    return brokerFetch<T>(path, body, true);
+    return brokerFetch<T>(path, rewriteAuthBodyForPeer(path, body, attemptPeerId, myId), true);
   }
   if (!res.ok) {
     const err = await res.text();
@@ -117,6 +149,24 @@ async function brokerFetch<T>(path: string, body: unknown, _retry = false): Prom
 let reregisterPeer: () => Promise<void> = async () => {
   throw new Error("reregisterPeer called before main() completed initial registration");
 };
+
+export function __testSetBrokerAuthStateForTest(state: {
+  id?: PeerId | null;
+  token?: string | null;
+  shuttingDown?: boolean;
+  reregisterPeer?: () => Promise<void>;
+  resetInFlight?: boolean;
+}): void {
+  if ("id" in state) myId = state.id ?? null;
+  if ("token" in state) myToken = state.token ?? null;
+  if ("shuttingDown" in state) shuttingDown = Boolean(state.shuttingDown);
+  if (state.reregisterPeer) reregisterPeer = state.reregisterPeer;
+  if (state.resetInFlight !== false) reregisterInFlight = null;
+}
+
+export async function __testBrokerFetchForTest<T>(path: string, body: unknown): Promise<T> {
+  return brokerFetch<T>(path, body);
+}
 
 async function isBrokerAlive(): Promise<boolean> {
   try {
@@ -403,6 +453,7 @@ let myClientType: ClientType = "unknown";
 let myReceiverMode: ReceiverMode = "unknown";
 let myRegisterPid = process.pid;
 let myTmuxInfo: TmuxPaneInfo | null = null;
+let latestTmuxMirrorFailure: string | null = null;
 
 // Local buffer for messages fetched by the poll loop, awaiting delivery
 // via piggyback (drainPendingMessages) or check_messages.
@@ -575,16 +626,20 @@ function readTmuxPaneOption(target: string, optionName: string): string | null {
   return cleanTmuxOptionValue(runTmux(["show-options", "-p", "-t", target, "-v", optionName]));
 }
 
-function setTmuxPaneOption(target: string, optionName: string, value: string): void {
+function setTmuxPaneOption(target: string, optionName: string, value: string): boolean {
   try {
-    Bun.spawnSync(["tmux", "set-option", "-p", "-t", target, optionName, value], {
+    const result = Bun.spawnSync(["tmux", "set-option", "-p", "-t", target, optionName, value], {
       stdout: "ignore",
       stderr: "ignore",
     });
+    return result.exitCode === 0;
   } catch {
     // Best-effort label publishing only; registration still works without it.
+    return false;
   }
 }
+
+type TmuxMirrorResult = { ok: boolean; target: string | null; failedOptions: string[] };
 
 export function brokerIdentityPaneTarget(tmuxInfo: TmuxPaneInfo | null): string | null {
   if (tmuxInfo?.pane_id) return tmuxInfo.pane_id;
@@ -598,21 +653,39 @@ export function publishBrokerIdentityToTmux(identity: {
   resolved_name: string | null;
   client_type: ClientType;
   receiver_mode: ReceiverMode;
-}, tmuxInfo: TmuxPaneInfo | null = myTmuxInfo): void {
+}, tmuxInfo: TmuxPaneInfo | null = myTmuxInfo, options: { updateOperatorLabel?: boolean } = {}): TmuxMirrorResult {
   const paneTarget = brokerIdentityPaneTarget(tmuxInfo);
-  if (!paneTarget) return;
+  if (!paneTarget) return { ok: true, target: null, failedOptions: [] };
 
   const displayLabel = identity.name || identity.resolved_name || identity.id;
   const existingOperatorLabel = readTmuxPaneOption(paneTarget, "@operator_label");
-  if (!existingOperatorLabel && displayLabel) {
-    setTmuxPaneOption(paneTarget, "@operator_label", displayLabel);
+  const failedOptions: string[] = [];
+  const setOption = (optionName: string, value: string) => {
+    if (!setTmuxPaneOption(paneTarget, optionName, value)) failedOptions.push(optionName);
+  };
+  if ((options.updateOperatorLabel || !existingOperatorLabel) && displayLabel) {
+    setOption("@operator_label", displayLabel);
   }
-  setTmuxPaneOption(paneTarget, "@peer_id", identity.id);
-  setTmuxPaneOption(paneTarget, "@peer_label", displayLabel);
-  setTmuxPaneOption(paneTarget, "@peer_resolved_name", identity.resolved_name ?? "");
-  setTmuxPaneOption(paneTarget, "@peer_client_type", identity.client_type);
-  setTmuxPaneOption(paneTarget, "@peer_receiver_mode", identity.receiver_mode);
-  log(`tmux broker identity mirrored: @peer_id=${identity.id} @peer_label=${displayLabel} @peer_resolved_name=${identity.resolved_name ?? ""} (target=${paneTarget})`);
+  setOption("@peer_id", identity.id);
+  setOption("@peer_label", displayLabel);
+  setOption("@peer_resolved_name", identity.resolved_name ?? "");
+  setOption("@peer_client_type", identity.client_type);
+  setOption("@peer_receiver_mode", identity.receiver_mode);
+  const ok = failedOptions.length === 0;
+  const verb = ok ? "mirrored" : "partially failed";
+  const failed = ok ? "" : ` failed_options=${failedOptions.join(",")}`;
+  log(`tmux broker identity ${verb}: @peer_id=${identity.id} @peer_label=${displayLabel} @peer_resolved_name=${identity.resolved_name ?? ""} (target=${paneTarget})${failed}`);
+  return { ok, target: paneTarget, failedOptions };
+}
+
+function recordTmuxMirrorResult(context: string, result: TmuxMirrorResult): void {
+  if (!result.target) return;
+  if (result.ok) {
+    latestTmuxMirrorFailure = null;
+    return;
+  }
+  latestTmuxMirrorFailure = `${context}: target=${result.target} failed_options=${result.failedOptions.join(",")}`;
+  log(`tmux broker identity mirror warning (${latestTmuxMirrorFailure})`);
 }
 
 function readUsedOperatorLabels(session: string, currentPaneId: string): string[] {
@@ -714,6 +787,12 @@ function sendStatusHint(target: SendMessageResponse["target"] | undefined, deliv
     return " Still queued; Gemini receiver has no active hook yet and must use check_messages or install the Gemini drain hook.";
   }
   return " Still queued; receiver mode is unknown, so manual check_messages may be required.";
+}
+
+export function listPeersRoutingHint(scope: "machine" | "directory" | "repo", peerCount: number, hasTmux: boolean): string {
+  if (scope !== "repo" || peerCount <= 1) return "";
+  const tmuxHint = hasTmux ? "" : " Retry with has_tmux=true to hide headless/task peers.";
+  return `\n\nRouting guard: repo scope found ${peerCount} peers. Do not message the first row by position; use find_peer with an exact/name_like label, or send_to_peer with name, resolved_name, seat_key, or tmux_session + tmux_pane_id.${tmuxHint}`;
 }
 
 function formatPeerTarget(target: PeerTarget | undefined): string {
@@ -1080,7 +1159,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           content: [
             {
               type: "text" as const,
-              text: `Found ${peers.length} peer(s) (scope: ${scope}):\n\n${lines.join("\n\n")}${pending ?? ""}`,
+              text: `Found ${peers.length} peer(s) (scope: ${scope}):${listPeersRoutingHint(scope, peers.length, hasTmux)}\n\n${lines.join("\n\n")}${pending ?? ""}`,
             },
           ],
         };
@@ -1140,8 +1219,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             }
           } catch (e) {
             // Best-effort confirmation: log to stderr so ops can grep for
-            // repeated failures (auth breakage, broker restart race, etc.),
-            // but don't surface to the user's tool output — not worth noise.
+            // repeated failures (auth breakage, broker restart race, etc.).
+            statusLine = " Delivery status unavailable; ask the receiver to check_messages if this handoff is urgent.";
             log(`message-status probe failed for id=${result.id}: ${errMsg(e)}`);
           }
         }
@@ -1205,6 +1284,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
               statusLine = sendStatusHint(result.target, false);
             }
           } catch (e) {
+            statusLine = " Delivery status unavailable; ask the receiver to check_messages if this handoff is urgent.";
             log(`message-status probe failed for id=${result.id}: ${errMsg(e)}`);
           }
         }
@@ -1334,16 +1414,18 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const res = await brokerFetch<{ ok: boolean; name: string | null; resolved_name: string | null }>("/set-name", { id: myId, name: newName });
         myOperatorName = res.name ?? null;
         myResolvedName = res.resolved_name ?? res.name ?? null;
-        publishBrokerIdentityToTmux({
+        const mirror = publishBrokerIdentityToTmux({
           id: myId,
           name: myOperatorName,
           resolved_name: myResolvedName,
           client_type: myClientType,
           receiver_mode: myReceiverMode,
-        });
+        }, myTmuxInfo, { updateOperatorLabel: true });
+        recordTmuxMirrorResult("set_name", mirror);
         const pending = await drainPendingMessages();
+        const tmuxWarning = mirror.ok ? "" : `\nWarning: tmux label update partially failed for ${mirror.failedOptions.join(", ")}.`;
         return {
-          content: [{ type: "text" as const, text: `Name updated: "${newName}"${pending ?? ""}` }],
+          content: [{ type: "text" as const, text: `Name updated: "${newName}"${tmuxWarning}${pending ?? ""}` }],
         };
       } catch (e) {
         return {
@@ -1540,7 +1622,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         content: [
           {
             type: "text" as const,
-            text: `Peer ID: ${myId ?? "(not registered)"}\nOperator name: ${myOperatorName ?? "(none)"}\nResolved name: ${myResolvedName ?? "(none)"}\nClient: ${myClientType}\nReceiver mode: ${myReceiverMode}\nCWD: ${myCwd}\nGit root: ${myGitRoot ?? "(none)"}\n${brokerLine}`,
+            text: `Peer ID: ${myId ?? "(not registered)"}\nOperator name: ${myOperatorName ?? "(none)"}\nResolved name: ${myResolvedName ?? "(none)"}\nClient: ${myClientType}\nReceiver mode: ${myReceiverMode}\nCWD: ${myCwd}\nGit root: ${myGitRoot ?? "(none)"}\nTmux mirror: ${latestTmuxMirrorFailure ?? "ok"}\n${brokerLine}`,
           },
         ],
       };
@@ -1760,13 +1842,13 @@ async function main() {
     log(`note: '${peerName}' has duplicate MCP instances; runtime label is '${myResolvedName}'`);
   }
 
-  publishBrokerIdentityToTmux({
+  recordTmuxMirrorResult("register", publishBrokerIdentityToTmux({
     id: myId,
     name: myOperatorName,
     resolved_name: myResolvedName,
     client_type: myClientType,
     receiver_mode: myReceiverMode,
-  }, tmuxInfo);
+  }, tmuxInfo));
 
   // S2: reregister hook used by brokerFetch on 401. Clears token first so
   // the recursive /register call does not send a stale header.
@@ -1779,15 +1861,14 @@ async function main() {
     // peers came/went during the auth-reset window.
     myOperatorName = r.name ?? peerName;
     myResolvedName = r.resolved_name ?? r.name ?? peerName;
-    myClientType = r.client_type ?? myClientType;
-    myReceiverMode = r.receiver_mode ?? myReceiverMode;
-    publishBrokerIdentityToTmux({
+    applyReceiverMetadata(r.client_type ?? myClientType, r.receiver_mode ?? myReceiverMode, "re-register");
+    recordTmuxMirrorResult("re-register", publishBrokerIdentityToTmux({
       id: myId,
       name: myOperatorName,
       resolved_name: myResolvedName,
       client_type: myClientType,
       receiver_mode: myReceiverMode,
-    }, tmuxInfo);
+    }, tmuxInfo));
     log(`Re-registered as peer ${myId} name=${myOperatorName ?? "(none)"} resolved=${myResolvedName ?? "(none)"} after broker auth reset`);
   };
 
@@ -1824,7 +1905,7 @@ async function main() {
   // holds a pre-ACK copy, then the next tool call piggybacks the stale copy.
   // Manual check_messages remains available for these clients because it polls the
   // broker directly instead of relying on this local buffer.
-  let pollActive = true;
+  let pollActive = false;
 
   async function schedulePoll() {
     if (!pollActive) return;
@@ -1832,18 +1913,47 @@ async function main() {
     if (pollActive) setTimeout(schedulePoll, POLL_INTERVAL_MS);
   }
 
-  if (myClientType === "codex" || myClientType === "gemini") {
-    pollActive = false;
-    log(`${myClientType} client detected — background channel poll disabled; using hook/check_messages receive path`);
-  } else {
+  function startBackgroundPoll(reason: string) {
+    if (pollActive) return;
+    pollActive = true;
+    log(`background channel poll enabled (${reason})`);
     setTimeout(schedulePoll, POLL_INTERVAL_MS);
   }
+
+  function stopBackgroundPoll(reason: string) {
+    if (!pollActive) return;
+    pollActive = false;
+    log(`background channel poll disabled (${reason})`);
+  }
+
+  function applyReceiverMetadata(clientType: ClientType, receiverMode: ReceiverMode, reason: string): boolean {
+    const changed = clientType !== myClientType || receiverMode !== myReceiverMode;
+    myClientType = clientType;
+    myReceiverMode = receiverMode;
+    if (shouldDisableBackgroundPolling(myClientType, myReceiverMode)) {
+      stopBackgroundPoll(`${reason}; using hook/check_messages receive path`);
+    } else {
+      startBackgroundPoll(reason);
+    }
+    return changed;
+  }
+
+  applyReceiverMetadata(myClientType, myReceiverMode, "startup");
 
   // 7. Start heartbeat
   const heartbeatTimer = setInterval(async () => {
     if (myId) {
       try {
-        await brokerFetch("/heartbeat", { id: myId, client_type: myClientType, receiver_mode: myReceiverMode });
+        const heartbeat = await brokerFetch<HeartbeatResponse>("/heartbeat", { id: myId, client_type: myClientType, receiver_mode: myReceiverMode });
+        if (applyReceiverMetadata(heartbeat.client_type, heartbeat.receiver_mode, "heartbeat")) {
+          recordTmuxMirrorResult("heartbeat", publishBrokerIdentityToTmux({
+            id: myId,
+            name: myOperatorName,
+            resolved_name: myResolvedName,
+            client_type: myClientType,
+            receiver_mode: myReceiverMode,
+          }));
+        }
       } catch {
         // Non-critical
       }

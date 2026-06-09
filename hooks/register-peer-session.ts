@@ -236,7 +236,6 @@ async function ensureBroker(): Promise<void> {
 async function main(): Promise<void> {
   const meta = await metadata();
   if (!meta) {
-    await Bun.write(Bun.stdout, `${JSON.stringify({ suppressOutput: true })}\n`);
     return;
   }
 
@@ -274,12 +273,10 @@ async function main(): Promise<void> {
     log(`registration failed: ${e instanceof Error ? e.message : String(e)}`);
   }
 
-  await Bun.write(Bun.stdout, `${JSON.stringify({ suppressOutput: true })}\n`);
 }
 
 if (import.meta.main) {
   main().catch(async (e) => {
     log(`unexpected failure: ${e instanceof Error ? e.message : String(e)}`);
-    await Bun.write(Bun.stdout, `${JSON.stringify({ suppressOutput: true })}\n`);
   });
 }

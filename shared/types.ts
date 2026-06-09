@@ -88,6 +88,12 @@ export interface HeartbeatRequest {
   receiver_mode?: ReceiverMode;
 }
 
+export interface HeartbeatResponse {
+  ok: true;
+  client_type: ClientType;
+  receiver_mode: ReceiverMode;
+}
+
 export interface SetSummaryRequest {
   id: PeerId;
   summary: string;

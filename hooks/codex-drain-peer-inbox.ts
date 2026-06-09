@@ -302,7 +302,6 @@ async function main(): Promise<void> {
       hookEventName: HOOK_EVENT_NAME,
       additionalContext: context,
     },
-    suppressOutput: true,
   };
 
   try {

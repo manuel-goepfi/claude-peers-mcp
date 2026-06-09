@@ -18,7 +18,12 @@
 
 import { describe, test, expect } from "bun:test";
 import {
+  __testBrokerFetchForTest,
+  __testSetBrokerAuthStateForTest,
+  listPeersRoutingHint,
   publishBrokerIdentityToTmux,
+  rewriteAuthBodyForPeer,
+  shouldDisableBackgroundPolling,
   chooseOperatorLabel,
   isHumanOperatorLabel,
   resolvePeerName,
@@ -164,12 +169,12 @@ describe("Operator-label fallback — human name first, pane_id metadata last", 
     const helperSlice = source.slice(helperStart, helperStart + 1200);
 
     expect(helperSlice).toContain('readTmuxPaneOption(paneTarget, "@operator_label")');
-    expect(helperSlice).toContain("if (!existingOperatorLabel && displayLabel)");
-    expect(helperSlice).toContain('setTmuxPaneOption(paneTarget, "@peer_id", identity.id)');
-    expect(helperSlice).toContain('setTmuxPaneOption(paneTarget, "@peer_label", displayLabel)');
-    expect(helperSlice).toContain('setTmuxPaneOption(paneTarget, "@peer_resolved_name", identity.resolved_name ?? "")');
-    expect(helperSlice).toContain('setTmuxPaneOption(paneTarget, "@peer_client_type", identity.client_type)');
-    expect(helperSlice).toContain('setTmuxPaneOption(paneTarget, "@peer_receiver_mode", identity.receiver_mode)');
+    expect(helperSlice).toContain("options.updateOperatorLabel || !existingOperatorLabel");
+    expect(helperSlice).toContain('setOption("@peer_id", identity.id)');
+    expect(helperSlice).toContain('setOption("@peer_label", displayLabel)');
+    expect(helperSlice).toContain('setOption("@peer_resolved_name", identity.resolved_name ?? "")');
+    expect(helperSlice).toContain('setOption("@peer_client_type", identity.client_type)');
+    expect(helperSlice).toContain('setOption("@peer_receiver_mode", identity.receiver_mode)');
   });
 
   test("broker identity mirror only targets stable pane ids", async () => {
@@ -182,13 +187,22 @@ describe("Operator-label fallback — human name first, pane_id metadata last", 
     expect(helperSlice).not.toContain("tmuxInfo.session}:${tmuxInfo.window_index");
   });
 
-  test("broker identity mirror writes tmux pane options without overwriting operator label", () => {
-    const tmuxVersion = Bun.spawnSync(["tmux", "-V"], { stdout: "ignore", stderr: "ignore" });
-    if (tmuxVersion.exitCode !== 0) return;
+  function canCreateTmuxSession(): boolean {
+    if (Bun.spawnSync(["tmux", "-V"], { stdout: "ignore", stderr: "ignore" }).exitCode !== 0) return false;
+    const session = `claude-peers-probe-${process.pid}-${Date.now()}`;
+    const created = Bun.spawnSync(["tmux", "new-session", "-d", "-s", session], { stdout: "ignore", stderr: "ignore" });
+    if (created.exitCode !== 0) return false;
+    Bun.spawnSync(["tmux", "kill-session", "-t", session], { stdout: "ignore", stderr: "ignore" });
+    return true;
+  }
+
+  const tmuxAvailable = canCreateTmuxSession();
+
+  (tmuxAvailable ? test : test.skip)("broker identity mirror writes tmux pane options without overwriting operator label", () => {
 
     const session = `claude-peers-test-${process.pid}-${Date.now()}`;
     const created = Bun.spawnSync(["tmux", "new-session", "-d", "-s", session], { stdout: "ignore", stderr: "ignore" });
-    if (created.exitCode !== 0) return;
+    expect(created.exitCode).toBe(0);
 
     try {
       const paneIdResult = Bun.spawnSync(["tmux", "display-message", "-p", "-t", `${session}:0.0`, "#{pane_id}"], {
@@ -230,6 +244,23 @@ describe("Operator-label fallback — human name first, pane_id metadata last", 
       expect(readOption("@peer_resolved_name")).toBe("broker.7#2");
       expect(readOption("@peer_client_type")).toBe("codex");
       expect(readOption("@peer_receiver_mode")).toBe("codex-hook");
+
+      publishBrokerIdentityToTmux({
+        id: "peer456",
+        name: "broker.8",
+        resolved_name: "broker.8",
+        client_type: "codex",
+        receiver_mode: "manual-drain",
+      }, {
+        session,
+        window_index: "0",
+        window_name: "0",
+        pane_id: paneId,
+      }, { updateOperatorLabel: true });
+
+      expect(readOption("@operator_label")).toBe("broker.8");
+      expect(readOption("@peer_id")).toBe("peer456");
+      expect(readOption("@peer_receiver_mode")).toBe("manual-drain");
     } finally {
       Bun.spawnSync(["tmux", "kill-session", "-t", session], { stdout: "ignore", stderr: "ignore" });
     }
@@ -242,5 +273,120 @@ describe("Operator-label fallback — human name first, pane_id metadata last", 
     // Function definition plus initial register, auth-reset re-register, and set_name.
     expect(calls.length).toBeGreaterThanOrEqual(4);
     expect(source).not.toContain("tmuxInfo && process.env.TMUX && tmuxInfo.window_index");
+  });
+
+  test("auth recovery rewrites only peer identity fields that match the old self id", () => {
+    expect(rewriteAuthBodyForPeer("/list-peers", {
+      id: "old-self",
+      exclude_id: "old-self",
+      scope: "machine",
+    }, "old-self", "new-self")).toEqual({
+      id: "new-self",
+      exclude_id: "new-self",
+      scope: "machine",
+    });
+
+    expect(rewriteAuthBodyForPeer("/send-message", {
+      from_id: "old-self",
+      to_id: "old-self",
+      text: "self",
+    }, "old-self", "new-self")).toEqual({
+      from_id: "new-self",
+      to_id: "new-self",
+      text: "self",
+    });
+
+    expect(rewriteAuthBodyForPeer("/send-to-peer", {
+      from_id: "old-self",
+      selector: { id: "old-self", name: "self" },
+      text: "self selector",
+    }, "old-self", "new-self")).toEqual({
+      from_id: "new-self",
+      selector: { id: "new-self", name: "self" },
+      text: "self selector",
+    });
+
+    expect(rewriteAuthBodyForPeer("/messages-since-id", {
+      id: 42,
+      since: 10,
+    }, "old-self", "new-self")).toEqual({
+      id: 42,
+      since: 10,
+    });
+  });
+
+  test("broker auth recovery retries with the attempted peer id rewritten to the fresh id", async () => {
+    const originalFetch = globalThis.fetch;
+    const calls: Array<{ token: string | null; body: Record<string, unknown> }> = [];
+    __testSetBrokerAuthStateForTest({
+      id: "old-self",
+      token: "old-token",
+      shuttingDown: false,
+      reregisterPeer: async () => {
+        __testSetBrokerAuthStateForTest({
+          id: "new-self",
+          token: "new-token",
+          resetInFlight: false,
+        });
+      },
+    });
+
+    globalThis.fetch = (async (_url: RequestInfo | URL, init?: RequestInit) => {
+      const headers = init?.headers as Record<string, string> | undefined;
+      calls.push({
+        token: headers?.["X-Peer-Token"] ?? null,
+        body: JSON.parse(String(init?.body ?? "{}")),
+      });
+      if (calls.length === 1) return new Response("stale token", { status: 401 });
+      return Response.json({ ok: true });
+    }) as typeof fetch;
+
+    try {
+      await __testBrokerFetchForTest("/send-to-peer", {
+        from_id: "old-self",
+        selector: { id: "old-self" },
+        to_id: "old-self",
+        text: "self",
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+      __testSetBrokerAuthStateForTest({ id: null, token: null, shuttingDown: false });
+    }
+
+    expect(calls).toHaveLength(2);
+    expect(calls[0]).toEqual({
+      token: "old-token",
+      body: {
+        from_id: "old-self",
+        selector: { id: "old-self" },
+        to_id: "old-self",
+        text: "self",
+      },
+    });
+    expect(calls[1]).toEqual({
+      token: "new-token",
+      body: {
+        from_id: "new-self",
+        selector: { id: "new-self" },
+        to_id: "new-self",
+        text: "self",
+      },
+    });
+  });
+
+  test("background polling policy follows hook-capable receiver metadata", () => {
+    expect(shouldDisableBackgroundPolling("codex", "manual-drain")).toBe(true);
+    expect(shouldDisableBackgroundPolling("gemini", "manual-drain")).toBe(true);
+    expect(shouldDisableBackgroundPolling("unknown", "codex-hook")).toBe(true);
+    expect(shouldDisableBackgroundPolling("claude", "claude-channel")).toBe(false);
+    expect(shouldDisableBackgroundPolling("unknown", "manual-drain")).toBe(false);
+  });
+
+  test("repo-scope peer lists warn against first-row routing", () => {
+    expect(listPeersRoutingHint("repo", 17, false)).toContain("Do not message the first row");
+    expect(listPeersRoutingHint("repo", 17, false)).toContain("has_tmux=true");
+    expect(listPeersRoutingHint("repo", 17, true)).not.toContain("has_tmux=true");
+    expect(listPeersRoutingHint("repo", 1, false)).toBe("");
+    expect(listPeersRoutingHint("machine", 17, false)).toBe("");
   });
 });
