@@ -23,6 +23,7 @@ import type {
   ListPeersRequest,
   SendMessageRequest,
   SendMessageResponse,
+  SendToPeerRequest,
   PollMessagesRequest,
   PollMessagesResponse,
   AckMessagesRequest,
@@ -33,6 +34,9 @@ import type {
   ClientType,
   ReceiverMode,
   Peer,
+  PeerSelector,
+  PeerTarget,
+  PeerResolveErrorCode,
   Message,
 } from "./shared/types.ts";
 // #7 narrow (2026-05-14): predicate + TTL constant extracted to shared/
@@ -379,7 +383,9 @@ const selectRehydrateCandidates = db.prepare(`
       (? IS NOT NULL AND tmux_pane_id = ?)
       OR (? IS NULL AND tmux_window_index = ? AND tmux_window_name = ?)
     )
-    AND cwd = ? AND pid != ?
+    AND cwd = ?
+    AND ((? IS NULL AND git_root IS NULL) OR git_root = ?)
+    AND pid != ?
   ORDER BY last_seen DESC LIMIT 3
 `);
 
@@ -611,7 +617,10 @@ function hookMetadata(peerId: string, body: { client_type?: ClientType; receiver
   if (currentClient === "gemini") {
     return { clientType: "gemini", receiverMode: "gemini-hook" };
   }
-  return { clientType: "codex", receiverMode: "codex-hook" };
+  if (currentClient === "codex") {
+    return { clientType: "codex", receiverMode: "codex-hook" };
+  }
+  return { clientType: "unknown", receiverMode: validReceiverMode(current?.receiver_mode, "unknown") };
 }
 
 function claimCutoffIso(nowMs = Date.now()): string {
@@ -676,6 +685,8 @@ function handleRegister(body: RegisterRequest): RegisterResult {
       body.tmux_window_index,
       body.tmux_window_name,
       body.cwd,
+      body.git_root,
+      body.git_root,
       body.pid
     ) as { id: string; pid: number; last_seen: string }[];
     for (const c of candidates) {
@@ -700,7 +711,7 @@ function handleRegister(body: RegisterRequest): RegisterResult {
     }
   }
 
-  const clientType = validClientType(body.client_type);
+  const requestedClientType = validClientType(body.client_type);
   const existing = db.query(`
     SELECT id, token, cwd, git_root, absolute_git_dir, tty, tmux_session,
            tmux_window_index, tmux_window_name, tmux_pane_id, client_type,
@@ -720,6 +731,8 @@ function handleRegister(body: RegisterRequest): RegisterResult {
     client_type: ClientType | null;
     receiver_mode: ReceiverMode | null;
   } | null;
+  const existingClientType = validClientType(existing?.client_type);
+  const clientType = requestedClientType === "unknown" && existingClientType !== "unknown" ? existingClientType : requestedClientType;
   const samePidRefresh = Boolean(existing && inheritedId === null &&
     existing.cwd === body.cwd &&
     existing.git_root === body.git_root &&
@@ -729,7 +742,7 @@ function handleRegister(body: RegisterRequest): RegisterResult {
     existing.tmux_window_index === (body.tmux_window_index ?? null) &&
     existing.tmux_window_name === (body.tmux_window_name ?? null) &&
     existing.tmux_pane_id === (body.tmux_pane_id ?? null) &&
-    (!existing.client_type || existing.client_type === "unknown" || existing.client_type === clientType));
+    (requestedClientType === "unknown" || existingClientType === "unknown" || existingClientType === clientType));
   const id = inheritedId ?? (samePidRefresh ? existing!.id : null) ?? generateId();
 
   // Existing PID-dedup: a live peer re-registering must replace its own row.
@@ -873,6 +886,11 @@ function liveAndFreshPeers(peers: Peer[]): Peer[] {
   });
 }
 
+function livePeersForResolution(peers: Peer[]): Peer[] {
+  const now = Date.now();
+  return peers.filter((p) => !isReapable(p, isPidAlive, now, PEER_GHOST_AFTER_MS));
+}
+
 function activeOnly(peers: Peer[]): Peer[] {
   const byKey = new Map<string, Peer>();
   for (const peer of peers) {
@@ -883,6 +901,115 @@ function activeOnly(peers: Peer[]): Peer[] {
     }
   }
   return [...byKey.values()];
+}
+
+function describePeerTarget(peer: Peer): PeerTarget {
+  const clientType = validClientType(peer.client_type);
+  return {
+    id: peer.id,
+    name: peer.name,
+    resolved_name: peer.resolved_name,
+    seat_key: activePeerKey(peer),
+    cwd: peer.cwd,
+    git_root: peer.git_root,
+    tmux_session: peer.tmux_session,
+    tmux_window_index: peer.tmux_window_index,
+    tmux_window_name: peer.tmux_window_name,
+    tmux_pane_id: peer.tmux_pane_id,
+    client_type: clientType,
+    receiver_mode: validReceiverMode(peer.receiver_mode, clientType),
+    last_hook_seen_at: peer.last_hook_seen_at,
+    last_drain_at: peer.last_drain_at,
+    last_drain_error: peer.last_drain_error,
+    last_seen: peer.last_seen,
+  };
+}
+
+type ResolvePeerResult =
+  | { ok: true; peer: Peer }
+  | { ok: false; code: PeerResolveErrorCode; error: string; candidates?: PeerTarget[] };
+
+function selectorFields(selector: PeerSelector | undefined): string[] {
+  if (!selector || typeof selector !== "object") return [];
+  return [
+    typeof selector.id === "string" && selector.id.length > 0 ? "id" : "",
+    typeof selector.name === "string" && selector.name.length > 0 ? "name" : "",
+    typeof selector.resolved_name === "string" && selector.resolved_name.length > 0 ? "resolved_name" : "",
+    typeof selector.seat_key === "string" && selector.seat_key.length > 0 ? "seat_key" : "",
+    typeof selector.tmux_session === "string" && selector.tmux_session.length > 0 ? "tmux_session" : "",
+    typeof selector.tmux_pane_id === "string" && selector.tmux_pane_id.length > 0 ? "tmux_pane_id" : "",
+  ].filter(Boolean);
+}
+
+function sameSeatOrName(stale: Peer, live: Peer): boolean {
+  if (stale.name && live.name === stale.name) return true;
+  if (stale.resolved_name && live.resolved_name === stale.resolved_name) return true;
+  if (stale.tmux_session && stale.tmux_pane_id && live.tmux_session === stale.tmux_session && live.tmux_pane_id === stale.tmux_pane_id) return true;
+  return activePeerKey(stale) === activePeerKey(live);
+}
+
+function peerMatchesSelector(peer: Peer, selector: PeerSelector): boolean {
+  if (selector.id && peer.id !== selector.id) return false;
+  if (selector.name && peer.name !== selector.name) return false;
+  if (selector.resolved_name && peer.resolved_name !== selector.resolved_name) return false;
+  if (selector.seat_key && activePeerKey(peer) !== selector.seat_key) return false;
+  if (selector.tmux_session && peer.tmux_session !== selector.tmux_session) return false;
+  if (selector.tmux_pane_id && peer.tmux_pane_id !== selector.tmux_pane_id) return false;
+  return true;
+}
+
+function resolveFreshPeer(selector: PeerSelector | undefined): ResolvePeerResult {
+  const fields = selectorFields(selector);
+  if (fields.length === 0) {
+    return { ok: false, code: "INVALID_SELECTOR", error: "target selector must include id, name, resolved_name, seat_key, or tmux pane fields" };
+  }
+  const targetSelector = selector!;
+  if (fields.length === 1 && fields[0] === "tmux_session") {
+    return { ok: false, code: "INVALID_SELECTOR", error: "tmux_session alone is not a unique peer selector; include tmux_pane_id or another identity field" };
+  }
+
+  const allPeers = selectAllPeers.all() as Peer[];
+  const staleById = targetSelector.id ? allPeers.find((p) => p.id === targetSelector.id) ?? null : null;
+  const activePeers = activeOnly(livePeersForResolution(allPeers));
+
+  if (targetSelector.id) {
+    const liveIdMatch = activePeers.find((p) => p.id === targetSelector.id) ?? null;
+    if (liveIdMatch) {
+      if (peerMatchesSelector(liveIdMatch, targetSelector)) return { ok: true, peer: liveIdMatch };
+      return {
+        ok: false,
+        code: "PEER_NOT_FOUND",
+        error: `Peer ${targetSelector.id} is live but does not match the full target selector`,
+        candidates: [describePeerTarget(liveIdMatch)],
+      };
+    }
+    const candidates = staleById
+      ? activePeers.filter((p) => sameSeatOrName(staleById, p)).map(describePeerTarget)
+      : [];
+    if (staleById) {
+      return {
+        ok: false,
+        code: "STALE_PEER_ID",
+        error: `Peer ${targetSelector.id} is stale or no longer the active peer for its seat`,
+        candidates,
+      };
+    }
+    return { ok: false, code: "PEER_NOT_FOUND", error: `Peer ${targetSelector.id} not found` };
+  }
+
+  const matches = activePeers.filter((p) => peerMatchesSelector(p, targetSelector));
+  if (matches.length === 0) {
+    return { ok: false, code: "PEER_NOT_FOUND", error: "No live peer matched target selector" };
+  }
+  if (matches.length > 1) {
+    return {
+      ok: false,
+      code: "AMBIGUOUS_TARGET",
+      error: `Target selector matched ${matches.length} live peers; use resolved_name, seat_key, or tmux_pane_id`,
+      candidates: matches.map(describePeerTarget),
+    };
+  }
+  return { ok: true, peer: matches[0]! };
 }
 
 // R1: derive the shared repo root from absolute_git_dir.
@@ -954,28 +1081,28 @@ function handleSendMessage(authedFromId: string, body: SendMessageRequest): Send
   // S5: payload size cap.
   if (typeof body.text !== "string") return { ok: false, error: "text must be string" };
   if (utf8Bytes(body.text) > MAX_MSG_BYTES) return { ok: false, error: `text exceeds ${MAX_MSG_BYTES} bytes` };
-  const target = db.query("SELECT id, client_type, receiver_mode, last_hook_seen_at, last_drain_error, last_seen FROM peers WHERE id = ?").get(body.to_id) as {
-    id: string;
-    client_type: ClientType | null;
-    receiver_mode: ReceiverMode | null;
-    last_hook_seen_at: string | null;
-    last_drain_error: string | null;
-    last_seen: string | null;
-  } | null;
-  if (!target) return { ok: false, error: `Peer ${body.to_id} not found` };
-  const result = insertMessage.run(authedFromId, body.to_id, body.text, new Date().toISOString());
+  const resolved = resolveFreshPeer({ id: body.to_id });
+  if (!resolved.ok) {
+    return { ok: false, code: resolved.code, error: resolved.error, candidates: resolved.candidates };
+  }
+  const target = resolved.peer;
+  const result = insertMessage.run(authedFromId, target.id, body.text, new Date().toISOString());
   return {
     ok: true,
     id: Number(result.lastInsertRowid),
-    target: {
-      id: target.id,
-      client_type: validClientType(target.client_type),
-      receiver_mode: validReceiverMode(target.receiver_mode, validClientType(target.client_type)),
-      last_hook_seen_at: target.last_hook_seen_at,
-      last_drain_error: target.last_drain_error,
-      last_seen: target.last_seen,
-    },
+    target: describePeerTarget(target),
   };
+}
+
+function handleSendToPeer(authedFromId: string, body: SendToPeerRequest): SendMessageResponse {
+  if (typeof body.text !== "string") return { ok: false, error: "text must be string" };
+  if (utf8Bytes(body.text) > MAX_MSG_BYTES) return { ok: false, error: `text exceeds ${MAX_MSG_BYTES} bytes` };
+  const resolved = resolveFreshPeer(body.selector);
+  if (!resolved.ok) {
+    return { ok: false, code: resolved.code, error: resolved.error, candidates: resolved.candidates };
+  }
+  const result = insertMessage.run(authedFromId, resolved.peer.id, body.text, new Date().toISOString());
+  return { ok: true, id: Number(result.lastInsertRowid), target: describePeerTarget(resolved.peer) };
 }
 
 // /message-status: sender-scoped lookup of delivered/delivered_at for a
@@ -1390,7 +1517,7 @@ const server = Bun.serve({
       // client-side HEARTBEAT_INTERVAL_MS, and 429-ing it would cascade into
       // ghost-reaping a perfectly healthy peer.
       if (path !== "/heartbeat") {
-        const limited = rateCheck(auth.id, path === "/send-message" || path === "/broadcast-message");
+        const limited = rateCheck(auth.id, path === "/send-message" || path === "/send-to-peer" || path === "/broadcast-message");
         if (limited) {
           return new Response(JSON.stringify({ error: limited }), {
             status: 429,
@@ -1443,6 +1570,8 @@ const server = Bun.serve({
           return Response.json(handleListPeers(body as unknown as ListPeersRequest));
         case "/send-message":
           return Response.json(handleSendMessage(auth.id, body as unknown as SendMessageRequest));
+        case "/send-to-peer":
+          return Response.json(handleSendToPeer(auth.id, body as unknown as SendToPeerRequest));
         case "/broadcast-message":
           return Response.json(handleBroadcast(auth.id, body as unknown as BroadcastRequest));
         case "/message-status":

@@ -18,6 +18,7 @@
 
 import { describe, test, expect } from "bun:test";
 import {
+  publishBrokerIdentityToTmux,
   chooseOperatorLabel,
   isHumanOperatorLabel,
   resolvePeerName,
@@ -153,5 +154,93 @@ describe("Operator-label fallback — human name first, pane_id metadata last", 
   test("resolved-name suffix stripping is limited to broker numeric suffixes", () => {
     expect(stripResolvedNameSuffix("infra.2#4")).toBe("infra.2");
     expect(stripResolvedNameSuffix("custom#name")).toBe("custom#name");
+  });
+
+  test("broker identity mirror preserves operator label and writes peer metadata", async () => {
+    const source = await Bun.file(`${import.meta.dir}/../server.ts`).text();
+
+    expect(source).toContain("function publishBrokerIdentityToTmux");
+    const helperStart = source.indexOf("function publishBrokerIdentityToTmux");
+    const helperSlice = source.slice(helperStart, helperStart + 1200);
+
+    expect(helperSlice).toContain('readTmuxPaneOption(paneTarget, "@operator_label")');
+    expect(helperSlice).toContain("if (!existingOperatorLabel && displayLabel)");
+    expect(helperSlice).toContain('setTmuxPaneOption(paneTarget, "@peer_id", identity.id)');
+    expect(helperSlice).toContain('setTmuxPaneOption(paneTarget, "@peer_label", displayLabel)');
+    expect(helperSlice).toContain('setTmuxPaneOption(paneTarget, "@peer_resolved_name", identity.resolved_name ?? "")');
+    expect(helperSlice).toContain('setTmuxPaneOption(paneTarget, "@peer_client_type", identity.client_type)');
+    expect(helperSlice).toContain('setTmuxPaneOption(paneTarget, "@peer_receiver_mode", identity.receiver_mode)');
+  });
+
+  test("broker identity mirror only targets stable pane ids", async () => {
+    const source = await Bun.file(`${import.meta.dir}/../server.ts`).text();
+    const helperStart = source.indexOf("function brokerIdentityPaneTarget");
+    const helperSlice = source.slice(helperStart, helperStart + 360);
+
+    expect(helperSlice).toContain("tmuxInfo?.pane_id");
+    expect(helperSlice).toContain("process.env.TMUX_PANE");
+    expect(helperSlice).not.toContain("tmuxInfo.session}:${tmuxInfo.window_index");
+  });
+
+  test("broker identity mirror writes tmux pane options without overwriting operator label", () => {
+    const tmuxVersion = Bun.spawnSync(["tmux", "-V"], { stdout: "ignore", stderr: "ignore" });
+    if (tmuxVersion.exitCode !== 0) return;
+
+    const session = `claude-peers-test-${process.pid}-${Date.now()}`;
+    const created = Bun.spawnSync(["tmux", "new-session", "-d", "-s", session], { stdout: "ignore", stderr: "ignore" });
+    if (created.exitCode !== 0) return;
+
+    try {
+      const paneIdResult = Bun.spawnSync(["tmux", "display-message", "-p", "-t", `${session}:0.0`, "#{pane_id}"], {
+        stdout: "pipe",
+        stderr: "ignore",
+      });
+      const paneId = new TextDecoder().decode(paneIdResult.stdout).trim();
+      expect(paneId).toMatch(/^%/);
+
+      Bun.spawnSync(["tmux", "set-option", "-p", "-t", paneId, "@operator_label", "human.7"], {
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+
+      publishBrokerIdentityToTmux({
+        id: "peer123",
+        name: "broker.7",
+        resolved_name: "broker.7#2",
+        client_type: "codex",
+        receiver_mode: "codex-hook",
+      }, {
+        session,
+        window_index: "0",
+        window_name: "0",
+        pane_id: paneId,
+      });
+
+      const readOption = (name: string): string => {
+        const result = Bun.spawnSync(["tmux", "show-options", "-p", "-t", paneId, "-v", name], {
+          stdout: "pipe",
+          stderr: "ignore",
+        });
+        return new TextDecoder().decode(result.stdout).trim();
+      };
+
+      expect(readOption("@operator_label")).toBe("human.7");
+      expect(readOption("@peer_id")).toBe("peer123");
+      expect(readOption("@peer_label")).toBe("broker.7");
+      expect(readOption("@peer_resolved_name")).toBe("broker.7#2");
+      expect(readOption("@peer_client_type")).toBe("codex");
+      expect(readOption("@peer_receiver_mode")).toBe("codex-hook");
+    } finally {
+      Bun.spawnSync(["tmux", "kill-session", "-t", session], { stdout: "ignore", stderr: "ignore" });
+    }
+  });
+
+  test("registration, re-registration, and set_name publish through the same tmux mirror helper", async () => {
+    const source = await Bun.file(`${import.meta.dir}/../server.ts`).text();
+    const calls = source.match(/publishBrokerIdentityToTmux\(/g) ?? [];
+
+    // Function definition plus initial register, auth-reset re-register, and set_name.
+    expect(calls.length).toBeGreaterThanOrEqual(4);
+    expect(source).not.toContain("tmuxInfo && process.env.TMUX && tmuxInfo.window_index");
   });
 });
