@@ -639,6 +639,28 @@ function setTmuxPaneOption(target: string, optionName: string, value: string): b
   }
 }
 
+export function normalizeTmuxTargetSelector(value: string | null | undefined): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const match = trimmed.match(/^([A-Za-z0-9_.@-]+)(?::|\s+)(\d+)\.(\d+)$/);
+  if (!match) return null;
+  return `${match[1]}:${match[2]}.${match[3]}`;
+}
+
+function resolveTmuxTargetSelector(value: string | null | undefined): { tmux_session: string; tmux_pane_id: string } | { error: string } | null {
+  const target = normalizeTmuxTargetSelector(value);
+  if (!target) return null;
+
+  const out = runTmux(["display-message", "-p", "-t", target, "#{session_name}\t#{pane_id}"]);
+  if (!out) return { error: `tmux target '${value}' was not found; use a visible pane address like infra:1.2` };
+  const [tmux_session, tmux_pane_id] = out.trim().split("\t");
+  if (!tmux_session || !tmux_pane_id?.startsWith("%")) {
+    return { error: `tmux target '${value}' did not resolve to a stable pane id` };
+  }
+  return { tmux_session, tmux_pane_id };
+}
+
 type TmuxMirrorResult = { ok: boolean; target: string | null; failedOptions: string[] };
 
 export function brokerIdentityPaneTarget(tmuxInfo: TmuxPaneInfo | null): string | null {
@@ -941,18 +963,19 @@ const TOOLS = [
   {
     name: "send_to_peer",
     description:
-      "Send a message to one live peer using a selector: human name, resolved runtime name, live ID, seat_key, or tmux session + pane ID. Ambiguous human names fail with candidate details instead of guessing.",
+      "Send a message to one live peer using a selector: visible tmux pane address, human name, resolved runtime name, live ID, seat_key, or tmux session + pane ID. Ambiguous human names fail with candidate details instead of guessing.",
     inputSchema: {
       type: "object" as const,
       properties: {
         selector: {
           type: "object" as const,
-          description: "Target selector. Use name for human seat labels when unique; use resolved_name, seat_key, id, or tmux_session + tmux_pane_id for exact routing.",
+          description: "Target selector. Prefer tmux_target for visible pane addresses like infra:1.2. Use name only when unique; use resolved_name, seat_key, id, or tmux_session + tmux_pane_id for exact routing.",
           properties: {
             id: { type: "string" as const, description: "Live broker peer ID" },
             name: { type: "string" as const, description: "Human-facing seat label, e.g. infra.4" },
             resolved_name: { type: "string" as const, description: "Broker-unique runtime label, e.g. infra.4#2" },
             seat_key: { type: "string" as const, description: "Broker active-seat key returned by send/list diagnostics, e.g. pane:rag:%12" },
+            tmux_target: { type: "string" as const, description: "Visible tmux pane address, e.g. infra:1.2 or infra 1.2" },
             tmux_session: { type: "string" as const, description: "Tmux session name" },
             tmux_pane_id: { type: "string" as const, description: "Stable tmux pane ID such as %12" },
           },
@@ -1257,9 +1280,21 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         };
       }
       try {
+        let effectiveSelector = selector;
+        if (selector?.tmux_target) {
+          const resolved = resolveTmuxTargetSelector(selector.tmux_target);
+          if (!resolved || "error" in resolved) {
+            return {
+              content: [{ type: "text" as const, text: `Failed to send: ${resolved?.error ?? "invalid tmux_target selector"}` }],
+              isError: true,
+            };
+          }
+          const { tmux_target: _tmuxTarget, ...rest } = selector;
+          effectiveSelector = { ...rest, tmux_session: resolved.tmux_session, tmux_pane_id: resolved.tmux_pane_id };
+        }
         const result = await brokerFetch<SendMessageResponse>("/send-to-peer", {
           from_id: myId,
-          selector,
+          selector: effectiveSelector,
           text: message,
         });
         if (!result.ok) {

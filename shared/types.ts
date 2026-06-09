@@ -143,6 +143,10 @@ export interface PeerSelector {
   name?: string;
   // Broker-unique runtime label, e.g. infra.4#2.
   resolved_name?: string;
+  // Human-visible tmux pane coordinate, e.g. "infra:1.2" or "infra 1.2".
+  // The MCP server resolves this to tmux_session + tmux_pane_id before it
+  // calls the broker; the broker intentionally stores only the stable pane id.
+  tmux_target?: string;
   tmux_session?: string;
   tmux_pane_id?: string;
   seat_key?: string;

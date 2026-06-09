@@ -21,6 +21,7 @@ import {
   __testBrokerFetchForTest,
   __testSetBrokerAuthStateForTest,
   listPeersRoutingHint,
+  normalizeTmuxTargetSelector,
   publishBrokerIdentityToTmux,
   rewriteAuthBodyForPeer,
   shouldDisableBackgroundPolling,
@@ -29,6 +30,29 @@ import {
   resolvePeerName,
   stripResolvedNameSuffix,
 } from "../server";
+
+describe("visible tmux pane selectors", () => {
+  test("normalizes visible colon and spoken-space pane addresses", () => {
+    expect(normalizeTmuxTargetSelector("infra:1.2")).toBe("infra:1.2");
+    expect(normalizeTmuxTargetSelector(" infra 1.2 ")).toBe("infra:1.2");
+    expect(normalizeTmuxTargetSelector("pr_review:3.12")).toBe("pr_review:3.12");
+  });
+
+  test("rejects ambiguous or non-pane tmux targets", () => {
+    expect(normalizeTmuxTargetSelector("infra")).toBeNull();
+    expect(normalizeTmuxTargetSelector("infra.2")).toBeNull();
+    expect(normalizeTmuxTargetSelector("infra:%64")).toBeNull();
+    expect(normalizeTmuxTargetSelector("")).toBeNull();
+  });
+
+  test("send_to_peer tool exposes tmux_target as the human-visible selector", async () => {
+    const source = await Bun.file(`${import.meta.dir}/../server.ts`).text();
+    expect(source).toContain("tmux_target");
+    expect(source).toContain("resolveTmuxTargetSelector(selector.tmux_target)");
+    expect(source).toContain("tmux_session: resolved.tmux_session");
+    expect(source).toContain("tmux_pane_id: resolved.tmux_pane_id");
+  });
+});
 
 describe("#11 — resolvePeerName fallback chain", () => {
   const PID = 12345;
