@@ -25,7 +25,7 @@ if [[ -n "$HEALTH" ]]; then
   BROKER_PID=$(pgrep -f 'bun.*broker\.ts' 2>/dev/null | head -1)
   ok "broker /health responding (${PEER_COUNT} peers${BROKER_PID:+, pid $BROKER_PID})"
 else
-  fail "broker /health not responding on 127.0.0.1:7899" "launch any peer session to auto-relaunch, or: cd ~/claude-peers-mcp && setsid bun broker.ts >> ~/.claude-peers-broker.log 2>&1 < /dev/null & disown"
+  fail "broker /health not responding on 127.0.0.1:7899" "systemctl --user restart claude-peers-broker (managed unit with memory cap — do NOT spawn bun broker.ts manually)"
 fi
 
 # 3. DB readable
