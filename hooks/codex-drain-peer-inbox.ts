@@ -235,7 +235,30 @@ async function claim(pid: number, drainId: string): Promise<{ peer_id?: string; 
   });
 }
 
+// Codex pipes the hook event JSON on stdin. Reading it is best-effort: a
+// manual TTY run or an empty pipe must not hang the hook (1.5s race guard).
+export async function readHookInput(): Promise<Record<string, unknown> | null> {
+  if (process.stdin.isTTY) return null;
+  try {
+    const text = await Promise.race([
+      Bun.stdin.text(),
+      new Promise<string>((resolve) => setTimeout(() => resolve(""), 1500)),
+    ]);
+    if (!text.trim()) return null;
+    return JSON.parse(text) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
 async function main(): Promise<void> {
+  const hookInput = await readHookInput();
+  // Stop-event loop guard (official Codex hooks contract): stop_hook_active
+  // means this Stop already blocked once without progress — let Codex stop.
+  if (HOOK_EVENT_NAME === "Stop" && hookInput?.stop_hook_active === true) {
+    return;
+  }
+
   const pids = findHookPeerPids();
   if (!pids) {
     process.exitCode = 1;
@@ -247,18 +270,25 @@ async function main(): Promise<void> {
   let pid = pids.primary;
   const claimPids = [pids.primary, ...pids.fallbacks].filter((candidate, index, all) => all.indexOf(candidate) === index);
   let lastClaimError = "";
-  for (const candidatePid of claimPids) {
-    pid = candidatePid;
-    try {
-      claimed = await claim(pid, drainId);
-      break;
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      lastClaimError = msg;
-      if (!/unknown target pid|no peer|peer not found/i.test(msg)) {
-        log(`claim failed: ${msg}`);
-        await heartbeat(pid, "error", 0, msg);
-        return;
+  // At SessionStart the peer-register hook and MCP servers launch concurrently
+  // with this drain (Codex runs same-event hooks in parallel) — retry
+  // peer-not-found briefly instead of giving up on the race.
+  const notFoundAttempts = HOOK_EVENT_NAME === "SessionStart" ? 5 : 1;
+  for (let attempt = 0; attempt < notFoundAttempts && !claimed; attempt++) {
+    if (attempt > 0) await Bun.sleep(600);
+    for (const candidatePid of claimPids) {
+      pid = candidatePid;
+      try {
+        claimed = await claim(pid, drainId);
+        break;
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        lastClaimError = msg;
+        if (!/unknown target pid|no peer|peer not found/i.test(msg)) {
+          log(`claim failed: ${msg}`);
+          await heartbeat(pid, "error", 0, msg);
+          return;
+        }
       }
     }
   }
@@ -297,12 +327,21 @@ async function main(): Promise<void> {
 
   const lines = messages.map(renderInboundLine);
   const context = `---\n${messages.length} pending peer message(s):\n\n${lines.join("\n\n")}`;
-  const output = {
-    hookSpecificOutput: {
-      hookEventName: HOOK_EVENT_NAME,
-      additionalContext: context,
-    },
-  };
+  // Output shape is event-dependent (official Codex hooks contract): Stop
+  // ignores additionalContext / plain stdout, but supports decision:"block"
+  // with a reason that is fed back to the model — turn-end delivery. All
+  // other events take hookSpecificOutput.additionalContext.
+  const output = HOOK_EVENT_NAME === "Stop"
+    ? {
+      decision: "block",
+      reason: `${messages.length} peer message(s) arrived during this turn. Read and handle them before stopping:\n\n${lines.join("\n\n")}`,
+    }
+    : {
+      hookSpecificOutput: {
+        hookEventName: HOOK_EVENT_NAME,
+        additionalContext: context,
+      },
+    };
 
   try {
     await Bun.write(Bun.stdout, `${JSON.stringify(output)}\n`);

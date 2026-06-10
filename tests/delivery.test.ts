@@ -1479,6 +1479,87 @@ describe("Live broker delivery features", () => {
     child.kill();
   });
 
+  test("Codex Stop-event hook emits decision:block with reason and ACKs", async () => {
+    const child = spawnSleep();
+    const peer = await brokerFetch<{ id: string }>("/register", {
+      pid: child.pid, cwd: "/codex-stop-hook", git_root: null, tty: null, name: "codex-stop-hook",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null,
+      client_type: "codex", receiver_mode: "manual-drain", summary: "",
+    });
+    const send = await brokerFetch<{ id: number }>("/send-message", {
+      from_id: peer.id, to_id: peer.id, text: "stop-hook-visible",
+    });
+
+    const hook = Bun.spawn(["bun", new URL("../hooks/codex-drain-peer-inbox.ts", import.meta.url).pathname], {
+      cwd: new URL("..", import.meta.url).pathname,
+      env: {
+        ...process.env,
+        CLAUDE_PEERS_PORT: String(BROKER_PORT),
+        CLAUDE_PEERS_MCP_PID: String(child.pid),
+        CLAUDE_PEERS_HOOK_EVENT_NAME: "Stop",
+      },
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    hook.stdin.write(JSON.stringify({ hook_event_name: "Stop", stop_hook_active: false }));
+    hook.stdin.end();
+    const stdout = await new Response(hook.stdout).text();
+    const code = await hook.exited;
+    expect(code).toBe(0);
+    const json = JSON.parse(stdout) as { decision: string; reason: string; hookSpecificOutput?: unknown };
+    // Official Codex hooks contract: Stop ignores additionalContext / plain
+    // stdout; turn-end delivery must use decision:"block" + reason.
+    expect(json.decision).toBe("block");
+    expect(json.reason).toContain("stop-hook-visible");
+    expect(json.reason).toContain("<peer-message");
+    expect(json.hookSpecificOutput).toBeUndefined();
+
+    const status = await brokerFetch<{ statuses: { delivered: boolean }[] }>(
+      "/message-status", { id: peer.id, ids: [send.id] }
+    );
+    expect(status.statuses[0]!.delivered).toBe(true);
+    child.kill();
+  });
+
+  test("Codex Stop-event hook honors stop_hook_active and leaves mail unclaimed", async () => {
+    const child = spawnSleep();
+    const peer = await brokerFetch<{ id: string }>("/register", {
+      pid: child.pid, cwd: "/codex-stop-active", git_root: null, tty: null, name: "codex-stop-active",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null,
+      client_type: "codex", receiver_mode: "manual-drain", summary: "",
+    });
+    const send = await brokerFetch<{ id: number }>("/send-message", {
+      from_id: peer.id, to_id: peer.id, text: "must-stay-queued",
+    });
+
+    const hook = Bun.spawn(["bun", new URL("../hooks/codex-drain-peer-inbox.ts", import.meta.url).pathname], {
+      cwd: new URL("..", import.meta.url).pathname,
+      env: {
+        ...process.env,
+        CLAUDE_PEERS_PORT: String(BROKER_PORT),
+        CLAUDE_PEERS_MCP_PID: String(child.pid),
+        CLAUDE_PEERS_HOOK_EVENT_NAME: "Stop",
+      },
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+    hook.stdin.write(JSON.stringify({ hook_event_name: "Stop", stop_hook_active: true }));
+    hook.stdin.end();
+    const stdout = await new Response(hook.stdout).text();
+    const code = await hook.exited;
+    expect(code).toBe(0);
+    // Loop guard: no output at all, and the message stays undelivered for the
+    // next UserPromptSubmit / session-start drain.
+    expect(stdout.trim()).toBe("");
+    const status = await brokerFetch<{ statuses: { delivered: boolean }[] }>(
+      "/message-status", { id: peer.id, ids: [send.id] }
+    );
+    expect(status.statuses[0]!.delivered).toBe(false);
+    child.kill();
+  });
+
   test("Gemini hook script emits BeforeAgent additionalContext and ACKs", async () => {
     const child = spawnSleep();
     const peer = await brokerFetch<{ id: string }>("/register", {

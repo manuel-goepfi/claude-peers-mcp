@@ -55,6 +55,20 @@ describe("Codex hook installer", () => {
       expect(startupHooks.filter((hook) => hook.command === expectedRegisterCommand)).toHaveLength(1);
       expect(startupHooks.find((hook) => hook.command === expectedRegisterCommand)?.name).toBe("claude-peers-codex-register");
       expect(startupHooks.find((hook) => hook.command === expectedRegisterCommand)?.timeout).toBe(10);
+
+      // Session-start drain + Stop drain are installed exactly once each (the
+      // double-run above is the idempotence guard).
+      const expectedSessionDrain = `CLAUDE_PEERS_HOOK_EVENT_NAME=SessionStart ${expectedDrainCommand}`;
+      const expectedStopDrain = `CLAUDE_PEERS_HOOK_EVENT_NAME=Stop ${expectedDrainCommand}`;
+      expect(startupHooks.filter((hook) => hook.command === expectedSessionDrain)).toHaveLength(1);
+      expect(startupHooks.find((hook) => hook.command === expectedSessionDrain)?.name).toBe("claude-peers-codex-session-drain");
+      const stopBuckets = (doc.hooks as unknown as { Stop?: Array<{ hooks: Array<{ command: string; name?: string }> }> }).Stop ?? [];
+      const stopHooks = stopBuckets.flatMap((bucket) => bucket.hooks);
+      expect(stopHooks.filter((hook) => hook.command === expectedStopDrain)).toHaveLength(1);
+      expect(stopHooks.find((hook) => hook.command === expectedStopDrain)?.name).toBe("claude-peers-codex-stop-drain");
+      // The plain UserPromptSubmit drain must not have been duplicated or
+      // captured by the new env-prefixed predicates.
+      expect(commands.filter((command) => command.includes("CLAUDE_PEERS_HOOK_EVENT_NAME="))).toHaveLength(0);
     } finally {
       rmSync(repo, { recursive: true, force: true });
     }
@@ -208,7 +222,10 @@ describe("Codex hook installer", () => {
       };
       expect(doc.hooks.SessionStart).toHaveLength(1);
       expect(doc.hooks.SessionStart[0]?.matcher).toBe("startup|resume");
-      expect(doc.hooks.SessionStart[0]?.hooks.map((hook) => hook.command)).toEqual([expectedRegisterCommand]);
+      expect(doc.hooks.SessionStart[0]?.hooks.map((hook) => hook.command)).toEqual([
+        expectedRegisterCommand,
+        `CLAUDE_PEERS_HOOK_EVENT_NAME=SessionStart ${expectedDrainCommand}`,
+      ]);
     } finally {
       rmSync(repo, { recursive: true, force: true });
     }
