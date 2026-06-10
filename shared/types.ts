@@ -88,6 +88,12 @@ export interface HeartbeatRequest {
   receiver_mode?: ReceiverMode;
 }
 
+export interface HeartbeatResponse {
+  ok: true;
+  client_type: ClientType;
+  receiver_mode: ReceiverMode;
+}
+
 export interface SetSummaryRequest {
   id: PeerId;
   summary: string;
@@ -129,19 +135,65 @@ export interface SendMessageRequest {
   text: string;
 }
 
+export interface PeerSelector {
+  id?: PeerId;
+  // Operator-facing stable seat label, e.g. infra.4. Ambiguous if multiple
+  // live peers share it; callers should then choose a returned resolved_name,
+  // seat_key, or tmux pane selector.
+  name?: string;
+  // Broker-unique runtime label, e.g. infra.4#2.
+  resolved_name?: string;
+  // Human-visible tmux pane coordinate, e.g. "infra:1.2" or "infra 1.2".
+  // The MCP server resolves this to tmux_session + tmux_pane_id before it
+  // calls the broker; the broker intentionally stores only the stable pane id.
+  tmux_target?: string;
+  tmux_session?: string;
+  tmux_pane_id?: string;
+  seat_key?: string;
+}
+
+export type PeerResolveErrorCode =
+  | "INVALID_SELECTOR"
+  | "PEER_NOT_FOUND"
+  | "STALE_PEER_ID"
+  | "PEER_NOT_LIVE"
+  | "AMBIGUOUS_TARGET";
+
+export interface PeerTarget {
+  id: PeerId;
+  name: string | null;
+  resolved_name: string | null;
+  seat_key: string;
+  cwd: string;
+  git_root: string | null;
+  tmux_session: string | null;
+  tmux_window_index: string | null;
+  tmux_window_name: string | null;
+  tmux_pane_id: string | null;
+  client_type: ClientType;
+  receiver_mode: ReceiverMode;
+  last_hook_seen_at: string | null;
+  last_drain_at: string | null;
+  last_drain_error: string | null;
+  last_seen: string | null;
+}
+
 export interface SendMessageResponse {
   ok: boolean;
   id?: number;
+  code?: PeerResolveErrorCode;
   error?: string;
-  target?: {
-    id: PeerId;
-    client_type: ClientType;
-    receiver_mode: ReceiverMode;
-    last_hook_seen_at: string | null;
-    last_drain_error: string | null;
-    last_seen: string | null;
-  };
+  target?: PeerTarget;
+  candidates?: PeerTarget[];
 }
+
+export interface SendToPeerRequest {
+  from_id: PeerId;
+  selector: PeerSelector;
+  text: string;
+}
+
+export type SendToPeerResponse = SendMessageResponse;
 
 export interface TmuxPaneSnapshot {
   ok: boolean;

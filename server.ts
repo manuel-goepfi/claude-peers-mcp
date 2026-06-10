@@ -30,11 +30,14 @@ import type {
   PeerId,
   Peer,
   RegisterResponse,
+  HeartbeatResponse,
   PollMessagesResponse,
   Message,
   ClientType,
   ReceiverMode,
   SendMessageResponse,
+  PeerSelector,
+  PeerTarget,
   TmuxPaneSnapshot,
 } from "./shared/types.ts";
 import { detectClientFromProcessChain, findClientPidFromProcessChain, initialReceiverMode, type ProcessInfo } from "./shared/client.ts";
@@ -75,9 +78,40 @@ let reregisterInFlight: Promise<void> | null = null;
 // reregister-after-unregister "resurrection" races during shutdown.
 let shuttingDown = false;
 
+const PEER_ID_BODY_PATHS = new Set([
+  "/heartbeat",
+  "/set-summary",
+  "/set-name",
+  "/list-peers",
+  "/poll-messages",
+  "/ack-messages",
+  "/message-status",
+]);
+
+export function rewriteAuthBodyForPeer(path: string, body: unknown, oldPeerId: string | null, newPeerId: string | null): unknown {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return body;
+  const next = { ...(body as Record<string, unknown>) };
+  if (PEER_ID_BODY_PATHS.has(path) && next.id === oldPeerId) next.id = newPeerId;
+  if (next.from_id === oldPeerId) next.from_id = newPeerId;
+  if (next.exclude_id === oldPeerId) next.exclude_id = newPeerId;
+  if (next.to_id === oldPeerId) next.to_id = newPeerId;
+  if (next.selector && typeof next.selector === "object" && !Array.isArray(next.selector)) {
+    const selector = { ...(next.selector as Record<string, unknown>) };
+    if (selector.id === oldPeerId) selector.id = newPeerId;
+    next.selector = selector;
+  }
+  return next;
+}
+
+export function shouldDisableBackgroundPolling(clientType: ClientType, receiverMode: ReceiverMode): boolean {
+  return clientType === "codex" || clientType === "gemini" || receiverMode === "codex-hook" || receiverMode === "gemini-hook";
+}
+
 async function brokerFetch<T>(path: string, body: unknown, _retry = false): Promise<T> {
+  const attemptPeerId = myId;
+  const attemptToken = myToken;
   const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (myToken) headers["X-Peer-Token"] = myToken;
+  if (attemptToken) headers["X-Peer-Token"] = attemptToken;
   const res = await fetch(`${BROKER_URL}${path}`, {
     method: "POST",
     headers,
@@ -91,17 +125,17 @@ async function brokerFetch<T>(path: string, body: unknown, _retry = false): Prom
     // 401 path context — the previous code threw the raw register error, which
     // looked unrelated to the call that triggered recovery.
     log(`Broker returned 401 on ${path} — re-registering`);
-    if (!reregisterInFlight) {
+    if (myId === attemptPeerId && !reregisterInFlight) {
       reregisterInFlight = (async () => {
         try { await reregisterPeer(); } finally { reregisterInFlight = null; }
       })();
     }
     try {
-      await reregisterInFlight;
+      if (reregisterInFlight) await reregisterInFlight;
     } catch (e) {
       throw new Error(`Broker auth recovery failed during ${path}: ${e instanceof Error ? e.message : String(e)} (original request was rejected with 401)`);
     }
-    return brokerFetch<T>(path, body, true);
+    return brokerFetch<T>(path, rewriteAuthBodyForPeer(path, body, attemptPeerId, myId), true);
   }
   if (!res.ok) {
     const err = await res.text();
@@ -115,6 +149,24 @@ async function brokerFetch<T>(path: string, body: unknown, _retry = false): Prom
 let reregisterPeer: () => Promise<void> = async () => {
   throw new Error("reregisterPeer called before main() completed initial registration");
 };
+
+export function __testSetBrokerAuthStateForTest(state: {
+  id?: PeerId | null;
+  token?: string | null;
+  shuttingDown?: boolean;
+  reregisterPeer?: () => Promise<void>;
+  resetInFlight?: boolean;
+}): void {
+  if ("id" in state) myId = state.id ?? null;
+  if ("token" in state) myToken = state.token ?? null;
+  if ("shuttingDown" in state) shuttingDown = Boolean(state.shuttingDown);
+  if (state.reregisterPeer) reregisterPeer = state.reregisterPeer;
+  if (state.resetInFlight !== false) reregisterInFlight = null;
+}
+
+export async function __testBrokerFetchForTest<T>(path: string, body: unknown): Promise<T> {
+  return brokerFetch<T>(path, body);
+}
 
 async function isBrokerAlive(): Promise<boolean> {
   try {
@@ -400,6 +452,8 @@ let myAbsoluteGitDir: string | null = null;
 let myClientType: ClientType = "unknown";
 let myReceiverMode: ReceiverMode = "unknown";
 let myRegisterPid = process.pid;
+let myTmuxInfo: TmuxPaneInfo | null = null;
+let latestTmuxMirrorFailure: string | null = null;
 
 // Local buffer for messages fetched by the poll loop, awaiting delivery
 // via piggyback (drainPendingMessages) or check_messages.
@@ -572,15 +626,88 @@ function readTmuxPaneOption(target: string, optionName: string): string | null {
   return cleanTmuxOptionValue(runTmux(["show-options", "-p", "-t", target, "-v", optionName]));
 }
 
-function setTmuxPaneOption(target: string, optionName: string, value: string): void {
+function setTmuxPaneOption(target: string, optionName: string, value: string): boolean {
   try {
-    Bun.spawnSync(["tmux", "set-option", "-p", "-t", target, optionName, value], {
+    const result = Bun.spawnSync(["tmux", "set-option", "-p", "-t", target, optionName, value], {
       stdout: "ignore",
       stderr: "ignore",
     });
+    return result.exitCode === 0;
   } catch {
     // Best-effort label publishing only; registration still works without it.
+    return false;
   }
+}
+
+export function normalizeTmuxTargetSelector(value: string | null | undefined): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const match = trimmed.match(/^([A-Za-z0-9_.@-]+)(?::|\s+)(\d+)\.(\d+)$/);
+  if (!match) return null;
+  return `${match[1]}:${match[2]}.${match[3]}`;
+}
+
+function resolveTmuxTargetSelector(value: string | null | undefined): { tmux_session: string; tmux_pane_id: string } | { error: string } | null {
+  const target = normalizeTmuxTargetSelector(value);
+  if (!target) return null;
+
+  const out = runTmux(["display-message", "-p", "-t", target, "#{session_name}\t#{pane_id}"]);
+  if (!out) return { error: `tmux target '${value}' was not found; use a visible pane address like infra:1.2` };
+  const [tmux_session, tmux_pane_id] = out.trim().split("\t");
+  if (!tmux_session || !tmux_pane_id?.startsWith("%")) {
+    return { error: `tmux target '${value}' did not resolve to a stable pane id` };
+  }
+  return { tmux_session, tmux_pane_id };
+}
+
+type TmuxMirrorResult = { ok: boolean; target: string | null; failedOptions: string[] };
+
+export function brokerIdentityPaneTarget(tmuxInfo: TmuxPaneInfo | null): string | null {
+  if (tmuxInfo?.pane_id) return tmuxInfo.pane_id;
+  if (process.env.TMUX_PANE) return process.env.TMUX_PANE;
+  return null;
+}
+
+export function publishBrokerIdentityToTmux(identity: {
+  id: PeerId;
+  name: string | null;
+  resolved_name: string | null;
+  client_type: ClientType;
+  receiver_mode: ReceiverMode;
+}, tmuxInfo: TmuxPaneInfo | null = myTmuxInfo, options: { updateOperatorLabel?: boolean } = {}): TmuxMirrorResult {
+  const paneTarget = brokerIdentityPaneTarget(tmuxInfo);
+  if (!paneTarget) return { ok: true, target: null, failedOptions: [] };
+
+  const displayLabel = identity.name || identity.resolved_name || identity.id;
+  const existingOperatorLabel = readTmuxPaneOption(paneTarget, "@operator_label");
+  const failedOptions: string[] = [];
+  const setOption = (optionName: string, value: string) => {
+    if (!setTmuxPaneOption(paneTarget, optionName, value)) failedOptions.push(optionName);
+  };
+  if ((options.updateOperatorLabel || !existingOperatorLabel) && displayLabel) {
+    setOption("@operator_label", displayLabel);
+  }
+  setOption("@peer_id", identity.id);
+  setOption("@peer_label", displayLabel);
+  setOption("@peer_resolved_name", identity.resolved_name ?? "");
+  setOption("@peer_client_type", identity.client_type);
+  setOption("@peer_receiver_mode", identity.receiver_mode);
+  const ok = failedOptions.length === 0;
+  const verb = ok ? "mirrored" : "partially failed";
+  const failed = ok ? "" : ` failed_options=${failedOptions.join(",")}`;
+  log(`tmux broker identity ${verb}: @peer_id=${identity.id} @peer_label=${displayLabel} @peer_resolved_name=${identity.resolved_name ?? ""} (target=${paneTarget})${failed}`);
+  return { ok, target: paneTarget, failedOptions };
+}
+
+function recordTmuxMirrorResult(context: string, result: TmuxMirrorResult): void {
+  if (!result.target) return;
+  if (result.ok) {
+    latestTmuxMirrorFailure = null;
+    return;
+  }
+  latestTmuxMirrorFailure = `${context}: target=${result.target} failed_options=${result.failedOptions.join(",")}`;
+  log(`tmux broker identity mirror warning (${latestTmuxMirrorFailure})`);
 }
 
 function readUsedOperatorLabels(session: string, currentPaneId: string): string[] {
@@ -684,6 +811,33 @@ function sendStatusHint(target: SendMessageResponse["target"] | undefined, deliv
   return " Still queued; receiver mode is unknown, so manual check_messages may be required.";
 }
 
+export function listPeersRoutingHint(scope: "machine" | "directory" | "repo", peerCount: number, hasTmux: boolean): string {
+  if (scope !== "repo" || peerCount <= 1) return "";
+  const tmuxHint = hasTmux ? "" : " Retry with has_tmux=true to hide headless/task peers.";
+  return `\n\nRouting guard: repo scope found ${peerCount} peers. Do not message the first row by position; use find_peer with an exact/name_like label, or send_to_peer with name, resolved_name, seat_key, or tmux_session + tmux_pane_id.${tmuxHint}`;
+}
+
+function formatPeerTarget(target: PeerTarget | undefined): string {
+  if (!target) return "(unknown peer)";
+  const label = target.name ?? target.resolved_name ?? target.id;
+  const resolved = target.resolved_name && target.resolved_name !== target.name ? ` resolved=${target.resolved_name}` : "";
+  const tmux = target.tmux_session
+    ? ` tmux=${target.tmux_session}:${target.tmux_window_name ?? target.tmux_window_index ?? ""}${target.tmux_pane_id ? `:${target.tmux_pane_id}` : ""}`
+    : "";
+  return `${label}${resolved} id=${target.id} seat=${target.seat_key} receiver=${target.client_type}/${target.receiver_mode}${tmux}`;
+}
+
+function formatPeerCandidates(candidates: PeerTarget[] | undefined): string {
+  if (!candidates || candidates.length === 0) return "";
+  return `\n\nLive candidate(s):\n${candidates.map((p) => `- ${formatPeerTarget(p)}`).join("\n")}`;
+}
+
+function peerSeatKey(peer: Pick<Peer, "id" | "tty" | "tmux_session" | "tmux_pane_id">): string {
+  if (peer.tmux_session && peer.tmux_pane_id) return `pane:${peer.tmux_session}:${peer.tmux_pane_id}`;
+  if (peer.tty) return `tty:${peer.tty}`;
+  return `id:${peer.id}`;
+}
+
 function clampTmuxLineCount(value: unknown): number {
   const parsed = typeof value === "number" ? value : Number(value);
   if (!Number.isFinite(parsed)) return TMUX_CAPTURE_DEFAULT_LINES;
@@ -785,7 +939,7 @@ const TOOLS = [
   {
     name: "send_message",
     description:
-      "Send a message to another peer by ID. Claude peers receive via MCP poll/piggyback/check paths; Codex and Gemini peers receive on next prompt only when their drain hook is installed, otherwise via check_messages.",
+      "Send a message to another peer by live ID. Rejects stale or inactive IDs and returns live candidates when the target seat has relaunched. Prefer send_to_peer for human names or tmux selectors.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -804,6 +958,39 @@ const TOOLS = [
         },
       },
       required: ["to_id", "message"],
+    },
+  },
+  {
+    name: "send_to_peer",
+    description:
+      "Send a message to one live peer using a selector: visible tmux pane address, human name, resolved runtime name, live ID, seat_key, or tmux session + pane ID. Ambiguous human names fail with candidate details instead of guessing.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        selector: {
+          type: "object" as const,
+          description: "Target selector. Prefer tmux_target for visible pane addresses like infra:1.2. Use name only when unique; use resolved_name, seat_key, id, or tmux_session + tmux_pane_id for exact routing.",
+          properties: {
+            id: { type: "string" as const, description: "Live broker peer ID" },
+            name: { type: "string" as const, description: "Human-facing seat label, e.g. infra.4" },
+            resolved_name: { type: "string" as const, description: "Broker-unique runtime label, e.g. infra.4#2" },
+            seat_key: { type: "string" as const, description: "Broker active-seat key returned by send/list diagnostics, e.g. pane:rag:%12" },
+            tmux_target: { type: "string" as const, description: "Visible tmux pane address, e.g. infra:1.2 or infra 1.2" },
+            tmux_session: { type: "string" as const, description: "Tmux session name" },
+            tmux_pane_id: { type: "string" as const, description: "Stable tmux pane ID such as %12" },
+          },
+        },
+        message: {
+          type: "string" as const,
+          description: "The message to send",
+        },
+        include_tmux_context: {
+          type: "boolean" as const,
+          description:
+            "Optional. When true, read the target peer's tmux pane after resolution and include the read-only snapshot in this tool result. This never writes to tmux or modifies the message body.",
+        },
+      },
+      required: ["selector", "message"],
     },
   },
   {
@@ -975,12 +1162,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
         const lines = peers.map((p) => {
           const parts = [
+            `Name: ${p.name ?? "(unnamed)"}`,
+            `Resolved: ${p.resolved_name ?? "(none)"}`,
+            `Seat: ${peerSeatKey(p)}`,
             `ID: ${p.id}`,
             `PID: ${p.pid}`,
             `CWD: ${p.cwd}`,
           ];
-          if (p.name) parts.push(`Name: ${p.name}`);
-          if (p.resolved_name && p.resolved_name !== p.name) parts.push(`Resolved: ${p.resolved_name}`);
           parts.push(receiverLine(p));
           if (p.git_root) parts.push(`Repo: ${p.git_root}`);
           if (p.tty) parts.push(`TTY: ${p.tty}`);
@@ -994,7 +1182,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           content: [
             {
               type: "text" as const,
-              text: `Found ${peers.length} peer(s) (scope: ${scope}):\n\n${lines.join("\n\n")}${pending ?? ""}`,
+              text: `Found ${peers.length} peer(s) (scope: ${scope}):${listPeersRoutingHint(scope, peers.length, hasTmux)}\n\n${lines.join("\n\n")}${pending ?? ""}`,
             },
           ],
         };
@@ -1024,7 +1212,6 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         };
       }
       try {
-        const tmuxSnapshot = include_tmux_context === true ? await inspectPeerPane(to_id) : null;
         const result = await brokerFetch<SendMessageResponse>("/send-message", {
           from_id: myId,
           to_id,
@@ -1032,7 +1219,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         });
         if (!result.ok) {
           return {
-            content: [{ type: "text" as const, text: `Failed to send: ${result.error}` }],
+            content: [{ type: "text" as const, text: `Failed to send: ${result.error}${formatPeerCandidates(result.candidates)}` }],
             isError: true,
           };
         }
@@ -1055,16 +1242,17 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             }
           } catch (e) {
             // Best-effort confirmation: log to stderr so ops can grep for
-            // repeated failures (auth breakage, broker restart race, etc.),
-            // but don't surface to the user's tool output — not worth noise.
+            // repeated failures (auth breakage, broker restart race, etc.).
+            statusLine = " Delivery status unavailable; ask the receiver to check_messages if this handoff is urgent.";
             log(`message-status probe failed for id=${result.id}: ${errMsg(e)}`);
           }
         }
 
         const pending = await drainPendingMessages();
+        const tmuxSnapshot = include_tmux_context === true && result.target ? await inspectPeerPane(result.target.id) : null;
         const tmuxText = tmuxSnapshot ? `\n\n${formatTmuxSnapshot(tmuxSnapshot)}` : "";
         return {
-          content: [{ type: "text" as const, text: `Message sent to peer ${to_id}.${statusLine}${tmuxText}${pending ?? ""}` }],
+          content: [{ type: "text" as const, text: `Message sent to ${formatPeerTarget(result.target)}.${statusLine}${tmuxText}${pending ?? ""}` }],
         };
       } catch (e) {
         return {
@@ -1074,6 +1262,77 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
               text: `Error sending message: ${e instanceof Error ? e.message : String(e)}`,
             },
           ],
+          isError: true,
+        };
+      }
+    }
+
+    case "send_to_peer": {
+      const { selector, message, include_tmux_context } = args as {
+        selector: PeerSelector;
+        message: string;
+        include_tmux_context?: boolean;
+      };
+      if (!myId) {
+        return {
+          content: [{ type: "text" as const, text: "Not registered with broker yet" }],
+          isError: true,
+        };
+      }
+      try {
+        let effectiveSelector = selector;
+        if (selector?.tmux_target) {
+          const resolved = resolveTmuxTargetSelector(selector.tmux_target);
+          if (!resolved || "error" in resolved) {
+            return {
+              content: [{ type: "text" as const, text: `Failed to send: ${resolved?.error ?? "invalid tmux_target selector"}` }],
+              isError: true,
+            };
+          }
+          const { tmux_target: _tmuxTarget, ...rest } = selector;
+          effectiveSelector = { ...rest, tmux_session: resolved.tmux_session, tmux_pane_id: resolved.tmux_pane_id };
+        }
+        const result = await brokerFetch<SendMessageResponse>("/send-to-peer", {
+          from_id: myId,
+          selector: effectiveSelector,
+          text: message,
+        });
+        if (!result.ok) {
+          return {
+            content: [{ type: "text" as const, text: `Failed to send: ${result.error}${formatPeerCandidates(result.candidates)}` }],
+            isError: true,
+          };
+        }
+
+        let statusLine = "";
+        if (typeof result.id === "number") {
+          await new Promise((r) => setTimeout(r, 2000));
+          try {
+            const s = await brokerFetch<{ ok: boolean; statuses: { id: number; delivered: boolean; delivered_at: string | null }[] }>(
+              "/message-status",
+              { id: myId, ids: [result.id] }
+            );
+            const row = s.statuses?.[0];
+            if (row?.delivered && row.delivered_at) {
+              statusLine = ` Delivered at ${row.delivered_at}.`;
+            } else if (row && !row.delivered) {
+              statusLine = sendStatusHint(result.target, false);
+            }
+          } catch (e) {
+            statusLine = " Delivery status unavailable; ask the receiver to check_messages if this handoff is urgent.";
+            log(`message-status probe failed for id=${result.id}: ${errMsg(e)}`);
+          }
+        }
+
+        const pending = await drainPendingMessages();
+        const tmuxSnapshot = include_tmux_context === true && result.target ? await inspectPeerPane(result.target.id) : null;
+        const tmuxText = tmuxSnapshot ? `\n\n${formatTmuxSnapshot(tmuxSnapshot)}` : "";
+        return {
+          content: [{ type: "text" as const, text: `Message sent to ${formatPeerTarget(result.target)}.${statusLine}${tmuxText}${pending ?? ""}` }],
+        };
+      } catch (e) {
+        return {
+          content: [{ type: "text" as const, text: `Error sending message: ${e instanceof Error ? e.message : String(e)}` }],
           isError: true,
         };
       }
@@ -1190,16 +1449,18 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const res = await brokerFetch<{ ok: boolean; name: string | null; resolved_name: string | null }>("/set-name", { id: myId, name: newName });
         myOperatorName = res.name ?? null;
         myResolvedName = res.resolved_name ?? res.name ?? null;
-        // Update tmux pane label so the border reflects the new name live.
-        if (process.env.TMUX_PANE) {
-          const newLabel = myOperatorName || myId;
-          Bun.spawnSync(["tmux", "set-option", "-p", "-t", process.env.TMUX_PANE, "@peer_label", newLabel], {
-            stdout: "ignore", stderr: "ignore",
-          });
-        }
+        const mirror = publishBrokerIdentityToTmux({
+          id: myId,
+          name: myOperatorName,
+          resolved_name: myResolvedName,
+          client_type: myClientType,
+          receiver_mode: myReceiverMode,
+        }, myTmuxInfo, { updateOperatorLabel: true });
+        recordTmuxMirrorResult("set_name", mirror);
         const pending = await drainPendingMessages();
+        const tmuxWarning = mirror.ok ? "" : `\nWarning: tmux label update partially failed for ${mirror.failedOptions.join(", ")}.`;
         return {
-          content: [{ type: "text" as const, text: `Name updated: "${newName}"${pending ?? ""}` }],
+          content: [{ type: "text" as const, text: `Name updated: "${newName}"${tmuxWarning}${pending ?? ""}` }],
         };
       } catch (e) {
         return {
@@ -1349,11 +1610,54 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     case "whoami": {
+      let brokerLine = "Broker row: unavailable";
+      if (myId) {
+        try {
+          const peers = await brokerFetch<Peer[]>("/list-peers", {
+            id: myId,
+            scope: "machine" as const,
+            cwd: myCwd,
+            git_root: myGitRoot,
+            absolute_git_dir: myAbsoluteGitDir,
+            include_inactive: true,
+          });
+          const self = peers.find((p) => p.id === myId);
+          if (self) {
+            const drift: string[] = [];
+            if (self.name !== myOperatorName) drift.push(`name local=${myOperatorName ?? "(none)"} broker=${self.name ?? "(none)"}`);
+            if (self.resolved_name !== myResolvedName) drift.push(`resolved local=${myResolvedName ?? "(none)"} broker=${self.resolved_name ?? "(none)"}`);
+            if (self.client_type !== myClientType) drift.push(`client local=${myClientType} broker=${self.client_type}`);
+            if (self.receiver_mode !== myReceiverMode) drift.push(`receiver local=${myReceiverMode} broker=${self.receiver_mode}`);
+            brokerLine = `Broker row: ${formatPeerTarget({
+              id: self.id,
+              name: self.name,
+              resolved_name: self.resolved_name,
+              seat_key: peerSeatKey(self),
+              cwd: self.cwd,
+              git_root: self.git_root,
+              tmux_session: self.tmux_session,
+              tmux_window_index: self.tmux_window_index,
+              tmux_window_name: self.tmux_window_name,
+              tmux_pane_id: self.tmux_pane_id,
+              client_type: self.client_type ?? "unknown",
+              receiver_mode: self.receiver_mode ?? "unknown",
+              last_hook_seen_at: self.last_hook_seen_at,
+              last_drain_at: self.last_drain_at,
+              last_drain_error: self.last_drain_error,
+              last_seen: self.last_seen,
+            })}${drift.length ? `\nDrift: ${drift.join("; ")}` : "\nDrift: none"}`;
+          } else {
+            brokerLine = "Broker row: missing for local peer id";
+          }
+        } catch (e) {
+          brokerLine = `Broker row: unavailable (${errMsg(e)})`;
+        }
+      }
       return {
         content: [
           {
             type: "text" as const,
-            text: `Peer ID: ${myId ?? "(not registered)"}\nOperator name: ${myOperatorName ?? "(none)"}\nResolved name: ${myResolvedName ?? "(none)"}\nClient: ${myClientType}\nReceiver mode: ${myReceiverMode}\nCWD: ${myCwd}\nGit root: ${myGitRoot ?? "(none)"}`,
+            text: `Peer ID: ${myId ?? "(not registered)"}\nOperator name: ${myOperatorName ?? "(none)"}\nResolved name: ${myResolvedName ?? "(none)"}\nClient: ${myClientType}\nReceiver mode: ${myReceiverMode}\nCWD: ${myCwd}\nGit root: ${myGitRoot ?? "(none)"}\nTmux mirror: ${latestTmuxMirrorFailure ?? "ok"}\n${brokerLine}`,
           },
         ],
       };
@@ -1473,6 +1777,7 @@ async function main() {
       log(`Tmux (env hint): ${envHint.session}:${envHint.window_index ?? ""}:${envHint.window_name ?? ""}`);
     }
   }
+  myTmuxInfo = tmuxInfo;
   // Name fallback resolution: env → tmux pane → observer-${pid} (final
   // fallback closes the historic name=null gap for bare-claude sessions
   // with no env AND no tmux). Single call to isTaskSubagent() — result
@@ -1572,32 +1877,13 @@ async function main() {
     log(`note: '${peerName}' has duplicate MCP instances; runtime label is '${myResolvedName}'`);
   }
 
-  // If running inside tmux, publish our identity as per-pane options so
-  // pane-border-format can display the peer's name/id without extra lookups.
-  // Best-effort — tmux not installed or pane resolution fails → silent skip.
-  // Fix B: env-hint-only peers (bg-job workers) are NOT attached to a tmux
-  // server, so `tmux set-option` calls would either fail or target the wrong
-  // pane on a same-name session. Gate the publish block on real $TMUX so it
-  // only fires for live-walk peers. Env-hint peers still get their tmux_*
-  // fields registered with the broker — they just don't try to write back
-  // into tmux from a process that isn't attached to it.
-  if (tmuxInfo && process.env.TMUX && tmuxInfo.window_index) {
-    const target = `${tmuxInfo.session}:${tmuxInfo.window_index}.${process.env.TMUX_PANE ?? ""}`;
-    const displayLabel = myOperatorName || peerName || myId;
-    try {
-      // Use pane-id when present; fall back to session:window.pane coordinate.
-      const paneTarget = process.env.TMUX_PANE
-        ? process.env.TMUX_PANE
-        : `${tmuxInfo.session}:${tmuxInfo.window_index}`;
-      setTmuxPaneOption(paneTarget, "@peer_id", myId);
-      setTmuxPaneOption(paneTarget, "@operator_label", displayLabel);
-      setTmuxPaneOption(paneTarget, "@peer_label", displayLabel);
-      setTmuxPaneOption(paneTarget, "@peer_resolved_name", myResolvedName ?? "");
-      log(`tmux pane labeled: @peer_id=${myId} @operator_label=${displayLabel} @peer_resolved_name=${myResolvedName ?? ""} (target=${paneTarget})`);
-    } catch (e) {
-      log(`tmux set-option failed (non-critical): ${errMsg(e)} (target=${target})`);
-    }
-  }
+  recordTmuxMirrorResult("register", publishBrokerIdentityToTmux({
+    id: myId,
+    name: myOperatorName,
+    resolved_name: myResolvedName,
+    client_type: myClientType,
+    receiver_mode: myReceiverMode,
+  }, tmuxInfo));
 
   // S2: reregister hook used by brokerFetch on 401. Clears token first so
   // the recursive /register call does not send a stale header.
@@ -1610,8 +1896,14 @@ async function main() {
     // peers came/went during the auth-reset window.
     myOperatorName = r.name ?? peerName;
     myResolvedName = r.resolved_name ?? r.name ?? peerName;
-    myClientType = r.client_type ?? myClientType;
-    myReceiverMode = r.receiver_mode ?? myReceiverMode;
+    applyReceiverMetadata(r.client_type ?? myClientType, r.receiver_mode ?? myReceiverMode, "re-register");
+    recordTmuxMirrorResult("re-register", publishBrokerIdentityToTmux({
+      id: myId,
+      name: myOperatorName,
+      resolved_name: myResolvedName,
+      client_type: myClientType,
+      receiver_mode: myReceiverMode,
+    }, tmuxInfo));
     log(`Re-registered as peer ${myId} name=${myOperatorName ?? "(none)"} resolved=${myResolvedName ?? "(none)"} after broker auth reset`);
   };
 
@@ -1648,7 +1940,7 @@ async function main() {
   // holds a pre-ACK copy, then the next tool call piggybacks the stale copy.
   // Manual check_messages remains available for these clients because it polls the
   // broker directly instead of relying on this local buffer.
-  let pollActive = true;
+  let pollActive = false;
 
   async function schedulePoll() {
     if (!pollActive) return;
@@ -1656,18 +1948,47 @@ async function main() {
     if (pollActive) setTimeout(schedulePoll, POLL_INTERVAL_MS);
   }
 
-  if (myClientType === "codex" || myClientType === "gemini") {
-    pollActive = false;
-    log(`${myClientType} client detected — background channel poll disabled; using hook/check_messages receive path`);
-  } else {
+  function startBackgroundPoll(reason: string) {
+    if (pollActive) return;
+    pollActive = true;
+    log(`background channel poll enabled (${reason})`);
     setTimeout(schedulePoll, POLL_INTERVAL_MS);
   }
+
+  function stopBackgroundPoll(reason: string) {
+    if (!pollActive) return;
+    pollActive = false;
+    log(`background channel poll disabled (${reason})`);
+  }
+
+  function applyReceiverMetadata(clientType: ClientType, receiverMode: ReceiverMode, reason: string): boolean {
+    const changed = clientType !== myClientType || receiverMode !== myReceiverMode;
+    myClientType = clientType;
+    myReceiverMode = receiverMode;
+    if (shouldDisableBackgroundPolling(myClientType, myReceiverMode)) {
+      stopBackgroundPoll(`${reason}; using hook/check_messages receive path`);
+    } else {
+      startBackgroundPoll(reason);
+    }
+    return changed;
+  }
+
+  applyReceiverMetadata(myClientType, myReceiverMode, "startup");
 
   // 7. Start heartbeat
   const heartbeatTimer = setInterval(async () => {
     if (myId) {
       try {
-        await brokerFetch("/heartbeat", { id: myId, client_type: myClientType, receiver_mode: myReceiverMode });
+        const heartbeat = await brokerFetch<HeartbeatResponse>("/heartbeat", { id: myId, client_type: myClientType, receiver_mode: myReceiverMode });
+        if (applyReceiverMetadata(heartbeat.client_type, heartbeat.receiver_mode, "heartbeat")) {
+          recordTmuxMirrorResult("heartbeat", publishBrokerIdentityToTmux({
+            id: myId,
+            name: myOperatorName,
+            resolved_name: myResolvedName,
+            client_type: myClientType,
+            receiver_mode: myReceiverMode,
+          }));
+        }
       } catch {
         // Non-critical
       }
