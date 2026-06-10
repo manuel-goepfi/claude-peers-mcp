@@ -126,6 +126,40 @@ else
   warn "Gemini inbox hook not executable at $GEMINI_HOOK" "chmod +x $GEMINI_HOOK or reinstall fork"
 fi
 
+# 7c. orphaned / spare-parented server.ts processes. An orphan (ppid=1) is a
+# dead session's MCP server still heartbeating — it squats a seat, breeds #N
+# duplicate names, and blocks rehydration. Spare-parented (claude --bg-spare)
+# servers are pre-warm ghosts. Both classes should not exist after the
+# 2026-06-10 lifecycle fix; flag any survivors running old code.
+ORPHANS=""
+SPARES=""
+for pid in $(pgrep -f 'claude-peers-mcp/server\.ts' 2>/dev/null); do
+  ppid=$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' ')
+  [[ -z "$ppid" ]] && continue
+  if [[ "$ppid" == "1" ]]; then
+    ORPHANS+="$pid "
+  elif ps -p "$ppid" -o args= 2>/dev/null | grep -q -- '--bg-spare'; then
+    SPARES+="$pid "
+  fi
+done
+if [[ -z "$ORPHANS" && -z "$SPARES" ]]; then
+  ok "no orphaned or bg-spare server.ts processes"
+else
+  [[ -n "$ORPHANS" ]] && fail "orphaned server.ts (ppid=1): ${ORPHANS}" "kill ${ORPHANS}— these predate the stdin-EOF/parent-watchdog fix"
+  [[ -n "$SPARES" ]] && warn "bg-spare-parented server.ts: ${SPARES}" "kill ${SPARES}— pre-warm ghosts; new code defers their registration"
+fi
+
+# 7d. Codex hook trust. Codex trust is hash-based: any hooks.json rewrite
+# (e.g. install-codex-hook.ts) marks hooks untrusted and they silently stop
+# running until re-trusted. We can't read Codex's trust store portably, so
+# flag recently-modified hooks.json files as a reminder.
+for cf in "$HOME/.codex/hooks.json" "$HOME"/*/.codex/hooks.json; do
+  [[ -f "$cf" ]] || continue
+  if [[ -n "$(find "$cf" -mmin -1440 2>/dev/null)" ]]; then
+    warn "Codex hooks.json modified <24h ago: $cf" "run /hooks inside Codex to re-trust, or hooks may be silently skipped"
+  fi
+done
+
 # 8. latency log has recent entries
 LOG="$HOME/.claude-peers-broker.log"
 if [[ -f "$LOG" ]]; then
