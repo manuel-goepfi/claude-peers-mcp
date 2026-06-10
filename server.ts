@@ -55,7 +55,8 @@ import { parseTmuxPanes, parsePsTree, composeTmuxFromEnv, prepareTmuxPaneText, t
 const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 const POLL_INTERVAL_MS = 1000;
-const HEARTBEAT_INTERVAL_MS = 15_000;
+// Env override exists for tests only (lifecycle tests need sub-second ticks).
+const HEARTBEAT_INTERVAL_MS = parseInt(process.env.CLAUDE_PEERS_HEARTBEAT_MS ?? "15000", 10);
 const BROKER_SCRIPT = new URL("./broker.ts", import.meta.url).pathname;
 const BROKER_LOG = `${process.env.HOME}/.claude-peers-broker.log`;
 const BROKER_LOG_MAX_BYTES = 10 * 1024 * 1024; // 10MB
@@ -2035,14 +2036,23 @@ async function main() {
   }, 60_000);
 
   // 9. Clean up on exit
-  const cleanup = async () => {
+  const cleanup = async (reason: string) => {
+    // Re-entry guard: stdin EOF, transport close, parent-death watchdog, and
+    // signals can all fire around the same shutdown — only the first wins.
+    if (shuttingDown) return;
     // H3: set shuttingDown BEFORE unregistering so any concurrent poll/tool
     // call that sees a 401 during the shutdown window doesn't try to
     // reregister and resurrect this peer.
     shuttingDown = true;
+    log(`Shutting down (${reason})`);
+    // Orphan-prevention is the whole point: if the broker is wedged, the
+    // unregister fetch must not keep this process alive. Hard exit either way.
+    const hardExit = setTimeout(() => process.exit(0), 3000);
+    if (typeof hardExit.unref === "function") hardExit.unref();
     pollActive = false;
     clearInterval(heartbeatTimer);
     clearInterval(pruneTimer);
+    clearInterval(parentWatchdogTimer);
     if (myId) {
       try {
         await brokerFetch("/unregister", { id: myId });
@@ -2055,8 +2065,32 @@ async function main() {
     process.exit(0);
   };
 
-  process.on("SIGINT", cleanup);
-  process.on("SIGTERM", cleanup);
+  process.on("SIGINT", () => void cleanup("SIGINT"));
+  process.on("SIGTERM", () => void cleanup("SIGTERM"));
+
+  // Lifecycle hardening (2026-06-10). An MCP stdio server must live exactly as
+  // long as its client session. Before this, a hard-killed/crashed Claude (or a
+  // harness-side MCP reconnect) left this process running and heartbeating
+  // forever: the broker saw a live ghost occupying the seat, new sessions got
+  // #N-suffixed names, senders messaged dead peers, and rehydration never fired
+  // (it requires the old PID to be dead). Three exit paths, first one wins:
+  //
+  // (a) stdin EOF/close — the client closed our pipe (graceful exit, reconnect,
+  //     or kill). This is the contractual stdio-transport death signal.
+  process.stdin.on("end", () => void cleanup("stdin EOF"));
+  process.stdin.on("close", () => void cleanup("stdin closed"));
+  // (b) MCP transport close as reported by the SDK (covers transport-level
+  //     teardown that may not surface as a stdin event).
+  mcp.onclose = () => void cleanup("MCP transport closed");
+  // (c) Parent-death watchdog — belt and braces for kill -9/crash paths where
+  //     the pipe fd can linger (e.g. inherited by our own grandchildren).
+  //     Reparenting (typically to pid 1 or a subreaper) means the client died.
+  const initialPpid = process.ppid;
+  const parentWatchdogTimer = setInterval(() => {
+    if (process.ppid !== initialPpid) {
+      void cleanup(`parent died (ppid ${initialPpid} -> ${process.ppid})`);
+    }
+  }, HEARTBEAT_INTERVAL_MS);
 }
 
 // Only bootstrap when this file is the entry point — prevents tests that
