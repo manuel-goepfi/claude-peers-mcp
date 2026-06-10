@@ -1560,6 +1560,54 @@ describe("Live broker delivery features", () => {
     child.kill();
   });
 
+  test("Codex SessionStart hook retries claim until the racing registration lands", async () => {
+    // At SessionStart the register hook and MCP servers launch concurrently
+    // with the drain. The retry path is gated on the broker's literal
+    // "peer not found" error strings — this test pins that contract: reword
+    // the broker error and the drain silently gives up on attempt 1.
+    const child = spawnSleep();
+
+    const hook = Bun.spawn(["bun", new URL("../hooks/codex-drain-peer-inbox.ts", import.meta.url).pathname], {
+      cwd: new URL("..", import.meta.url).pathname,
+      env: {
+        ...process.env,
+        CLAUDE_PEERS_PORT: String(BROKER_PORT),
+        CLAUDE_PEERS_MCP_PID: String(child.pid),
+        CLAUDE_PEERS_HOOK_EVENT_NAME: "SessionStart",
+      },
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+
+    // Let the hook burn its first claim attempt(s) against an unregistered
+    // pid, then SIGSTOP it so no claim can land in the gap between /register
+    // and /send-message (an empty claim would end the drain mail-less).
+    await Bun.sleep(800);
+    hook.kill("SIGSTOP");
+    const peer = await brokerFetch<{ id: string }>("/register", {
+      pid: child.pid, cwd: "/codex-sessionstart-race", git_root: null, tty: null, name: "codex-ss-race",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null,
+      client_type: "codex", receiver_mode: "manual-drain", summary: "",
+    });
+    const send = await brokerFetch<{ id: number }>("/send-message", {
+      from_id: peer.id, to_id: peer.id, text: "race-visible",
+    });
+    hook.kill("SIGCONT");
+
+    const stdout = await new Response(hook.stdout).text();
+    const code = await hook.exited;
+    expect(code).toBe(0);
+    const json = JSON.parse(stdout) as { hookSpecificOutput: { hookEventName: string; additionalContext: string } };
+    expect(json.hookSpecificOutput.hookEventName).toBe("SessionStart");
+    expect(json.hookSpecificOutput.additionalContext).toContain("race-visible");
+
+    const status = await brokerFetch<{ statuses: { delivered: boolean }[] }>(
+      "/message-status", { id: peer.id, ids: [send.id] }
+    );
+    expect(status.statuses[0]!.delivered).toBe(true);
+    child.kill();
+  }, 15000);
+
   test("Gemini hook script emits BeforeAgent additionalContext and ACKs", async () => {
     const child = spawnSleep();
     const peer = await brokerFetch<{ id: string }>("/register", {

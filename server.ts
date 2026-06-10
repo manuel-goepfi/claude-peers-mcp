@@ -19,7 +19,7 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { openSync, closeSync, statSync, existsSync, readlinkSync } from "node:fs";
+import { openSync, closeSync, statSync, existsSync, readlinkSync, readFileSync } from "node:fs";
 
 // --- Tiny error formatting helper (avoids the e instanceof Error ternary
 //     repeated at every catch site) ---
@@ -1783,7 +1783,7 @@ async function main() {
   }
   myGitRoot = await getGitRoot(myCwd);
   myAbsoluteGitDir = await getAbsoluteGitDir(myCwd);
-  const tty = getTty(registrationTtyPid(myRegisterPid, myClientType));
+  let tty = getTty(registrationTtyPid(myRegisterPid, myClientType));
   let tmuxInfo = await detectTmuxPane();
   // Fix B (2026-05-12): if the live ancestry walk found nothing, fall back to
   // CLAUDE_PEER_TMUX_* env hints exported by the cc/ccc/cccr/cc2 bashrc
@@ -1820,7 +1820,7 @@ async function main() {
       ? `${tmuxInfo.session}.${tmuxInfo.pane_id}`
       : null);
   const isSubagent = isTaskSubagent();
-  const peerName: string = resolvePeerName(envName, tmuxFallbackName, isSubagent, myRegisterPid);
+  let peerName: string = resolvePeerName(envName, tmuxFallbackName, isSubagent, myRegisterPid);
   if (envName && !tmuxFallbackName && isSubagent) {
     log(`Task subagent detected — peer name suffixed: ${peerName}`);
   }
@@ -1887,8 +1887,40 @@ async function main() {
     summary: initialSummary,
   });
 
+  // Identity computed while still a pre-warm spare is stale by promotion time
+  // (env ignored, cwd/repo may have changed since the daemon launched us).
+  // Recompute from the live process state at registration time. Env-derived
+  // hints (CLAUDE_PEER_NAME / TMUX_PANE) stay ignored — they are the daemon's.
+  const refreshSpareIdentity = async () => {
+    const cwdResult = registrationCwdResult(process.cwd(), myRegisterPid, myClientType);
+    myCwd = cwdResult.cwd;
+    myGitRoot = await getGitRoot(myCwd);
+    myAbsoluteGitDir = await getAbsoluteGitDir(myCwd);
+    tty = getTty(registrationTtyPid(myRegisterPid, myClientType));
+    tmuxInfo = await detectTmuxPane();
+    myTmuxInfo = tmuxInfo;
+    const freshLabel = resolveTmuxOperatorLabel(tmuxInfo) ??
+      (tmuxInfo?.pane_id ? `${tmuxInfo.session}.${tmuxInfo.pane_id}` : null);
+    peerName = resolvePeerName(null, freshLabel, isSubagent, myRegisterPid);
+    log(`spare identity refreshed at registration: cwd=${myCwd} name=${peerName} tmux=${tmuxInfo ? tmuxInfo.session : "(none)"}`);
+  };
+
   const performRegistration = async () => {
+    if (spareAncestor) await refreshSpareIdentity();
     const reg = await brokerFetch<RegisterResponse>("/register", buildRegisterPayload());
+    if (shuttingDown) {
+      // Cleanup won the race while /register was in flight — tear the fresh
+      // row down so no ghost outlives this process.
+      myToken = reg.token;
+      try {
+        await brokerFetch("/unregister", { id: reg.id });
+        log(`registration completed after shutdown began — unregistered ${reg.id}`);
+      } catch {
+        // Row falls to the broker's dead-PID reaper.
+      }
+      myToken = null;
+      return;
+    }
     myId = reg.id;
     myToken = reg.token;
     myOperatorName = reg.name ?? peerName;
@@ -1957,10 +1989,20 @@ async function main() {
         clearInterval(promotionTimer);
         return;
       }
-      if (!findBgSpareAncestor(process.ppid, processTable())) {
+      const table = processTable();
+      // A `ps` failure yields an empty table — indistinguishable from "spare
+      // marker gone". Treat it as "can't tell" and skip the tick; registering
+      // on a failed probe would recreate the ghost this feature prevents.
+      if (table.size === 0) {
+        log("promotion watcher: process table unavailable, skipping tick");
+        return;
+      }
+      if (!findBgSpareAncestor(process.ppid, table)) {
         log("bg-spare promotion detected — registering with broker");
-        clearInterval(promotionTimer);
-        void ensureRegistered().catch((e) => log(`promotion registration failed: ${errMsg(e)}`));
+        // Watcher stays armed until registration actually succeeds; the next
+        // tick exits through the myId guard. A transient broker error here
+        // must not permanently orphan the promoted session.
+        void ensureRegistered().catch((e) => log(`promotion registration failed (will retry): ${errMsg(e)}`));
       }
     }, HEARTBEAT_INTERVAL_MS);
   }
@@ -2142,10 +2184,23 @@ async function main() {
   // (c) Parent-death watchdog — belt and braces for kill -9/crash paths where
   //     the pipe fd can linger (e.g. inherited by our own grandchildren).
   //     Reparenting (typically to pid 1 or a subreaper) means the client died.
+  //     Bun caches process.ppid at startup (verified 2026-06-10: still returns
+  //     the dead parent's pid after reparenting), so the live value must come
+  //     from /proc. On non-Linux the readFileSync fails and the watchdog is
+  //     inert — the stdin-EOF and transport-close paths still cover shutdown.
   const initialPpid = process.ppid;
+  const liveParentPid = (): number | null => {
+    try {
+      const match = readFileSync("/proc/self/status", "utf8").match(/^PPid:\s*(\d+)/m);
+      return match ? Number(match[1]) : null;
+    } catch {
+      return null;
+    }
+  };
   const parentWatchdogTimer = setInterval(() => {
-    if (process.ppid !== initialPpid) {
-      void cleanup(`parent died (ppid ${initialPpid} -> ${process.ppid})`);
+    const ppidNow = liveParentPid();
+    if (ppidNow !== null && ppidNow !== initialPpid) {
+      void cleanup(`parent died (ppid ${initialPpid} -> ${ppidNow})`);
     }
   }, HEARTBEAT_INTERVAL_MS);
 }

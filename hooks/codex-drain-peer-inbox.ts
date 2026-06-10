@@ -246,17 +246,28 @@ export async function readHookInput(): Promise<Record<string, unknown> | null> {
     ]);
     if (!text.trim()) return null;
     return JSON.parse(text) as Record<string, unknown>;
-  } catch {
+  } catch (e) {
+    log(`hook input unreadable: ${e instanceof Error ? e.message : String(e)}`);
     return null;
   }
 }
 
 async function main(): Promise<void> {
   const hookInput = await readHookInput();
-  // Stop-event loop guard (official Codex hooks contract): stop_hook_active
-  // means this Stop already blocked once without progress — let Codex stop.
-  if (HOOK_EVENT_NAME === "Stop" && hookInput?.stop_hook_active === true) {
-    return;
+  if (HOOK_EVENT_NAME === "Stop") {
+    // Stop-event loop guard (official Codex hooks contract): stop_hook_active
+    // means this Stop already blocked once without progress — let Codex stop.
+    if (hookInput?.stop_hook_active === true) {
+      return;
+    }
+    // Fail CLOSED when the payload could not be read on a piped stdin: a
+    // dropped stop_hook_active=true would otherwise re-block a turn we were
+    // contractually told to release. Skipping leaves mail for the next
+    // UserPromptSubmit / SessionStart drain — nothing is lost.
+    if (hookInput === null && !process.stdin.isTTY) {
+      log("Stop hook input unreadable — failing closed (no drain, no block)");
+      return;
+    }
   }
 
   const pids = findHookPeerPids();

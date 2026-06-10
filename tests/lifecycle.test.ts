@@ -136,7 +136,7 @@ describe("server.ts lifecycle", () => {
       // (held open by this test), so the stdin-EOF path cannot fire — only the
       // parent-death watchdog can. Heartbeat interval shrunk via env override.
       const wrapper = Bun.spawn(
-        ["bash", "-c", `bun "${SERVER_SCRIPT}" & sleep 0.3`],
+        ["bash", "-c", `bun "${SERVER_SCRIPT}" <&0 & sleep 0.3`],
         {
           env: serverEnv({ CLAUDE_PEERS_HEARTBEAT_MS: "200" }),
           stdin: "pipe", // held open for the server's whole lifetime
@@ -181,7 +181,7 @@ describe("server.ts lifecycle", () => {
       // a spare inherits a stale name from the daemon's launch shell, and
       // registering with it is exactly the ghost-duplicate bug.
       const wrapper = Bun.spawn(
-        ["bash", "-c", `bun "${SERVER_SCRIPT}" & wait`, "bash", "--bg-spare", "/tmp/cc-daemon-test/spare/x"],
+        ["bash", "-c", `bun "${SERVER_SCRIPT}" <&0 & wait`, "bash", "--bg-spare", "/tmp/cc-daemon-test/spare/x"],
         {
           env: serverEnv({ CLAUDE_PEER_NAME: "ux.2", TMUX_PANE: "%34" }),
           stdin: "pipe",
@@ -199,5 +199,113 @@ describe("server.ts lifecycle", () => {
       }
     },
     15000
+  );
+
+  test(
+    "bg-spare: first MCP tool call triggers deferred registration (ensureRegistered)",
+    async () => {
+      const wrapper = Bun.spawn(
+        ["bash", "-c", `bun "${SERVER_SCRIPT}" <&0 & wait`, "bash", "--bg-spare", "/tmp/cc-daemon-test/spare/y"],
+        {
+          env: serverEnv({ CLAUDE_PEER_NAME: "stale-spare-name" }),
+          stdin: "pipe",
+          stdout: "ignore",
+          stderr: "ignore",
+        }
+      );
+      try {
+        // Confirm deferral, then drive the MCP handshake + one tool call over
+        // stdio. The CallTool handler must register before serving the tool.
+        await Bun.sleep(2500);
+        expect(peerRows().length).toBe(0);
+
+        const frames = [
+          { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "lifecycle-test", version: "0" } } },
+          { jsonrpc: "2.0", method: "notifications/initialized" },
+          { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "whoami", arguments: {} } },
+        ];
+        for (const frame of frames) {
+          wrapper.stdin.write(`${JSON.stringify(frame)}\n`);
+        }
+        wrapper.stdin.flush();
+
+        await waitFor(() => peerRows().length === 1, 10000, "deferred registration on first tool call");
+      } finally {
+        wrapper.stdin.end();
+        wrapper.kill();
+      }
+    },
+    20000
+  );
+
+  test(
+    "bg-spare: promotion watcher registers when the spare marker leaves the ancestor chain",
+    async () => {
+      // `exec sleep` replaces the bash image in place: same pid, argv loses
+      // the --bg-spare marker — the exec-style promotion the watcher exists
+      // for. Watcher cadence shrunk via the heartbeat env override.
+      const wrapper = Bun.spawn(
+        ["bash", "-c", `bun "${SERVER_SCRIPT}" <&0 & exec sleep 60`, "bash", "--bg-spare", "/tmp/cc-daemon-test/spare/z"],
+        {
+          env: serverEnv({ CLAUDE_PEERS_HEARTBEAT_MS: "200" }),
+          stdin: "pipe",
+          stdout: "ignore",
+          stderr: "ignore",
+        }
+      );
+      try {
+        await waitFor(() => peerRows().length === 1, 10000, "promotion-watcher registration");
+      } finally {
+        wrapper.stdin.end();
+        wrapper.kill();
+        // The server reparents when sleep dies; its own watchdog reaps it.
+      }
+    },
+    20000
+  );
+
+  test(
+    "hard-exit timer: server still exits when the broker wedges during unregister",
+    async () => {
+      // Mini-broker that registers/heartbeats normally but never answers
+      // /unregister — the unref'd 3s hard-exit timer is the only orphan
+      // defense on this path.
+      let registered = false;
+      const wedgePort = await findFreeBrokerPort();
+      const wedge = Bun.serve({
+        port: wedgePort,
+        hostname: "127.0.0.1",
+        fetch(req) {
+          const path = new URL(req.url).pathname;
+          if (path === "/health") return Response.json({ status: "ok", peers: 0 });
+          if (path === "/register") {
+            registered = true;
+            return Response.json({ id: "wedge-peer", token: "wedge-token", name: "wedge", resolved_name: "wedge", client_type: "unknown", receiver_mode: "unknown" });
+          }
+          if (path === "/unregister") return new Promise<Response>(() => {}); // hang forever
+          return Response.json({ ok: true, messages: [] });
+        },
+      });
+      const proc = Bun.spawn(["bun", SERVER_SCRIPT], {
+        env: serverEnv({ CLAUDE_PEERS_PORT: String(wedgePort) }),
+        stdin: "pipe",
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      try {
+        await waitFor(() => registered, 10000, "registration against wedge broker");
+        proc.stdin.end();
+        const exitCode = await Promise.race([
+          proc.exited,
+          Bun.sleep(6000).then(() => "timeout" as const),
+        ]);
+        // Hard exit fires at ~3s; anything that exits beats an orphan.
+        expect(exitCode).not.toBe("timeout");
+      } finally {
+        proc.kill();
+        wedge.stop(true);
+      }
+    },
+    20000
   );
 });
