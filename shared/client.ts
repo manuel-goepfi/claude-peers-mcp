@@ -58,6 +58,27 @@ export function findClientPidFromProcessChain(
   return null;
 }
 
+// Claude Code pre-warms spare sessions (`claude --bg-spare /tmp/cc-daemon-...`)
+// that load MCP servers before any real session exists. A spare inherits stale
+// CLAUDE_PEER_NAME / TMUX_PANE env from the shell that started the daemon, so
+// registering it creates a ghost duplicate on a pane it does not occupy
+// (observed 2026-06-10: ux.2#3 squatting pane %34). Returns the spare ancestor
+// row when the chain contains one, else null.
+export function findBgSpareAncestor(
+  startPid: number,
+  processes: Map<number, ProcessInfo>,
+): ProcessInfo | null {
+  let current = startPid;
+  for (let i = 0; i < 30; i++) {
+    const p = processes.get(current);
+    if (!p) break;
+    if (/(^|\s)--bg-spare(\s|$)/.test(p.args)) return p;
+    if (p.ppid <= 1 || p.ppid === current) break;
+    current = p.ppid;
+  }
+  return null;
+}
+
 export function detectClientFromProcessChain(
   startPid: number,
   processes: Map<number, ProcessInfo>,

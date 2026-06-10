@@ -171,4 +171,33 @@ describe("server.ts lifecycle", () => {
     },
     30000
   );
+
+  test(
+    "bg-spare ancestor: server defers registration and ignores inherited env identity",
+    async () => {
+      // The extra positional args make bash's own ps row read
+      // "bash -c ... bash --bg-spare /tmp/..." — the same marker a real
+      // pre-warm daemon chain carries. CLAUDE_PEER_NAME is set on purpose:
+      // a spare inherits a stale name from the daemon's launch shell, and
+      // registering with it is exactly the ghost-duplicate bug.
+      const wrapper = Bun.spawn(
+        ["bash", "-c", `bun "${SERVER_SCRIPT}" & wait`, "bash", "--bg-spare", "/tmp/cc-daemon-test/spare/x"],
+        {
+          env: serverEnv({ CLAUDE_PEER_NAME: "ux.2", TMUX_PANE: "%34" }),
+          stdin: "pipe",
+          stdout: "ignore",
+          stderr: "ignore",
+        }
+      );
+      try {
+        // Give the server ample time to start and (wrongly) register.
+        await Bun.sleep(3000);
+        expect(peerRows().length).toBe(0);
+      } finally {
+        wrapper.stdin.end();
+        wrapper.kill();
+      }
+    },
+    15000
+  );
 });

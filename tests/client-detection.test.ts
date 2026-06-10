@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { findClientPidFromTable, findHookPeerPidsFromTable, findMcpPidFromTable } from "../hooks/codex-drain-peer-inbox.ts";
-import { detectClientFromProcessChain, initialReceiverMode, type ProcessInfo } from "../shared/client.ts";
+import { detectClientFromProcessChain, findBgSpareAncestor, initialReceiverMode, type ProcessInfo } from "../shared/client.ts";
 import { registrationCwd, registrationCwdResult, registrationTtyPid } from "../server.ts";
 
 function table(rows: ProcessInfo[]): Map<number, ProcessInfo> {
@@ -183,5 +183,39 @@ describe("client detection", () => {
     ]);
     const pid = findMcpPidFromTable(processes, 30, "/repo", (candidate) => candidate === 20 ? "/repo" : "/other", "gemini");
     expect(pid).toBe(20);
+  });
+});
+
+describe("findBgSpareAncestor", () => {
+  test("detects a --bg-spare claude ancestor", () => {
+    const processes = table([
+      { pid: 30, ppid: 20, comm: "bun", args: "bun /home/manzo/claude-peers-mcp/server.ts" },
+      { pid: 20, ppid: 1, comm: "claude", args: "claude --bg-spare /tmp/cc-daemon-1000/x/spare/17e52" },
+    ]);
+    expect(findBgSpareAncestor(30, processes)?.pid).toBe(20);
+  });
+
+  test("regular session chain returns null", () => {
+    const processes = table([
+      { pid: 30, ppid: 20, comm: "bun", args: "bun /home/manzo/claude-peers-mcp/server.ts" },
+      { pid: 20, ppid: 10, comm: "claude", args: "claude --dangerously-skip-permissions" },
+      { pid: 10, ppid: 1, comm: "bash", args: "bash" },
+    ]);
+    expect(findBgSpareAncestor(30, processes)).toBeNull();
+  });
+
+  test("does not match --bg-spare as a substring of another flag", () => {
+    const processes = table([
+      { pid: 30, ppid: 20, comm: "bun", args: "bun server.ts" },
+      { pid: 20, ppid: 1, comm: "claude", args: "claude --bg-spare-pool-size 2" },
+    ]);
+    expect(findBgSpareAncestor(30, processes)).toBeNull();
+  });
+
+  test("terminates on ppid self-cycle", () => {
+    const processes = table([
+      { pid: 30, ppid: 30, comm: "bun", args: "bun server.ts" },
+    ]);
+    expect(findBgSpareAncestor(30, processes)).toBeNull();
   });
 });

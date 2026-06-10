@@ -40,7 +40,7 @@ import type {
   PeerTarget,
   TmuxPaneSnapshot,
 } from "./shared/types.ts";
-import { detectClientFromProcessChain, findClientPidFromProcessChain, initialReceiverMode, type ProcessInfo } from "./shared/client.ts";
+import { detectClientFromProcessChain, findBgSpareAncestor, findClientPidFromProcessChain, initialReceiverMode, type ProcessInfo } from "./shared/client.ts";
 import { frameUntrusted, renderInboundLine } from "./shared/render.ts";
 export { frameUntrusted, renderInboundLine } from "./shared/render.ts";
 import {
@@ -150,6 +150,12 @@ async function brokerFetch<T>(path: string, body: unknown, _retry = false): Prom
 let reregisterPeer: () => Promise<void> = async () => {
   throw new Error("reregisterPeer called before main() completed initial registration");
 };
+
+// Deferred-registration hook for bg-spare pre-warm sessions: a spare must not
+// claim a broker seat, but if it gets promoted and serves a real tool call,
+// the CallTool handler awaits this to register on first use. Replaced by
+// main() with the real closure; no-op resolution once registered.
+let ensureRegistered: () => Promise<void> = async () => {};
 
 export function __testSetBrokerAuthStateForTest(state: {
   id?: PeerId | null;
@@ -1125,6 +1131,16 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: args } = req.params;
 
+  // bg-spare deferral: a pre-warmed spare session stays unregistered, but the
+  // moment it serves a real tool call it must exist on the broker.
+  if (!myId) {
+    try {
+      await ensureRegistered();
+    } catch (e) {
+      return { content: [{ type: "text" as const, text: `Peer registration failed: ${errMsg(e)}` }], isError: true };
+    }
+  }
+
   switch (name) {
     case "list_peers": {
       const scope = (args as { scope: string }).scope as "machine" | "directory" | "repo";
@@ -1750,6 +1766,13 @@ async function main() {
   const serverCwd = process.cwd();
   myClientType = detectClientType();
   myReceiverMode = initialReceiverMode(myClientType);
+  // bg-spare pre-warm sessions must not register: they inherit stale
+  // CLAUDE_PEER_NAME / TMUX_PANE env from the daemon's launch shell and would
+  // squat another session's seat as a ghost duplicate (see findBgSpareAncestor).
+  const spareAncestor = findBgSpareAncestor(process.ppid, processTable());
+  if (spareAncestor) {
+    log(`bg-spare pre-warm detected (ancestor pid ${spareAncestor.pid}) — ignoring inherited env identity, deferring registration until promotion or first tool call`);
+  }
   if (myClientType === "codex" || myClientType === "gemini") {
     myRegisterPid = findClientPidFromProcessChain(process.ppid, processTable(), myClientType) ?? process.pid;
   }
@@ -1768,7 +1791,7 @@ async function main() {
   // whose own $TMUX is empty (daemon strips it) but whose launching shell
   // was inside tmux. The env hints carry session/window/pane_id but NOT
   // pane_index — see composeTmuxFromEnv() comments for why.
-  if (!tmuxInfo) {
+  if (!tmuxInfo && !spareAncestor) {
     const envHint = composeTmuxFromEnv(process.env);
     if (envHint) {
       tmuxInfo = envHint;
@@ -1789,7 +1812,7 @@ async function main() {
   // `codex.2`, etc.) so `find_peer({ name })` follows what the operator sees.
   // The stable tmux pane_id still travels separately as `tmux_pane_id`; it is
   // not the operator-facing name unless all human-label resolution fails.
-  const envName = process.env.CLAUDE_PEER_NAME ?? null;
+  const envName = spareAncestor ? null : (process.env.CLAUDE_PEER_NAME ?? null);
   const tmuxOperatorLabel = envName ? null : resolveTmuxOperatorLabel(tmuxInfo);
   const tmuxFallbackName =
     tmuxOperatorLabel ??
@@ -1858,33 +1881,35 @@ async function main() {
     tmux_session: tmuxInfo?.session ?? null,
     tmux_window_index: tmuxInfo?.window_index ?? null,
     tmux_window_name: tmuxInfo?.window_name ?? null,
-    tmux_pane_id: tmuxInfo?.pane_id ?? (process.env.TMUX_PANE ?? null),
+    tmux_pane_id: tmuxInfo?.pane_id ?? (spareAncestor ? null : (process.env.TMUX_PANE ?? null)),
     client_type: myClientType,
     receiver_mode: myReceiverMode,
     summary: initialSummary,
   });
 
-  const reg = await brokerFetch<RegisterResponse>("/register", buildRegisterPayload());
-  myId = reg.id;
-  myToken = reg.token;
-  myOperatorName = reg.name ?? peerName;
-  myResolvedName = reg.resolved_name ?? reg.name ?? peerName;
-  myClientType = reg.client_type ?? myClientType;
-  myReceiverMode = reg.receiver_mode ?? myReceiverMode;
-  log(`Registered as peer ${myId} name=${myOperatorName ?? "(none)"} resolved=${myResolvedName ?? "(none)"} (token issued)`);
-  // Breadcrumb when broker dedup'd a colliding runtime name. Visible in stderr
-  // + ~/.claude-peers-broker.log, but not promoted to the operator label.
-  if (peerName && myResolvedName && peerName !== myResolvedName) {
-    log(`note: '${peerName}' has duplicate MCP instances; runtime label is '${myResolvedName}'`);
-  }
+  const performRegistration = async () => {
+    const reg = await brokerFetch<RegisterResponse>("/register", buildRegisterPayload());
+    myId = reg.id;
+    myToken = reg.token;
+    myOperatorName = reg.name ?? peerName;
+    myResolvedName = reg.resolved_name ?? reg.name ?? peerName;
+    myClientType = reg.client_type ?? myClientType;
+    myReceiverMode = reg.receiver_mode ?? myReceiverMode;
+    log(`Registered as peer ${myId} name=${myOperatorName ?? "(none)"} resolved=${myResolvedName ?? "(none)"} (token issued)`);
+    // Breadcrumb when broker dedup'd a colliding runtime name. Visible in stderr
+    // + ~/.claude-peers-broker.log, but not promoted to the operator label.
+    if (peerName && myResolvedName && peerName !== myResolvedName) {
+      log(`note: '${peerName}' has duplicate MCP instances; runtime label is '${myResolvedName}'`);
+    }
 
-  recordTmuxMirrorResult("register", publishBrokerIdentityToTmux({
-    id: myId,
-    name: myOperatorName,
-    resolved_name: myResolvedName,
-    client_type: myClientType,
-    receiver_mode: myReceiverMode,
-  }, tmuxInfo));
+    recordTmuxMirrorResult("register", publishBrokerIdentityToTmux({
+      id: myId,
+      name: myOperatorName,
+      resolved_name: myResolvedName,
+      client_type: myClientType,
+      receiver_mode: myReceiverMode,
+    }, tmuxInfo));
+  };
 
   // S2: reregister hook used by brokerFetch on 401. Clears token first so
   // the recursive /register call does not send a stale header.
@@ -1907,6 +1932,38 @@ async function main() {
     }, tmuxInfo));
     log(`Re-registered as peer ${myId} name=${myOperatorName ?? "(none)"} resolved=${myResolvedName ?? "(none)"} after broker auth reset`);
   };
+
+  // Registration dispatch. Normal sessions register before the MCP transport
+  // connects (unchanged behavior). bg-spare sessions stay unregistered: the
+  // first real tool call registers via ensureRegistered (CallTool handler),
+  // and a watcher catches exec-style promotion where the --bg-spare marker
+  // disappears from the ancestor chain.
+  let registerInFlight: Promise<void> | null = null;
+  ensureRegistered = () => {
+    if (myId || shuttingDown) return Promise.resolve();
+    if (!registerInFlight) {
+      registerInFlight = performRegistration().catch((e) => {
+        registerInFlight = null;
+        throw e;
+      });
+    }
+    return registerInFlight;
+  };
+  if (!spareAncestor) {
+    await ensureRegistered();
+  } else {
+    const promotionTimer = setInterval(() => {
+      if (myId || shuttingDown) {
+        clearInterval(promotionTimer);
+        return;
+      }
+      if (!findBgSpareAncestor(process.ppid, processTable())) {
+        log("bg-spare promotion detected — registering with broker");
+        clearInterval(promotionTimer);
+        void ensureRegistered().catch((e) => log(`promotion registration failed: ${errMsg(e)}`));
+      }
+    }, HEARTBEAT_INTERVAL_MS);
+  }
 
   // If summary generation is still running, update it when done
   if (!initialSummary) {
