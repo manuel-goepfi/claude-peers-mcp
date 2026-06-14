@@ -183,3 +183,99 @@ export function parsePsTree(output: string): Map<number, number> {
   }
   return tree;
 }
+
+/** Minimal process shape the bg-attach resolver needs (pid, ppid, full args). */
+export interface ProcLike {
+  pid: number;
+  ppid: number;
+  args: string;
+}
+
+/**
+ * Extract a backgrounded session's short id from a pty-host ancestor's args.
+ *
+ * A `claude --bg` session runs under a daemon pty-host whose args carry the
+ * session id in one of two forms (observed on v2.1.177):
+ *   --bg-pty-host /tmp/cc-daemon-1000/<acct>/pty/<8hex>.sock ...
+ *   ... --session-id <8hex>-<rest-of-uuid> ...
+ * The short id (8 hex chars) is the agent-view id AND the prefix of the
+ * session UUID — and the same token the `claude attach <id>` client uses.
+ * Returns the 8-hex short id, or null if no pty-host marker is present.
+ *
+ * Pure: takes a single args string; the caller walks ancestry and passes
+ * each ancestor's args until one matches.
+ */
+export function bgSessionIdFromPtyHostArgs(args: string): string | null {
+  if (!/--bg-pty-host(\s|=)/.test(args)) return null;
+  // Prefer the .sock basename (always the short id); fall back to --session-id.
+  const sock = args.match(/\/pty\/([0-9a-f]{8})\.sock/);
+  if (sock) return sock[1]!;
+  const sid = args.match(/--session-id[=\s]+([0-9a-f]{8})/);
+  if (sid) return sid[1]!;
+  return null;
+}
+
+/**
+ * Resolve the tmux pane a BACKGROUNDED session is currently displayed in, by
+ * locating the live `claude attach <bgSessionId>` client and walking UP from it
+ * to the owning pane.
+ *
+ * Why this exists: a `--bg` session's own process ancestry is
+ * `daemon → bg-pty-host → session` — detached from any tmux pane, so the
+ * standard ancestry walk in detectTmuxPane() finds nothing, and the
+ * CLAUDE_PEER_TMUX_* env hint is suppressed for spares (the env is the
+ * daemon pool-warmer's, not this session's launcher — stale). The ONE source
+ * of the correct, current pane is the operator's `claude attach <id>` client,
+ * which runs in a real tmux pane in a SEPARATE process tree. This reads it
+ * live at registration time, so it is never stale and self-corrects if the
+ * operator re-attaches the session in a different pane.
+ *
+ * Matching is exact on the short id with a right boundary (end-of-string or
+ * whitespace) so `claude attach 4c98759b` does NOT match a longer id that
+ * merely starts with the same 8 hex (defensive — short ids are unique in
+ * practice, but a prefix match would be a latent ghost-pane bug).
+ *
+ * Returns the TmuxPaneInfo for the owning pane, or null when no matching
+ * attach client is found in any pane's subtree (e.g. the session is
+ * backgrounded but not currently attached anywhere).
+ *
+ * Pure function: all inputs passed in, no process spawning, so it is unit
+ * tested directly with synthetic process tables.
+ */
+export function resolveBgAttachPane(
+  bgSessionId: string,
+  paneMap: Map<number, TmuxPaneInfo>,
+  processes: ProcLike[],
+): TmuxPaneInfo | null {
+  if (!bgSessionId || paneMap.size === 0) return null;
+  // Match `claude attach <id>` with an exact-id right boundary so a longer id
+  // sharing the same 8-hex prefix never ghost-matches. The left side accepts an
+  // optional path/wrapper before `claude` ((^|\s|/)) so an absolute-path exe
+  // (`/usr/bin/claude attach <id>`) still matches; verified the live v2.1.177
+  // attach client is the bare `claude attach <id>` form, abs-path is defensive.
+  // NO nested quantifier (would be a ReDoS shape) — flags between `attach` and
+  // the id are not currently emitted, so we don't pay catastrophic-backtracking
+  // risk to tolerate a form that doesn't occur. bgSessionId is provably
+  // [0-9a-f]{8} (sole producer: bgSessionIdFromPtyHostArgs) → no metacharacter,
+  // no injection surface.
+  const attachRe = new RegExp(
+    `(^|\\s|/)claude\\s+attach\\s+${bgSessionId}(\\s|$)`,
+  );
+  const ppidMap = new Map<number, number>();
+  for (const p of processes) ppidMap.set(p.pid, p.ppid);
+
+  for (const p of processes) {
+    if (!attachRe.test(p.args)) continue;
+    // Walk UP from the attach client to the owning pane (pane_pid may be the
+    // attach client itself, or an ancestor like the pane's login shell).
+    let cur: number | undefined = p.pid;
+    for (let i = 0; i < 30 && cur !== undefined; i++) {
+      const pane = paneMap.get(cur);
+      if (pane) return pane;
+      const parent: number | undefined = ppidMap.get(cur);
+      if (parent === undefined || parent <= 1 || parent === cur) break;
+      cur = parent;
+    }
+  }
+  return null;
+}

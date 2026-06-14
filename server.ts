@@ -48,7 +48,7 @@ import {
   getGitBranch,
   getRecentFiles,
 } from "./shared/summarize.ts";
-import { parseTmuxPanes, parsePsTree, composeTmuxFromEnv, prepareTmuxPaneText, tmuxPaneTarget, type TmuxPaneInfo } from "./shared/tmux.ts";
+import { parseTmuxPanes, composeTmuxFromEnv, prepareTmuxPaneText, tmuxPaneTarget, bgSessionIdFromPtyHostArgs, resolveBgAttachPane, type TmuxPaneInfo } from "./shared/tmux.ts";
 
 // --- Configuration ---
 
@@ -415,12 +415,15 @@ async function detectTmuxPane(): Promise<TmuxPaneInfo | null> {
     const paneMap = parseTmuxPanes(listText);
     if (paneMap.size === 0) return null;
 
-    // 2. Snapshot the entire process tree in a single `ps` call instead of one
-    //    spawnSync per ancestor step — 20 sync subprocess spawns add ~100ms+ to
-    //    broker startup and slow down macOS where ps is heavyweight.
-    const psProc = Bun.spawnSync(["ps", "-eo", "pid,ppid"]);
-    if (psProc.exitCode !== 0) return null;
-    const ppidMap = parsePsTree(new TextDecoder().decode(psProc.stdout));
+    // 2. Snapshot the entire process tree in a single `ps` call (with args, so
+    //    the bg-session fallback in step 4 reuses it instead of re-spawning) —
+    //    one spawn vs a spawnSync per ancestor step (20 spawns add ~100ms+ to
+    //    broker startup and slow down macOS where ps is heavyweight). One
+    //    snapshot also means steps 3 and 4 walk a consistent tree (no skew).
+    const procs = processTable();
+    if (procs.size === 0) return null;
+    const ppidMap = new Map<number, number>();
+    for (const p of procs.values()) ppidMap.set(p.pid, p.ppid);
 
     // 3. Walk upward from process.ppid (the MCP server itself is never a tmux
     //    pane; its parent or further ancestor will be).
@@ -432,6 +435,37 @@ async function detectTmuxPane(): Promise<TmuxPaneInfo | null> {
       const parentPid = ppidMap.get(currentPid);
       if (parentPid === undefined || parentPid <= 1) break;
       currentPid = parentPid;
+    }
+
+    // 4. Backgrounded-session fallback. A `claude --bg` session's own ancestry
+    //    is daemon → bg-pty-host → session — detached from any tmux pane, so
+    //    the walk above finds nothing. The session IS, however, displayed in a
+    //    real pane whenever the operator has `claude attach <id>`-ed it, and
+    //    that attach client lives in a SEPARATE process tree (the pane's). Find
+    //    our bg short id from the pty-host ancestor, then locate the pane whose
+    //    subtree runs `claude attach <that-id>`. Reads the live attach client,
+    //    so it is never stale (unlike the suppressed CLAUDE_PEER_TMUX_* hint)
+    //    and self-corrects on re-attach. Only fires for actual bg sessions
+    //    (bgSessionIdFromPtyHostArgs returns null otherwise), so interactive
+    //    and non-attached sessions are unaffected. Reuses the step-2 snapshot.
+    let bgId: string | null = null;
+    let walk: number | undefined = process.ppid;
+    for (let i = 0; i < 20 && walk !== undefined; i++) {
+      const info = procs.get(walk);
+      if (info) {
+        bgId = bgSessionIdFromPtyHostArgs(info.args);
+        if (bgId) break;
+      }
+      const parent: number | undefined = ppidMap.get(walk);
+      if (parent === undefined || parent <= 1 || parent === walk) break;
+      walk = parent;
+    }
+    if (bgId) {
+      const pane = resolveBgAttachPane(bgId, paneMap, Array.from(procs.values()));
+      if (pane) {
+        log(`Tmux (bg-attach): session ${bgId} attached in ${pane.session}:${pane.pane_id ?? ""}`);
+        return pane;
+      }
     }
   } catch (e) {
     // Most commonly: tmux not installed. But also surfaces parsing/walk bugs.
