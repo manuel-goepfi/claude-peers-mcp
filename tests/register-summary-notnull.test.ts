@@ -105,3 +105,81 @@ describe("register: summary NOT NULL crash", () => {
     db.close();
   });
 });
+
+// Two UPDATE shapes prove the fix. `applyFix=false` mirrors the PRE-FIX SQL
+// (`summary = ?` — binds the value straight in, so undefined/empty clobbers or
+// crashes). `applyFix=true` mirrors the FIXED SQL
+// (`summary = COALESCE(NULLIF(?, ''), summary)` — empty/undefined preserves the
+// existing live summary). This is the Verification-of-the-Verifier pair: the
+// planted (pre-fix) shape fails the way the bug did; the fixed shape holds.
+function updateStmt(db: Database, applyFix: boolean) {
+  const summaryClause = applyFix ? "summary = COALESCE(NULLIF(?, ''), summary)" : "summary = ?";
+  return db.prepare(`
+    UPDATE peers
+    SET pid = ?, cwd = ?, git_root = ?, absolute_git_dir = ?, tty = ?,
+        name = ?, resolved_name = ?, tmux_session = ?, tmux_window_index = ?,
+        tmux_window_name = ?, tmux_pane_id = ?, client_type = ?,
+        receiver_mode = ?, ${summaryClause},
+        last_seen = ?, token = ?
+    WHERE id = ?
+  `);
+}
+
+function runUpdate(db: Database, summary: string | undefined, applyFix: boolean) {
+  const now = new Date().toISOString();
+  updateStmt(db, applyFix).run(
+    1234, "/tmp/x", "/tmp/x", null, "/dev/pts/3",
+    "lane.1", "lane.1", null, null, null, null,
+    "claude", "claude-channel", summary as string, now, "tok2", "peer1",
+  );
+}
+
+describe("register: re-registration summary preservation", () => {
+  test("PLANTED ERROR — pre-fix UPDATE bind (undefined summary) throws NOT NULL", () => {
+    const db = freshPeersDb();
+    runInsert(db, "live operator summary", "/dev/pts/3", true);
+    // Pre-fix SQL bound `summary = ?` directly — undefined throws NOT NULL.
+    expect(() => runUpdate(db, undefined, false)).toThrow(/NOT NULL/);
+    db.close();
+  });
+
+  test("PLANTED ERROR — pre-fix UPDATE bind (empty summary) CLOBBERS the live summary", () => {
+    const db = freshPeersDb();
+    runInsert(db, "live operator summary", "/dev/pts/3", true);
+    // Pre-fix SQL with empty "" silently overwrote the live summary — the bug.
+    runUpdate(db, "", false);
+    const row = db.query("SELECT summary FROM peers WHERE id = 'peer1'").get() as { summary: string };
+    expect(row.summary).toBe(""); // demonstrates the clobber the fix prevents
+    db.close();
+  });
+
+  test("FIX — re-register with EMPTY summary preserves the live summary", () => {
+    const db = freshPeersDb();
+    runInsert(db, "live operator summary", "/dev/pts/3", true);
+    // A lane re-registering (401 recovery) re-sends its frozen startup summary,
+    // which is "" after the operator set the real one via /set-summary.
+    // COALESCE(NULLIF('', ''), summary) keeps the live value.
+    runUpdate(db, "", true);
+    const row = db.query("SELECT summary FROM peers WHERE id = 'peer1'").get() as { summary: string };
+    expect(row.summary).toBe("live operator summary");
+    db.close();
+  });
+
+  test("FIX — re-register with a NEW non-empty summary updates it", () => {
+    const db = freshPeersDb();
+    runInsert(db, "old summary", "/dev/pts/3", true);
+    runUpdate(db, "fresh summary", true);
+    const row = db.query("SELECT summary FROM peers WHERE id = 'peer1'").get() as { summary: string };
+    expect(row.summary).toBe("fresh summary");
+    db.close();
+  });
+
+  test("FIX — re-register with undefined summary preserves the live summary (no crash)", () => {
+    const db = freshPeersDb();
+    runInsert(db, "live operator summary", "/dev/pts/3", true);
+    expect(() => runUpdate(db, undefined, true)).not.toThrow();
+    const row = db.query("SELECT summary FROM peers WHERE id = 'peer1'").get() as { summary: string };
+    expect(row.summary).toBe("live operator summary");
+    db.close();
+  });
+});

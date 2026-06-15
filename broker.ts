@@ -255,7 +255,13 @@ const updatePeerRegistration = db.prepare(`
       tmux_pane_id = ?,
       client_type = ?,
       receiver_mode = ?,
-      summary = ?,
+      -- Preserve a live summary on re-registration: a lane that re-registers
+      -- (e.g. 401 auth-reset recovery) re-sends its FROZEN startup summary,
+      -- which is empty/stale when the operator set the real summary later via
+      -- /set-summary (that updates the DB row, not the lane's closure var).
+      -- Binding it unconditionally would silently overwrite the live summary
+      -- with "". NULLIF(?, '') keeps the new value only when non-empty.
+      summary = COALESCE(NULLIF(?, ''), summary),
       last_seen = ?,
       token = ?
   WHERE id = ?
@@ -793,13 +799,6 @@ function handleRegister(body: RegisterRequest): RegisterResult {
     (requestedClientType === "unknown" || existingClientType === "unknown" || existingClientType === clientType));
   const id = inheritedId ?? (samePidRefresh ? existing!.id : null) ?? generateId();
 
-  // Existing PID-dedup: a live peer re-registering must replace its own row.
-  // Guarded against clobbering the inherited row we just re-created above.
-  if (existing && existing.id !== id) {
-    deletePeer.run(existing.id);
-    buckets.delete(existing.id);
-  }
-
   // Runtime-name de-dupe: keep the operator-facing name unchanged, but assign
   // a broker-unique resolved_name for diagnostics and exact process identity.
   const requestedName = body.name ?? null;
@@ -833,14 +832,35 @@ function handleRegister(body: RegisterRequest): RegisterResult {
   // Catch the binding/constraint error, log the real cause server-side, and
   // return a structured failure so the caller gets a real status, not a bare 500.
   try {
-    if (existing?.id === id) {
-      updatePeerRegistration.run(body.pid, body.cwd, body.git_root, body.absolute_git_dir ?? null, ttyValue, requestedName, finalName, body.tmux_session ?? null, body.tmux_window_index ?? null, body.tmux_window_name ?? null, body.tmux_pane_id ?? null, clientType, receiverMode, summaryValue, now, issuedToken, id);
-    } else {
-      insertPeer.run(id, body.pid, body.cwd, body.git_root, body.absolute_git_dir ?? null, ttyValue, requestedName, finalName, body.tmux_session ?? null, body.tmux_window_index ?? null, body.tmux_window_name ?? null, body.tmux_pane_id ?? null, clientType, receiverMode, summaryValue, now, now, issuedToken);
+    // Atomic delete-then-write: the existing-PID-dedup delete must roll back if
+    // the subsequent insert/update fails, otherwise a failed write leaves the
+    // PID with its old row deleted and no new row — a ghost (broker-invisible
+    // peer). db.transaction() makes the delete + write all-or-nothing; the
+    // buckets.delete (in-memory) runs only after the transaction commits.
+    db.transaction(() => {
+      // Existing PID-dedup: a live peer re-registering must replace its own row.
+      // Guarded against clobbering the inherited row we re-created above.
+      if (existing && existing.id !== id) {
+        deletePeer.run(existing.id);
+      }
+      if (existing?.id === id) {
+        updatePeerRegistration.run(body.pid, body.cwd, body.git_root, body.absolute_git_dir ?? null, ttyValue, requestedName, finalName, body.tmux_session ?? null, body.tmux_window_index ?? null, body.tmux_window_name ?? null, body.tmux_pane_id ?? null, clientType, receiverMode, summaryValue, now, issuedToken, id);
+      } else {
+        insertPeer.run(id, body.pid, body.cwd, body.git_root, body.absolute_git_dir ?? null, ttyValue, requestedName, finalName, body.tmux_session ?? null, body.tmux_window_index ?? null, body.tmux_window_name ?? null, body.tmux_pane_id ?? null, clientType, receiverMode, summaryValue, now, now, issuedToken);
+      }
+    })();
+    if (existing && existing.id !== id) {
+      buckets.delete(existing.id);
     }
   } catch (e) {
+    // SEC-04 / H4: log the full cause server-side, but return a GENERIC message
+    // to the caller. /register is the only unauthenticated route — surfacing the
+    // raw SQLite error (e.g. "UNIQUE constraint failed: peers.id") would leak
+    // table/column names to an unauthenticated client, the exact disclosure the
+    // route-level H4 catch exists to prevent. ENC-08 is still satisfied: a real
+    // 500 + a stable error string + the logged cause.
     console.error(`[broker] /register DB write failed for pid=${body.pid} name="${requestedName ?? ""}":`, e);
-    return { ok: false, status: 500, error: `registration persistence failed: ${e instanceof Error ? e.message : String(e)}` };
+    return { ok: false, status: 500, error: "registration persistence failed" };
   }
   return { ok: true, value: { id, token: issuedToken, name: requestedName, resolved_name: finalName, client_type: clientType, receiver_mode: receiverMode } };
 }
