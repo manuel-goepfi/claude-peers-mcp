@@ -844,15 +844,23 @@ function handleRegister(body: RegisterRequest): RegisterResult {
   } | null;
   const existingClientType = validClientType(existing?.client_type);
   const clientType = requestedClientType === "unknown" && existingClientType !== "unknown" ? existingClientType : requestedClientType;
+  // Same-pid refresh: a live peer re-registering (e.g. 401 recovery after a
+  // broker restart) must KEEP its broker id so mail addressed to that id still
+  // resolves. The gate is the STABLE identity of the process: pid (already
+  // matched by the `existing`-by-pid lookup), cwd, git_root, absolute_git_dir,
+  // tty. The tmux LOCATION fields (session/window/pane_id) are deliberately NOT
+  // in the gate — a pid is one process is one peer regardless of which pane it
+  // is currently displayed in, and a bg lane's pane_id is unstable (null until
+  // resolved, then a real %id; can shift on re-attach). Gating on pane_id made a
+  // bg lane get a fresh generateId() on re-register, whose dedup-delete then
+  // wiped the old id's undelivered mail (the "re-registration race" that forced
+  // a manual nudge). The location fields still UPDATE on the refresh (the UPDATE
+  // path binds the new tmux_* values) — they just no longer break id stability.
   const samePidRefresh = Boolean(existing && inheritedId === null &&
     existing.cwd === body.cwd &&
     existing.git_root === body.git_root &&
     existing.absolute_git_dir === (body.absolute_git_dir ?? null) &&
     existing.tty === body.tty &&
-    existing.tmux_session === (body.tmux_session ?? null) &&
-    existing.tmux_window_index === (body.tmux_window_index ?? null) &&
-    existing.tmux_window_name === (body.tmux_window_name ?? null) &&
-    existing.tmux_pane_id === (body.tmux_pane_id ?? null) &&
     (requestedClientType === "unknown" || existingClientType === "unknown" || existingClientType === clientType));
   const id = inheritedId ?? (samePidRefresh ? existing!.id : null) ?? generateId();
 

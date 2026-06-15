@@ -3012,4 +3012,45 @@ describe("Live broker delivery features", () => {
     senderProc.kill();
     recvProc.kill();
   });
+
+  // Re-registration race: a bg lane registers with tmux_pane_id=null (pane not
+  // yet resolved), then re-registers (e.g. 401 recovery after a broker restart)
+  // once its pane resolves to a real %id. The same pid is the same peer, so its
+  // broker id MUST be preserved and its queued mail MUST survive — gating
+  // id-stability on tmux_pane_id equality used to mint a new id here and the
+  // dedup-delete then wiped the old id's undelivered mail (the bug that forced a
+  // manual nudge).
+  test("re-register with a resolved pane_id keeps the same id + preserves queued mail", async () => {
+    const laneProc = spawnSleep();
+    const senderProc = spawnSleep();
+    // 1. bg lane registers with NO pane (pane unresolved)
+    const reg1 = await brokerFetch<{ id: string }>("/register", {
+      pid: laneProc.pid, cwd: "/rereg-race", git_root: "/rereg-race", tty: null,
+      name: "rr-lane", tmux_session: "rr", tmux_window_index: "0",
+      tmux_window_name: "claude", tmux_pane_id: null, summary: "",
+    });
+    // 2. a peer queues mail to that id
+    const sender = await brokerFetch<{ id: string }>("/register", {
+      pid: senderProc.pid, cwd: "/rereg-s", git_root: null, tty: null, name: "rr-s",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
+    });
+    const send = await brokerFetch<{ id: number }>("/send-message", {
+      from_id: sender.id, to_id: reg1.id, text: "survive the re-register",
+    });
+    // 3. SAME pid re-registers, now with a RESOLVED pane_id (and a different
+    //    tmux_window metadata, to prove location drift does not break identity)
+    const reg2 = await brokerFetch<{ id: string }>("/register", {
+      pid: laneProc.pid, cwd: "/rereg-race", git_root: "/rereg-race", tty: null,
+      name: "rr-lane", tmux_session: "rr", tmux_window_index: "0",
+      tmux_window_name: "claude", tmux_pane_id: "%999", summary: "",
+    });
+    // id PRESERVED despite the pane_id change
+    expect(reg2.id).toBe(reg1.id);
+    // queued mail SURVIVES (not wiped by a dedup-delete on an id change)
+    const poll = await brokerFetch<{ messages: { text: string }[] }>("/poll-messages", { id: reg2.id });
+    expect(poll.messages.some((m) => m.text === "survive the re-register")).toBe(true);
+    expect(send.id).toBeGreaterThan(0);
+    laneProc.kill();
+    senderProc.kill();
+  });
 });
