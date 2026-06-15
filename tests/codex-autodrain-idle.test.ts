@@ -91,6 +91,77 @@ describe("paneTextIsIdle", () => {
   });
 });
 
+// --- Claude lane idle/busy gate (bg-claude wake support) ---
+// Same safety contract as the Codex gate, against Claude's TUI: the prompt glyph
+// is ❯ (U+276F, not ›) and the busy vocabulary is Claude's spinner verbs + the
+// "· N tokens" in-flight status row. These fixtures replicate shapes captured
+// live from a real backgrounded Claude pane (2026-06-15).
+import { profileFor } from "../bin/codex-autodrain-poller.ts";
+const CLAUDE = profileFor("claude");
+const cPrompt = bold("❯"); // bright ❯ glyph, as Claude renders the input prompt
+
+function claudeIdleCapture(afterGlyph: string): string {
+  return [
+    "● I'll start by registering my name as instructed.",
+    "● ready",
+    "─".repeat(20),
+    `${cPrompt} ${afterGlyph}`,
+    "─".repeat(20),
+    "  [B] Clause5 | main | 92% left | Opus 4.8 (1M context) (xhigh)",
+  ].join("\n");
+}
+
+describe("paneTextIsIdle — claude profile", () => {
+  test("NUDGE: idle ❯ prompt, empty input", () => {
+    expect(paneTextIsIdle(claudeIdleCapture(""), CLAUDE)).toBe(true);
+  });
+
+  test("NUDGE: idle ❯ prompt with a dim placeholder", () => {
+    // Claude renders its ghost suggestion dim, same as Codex
+    expect(paneTextIsIdle(claudeIdleCapture(dim('Try "create a util logging.py that..."')), CLAUDE)).toBe(true);
+  });
+
+  test("SKIP: bright (real) queued operator text after ❯ — must not submit", () => {
+    expect(paneTextIsIdle(claudeIdleCapture("git push origin main"), CLAUDE)).toBe(false);
+  });
+
+  // Boundary the room cared about most — busy vs done. Grounded in live captures:
+  // a COMPLETED turn prints a PAST-tense "Cogitated for 11s" (no ellipsis, no
+  // active "(Ns ·" timer) and the lane IS idle → safe to nudge. An IN-FLIGHT turn
+  // prints "Verb… (Ns · ↑ tokens)" → busy → never nudge. The active-timer shape
+  // "(\d+s ·" is the discriminator; matching the bare word would wrongly freeze a
+  // just-finished idle lane forever (it would never be woken).
+  test("NUDGE: 'Cogitated for 11s' is a DONE turn (past tense) — lane is idle", () => {
+    const done = ["✻ Cogitated for 11s", `${cPrompt} `].join("\n");
+    expect(paneTextIsIdle(done, CLAUDE)).toBe(true);
+  });
+
+  test("SKIP: busy — 'Warping… (18s · ↑ 355 tokens)'", () => {
+    const busy = ["✻ Warping… (18s · ↑ 355 tokens)", `${cPrompt} `].join("\n");
+    expect(paneTextIsIdle(busy, CLAUDE)).toBe(false);
+  });
+
+  test("SKIP: busy — 'Evaporating… (6s · ↑ 122 tokens)'", () => {
+    const busy = ["✽ Evaporating… (6s · ↑ 122 tokens)", `${cPrompt} `].join("\n");
+    expect(paneTextIsIdle(busy, CLAUDE)).toBe(false);
+  });
+
+  test("SKIP: busy — generic '(Ns ·' in-flight timer", () => {
+    const busy = ["✻ Synthesizing… (3s · ↓ 1.2k tokens)", `${cPrompt} `].join("\n");
+    expect(paneTextIsIdle(busy, CLAUDE)).toBe(false);
+  });
+
+  // Cross-profile guard: a Codex pane fed the CLAUDE profile must NOT be seen as
+  // idle (different glyph), so the poller can never nudge with the wrong profile.
+  test("SKIP: a Codex › pane judged under the claude profile is NOT idle", () => {
+    expect(paneTextIsIdle(idleCapture(""), CLAUDE)).toBe(false); // › glyph, ❯ profile
+  });
+
+  test("SKIP: a Claude ❯ pane judged under the codex profile is NOT idle", () => {
+    expect(paneTextIsIdle(claudeIdleCapture(""), profileFor("codex"))).toBe(false);
+  });
+});
+
 describe("everyVisibleCharIsDim", () => {
   const E = "\x1b";
   test("all-dim text => true", () => {
