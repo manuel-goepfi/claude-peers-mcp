@@ -231,3 +231,69 @@ describe("register: orphan-mail sweep", () => {
     db.close();
   });
 });
+
+// Seat-dedup: purge stale self-duplicate rows on the same pane (same cwd + name,
+// dead PID) so close+reopen does not pile up pr.1#2..#6. Deliberately narrow —
+// a DIFFERENT session sharing the pane (different cwd OR name) is left for the
+// rehydration/recovery path, so this never destroys a recoverable inbox.
+function insertPaneRow(db: Database, id: string, pid: number, pane: string, cwd: string, name: string) {
+  const now = new Date().toISOString();
+  db.prepare(`INSERT INTO peers (id, pid, cwd, git_root, tty, name, resolved_name, tmux_session, tmux_pane_id, client_type, receiver_mode, summary, registered_at, last_seen, token) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(id, pid, cwd, cwd, null, name, name, "pr", pane, "claude", "claude-channel", "", now, now, "tok-" + id);
+}
+
+// Mirror of broker.ts: delete same-pane rows with same cwd+name and a DEAD pid.
+// `deadPids` is the set the test declares dead (stand-in for isPidAlive).
+function purgeSelfDups(db: Database, session: string, pane: string, cwd: string, name: string, myPid: number, deadPids: Set<number>): number {
+  const dups = db.prepare("SELECT id, pid FROM peers WHERE tmux_session=? AND tmux_pane_id=? AND cwd=? AND name=? AND pid!=?")
+    .all(session, pane, cwd, name, myPid) as { id: string; pid: number }[];
+  let purged = 0;
+  for (const d of dups) {
+    if (!deadPids.has(d.pid)) continue; // live row never purged
+    db.run("DELETE FROM peers WHERE id=?", [d.id]);
+    db.run("DELETE FROM messages WHERE to_id=? AND delivered=0", [d.id]);
+    purged++;
+  }
+  return purged;
+}
+
+describe("register: seat-dedup (stale self-duplicate purge)", () => {
+  test("purges the pr.1#2..#6 pileup — dead same-cwd same-name rows on one pane", () => {
+    const db = dbWithMessages();
+    // 5 dead leftovers + register a 6th live one (pid 600), all pr.1 on %203, same cwd.
+    for (let i = 0; i < 5; i++) insertPaneRow(db, "old" + i, 100 + i, "%203", "/repo/A", "pr.1");
+    const dead = new Set([100, 101, 102, 103, 104]);
+    const purged = purgeSelfDups(db, "pr", "%203", "/repo/A", "pr.1", 600, dead);
+    expect(purged).toBe(5); // all 5 stale copies gone
+    expect((db.query("SELECT COUNT(*) n FROM peers WHERE tmux_pane_id='%203'").get() as { n: number }).n).toBe(0);
+    db.close();
+  });
+
+  test("does NOT purge a LIVE row on the same pane (only dead stale copies)", () => {
+    const db = dbWithMessages();
+    insertPaneRow(db, "liveOld", 200, "%203", "/repo/A", "pr.1"); // still alive
+    const purged = purgeSelfDups(db, "pr", "%203", "/repo/A", "pr.1", 600, new Set()); // nothing dead
+    expect(purged).toBe(0);
+    expect((db.query("SELECT COUNT(*) n FROM peers").get() as { n: number }).n).toBe(1);
+    db.close();
+  });
+
+  test("RECOVERY-SAFE: a different session on the same pane (different cwd) is NOT purged", () => {
+    const db = dbWithMessages();
+    insertPaneRow(db, "other", 300, "%203", "/repo/OTHER", "pr.1"); // same pane+name, DIFFERENT cwd
+    db.run("INSERT INTO messages (from_id, to_id, text, sent_at, delivered) VALUES (?,?,?,?,0)", ["x", "other", "recoverable", new Date().toISOString()]);
+    const purged = purgeSelfDups(db, "pr", "%203", "/repo/A", "pr.1", 600, new Set([300])); // dead, but different cwd
+    expect(purged).toBe(0); // cwd differs → left for rehydration/recovery
+    expect((db.query("SELECT COUNT(*) n FROM peers WHERE id='other'").get() as { n: number }).n).toBe(1);
+    expect((db.query("SELECT COUNT(*) n FROM messages WHERE to_id='other'").get() as { n: number }).n).toBe(1); // inbox intact
+    db.close();
+  });
+
+  test("RECOVERY-SAFE: a different name on the same pane+cwd is NOT purged", () => {
+    const db = dbWithMessages();
+    insertPaneRow(db, "diffname", 400, "%203", "/repo/A", "ux.1"); // same pane+cwd, DIFFERENT name
+    const purged = purgeSelfDups(db, "pr", "%203", "/repo/A", "pr.1", 600, new Set([400]));
+    expect(purged).toBe(0);
+    db.close();
+  });
+});
