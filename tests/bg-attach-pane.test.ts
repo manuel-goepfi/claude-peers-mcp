@@ -57,6 +57,20 @@ describe("bgSessionIdFromPtyHostArgs", () => {
     expect(bgSessionIdFromPtyHostArgs(args)).toBeNull();
   });
 
+  test("extracts the short id from a pty-host hosted on a /spare/ slot (.pty.sock)", () => {
+    // A promoted bg session can keep running on its pre-warm spare slot, so the
+    // pty-host sock is /spare/<8hex>.pty.sock rather than /pty/<8hex>.sock. Both
+    // carry the same short id; the /pty/-only match silently dropped every
+    // spare-hosted bg session (verified live: my own session at 0f805b32 had no
+    // pane registered until this widened match). The --bg-pty-host marker IS
+    // present here (unlike the unpromoted .claim.sock spare above), so it is a
+    // real, resolvable session.
+    const args =
+      "/home/manzo/.local/share/claude/versions/2.1.177 --bg-pty-host " +
+      "/tmp/cc-daemon-1000/d696beb3/spare/0f805b32.pty.sock 200 50 -- ...";
+    expect(bgSessionIdFromPtyHostArgs(args)).toBe("0f805b32");
+  });
+
   test("does not misread a 7-or-9-char token as the 8-hex short id", () => {
     // Right-length discipline: only an exact 8-hex run after pty/ is the id.
     const tooShort = "x --bg-pty-host /tmp/d/pty/654ce8.sock"; // 6 hex

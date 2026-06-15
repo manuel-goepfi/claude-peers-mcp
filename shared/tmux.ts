@@ -208,7 +208,12 @@ export interface ProcLike {
 export function bgSessionIdFromPtyHostArgs(args: string): string | null {
   if (!/--bg-pty-host(\s|=)/.test(args)) return null;
   // Prefer the .sock basename (always the short id); fall back to --session-id.
-  const sock = args.match(/\/pty\/([0-9a-f]{8})\.sock/);
+  // The sock lives under /pty/ for a fully-promoted bg session OR /spare/ for a
+  // session still hosted on its pre-warm spare slot (observed on v2.1.177:
+  // /tmp/cc-daemon-<uid>/<daemon>/spare/<8hex>.pty.sock). Both carry the same
+  // 8-hex short id; matching only /pty/ silently dropped every spare-hosted bg
+  // session, so its pane never resolved.
+  const sock = args.match(/\/(?:pty|spare)\/([0-9a-f]{8})\.(?:pty\.)?sock/);
   if (sock) return sock[1]!;
   const sid = args.match(/--session-id[=\s]+([0-9a-f]{8})/);
   if (sid) return sid[1]!;
