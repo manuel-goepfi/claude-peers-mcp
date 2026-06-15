@@ -34,18 +34,41 @@
 import { Database } from "bun:sqlite";
 import { homedir } from "node:os";
 
+// Env parse with validation: a bad value must NOT silently break the daemon.
+// Number("") === 0 (a 0ms interval is a spin loop) and Number("abc") === NaN
+// (setInterval(NaN) never fires) — both are caught here, falling back to the
+// default with a warning rather than a silently-dead or runaway daemon.
+function envMs(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) {
+    console.error(`[codex-autodrain] invalid ${name}="${raw}" — using default ${fallback}ms`);
+    return fallback;
+  }
+  return n;
+}
+
 const DB_PATH = process.env.CLAUDE_PEERS_DB ?? `${homedir()}/.claude-peers.db`;
-const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS ?? 15_000);
-const NUDGE_COOLDOWN_MS = Number(process.env.NUDGE_COOLDOWN_MS ?? 60_000);
+const POLL_INTERVAL_MS = envMs("POLL_INTERVAL_MS", 15_000);
+const NUDGE_COOLDOWN_MS = envMs("NUDGE_COOLDOWN_MS", 60_000);
 const DRY_RUN = process.env.DRY_RUN === "1";
 const NUDGE_TEXT = "check your peer inbox and handle any pending messages";
+// Give up nudging a lane after this many consecutive attempts with mail still
+// unread — a lane whose drain hook is broken must NOT be keystroke-bombed
+// forever. The counter resets to 0 the moment the lane has no unread mail.
+const MAX_NUDGE_ATTEMPTS = Number(process.env.MAX_NUDGE_ATTEMPTS ?? 5);
 
 // Busy markers that mean the Codex lane is mid-turn — never nudge then.
 const BUSY_MARKERS = [/esc to interrupt/i, /\bWorking\b/, /\bRunning\b/, /Reviewing approval/i, /tokens used/i];
-// The Codex idle prompt glyph (start of the input line when waiting).
-const PROMPT_GLYPH = /(^|\n)\s*[›>]\s/;
+// The Codex idle prompt glyph. Only U+203A (›) is the real Codex/Gemini input
+// prompt — ASCII '>' was dropped because it also matches output lines (markdown
+// blockquotes, diff context, heredoc continuations), which could mis-select a
+// non-input line as the prompt.
+const PROMPT_GLYPH = /(^|\n)\s*›\s/;
 
-const lastNudge = new Map<string, number>(); // peer id -> epoch ms
+const lastNudge = new Map<string, number>();  // peer id -> epoch ms of last nudge
+const nudgeAttempts = new Map<string, number>(); // peer id -> consecutive nudge count
 
 function log(msg: string): void {
   console.error(`[codex-autodrain] ${new Date().toISOString()} ${msg}`);
@@ -117,16 +140,55 @@ export function paneTextIsIdle(captureWithAnsi: string): boolean {
   if (BUSY_MARKERS.some((re) => re.test(plain))) return false; // mid-turn
   if (!PROMPT_GLYPH.test(plain)) return false;                 // no idle prompt visible
 
-  // Last line whose stripped form starts with the prompt glyph.
+  // Last line whose stripped form starts with the prompt glyph (› only).
   const promptLine = [...captureWithAnsi.split("\n")].reverse()
-    .find((l) => /^\s*[›>]/.test(stripAnsi(l))) ?? "";
+    .find((l) => /^\s*›/.test(stripAnsi(l))) ?? "";
   if (!promptLine) return false;
-  const afterGlyph = promptLine.replace(/^.*?[›>]\s?/, "");   // keep SGR codes
+  const afterGlyph = promptLine.replace(/^.*?›\s?/, "");      // keep SGR codes
   const afterPlain = stripAnsi(afterGlyph).trim();
   if (afterPlain === "") return true;                          // empty input — nudge
-  // Non-empty: a placeholder ONLY if rendered dim (ESC[2m). Bright text = real
-  // queued operator input → never nudge (would submit their text).
-  return /\x1b\[2m/.test(afterGlyph);
+  // Non-empty: it is a placeholder (safe to nudge) ONLY if the ENTIRE visible
+  // text is rendered dim. Merely CONTAINING a dim span is not enough — real
+  // bright operator input with a dim ghost-autocomplete suffix or a dim inline
+  // @mention (e.g. "deploy to prod\x1b[2muction\x1b[0m") would otherwise be
+  // misread as empty and the nudge would SUBMIT the operator's text. We verify
+  // dimness by reconstructing only the text that is under an active dim (ESC[2m)
+  // SGR state and checking it covers the whole non-space input.
+  return everyVisibleCharIsDim(afterGlyph);
+}
+
+/**
+ * True iff every non-space visible character in an SGR-bearing string is
+ * rendered under an active dim (ESC[2m) state. Returns false if any visible
+ * char is bright (no dim active) — i.e. there is real, non-placeholder input.
+ * Dim is turned on by ESC[2m and cleared by ESC[0m or ESC[22m (and a fresh
+ * ESC[<other>m without 2 does not clear dim, per SGR semantics).
+ */
+export function everyVisibleCharIsDim(s: string): boolean {
+  let dim = false;
+  let sawVisible = false;
+  let i = 0;
+  while (i < s.length) {
+    if (s[i] === "\x1b" && s[i + 1] === "[") {
+      const m = /^\x1b\[([0-9;]*)m/.exec(s.slice(i));
+      if (m) {
+        const codes = m[1]!.split(";").filter((c) => c !== "");
+        for (const c of codes.length ? codes : ["0"]) {
+          if (c === "2") dim = true;
+          else if (c === "0" || c === "22") dim = false;
+        }
+        i += m[0].length;
+        continue;
+      }
+    }
+    const ch = s[i]!;
+    if (ch.trim() !== "") {           // a visible, non-space char
+      sawVisible = true;
+      if (!dim) return false;          // a bright visible char => real input
+    }
+    i++;
+  }
+  return sawVisible;                    // all visible chars were dim (placeholder)
 }
 
 function paneIsIdle(paneId: string): boolean {
@@ -143,10 +205,15 @@ function nudge(lane: CodexLane): void {
   // does NOT submit on the `Enter` keyname (it leaves the text queued in the
   // input line); C-m is the reliable submit. Verified live on marketing.1:
   // `Enter` left the nudge unsubmitted, `C-m` submitted + drained all 5 unread.
-  sh(["tmux", "send-keys", "-t", lane.tmux_pane_id, NUDGE_TEXT]);
+  // Check the FIRST send-keys: if it failed (pane vanished in the race window),
+  // do NOT send C-m and do NOT set the cooldown — leaving the cooldown unset
+  // lets the next tick retry rather than recording a phantom success.
+  const sent = sh(["tmux", "send-keys", "-t", lane.tmux_pane_id, NUDGE_TEXT]);
+  if (!sent.ok) { log(`nudge send-keys failed for ${tag} — pane gone? skipping`); return; }
   sh(["tmux", "send-keys", "-t", lane.tmux_pane_id, "C-m"]);
   lastNudge.set(lane.id, Date.now());
-  log(`nudged ${tag} (${lane.unread} unread)`);
+  nudgeAttempts.set(lane.id, (nudgeAttempts.get(lane.id) ?? 0) + 1);
+  log(`nudged ${tag} (${lane.unread} unread, attempt ${nudgeAttempts.get(lane.id)})`);
 }
 
 function tick(db: Database): void {
@@ -154,13 +221,37 @@ function tick(db: Database): void {
   try { lanes = lanesWithUnread(db); } catch (e) {
     log(`DB read failed: ${e instanceof Error ? e.message : String(e)}`); return;
   }
+  // Prune per-lane state for lanes that no longer have unread mail: reset their
+  // attempt counter (so a future stuck episode starts fresh) AND bound both maps
+  // to current lanes so they cannot grow unbounded over a multi-day run.
+  const active = new Set(lanes.map((l) => l.id));
+  for (const id of nudgeAttempts.keys()) if (!active.has(id)) nudgeAttempts.delete(id);
+  for (const id of lastNudge.keys()) if (!active.has(id)) lastNudge.delete(id);
+
   for (const lane of lanes) {
-    if (!isPidAlive(lane.pid)) continue;                       // dead lane — reaper handles it
-    const since = Date.now() - (lastNudge.get(lane.id) ?? 0);
-    if (since < NUDGE_COOLDOWN_MS) continue;                   // recently nudged — give it time to drain
-    if (!paneOwnedByPid(lane.tmux_pane_id, lane.pid)) continue; // pane gone/reused
-    if (!paneIsIdle(lane.tmux_pane_id)) continue;              // busy or has queued input — never disturb
-    nudge(lane);
+    // Per-lane crash isolation: a throw from any check (e.g. pstree missing,
+    // tmux gone) must NOT escape the setInterval callback and kill the daemon.
+    // Log it and move to the next lane.
+    try {
+      if (!isPidAlive(lane.pid)) continue;                       // dead lane — reaper handles it
+      if ((nudgeAttempts.get(lane.id) ?? 0) >= MAX_NUDGE_ATTEMPTS) {
+        // Drain hook likely broken — stop hammering. One warning, then silent
+        // until the lane's unread clears (which resets the counter via the prune
+        // above) or it drops out of the lane set.
+        if ((nudgeAttempts.get(lane.id) ?? 0) === MAX_NUDGE_ATTEMPTS) {
+          log(`giving up on ${lane.name ?? lane.id}: ${MAX_NUDGE_ATTEMPTS} nudges, still ${lane.unread} unread (drain hook stuck?)`);
+          nudgeAttempts.set(lane.id, MAX_NUDGE_ATTEMPTS + 1); // mark "warned", stop re-logging
+        }
+        continue;
+      }
+      const since = Date.now() - (lastNudge.get(lane.id) ?? 0);
+      if (since < NUDGE_COOLDOWN_MS) continue;                   // recently nudged — give it time to drain
+      if (!paneOwnedByPid(lane.tmux_pane_id, lane.pid)) continue; // pane gone/reused
+      if (!paneIsIdle(lane.tmux_pane_id)) continue;              // busy or has queued input — never disturb
+      nudge(lane);
+    } catch (e) {
+      log(`tick: error handling lane ${lane.name ?? lane.id} — ${e instanceof Error ? e.message : String(e)} (continuing)`);
+    }
   }
 }
 

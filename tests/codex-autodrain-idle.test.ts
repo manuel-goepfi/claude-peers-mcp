@@ -11,7 +11,7 @@
  * i.e. a dim placeholder = empty input = nudgeable.
  */
 import { describe, test, expect } from "bun:test";
-import { paneTextIsIdle } from "../bin/codex-autodrain-poller.ts";
+import { paneTextIsIdle, everyVisibleCharIsDim } from "../bin/codex-autodrain-poller.ts";
 
 const ESC = "\x1b";
 const dim = (s: string) => `${ESC}[2m${s}${ESC}[0m`;
@@ -69,5 +69,46 @@ describe("paneTextIsIdle", () => {
       `${prompt} ${dim("Implement {feature}")}`,
     ].join("\n");
     expect(paneTextIsIdle(approving)).toBe(false);
+  });
+
+  // ADVERSARIAL (review finding, high/conf90): real BRIGHT operator input with a
+  // dim ghost-autocomplete suffix or dim @mention must NOT be misread as idle —
+  // a substring "contains [2m" check would submit the operator's text. The
+  // whole-input-must-be-dim rule defends this.
+  test("SKIP: bright command + dim ghost-autocomplete suffix (the attack)", () => {
+    const ghost = `deploy to prod${dim("uction now")}`; // bright "deploy to prod" + dim suffix
+    expect(paneTextIsIdle(idleCapture(ghost))).toBe(false);
+  });
+
+  test("SKIP: bright command with a dim inline @mention", () => {
+    const mention = `please review ${dim("@deploy.yaml")} and run it`; // mostly bright
+    expect(paneTextIsIdle(idleCapture(mention))).toBe(false);
+  });
+
+  test("SKIP: real input that merely ends before a dim hint", () => {
+    const mixed = `rm -rf build ${dim("(press enter)")}`;
+    expect(paneTextIsIdle(idleCapture(mixed))).toBe(false);
+  });
+});
+
+describe("everyVisibleCharIsDim", () => {
+  const E = "\x1b";
+  test("all-dim text => true", () => {
+    expect(everyVisibleCharIsDim(`${E}[2mImplement {feature}${E}[0m`)).toBe(true);
+  });
+  test("bright text => false", () => {
+    expect(everyVisibleCharIsDim("deploy now")).toBe(false);
+  });
+  test("bright + dim suffix => false (the attack shape)", () => {
+    expect(everyVisibleCharIsDim(`bright${E}[2mdim${E}[0m`)).toBe(false);
+  });
+  test("dim cleared by [22m mid-string, then bright => false", () => {
+    expect(everyVisibleCharIsDim(`${E}[2mdim${E}[22mbright`)).toBe(false);
+  });
+  test("only whitespace (no visible char) => false", () => {
+    expect(everyVisibleCharIsDim(`${E}[2m   ${E}[0m`)).toBe(false);
+  });
+  test("dim spanning the whole thing across multiple SGR resets => true", () => {
+    expect(everyVisibleCharIsDim(`${E}[2mone ${E}[2mtwo${E}[0m`)).toBe(true);
   });
 });
