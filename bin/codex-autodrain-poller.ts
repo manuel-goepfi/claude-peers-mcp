@@ -201,15 +201,18 @@ function paneIsIdle(paneId: string): boolean {
 function nudge(lane: CodexLane): void {
   const tag = `${lane.name ?? "?"}/${lane.id} pane=${lane.tmux_pane_id}`;
   if (DRY_RUN) { log(`DRY_RUN would nudge ${tag} (${lane.unread} unread)`); return; }
-  // Send the prompt text, then submit with C-m (carriage return). The Codex TUI
-  // does NOT submit on the `Enter` keyname (it leaves the text queued in the
-  // input line); C-m is the reliable submit. Verified live on marketing.1:
-  // `Enter` left the nudge unsubmitted, `C-m` submitted + drained all 5 unread.
-  // Check the FIRST send-keys: if it failed (pane vanished in the race window),
-  // do NOT send C-m and do NOT set the cooldown — leaving the cooldown unset
-  // lets the next tick retry rather than recording a phantom success.
-  const sent = sh(["tmux", "send-keys", "-t", lane.tmux_pane_id, NUDGE_TEXT]);
+  // Type the literal prompt text then submit, with a short settle BETWEEN the
+  // two so the Codex TUI commits the typed input before the Enter arrives — a
+  // C-m that races ahead of the not-yet-committed text is dropped (verified
+  // live). `-l` sends NUDGE_TEXT literally (no key-name interpretation); the
+  // settle is the reliability fix; C-m is the submit (the Codex TUI ignores the
+  // "Enter" key-name but submits on C-m). We do NOT re-capture to "verify"
+  // submission: after submit the TUI echoes the prompt into its transcript, so a
+  // capture can't distinguish "still in input" from "submitted + shown in
+  // scrollback" — and a stuck row is already bounded by MAX_NUDGE_ATTEMPTS.
+  const sent = sh(["tmux", "send-keys", "-l", "-t", lane.tmux_pane_id, NUDGE_TEXT]);
   if (!sent.ok) { log(`nudge send-keys failed for ${tag} — pane gone? skipping`); return; }
+  Bun.spawnSync(["sleep", "0.3"]); // let the TUI commit the typed text before Enter
   sh(["tmux", "send-keys", "-t", lane.tmux_pane_id, "C-m"]);
   lastNudge.set(lane.id, Date.now());
   nudgeAttempts.set(lane.id, (nudgeAttempts.get(lane.id) ?? 0) + 1);
