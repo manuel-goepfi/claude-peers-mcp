@@ -211,6 +211,16 @@ for (const col of messageMigrationColumns) {
 // the returned "live" list is unused here.
 function cleanStalePeers() {
   liveAndFreshPeers(selectAllPeers.all() as Peer[]);
+  // Orphan-mail backstop: delete undelivered messages whose target peer row no
+  // longer exists. liveAndFreshPeers cleans a peer's mail at the moment it
+  // reaps the ROW, but mail can outlive its peer by other paths (a re-register
+  // that assigned a new id and abandoned the old row, a crash between delete
+  // and cleanup). Without this sweep those rows live forever — unbounded
+  // messages-table growth. Bounded, indexed by to_id; runs on the same 30s tick.
+  const orphaned = db.run("DELETE FROM messages WHERE delivered = 0 AND to_id NOT IN (SELECT id FROM peers)");
+  if (orphaned.changes > 0) {
+    console.error(`[broker] orphan-mail sweep: removed ${orphaned.changes} undelivered message(s) with no live peer`);
+  }
 }
 
 // D3 cold-start grace (2026-05-14): defer the first reap AND the periodic
@@ -842,6 +852,13 @@ function handleRegister(body: RegisterRequest): RegisterResult {
       // Guarded against clobbering the inherited row we re-created above.
       if (existing && existing.id !== id) {
         deletePeer.run(existing.id);
+        // Clean the abandoned id's undelivered mail too. Unlike the rehydrate
+        // path (which INHERITS the old id so mail still resolves), this dedup
+        // path assigns a NEW id — so any mail addressed to the old id is now
+        // unreachable. Mirrors the reap-path cleanup (liveAndFreshPeers) so a
+        // re-register with a new id does not strand orphaned messages that no
+        // peer row will ever drain (unbounded messages-table growth otherwise).
+        db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [existing.id]);
       }
       if (existing?.id === id) {
         updatePeerRegistration.run(body.pid, body.cwd, body.git_root, body.absolute_git_dir ?? null, ttyValue, requestedName, finalName, body.tmux_session ?? null, body.tmux_window_index ?? null, body.tmux_window_name ?? null, body.tmux_pane_id ?? null, clientType, receiverMode, summaryValue, now, issuedToken, id);

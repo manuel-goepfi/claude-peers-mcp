@@ -183,3 +183,51 @@ describe("register: re-registration summary preservation", () => {
     db.close();
   });
 });
+
+// Orphan-mail sweep: undelivered messages whose target peer row is gone (e.g. a
+// re-register that assigned a new id and abandoned the old) must be cleaned, or
+// the messages table grows unbounded. cleanStalePeers runs:
+//   DELETE FROM messages WHERE delivered = 0 AND to_id NOT IN (SELECT id FROM peers)
+function dbWithMessages(): Database {
+  const db = freshPeersDb();
+  db.run(`
+    CREATE TABLE messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      from_id TEXT NOT NULL, to_id TEXT NOT NULL, text TEXT NOT NULL,
+      sent_at TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0,
+      delivered_at TEXT, claimed_by TEXT, claimed_at TEXT
+    )
+  `);
+  return db;
+}
+
+describe("register: orphan-mail sweep", () => {
+  test("sweep removes undelivered mail to a gone peer, keeps mail to a live peer", () => {
+    const db = dbWithMessages();
+    const now = new Date().toISOString();
+    runInsert(db, "live", "/dev/pts/3", true); // creates peer1 (live)
+    // mail to the live peer (must survive) + mail to a gone peer (must go)
+    db.run("INSERT INTO messages (from_id, to_id, text, sent_at, delivered) VALUES (?,?,?,?,0)", ["x", "peer1", "to-live", now]);
+    db.run("INSERT INTO messages (from_id, to_id, text, sent_at, delivered) VALUES (?,?,?,?,0)", ["x", "GONE-ID", "to-gone", now]);
+    // an already-delivered row to a gone peer must NOT be touched (delivered=1)
+    db.run("INSERT INTO messages (from_id, to_id, text, sent_at, delivered) VALUES (?,?,?,?,1)", ["x", "GONE-ID", "old-delivered", now]);
+
+    const res = db.run("DELETE FROM messages WHERE delivered = 0 AND to_id NOT IN (SELECT id FROM peers)");
+    expect(res.changes).toBe(1); // only the undelivered orphan
+
+    const surviving = db.query("SELECT to_id, delivered FROM messages ORDER BY id").all() as { to_id: string; delivered: number }[];
+    expect(surviving.map((r) => r.to_id)).toEqual(["peer1", "GONE-ID"]); // live undelivered + delivered orphan kept
+    expect(surviving.find((r) => r.to_id === "peer1")!.delivered).toBe(0);
+    db.close();
+  });
+
+  test("sweep is a no-op when every undelivered message has a live peer", () => {
+    const db = dbWithMessages();
+    const now = new Date().toISOString();
+    runInsert(db, "live", "/dev/pts/3", true);
+    db.run("INSERT INTO messages (from_id, to_id, text, sent_at, delivered) VALUES (?,?,?,?,0)", ["x", "peer1", "ok", now]);
+    const res = db.run("DELETE FROM messages WHERE delivered = 0 AND to_id NOT IN (SELECT id FROM peers)");
+    expect(res.changes).toBe(0);
+    db.close();
+  });
+});
