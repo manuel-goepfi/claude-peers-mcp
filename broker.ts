@@ -815,10 +815,32 @@ function handleRegister(body: RegisterRequest): RegisterResult {
     console.error(`[broker] name dedup: pid=${body.pid} requested="${requestedName}" resolved="${finalName}" (collision)`);
   }
   const issuedToken = existing?.id === id && body.preserve_token ? existing.token : token;
-  if (existing?.id === id) {
-    updatePeerRegistration.run(body.pid, body.cwd, body.git_root, body.absolute_git_dir ?? null, body.tty, requestedName, finalName, body.tmux_session ?? null, body.tmux_window_index ?? null, body.tmux_window_name ?? null, body.tmux_pane_id ?? null, clientType, receiverMode, body.summary, now, issuedToken, id);
-  } else {
-    insertPeer.run(id, body.pid, body.cwd, body.git_root, body.absolute_git_dir ?? null, body.tty, requestedName, finalName, body.tmux_session ?? null, body.tmux_window_index ?? null, body.tmux_window_name ?? null, body.tmux_pane_id ?? null, clientType, receiverMode, body.summary, now, now, issuedToken);
+  // tty is a nullable column; summary is NOT NULL DEFAULT ''. bun:sqlite throws
+  // a NOT NULL constraint error when `undefined`/`null` is BOUND to summary —
+  // the column DEFAULT only applies when the column is omitted, not when a
+  // nullish value is bound. A bg/daemon-hosted lane registers lazily (first
+  // tool call) BEFORE its async auto-summary lands, so body.summary is
+  // undefined and the insert threw → /register 500 → the lane never registered
+  // and was invisible to the broker (the "lane needs a manual nudge" bug).
+  // Coalesce both to their column-valid empty forms so registration can't crash
+  // on a not-yet-summarized session.
+  const ttyValue = body.tty ?? null;
+  const summaryValue = body.summary ?? "";
+  // ENC-08 (no silent failure): a DB write that throws here would otherwise
+  // fall through to the route-level generic 500 ("internal error") with no
+  // signal to the registering peer about WHY it failed — which is exactly how
+  // the summary-NOT-NULL crash stayed invisible (lanes silently un-registered).
+  // Catch the binding/constraint error, log the real cause server-side, and
+  // return a structured failure so the caller gets a real status, not a bare 500.
+  try {
+    if (existing?.id === id) {
+      updatePeerRegistration.run(body.pid, body.cwd, body.git_root, body.absolute_git_dir ?? null, ttyValue, requestedName, finalName, body.tmux_session ?? null, body.tmux_window_index ?? null, body.tmux_window_name ?? null, body.tmux_pane_id ?? null, clientType, receiverMode, summaryValue, now, issuedToken, id);
+    } else {
+      insertPeer.run(id, body.pid, body.cwd, body.git_root, body.absolute_git_dir ?? null, ttyValue, requestedName, finalName, body.tmux_session ?? null, body.tmux_window_index ?? null, body.tmux_window_name ?? null, body.tmux_pane_id ?? null, clientType, receiverMode, summaryValue, now, now, issuedToken);
+    }
+  } catch (e) {
+    console.error(`[broker] /register DB write failed for pid=${body.pid} name="${requestedName ?? ""}":`, e);
+    return { ok: false, status: 500, error: `registration persistence failed: ${e instanceof Error ? e.message : String(e)}` };
   }
   return { ok: true, value: { id, token: issuedToken, name: requestedName, resolved_name: finalName, client_type: clientType, receiver_mode: receiverMode } };
 }
