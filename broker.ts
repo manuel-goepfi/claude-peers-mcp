@@ -425,15 +425,17 @@ const selectRehydrateCandidatesByWindow = db.prepare(`
 // Stale self-duplicates on the same pane: rows on the EXACT (tmux_session,
 // tmux_pane_id) seat that are the SAME logical session (same cwd AND same name)
 // as the one registering, but a different (dead) PID. These are the
-// close-then-reopen leftovers that pile up as pr.1, pr.1#2..#6 on one pane —
-// pure stale copies of THIS session, safe to purge. The cwd+name match is
+// close-then-reopen leftovers that pile up as pr.1, pr.1#2..#6 on one pane.
+// Ordered newest-first: the caller KEEPS the single most-recent dead row so the
+// rehydration path below can inherit it (its undelivered mail then follows the
+// reopened session), and purges only the OLDER extras. The cwd+name match is
 // deliberately narrow: it never touches a DIFFERENT session sharing the pane
-// (different cwd → the recovery/rehydration path owns that), so this cannot
-// destroy a recoverable inbox. PID-liveness is checked in code (the query
-// returns candidates; we delete only the dead ones).
+// (different cwd → the recovery/rehydration path owns that). PID-liveness is
+// checked in code (the query returns candidates; we act only on the dead ones).
 const selectSamePaneSelfDuplicates = db.prepare(`
   SELECT id, pid FROM peers
   WHERE tmux_session = ? AND tmux_pane_id = ? AND cwd = ? AND name = ? AND pid != ?
+  ORDER BY last_seen DESC
 `);
 
 // Broadcast target-selection. Each filter is optional; NULL means "don't
@@ -733,29 +735,34 @@ function handleRegister(body: RegisterRequest): RegisterResult {
   const now = new Date().toISOString();
   const token = generateToken();
 
-  // Purge stale self-duplicates on this pane BEFORE rehydration. When a pane is
-  // closed and reopened repeatedly, each relaunch (a new PID, same cwd + name,
-  // same pane) used to leave its predecessor's dead row behind — they piled up
-  // as pr.1, pr.1#2..#6 on one pane and made send_to_peer ambiguous (it could
-  // not tell which of N rows was the live one). Delete only rows that are the
-  // SAME logical session (same cwd AND name) on the SAME pane AND whose PID is
-  // dead. This is narrow on purpose: a DIFFERENT session sharing the pane
-  // (different cwd) is left untouched so the rehydration/recovery path below can
-  // still inherit it — purging here never destroys a recoverable inbox. Their
-  // undelivered mail is cleared (mirrors the reaper) since the registering
-  // session is the live successor and will get fresh delivery.
+  // Collapse stale self-duplicates on this pane to at most one BEFORE rehydration.
+  // A closed-and-reopened pane (new PID, same cwd + name, same pane) accumulates
+  // dead predecessor rows (pr.1, pr.1#2..#6) that make send_to_peer ambiguous.
+  // We KEEP the single newest dead row so the rehydration path below can inherit
+  // it — that preserves its undelivered mail (mail sent while the session was
+  // dead is exactly what rehydration recovers; purging it here would be silent
+  // data loss). We purge only the OLDER dead extras; their undelivered mail is
+  // cleared (mirrors the reaper) because only the newest predecessor is the
+  // recoverable inbox — older ones are superseded duplicates. Narrow on purpose:
+  // a DIFFERENT session sharing the pane (different cwd) is never touched, so the
+  // recovery path still owns it.
   if (body.tmux_session && body.tmux_pane_id && body.name) {
     const dups = selectSamePaneSelfDuplicates.all(body.tmux_session, body.tmux_pane_id, body.cwd, body.name, body.pid) as { id: string; pid: number }[];
     let purged = 0;
+    let keptNewestDead = false; // the first (newest) dead row is left for rehydration
     for (const d of dups) {
-      if (isPidAlive(d.pid)) continue; // a live row is not stale — never purge
+      if (isPidAlive(d.pid)) continue; // a live row is not stale — never touch it
+      if (!keptNewestDead) {
+        keptNewestDead = true; // preserve the newest dead row + its mail for rehydration
+        continue;
+      }
       deletePeer.run(d.id);
       db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [d.id]);
       buckets.delete(d.id);
       purged++;
     }
     if (purged > 0) {
-      console.error(`[broker] seat-dedup: pid=${body.pid} purged ${purged} stale self-dup row(s) on ${body.tmux_session}:${body.tmux_pane_id} (name=${body.name}, cwd=${body.cwd})`);
+      console.error(`[broker] seat-dedup: pid=${body.pid} purged ${purged} older stale self-dup row(s) on ${body.tmux_session}:${body.tmux_pane_id} (name=${body.name}, cwd=${body.cwd}); newest dead row kept for rehydration`);
     }
   }
 
