@@ -162,6 +162,52 @@ describe("paneTextIsIdle — claude profile", () => {
   });
 });
 
+// --- bg-claude pane resolution (the two bugs live-testing caught) ---
+import { sessionIdFromEnvironText, attachIdInTree } from "../bin/codex-autodrain-poller.ts";
+
+describe("sessionIdFromEnvironText", () => {
+  const NUL = "\0";
+  // REGRESSION: a spare-hosted bg session's pty-host .sock basename is the SPARE
+  // id (e.g. fdf1dffd), NOT the promoted session id the attach client uses
+  // (719595a7). The promoted id is the one in CLAUDE_CODE_SESSION_ID. Reading it
+  // here is what makes resolveBgAttachPane find the right pane.
+  test("extracts CLAUDE_CODE_SESSION_ID 8-hex prefix", () => {
+    const env = ["PATH=/usr/bin", "CLAUDE_CODE_SESSION_ID=719595a7-8fba-4907-a321-6ad48d8de97d", "HOME=/home/manzo"].join(NUL);
+    expect(sessionIdFromEnvironText(env)).toBe("719595a7");
+  });
+  test("returns null when the var is absent", () => {
+    expect(sessionIdFromEnvironText(["PATH=/usr/bin", "HOME=/home/manzo"].join(NUL))).toBeNull();
+  });
+  test("CLAUDE_JOB_DIR (a different var with an id) does NOT false-match", () => {
+    expect(sessionIdFromEnvironText(["CLAUDE_JOB_DIR=/home/manzo/.claude-b/jobs/719595a7"].join(NUL))).toBeNull();
+  });
+});
+
+describe("attachIdInTree", () => {
+  // REGRESSION: `pstree -pa` renders the attach client as `claude,<pid> attach
+  // <id>` — matching the literal "claude attach <id>" MISSES it (the comma+pid
+  // sits between "claude" and "attach"). This is the exact shape that made the
+  // ownership check skip a real idle bg-Claude.
+  test("matches the real pstree -pa shape: 'claude,684836 attach 9c27fddd'", () => {
+    const tree = "bash,1646219\n  `-claude,684836 attach 9c27fddd\n      |-{claude},684837";
+    expect(attachIdInTree(tree, "9c27fddd")).toBe(true);
+  });
+  test("does NOT match a different session id in the tree", () => {
+    const tree = "  `-claude,684836 attach 9c27fddd";
+    expect(attachIdInTree(tree, "fdf1dffd")).toBe(false); // the spare id must NOT match
+  });
+  test("exact-id boundary: a longer id sharing the prefix does not ghost-match", () => {
+    const tree = "  `-claude,684836 attach 9c27fddddead"; // 12 hex, prefix collides
+    expect(attachIdInTree(tree, "9c27fddd")).toBe(false);
+  });
+  test("rejects a non-8-hex sessionId (guards the dynamic RegExp)", () => {
+    expect(attachIdInTree("attach .* anything", ".*")).toBe(false);
+  });
+  test("no attach client in the tree → false", () => {
+    expect(attachIdInTree("bash,1646219\n  `-claude,684836\n      |-{claude},684837", "9c27fddd")).toBe(false);
+  });
+});
+
 describe("everyVisibleCharIsDim", () => {
   const E = "\x1b";
   test("all-dim text => true", () => {

@@ -143,20 +143,54 @@ function lanesWithUnread(db: Database): Lane[] {
   `).all(...NUDGEABLE_CLIENTS) as Lane[];
 }
 
-// Confirm the pane still belongs to the lane's pid (not a recycled/reused pane).
+// Confirm the pane still belongs to the lane (not a recycled/reused pane), so we
+// never type into a pane whose original lane exited and was replaced.
+//
+// Two ownership shapes, because a bg lane's process topology differs from a
+// foreground one:
+//   - Foreground / codex / gemini: the lane's pid is the pane_pid OR a descendant
+//     of it. Validate by walking the pane subtree for the lane pid.
+//   - Background claude: the lane's MCP server is DAEMON-hosted, NOT a descendant
+//     of the pane — the pane's legitimate occupant is the `claude attach
+//     <sessionId>` client. Validate by requiring that attach client in the pane
+//     subtree (the same binding resolveLanePane used to find the pane).
 function paneOwnedByPid(paneId: string, pid: number): boolean {
+  const tree = paneSubtree(paneId);
+  if (!tree) return false;
+  return tree.panePid === pid || tree.text.includes(`(${pid})`);
+}
+function paneOwnedByAttachId(paneId: string, sessionId: string): boolean {
+  const tree = paneSubtree(paneId);
+  if (!tree) return false;
+  return attachIdInTree(tree.text, sessionId);
+}
+
+/**
+ * True iff a process-tree text shows a `claude attach <sessionId>` client.
+ * Exported for unit testing without a live tmux/pstree.
+ *
+ * `pstree -pa` renders the attach client as `claude,<pid> attach <id>` (comm,
+ * then a comma+pid, then the args on the same line) — NOT `claude attach <id>`.
+ * Matching the literal `claude attach <id>` therefore misses it; we match the
+ * args fragment `attach <id>` with an exact-id right boundary (whitespace or
+ * line end) so a longer id sharing the same 8-hex prefix never ghost-matches.
+ * sessionId is provably [0-9a-f]{8} (sole producers: CLAUDE_CODE_SESSION_ID
+ * prefix + bgSessionIdFromPtyHostArgs) → no regex metacharacter / injection.
+ */
+export function attachIdInTree(treeText: string, sessionId: string): boolean {
+  if (!/^[0-9a-f]{8}$/.test(sessionId)) return false;
+  return new RegExp(`attach ${sessionId}(\\s|$)`, "m").test(treeText);
+}
+function paneSubtree(paneId: string): { panePid: number; text: string } | null {
   const { ok, out } = sh(["tmux", "list-panes", "-a", "-F", "#{pane_id} #{pane_pid}"]);
-  if (!ok) return false;
+  if (!ok) return null;
   const line = out.split("\n").find((l) => l.startsWith(`${paneId} `));
-  if (!line) return false; // pane gone
+  if (!line) return null; // pane gone
   const panePid = Number(line.split(" ")[1]);
-  if (!Number.isInteger(panePid)) return false;
-  if (panePid === pid) return true;
-  // pane_pid is the shell; the codex pid should be a descendant. Walk the pane's
-  // process subtree (pstree -p prints all pids) and require the codex pid in it,
-  // so we never type into a pane whose original lane exited and was replaced.
-  const tree = sh(["pstree", "-p", String(panePid)]);
-  return tree.ok && tree.out.includes(`(${pid})`);
+  if (!Number.isInteger(panePid)) return null;
+  const tree = sh(["pstree", "-pa", String(panePid)]);  // -a: include args so `claude attach <id>` is visible
+  if (!tree.ok) return null;
+  return { panePid, text: tree.out };
 }
 
 // Strip SGR escape sequences to a plain-text view.
@@ -272,27 +306,64 @@ const paneCache = new Map<string, string>();   // peer id → pane id
 // session id from the MCP-server process ancestry, then locate the tmux pane
 // whose subtree runs `claude attach <id>` (resolveBgAttachPane). Returns "" when
 // a bg lane has no live attach client (truly detached → unreachable by design).
-function resolveLanePane(lane: Lane, snap: TickSnapshot): string {
-  if (lane.tmux_pane_id) return lane.tmux_pane_id;       // already has a pane (codex/gemini/attached)
-  const cached = paneCache.get(lane.id);
-  if (cached) return cached;
-  // The lane's pid is its MCP server (bun server.ts). Walk its ancestry in the
-  // shared snapshot for the bg-pty-host id, then resolve the attach-client pane.
-  const ppidMap = new Map<number, number>();
-  for (const p of snap.procs) ppidMap.set(p.pid, p.ppid);
-  let bgId: string | null = null;
-  let walk: number | undefined = lane.pid;
-  for (let i = 0; i < 20 && walk !== undefined; i++) {
-    const info = snap.procs.find((p) => p.pid === walk);
-    if (info) { bgId = bgSessionIdFromPtyHostArgs(info.args); if (bgId) break; }
-    const parent = ppidMap.get(walk);
-    if (parent === undefined || parent <= 1 || parent === walk) break;
-    walk = parent;
+//
+// Session-id source matters: a bg session hosted on a pre-warm SPARE slot has a
+// pty-host `.sock` basename = the SPARE id (e.g. fdf1dffd), which is NOT the
+// promoted session id the `claude attach <id>` client uses (e.g. 719595a7).
+// resolveBgAttachPane keys on the attach id, so the spare id never matches. The
+// reliable id is in the MCP server process's OWN environ: CLAUDE_CODE_SESSION_ID
+// (8-hex prefix) == the attach id, for both spare- and pty-hosted bg sessions
+// (verified live 2026-06-15). We read environ first and only fall back to the
+// ancestry `.sock` walk if environ is unreadable.
+/**
+ * Parse the 8-hex session id from a NUL-separated /proc/<pid>/environ blob.
+ * Exported as a pure function for unit testing without /proc. Returns the
+ * CLAUDE_CODE_SESSION_ID prefix (== the `claude attach <id>` token) or null.
+ */
+export function sessionIdFromEnvironText(environ: string): string | null {
+  for (const kv of environ.split("\0")) {
+    if (kv.startsWith("CLAUDE_CODE_SESSION_ID=")) {
+      const m = kv.slice("CLAUDE_CODE_SESSION_ID=".length).match(/^([0-9a-f]{8})/);
+      if (m) return m[1]!;
+    }
   }
-  if (!bgId) return "";
+  return null;
+}
+function sessionIdFromEnviron(pid: number): string | null {
+  try {
+    return sessionIdFromEnvironText(require("node:fs").readFileSync(`/proc/${pid}/environ`, "utf8"));
+  } catch { /* /proc unreadable (not Linux, perms, race) → caller falls back */ return null; }
+}
+
+// Resolution result: the pane to nudge, plus the bg session id IF the pane was
+// resolved via the bg-attach path (null for a directly-registered pane). The
+// tick uses attachId to pick the correct ownership check — a bg lane's MCP
+// server is NOT in its pane subtree, so the lane-pid check would wrongly reject.
+interface ResolvedPane { paneId: string; attachId: string | null; }
+function resolveLanePane(lane: Lane, snap: TickSnapshot): ResolvedPane {
+  if (lane.tmux_pane_id) return { paneId: lane.tmux_pane_id, attachId: null }; // codex/gemini/attached
+  const cached = paneCache.get(lane.id);
+  // Primary: the promoted session id from the MCP server's environ (correct for
+  // spare-hosted bg sessions). Fallback: walk ancestry for the pty-host `.sock`
+  // id (correct only for pty-hosted, but harmless to try when environ is absent).
+  let bgId: string | null = sessionIdFromEnviron(lane.pid);
+  if (!bgId) {
+    const ppidMap = new Map<number, number>();
+    for (const p of snap.procs) ppidMap.set(p.pid, p.ppid);
+    let walk: number | undefined = lane.pid;
+    for (let i = 0; i < 20 && walk !== undefined; i++) {
+      const info = snap.procs.find((p) => p.pid === walk);
+      if (info) { bgId = bgSessionIdFromPtyHostArgs(info.args); if (bgId) break; }
+      const parent = ppidMap.get(walk);
+      if (parent === undefined || parent <= 1 || parent === walk) break;
+      walk = parent;
+    }
+  }
+  if (!bgId) return { paneId: "", attachId: null };
+  if (cached) return { paneId: cached, attachId: bgId };
   const pane = resolveBgAttachPane(bgId, snap.paneMap, snap.procs);
-  if (pane?.pane_id) { paneCache.set(lane.id, pane.pane_id); return pane.pane_id; }
-  return "";   // bg session not attached anywhere → no pane to nudge
+  if (pane?.pane_id) { paneCache.set(lane.id, pane.pane_id); return { paneId: pane.pane_id, attachId: bgId }; }
+  return { paneId: "", attachId: null };   // bg session not attached anywhere → no pane to nudge
 }
 
 function nudge(lane: Lane, paneId: string): void {
@@ -364,9 +435,12 @@ function tick(db: Database): void {
       }
       const since = Date.now() - (lastNudge.get(lane.id) ?? 0);
       if (since < NUDGE_COOLDOWN_MS) continue;                   // recently nudged — give it time to drain
-      const paneId = resolveLanePane(lane, snap);
+      const { paneId, attachId } = resolveLanePane(lane, snap);
       if (!paneId) continue;                                     // bg lane not attached anywhere → unreachable, skip
-      if (!paneOwnedByPid(paneId, lane.pid)) { paneCache.delete(lane.id); continue; } // pane gone/reused → drop cache
+      // Ownership: bg lane → require its attach client in the pane subtree (its
+      // MCP server is daemon-hosted, not under the pane). Else → lane pid in subtree.
+      const owned = attachId ? paneOwnedByAttachId(paneId, attachId) : paneOwnedByPid(paneId, lane.pid);
+      if (!owned) { paneCache.delete(lane.id); continue; }       // pane gone/reused → drop cache
       if (!paneIsIdle(paneId, profileFor(lane.client_type))) continue; // busy or has queued input — never disturb
       nudge(lane, paneId);
     } catch (e) {
