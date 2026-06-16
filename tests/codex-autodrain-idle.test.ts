@@ -311,7 +311,7 @@ describe("resolveLanePane wiring", () => {
 // pane's pane_pid through snap.procs (already captured this tick). These tests
 // pin that behavior: the subtree text is derived purely from the snapshot, with
 // the `(pid)` + args shapes the ownership checks depend on.
-import { paneSubtree, attachIdInTree } from "../bin/codex-autodrain-poller.ts";
+import { paneSubtree } from "../bin/codex-autodrain-poller.ts";
 
 function snapOf(procs: { pid: number; ppid: number; args: string }[], paneByPid: [string, number][]) {
   return { procs, paneByPid: new Map(paneByPid), paneMap: new Map() } as any;

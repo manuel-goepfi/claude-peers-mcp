@@ -43,11 +43,6 @@ import type {
 import { detectClientFromProcessChain, findBgSpareAncestor, findClientPidFromProcessChain, initialReceiverMode, type ProcessInfo } from "./shared/client.ts";
 import { frameUntrusted, renderInboundLine } from "./shared/render.ts";
 export { frameUntrusted, renderInboundLine } from "./shared/render.ts";
-import {
-  generateSummary,
-  getGitBranch,
-  getRecentFiles,
-} from "./shared/summarize.ts";
 import { parseTmuxPanes, composeTmuxFromEnv, prepareTmuxPaneText, tmuxPaneTarget, bgSessionIdFromPtyHostArgs, resolveBgAttachPane, type TmuxPaneInfo } from "./shared/tmux.ts";
 
 // --- Configuration ---
@@ -1921,38 +1916,16 @@ async function main() {
   if (peerName) log(`Peer name: ${peerName}`);
   if (tmuxInfo) log(`Tmux: ${tmuxInfo.session}:${tmuxInfo.window_index ?? ""}:${tmuxInfo.window_name ?? ""}`);
 
-  // 3. Generate initial summary via gpt-5.4-nano (non-blocking, best-effort)
-  let initialSummary = "";
-  const summaryPromise = (async () => {
-    try {
-      const branch = await getGitBranch(myCwd);
-      const recentFiles = await getRecentFiles(myCwd);
-      const summary = generateSummary({
-        cwd: myCwd,
-        git_root: myGitRoot,
-        git_branch: branch,
-        recent_files: recentFiles,
-      });
-      if (summary) {
-        initialSummary = summary;
-        log(`Auto-summary: ${summary}`);
-      }
-    } catch (e) {
-      log(`Auto-summary failed (non-critical): ${e instanceof Error ? e.message : String(e)}`);
-    }
-  })();
-
-  // Wait briefly for summary, but don't block startup
-  await Promise.race([summaryPromise, new Promise((r) => setTimeout(r, 3000))]);
-
-  // Prepend tmux tag to summary if detected. window_name is now optional
-  // (Fix B env-hint path may not populate it) — fall back to session-only
-  // when missing to avoid a trailing-colon "[tmux rag:]" eyesore.
-  if (tmuxInfo && initialSummary) {
-    initialSummary = tmuxInfo.window_name
-      ? `[tmux ${tmuxInfo.session}:${tmuxInfo.window_name}] ${initialSummary}`
-      : `[tmux ${tmuxInfo.session}] ${initialSummary}`;
-  }
+  // 3. No auto-generated summary. A lane registers with an EMPTY summary and
+  // shows blank in list_peers until an agent/operator sets a real one via the
+  // set_summary tool. The previous auto-summary ("[tmux <session>:<window>]
+  // <project> — editing <file>") was pure redundancy — every field was already
+  // visible elsewhere (tmux coords in the pane border, client in receiver_mode,
+  // the edited file in the pane title) — and it crowded out the DELIBERATE
+  // summaries (e.g. "ux.1 — lane COMMITTED") that carry real, non-duplicated
+  // status. The broker's /set-summary uses COALESCE(NULLIF(?, ''), summary), so
+  // passing "" means "do not set", never clobbering a summary set later.
+  const initialSummary = "";
 
   // 4. Register with broker (and define the re-register closure so 401
   //    recovery in brokerFetch() can rebuild auth state without the original
@@ -2091,27 +2064,6 @@ async function main() {
         void ensureRegistered().catch((e) => log(`promotion registration failed (will retry): ${errMsg(e)}`));
       }
     }, HEARTBEAT_INTERVAL_MS);
-  }
-
-  // If summary generation is still running, update it when done
-  if (!initialSummary) {
-    summaryPromise.then(async () => {
-      if (initialSummary && myId) {
-        // Prepend tmux tag to late summary. Mirrors the early-summary block
-        // above (Fix B: window_name may be undefined on env-hint paths).
-        if (tmuxInfo) {
-          initialSummary = tmuxInfo.window_name
-            ? `[tmux ${tmuxInfo.session}:${tmuxInfo.window_name}] ${initialSummary}`
-            : `[tmux ${tmuxInfo.session}] ${initialSummary}`;
-        }
-        try {
-          await brokerFetch("/set-summary", { id: myId, summary: initialSummary });
-          log(`Late auto-summary applied: ${initialSummary}`);
-        } catch {
-          // Non-critical
-        }
-      }
-    });
   }
 
   // 5. Connect MCP over stdio
