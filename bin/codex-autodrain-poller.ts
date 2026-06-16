@@ -181,15 +181,48 @@ export function attachIdInTree(treeText: string, sessionId: string): boolean {
   if (!/^[0-9a-f]{8}$/.test(sessionId)) return false;
   return new RegExp(`attach ${sessionId}(\\s|$)`, "m").test(treeText);
 }
-function paneSubtree(paneId: string, snap: TickSnapshot): { panePid: number; text: string } | null {
-  // pane_pid comes from the per-tick snapshot — no extra `tmux list-panes` here
-  // (takeSnapshot already captured it). Only the pstree must stay live per-lane,
-  // since process subtrees change between the snapshot and the ownership check.
+export function paneSubtree(paneId: string, snap: TickSnapshot): { panePid: number; text: string } | null {
+  // pane_pid + the whole subtree come from the per-tick `ps` snapshot — NO
+  // per-lane `pstree -pa` fork. `pstree -pa` is O(all processes) (~3s on a host
+  // with ~1700 procs, measured live) and ran once PER LANE, which blew ticks past
+  // the 15s interval (SLOW TICK). snap.procs is exactly as fresh as a separate
+  // pstree would be (same tick), so we walk DOWN from panePid in-memory instead.
   const panePid = snap.paneByPid.get(paneId);
   if (panePid === undefined) return null;          // pane gone since the snapshot
-  const tree = sh(["pstree", "-pa", String(panePid)]);  // -a: include args so `claude attach <id>` is visible
-  if (!tree.ok) return null;
-  return { panePid, text: tree.out };
+  // The synthesized `text` reproduces the two shapes the consumers depend on:
+  //   - `(pid)` for each subtree pid       (paneOwnedByPid: text.includes(`(${pid})`))
+  //   - `<args>` for each subtree process  (attachIdInTree: /attach <id>/ in args)
+  // so paneOwnedByPid / attachIdInTree keep working unchanged.
+  const lines: string[] = [];
+  const childrenOf = snapChildren(snap);
+  const queue: number[] = [panePid];
+  const seen = new Set<number>();
+  while (queue.length) {
+    const pid = queue.shift()!;
+    if (seen.has(pid)) continue;                   // cycle guard
+    seen.add(pid);
+    const proc = snap.procs.find((p) => p.pid === pid);
+    lines.push(`(${pid}) ${proc?.args ?? ""}`);
+    for (const child of childrenOf.get(pid) ?? []) queue.push(child);
+  }
+  return { panePid, text: lines.join("\n") };
+}
+
+// Per-tick memoized pid → children[] map, built once from snap.procs and reused
+// by every paneSubtree walk in the tick (replaces N pstree forks with one O(procs)
+// pass). Cached on the snapshot object so it is rebuilt fresh each tick.
+const snapChildrenCache = new WeakMap<TickSnapshot, Map<number, number[]>>();
+function snapChildren(snap: TickSnapshot): Map<number, number[]> {
+  let m = snapChildrenCache.get(snap);
+  if (m) return m;
+  m = new Map<number, number[]>();
+  for (const p of snap.procs) {
+    const arr = m.get(p.ppid);
+    if (arr) arr.push(p.pid);
+    else m.set(p.ppid, [p.pid]);
+  }
+  snapChildrenCache.set(snap, m);
+  return m;
 }
 
 // Strip SGR escape sequences to a plain-text view.
@@ -274,7 +307,7 @@ function paneIsIdle(paneId: string, profile: IdleProfile): boolean {
 // fan-out tick ~12s (83% of the poll window). Snapshotting once drops the whole
 // tick's resolution cost to a single ps regardless of lane count. Built fresh each
 // tick (cheap relative to the interval) so it never goes stale within a tick.
-interface TickSnapshot {
+export interface TickSnapshot {
   procs: ProcLike[];
   paneByPid: Map<string, number>;          // pane_id → pane_pid (for paneSubtree)
   paneMap: ReturnType<typeof parseTmuxPanes>;

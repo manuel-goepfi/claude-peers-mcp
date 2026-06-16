@@ -303,3 +303,60 @@ describe("resolveLanePane wiring", () => {
     expect(r.attachId).toBeNull();           // null → paneOwnedByPid branch, not attach-id
   });
 });
+
+// --- paneSubtree builds the subtree from the per-tick snapshot, NOT pstree ---
+// REGRESSION (perf): paneSubtree used to fork `pstree -pa` PER LANE — O(all
+// processes), ~3s on a loaded host, which pushed ticks past the poll interval
+// (SLOW TICK, observed live: 18.5s over 4 lanes). It now walks DOWN from the
+// pane's pane_pid through snap.procs (already captured this tick). These tests
+// pin that behavior: the subtree text is derived purely from the snapshot, with
+// the `(pid)` + args shapes the ownership checks depend on.
+import { paneSubtree, attachIdInTree } from "../bin/codex-autodrain-poller.ts";
+
+function snapOf(procs: { pid: number; ppid: number; args: string }[], paneByPid: [string, number][]) {
+  return { procs, paneByPid: new Map(paneByPid), paneMap: new Map() } as any;
+}
+
+describe("paneSubtree (snapshot walk, no pstree fork)", () => {
+  // pane %p → shell 100 → claude 200 → {bun 300, helper 400}
+  const procs = [
+    { pid: 100, ppid: 1, args: "-bash" },
+    { pid: 200, ppid: 100, args: "claude attach 9c27fddd" },
+    { pid: 300, ppid: 200, args: "bun server.ts" },
+    { pid: 400, ppid: 200, args: "some-helper" },
+    { pid: 999, ppid: 1, args: "unrelated-process" },   // NOT in the subtree
+  ];
+  const snap = snapOf(procs, [["%p", 100]]);
+
+  test("collects every descendant pid of the pane shell", () => {
+    const tree = paneSubtree("%p", snap)!;
+    expect(tree.panePid).toBe(100);
+    for (const pid of [100, 200, 300, 400]) expect(tree.text).toContain(`(${pid})`);
+  });
+
+  test("does NOT include unrelated processes outside the subtree", () => {
+    const tree = paneSubtree("%p", snap)!;
+    expect(tree.text).not.toContain("(999)");
+    expect(tree.text).not.toContain("unrelated-process");
+  });
+
+  test("subtree text carries args so attachIdInTree still matches the attach client", () => {
+    const tree = paneSubtree("%p", snap)!;
+    expect(attachIdInTree(tree.text, "9c27fddd")).toBe(true);   // the ownership check
+    expect(attachIdInTree(tree.text, "deadbeef")).toBe(false);
+  });
+
+  test("returns null when the pane id is not in the snapshot (pane gone)", () => {
+    expect(paneSubtree("%gone", snap)).toBeNull();
+  });
+
+  test("cycle guard: a ppid loop does not hang the walk", () => {
+    const looped = snapOf(
+      [{ pid: 10, ppid: 20, args: "a" }, { pid: 20, ppid: 10, args: "b" }],
+      [["%c", 10]],
+    );
+    const tree = paneSubtree("%c", looped)!;       // must terminate
+    expect(tree.text).toContain("(10)");
+    expect(tree.text).toContain("(20)");
+  });
+});
