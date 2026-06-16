@@ -173,19 +173,23 @@ function paneOwnedByAttachId(paneId: string, sessionId: string, snap: TickSnapsh
 
 /**
  * True iff a process-tree text shows a `claude attach <sessionId>` client.
- * Exported for unit testing without a live tmux/pstree.
+ * Exported for unit testing without a live tmux.
  *
- * `pstree -pa` renders the attach client as `claude,<pid> attach <id>` (comm,
- * then a comma+pid, then the args on the same line) — NOT `claude attach <id>`.
- * Matching the literal `claude attach <id>` therefore misses it; we match the
- * args fragment `attach <id>` with an exact-id right boundary (whitespace or
- * line end) so a longer id sharing the same 8-hex prefix never ghost-matches.
- * sessionId is provably [0-9a-f]{8} (sole producers: CLAUDE_CODE_SESSION_ID
- * prefix + bgSessionIdFromPtyHostArgs) → no regex metacharacter / injection.
+ * paneSubtree synthesizes one line per subtree process as `(pid) <full argv>`,
+ * so the attach client appears as `(NNN) claude attach <id>` (or with an
+ * absolute exe path, `(NNN) /usr/bin/claude attach <id>`). Anchor on `claude`
+ * immediately before `attach` (review #4) — matching resolveBgAttachPane's
+ * anchor — so a DIFFERENT tool whose args merely contain `attach <id>` (e.g.
+ * `git attach <id>`, a `--attach <id>` flag) can never produce a false
+ * ownership match and nudge the wrong pane. The exact-id right boundary
+ * (whitespace or line end) stops a longer id sharing the same 8-hex prefix from
+ * ghost-matching. sessionId is provably [0-9a-f]{8} (sole producers:
+ * CLAUDE_CODE_SESSION_ID prefix + bgSessionIdFromPtyHostArgs) → no regex
+ * metacharacter / injection.
  */
 export function attachIdInTree(treeText: string, sessionId: string): boolean {
   if (!/^[0-9a-f]{8}$/.test(sessionId)) return false;
-  return new RegExp(`attach ${sessionId}(\\s|$)`, "m").test(treeText);
+  return new RegExp(`(^|\\s|/)claude\\s+attach\\s+${sessionId}(\\s|$)`, "m").test(treeText);
 }
 export function paneSubtree(paneId: string, snap: TickSnapshot): { panePid: number; text: string } | null {
   // pane_pid + the whole subtree come from the per-tick `ps` snapshot — NO

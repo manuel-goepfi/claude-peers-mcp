@@ -15,6 +15,26 @@
 # Safe to call on every tmux reload and from a periodic watchdog tick.
 set -u
 
+# Single-flight (review #5): cron (every 2min) and the .tmux.conf run-shell can
+# fire this script concurrently. Two overlapping runs could each kill+sleep+spawn
+# and race into >1 poller (dedup-on-sight recovers on the next run, but the lock
+# closes the window to zero). Re-exec under a non-blocking flock; a second
+# concurrent run exits immediately rather than queueing. flock is best-effort —
+# if it is unavailable, fall through and run unlocked (dedup-on-sight still
+# bounds the damage).
+LOCK=/tmp/ensure-codex-autodrain.lock
+if [ -z "${_AUTODRAIN_LOCKED:-}" ] && command -v flock >/dev/null 2>&1; then
+  # Re-run self under the lock. NOT `exec` — exec would replace the shell, so
+  # flock's exit-1-on-contention would propagate as this script's exit code (a
+  # spurious cron error). Run in a subshell instead and normalize "lock held"
+  # (flock -n exit 1) to a clean exit 0.
+  _AUTODRAIN_LOCKED=1 flock -n "$LOCK" "$0" "$@"
+  rc=$?
+  [ "$rc" -eq 1 ] && exit 0   # lock held by a concurrent run → clean no-op
+  exit "$rc"
+fi
+export _AUTODRAIN_LOCKED
+
 POLLER=/home/manzo/claude-peers-mcp/bin/codex-autodrain-poller.ts
 LOG=/home/manzo/.claude-peers-codex-autodrain.log
 WINDOW=codex-autodrain
@@ -41,10 +61,14 @@ tmux() { "$TMUX_BIN" -S "$TMUX_SOCK" "$@"; }
 # a needless restart.
 STALE_AFTER_S=70
 
-# Match the actual `bun .../codex-autodrain-poller.ts` process specifically — NOT
-# the `bash -c ... exec bun ...` launcher wrapper (whose command string also
-# contains the path), so a lingering half-dead wrapper does not wrongly count.
-POLLER_PIDS=$(pgrep -f "bun .*codex-autodrain-poller\.ts" 2>/dev/null)
+# Match the actual `bun .../codex-autodrain-poller.ts` daemon specifically.
+# Defined ONCE so pgrep and every pkill use the identical pattern (no drift).
+# Anchoring (review #3): require `bun<...>` then the poller `.ts` at END of the
+# command line — so it does NOT match the `bash -c ... exec bun ...` launcher
+# wrapper, a one-shot `bun run <poller> --flag` (trailing flag → not end-
+# anchored), or an unrelated `bun <other>` that merely mentions the path.
+POLLER_MATCH='bun[^ ]* .*/codex-autodrain-poller\.ts$'
+POLLER_PIDS=$(pgrep -f "$POLLER_MATCH" 2>/dev/null)
 POLLER_COUNT=$(printf '%s\n' "$POLLER_PIDS" | grep -c .)
 
 # DEDUP-ON-SIGHT: two pollers both nudge the same lanes → double keystrokes into
@@ -54,7 +78,7 @@ POLLER_COUNT=$(printf '%s\n' "$POLLER_PIDS" | grep -c .)
 # zero unconditionally and respawn exactly one.
 if [ "$POLLER_COUNT" -gt 1 ]; then
   echo "$(date -Iseconds) watchdog: ${POLLER_COUNT} pollers running — collapsing to one" >> "$LOG"
-  pkill -9 -f "bun .*codex-autodrain-poller\.ts" 2>/dev/null
+  pkill -9 -f "$POLLER_MATCH" 2>/dev/null
   sleep 1
   # fall through to spawn exactly one
 elif [ "$POLLER_COUNT" -eq 1 ]; then
@@ -67,7 +91,7 @@ elif [ "$POLLER_COUNT" -eq 1 ]; then
       exit 0   # alive AND fresh → healthy, nothing to do
     fi
     echo "$(date -Iseconds) watchdog: poller alive but heartbeat stale (${age}s > ${STALE_AFTER_S}s) — restarting wedged poller" >> "$LOG"
-    pkill -9 -f "bun .*codex-autodrain-poller\.ts" 2>/dev/null
+    pkill -9 -f "$POLLER_MATCH" 2>/dev/null
     sleep 1   # let the process exit + release its tmux window
     # fall through to (re)spawn below
   else
@@ -84,7 +108,7 @@ elif [ "$POLLER_COUNT" -eq 1 ]; then
     poller_etime=$(ps -o etimes= -p "$POLLER_PIDS" 2>/dev/null | tr -d ' ' | sort -n | tail -1)
     if [ -n "${poller_etime:-}" ] && [ "$poller_etime" -gt "$STALE_AFTER_S" ]; then
       echo "$(date -Iseconds) watchdog: poller alive but NO heartbeat after ${poller_etime}s — restarting (pre-heartbeat or wedged)" >> "$LOG"
-      pkill -9 -f "bun .*codex-autodrain-poller\.ts" 2>/dev/null
+      pkill -9 -f "$POLLER_MATCH" 2>/dev/null
       sleep 1
       # fall through to respawn
     else

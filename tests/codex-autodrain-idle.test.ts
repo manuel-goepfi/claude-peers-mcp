@@ -184,27 +184,35 @@ describe("sessionIdFromEnvironText", () => {
 });
 
 describe("attachIdInTree", () => {
-  // REGRESSION: `pstree -pa` renders the attach client as `claude,<pid> attach
-  // <id>` — matching the literal "claude attach <id>" MISSES it (the comma+pid
-  // sits between "claude" and "attach"). This is the exact shape that made the
-  // ownership check skip a real idle bg-Claude.
-  test("matches the real pstree -pa shape: 'claude,684836 attach 9c27fddd'", () => {
-    const tree = "bash,1646219\n  `-claude,684836 attach 9c27fddd\n      |-{claude},684837";
+  // paneSubtree synthesizes one `(pid) <full argv>` line per subtree process, so
+  // the attach client appears as `(NNN) claude attach <id>`. The matcher anchors
+  // on `claude` immediately before `attach` (review #4) so a different tool whose
+  // args merely contain `attach <id>` can't false-match.
+  test("matches the synthesized line: '(684836) claude attach 9c27fddd'", () => {
+    const tree = "(1646219) -bash\n(684836) claude attach 9c27fddd\n(684837) bun server.ts";
     expect(attachIdInTree(tree, "9c27fddd")).toBe(true);
   });
+  test("matches an absolute-path exe: '(NNN) /usr/bin/claude attach <id>'", () => {
+    expect(attachIdInTree("(684836) /usr/bin/claude attach 9c27fddd", "9c27fddd")).toBe(true);
+  });
   test("does NOT match a different session id in the tree", () => {
-    const tree = "  `-claude,684836 attach 9c27fddd";
+    const tree = "(684836) claude attach 9c27fddd";
     expect(attachIdInTree(tree, "fdf1dffd")).toBe(false); // the spare id must NOT match
   });
   test("exact-id boundary: a longer id sharing the prefix does not ghost-match", () => {
-    const tree = "  `-claude,684836 attach 9c27fddddead"; // 12 hex, prefix collides
+    const tree = "(684836) claude attach 9c27fddddead"; // 12 hex, prefix collides
     expect(attachIdInTree(tree, "9c27fddd")).toBe(false);
   });
+  test("does NOT match a non-claude tool whose args contain 'attach <id>'", () => {
+    // review #4: bare-`attach <id>` ownership was the false-positive vector
+    expect(attachIdInTree("(700) git attach 9c27fddd", "9c27fddd")).toBe(false);
+    expect(attachIdInTree("(701) bun foo --attach 9c27fddd", "9c27fddd")).toBe(false);
+  });
   test("rejects a non-8-hex sessionId (guards the dynamic RegExp)", () => {
-    expect(attachIdInTree("attach .* anything", ".*")).toBe(false);
+    expect(attachIdInTree("(700) claude attach anything", ".*")).toBe(false);
   });
   test("no attach client in the tree → false", () => {
-    expect(attachIdInTree("bash,1646219\n  `-claude,684836\n      |-{claude},684837", "9c27fddd")).toBe(false);
+    expect(attachIdInTree("(1646219) -bash\n(684836) claude\n(684837) bun server.ts", "9c27fddd")).toBe(false);
   });
 });
 
@@ -368,7 +376,7 @@ describe("paneSubtree (snapshot walk, no pstree fork)", () => {
 // ISO timestamp. (HEARTBEAT_PATH is module-level; this test imports the module
 // AFTER setting the env override so the path points at a tmp file.)
 import { writeHeartbeat } from "../bin/codex-autodrain-poller.ts";
-import { readFileSync, existsSync, rmSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 
 describe("writeHeartbeat", () => {
   // The module already read CLAUDE_PEERS_AUTODRAIN_HEARTBEAT at import time. The
