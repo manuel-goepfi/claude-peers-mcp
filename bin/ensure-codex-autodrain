@@ -75,10 +75,15 @@ elif [ "$POLLER_COUNT" -eq 1 ]; then
     # poller (heartbeat lands on its first tick) OR an OLD poller predating the
     # heartbeat feature. Give a fresh start a grace window: if the process is
     # young, assume it's about to write one; if it's old (no heartbeat ever),
-    # treat it as wedged and restart. Use process start time as the age proxy.
-    oldest_etime=$(ps -o etimes= -C bun 2>/dev/null | tr -d ' ' | sort -n | tail -1)
-    if [ -n "${oldest_etime:-}" ] && [ "$oldest_etime" -gt "$STALE_AFTER_S" ]; then
-      echo "$(date -Iseconds) watchdog: poller alive but NO heartbeat after ${oldest_etime}s — restarting (pre-heartbeat or wedged)" >> "$LOG"
+    # treat it as wedged and restart. Use THE POLLER'S OWN process age as the
+    # proxy — scope the etime query to $POLLER_PIDS (the args-filtered pgrep
+    # result), NOT `-C bun` which matches EVERY bun process on the host: with
+    # other long-lived bun daemons present, `-C bun` always returns a huge oldest
+    # etime, the grace branch never fires, and a healthy young poller gets killed
+    # on every watchdog tick before it can write its first heartbeat.
+    poller_etime=$(ps -o etimes= -p "$POLLER_PIDS" 2>/dev/null | tr -d ' ' | sort -n | tail -1)
+    if [ -n "${poller_etime:-}" ] && [ "$poller_etime" -gt "$STALE_AFTER_S" ]; then
+      echo "$(date -Iseconds) watchdog: poller alive but NO heartbeat after ${poller_etime}s — restarting (pre-heartbeat or wedged)" >> "$LOG"
       pkill -9 -f "bun .*codex-autodrain-poller\.ts" 2>/dev/null
       sleep 1
       # fall through to respawn
@@ -87,6 +92,14 @@ elif [ "$POLLER_COUNT" -eq 1 ]; then
     fi
   fi
 fi
+
+# Reaching here means we are about to (re)spawn the poller (either none was
+# running, or we just killed a wedged/duplicate one). Remove any stale heartbeat
+# so the fresh poller does NOT inherit the dead poller's mtime — otherwise the
+# next watchdog tick would read an already-stale heartbeat and kill the new
+# poller before its first tick writes a fresh one (restart loop). The grace
+# window (scoped poller etime above) covers the gap until the first heartbeat.
+rm -f "$HEARTBEAT" 2>/dev/null
 
 # Need a tmux server with at least one session to host the window.
 if ! tmux list-sessions >/dev/null 2>&1; then

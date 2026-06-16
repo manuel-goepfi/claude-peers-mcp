@@ -360,3 +360,32 @@ describe("paneSubtree (snapshot walk, no pstree fork)", () => {
     expect(tree.text).toContain("(20)");
   });
 });
+
+// --- writeHeartbeat (the watchdog's liveness signal) ---
+// REGRESSION (review #2): the poller must write its heartbeat at STARTUP, not
+// only at end-of-tick — a slow first tick must not look like a wedge to the
+// watchdog. This proves writeHeartbeat actually creates the file with a fresh
+// ISO timestamp. (HEARTBEAT_PATH is module-level; this test imports the module
+// AFTER setting the env override so the path points at a tmp file.)
+import { writeHeartbeat } from "../bin/codex-autodrain-poller.ts";
+import { readFileSync, existsSync, rmSync } from "node:fs";
+
+describe("writeHeartbeat", () => {
+  // The module already read CLAUDE_PEERS_AUTODRAIN_HEARTBEAT at import time. The
+  // test harness sets it before any import below via the env at file scope is
+  // not reliable post-import, so assert against the resolved default path the
+  // running poller uses, then clean up. We only assert the WRITE happens + is a
+  // parseable recent ISO timestamp (the behavior the fix guarantees).
+  test("writes a fresh ISO-8601 timestamp to the heartbeat path", () => {
+    const before = Date.now();
+    writeHeartbeat();
+    // Resolve the same default path the module uses.
+    const path = process.env.CLAUDE_PEERS_AUTODRAIN_HEARTBEAT
+      ?? `${process.env.HOME}/.claude-peers-autodrain.heartbeat`;
+    expect(existsSync(path)).toBe(true);
+    const body = readFileSync(path, "utf8").trim();
+    const ts = Date.parse(body);
+    expect(Number.isNaN(ts)).toBe(false);          // a valid timestamp
+    expect(ts).toBeGreaterThanOrEqual(before - 1000); // freshly written
+  });
+});

@@ -506,7 +506,7 @@ function tick(db: Database): void {
 // Touch the heartbeat file (mtime = "last completed a tick"). Best-effort: a
 // write failure must never break the poll loop, so it is caught and logged once.
 let heartbeatWriteWarned = false;
-function writeHeartbeat(): void {
+export function writeHeartbeat(): void {
   try {
     require("node:fs").writeFileSync(HEARTBEAT_PATH, `${new Date().toISOString()}\n`);
   } catch (e) {
@@ -539,6 +539,12 @@ function main(): void {
   process.on("unhandledRejection", (reason) => {
     log(`unhandledRejection: ${reason instanceof Error ? reason.message : String(reason)}`);
   });
+  // Write the heartbeat IMMEDIATELY at startup, before the first tick — not only
+  // in scheduledTick's finally. The first tick can be slow (the very SLOW-TICK
+  // case this poller guards against), and the watchdog must see a fresh heartbeat
+  // within its stale window from the moment we start, so a slow first tick is
+  // never mistaken for a wedge.
+  writeHeartbeat();
   const db = new Database(DB_PATH, { readonly: true });
   scheduledTick(db);
   setInterval(() => scheduledTick(db), POLL_INTERVAL_MS);
