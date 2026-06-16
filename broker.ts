@@ -1007,8 +1007,11 @@ function disambiguateName(rawName: string | null, selfId: string, windowName?: s
   // orphaned-resume squatter), "#window" gives both the same suffix and tells
   // them apart no better than "#N" — so fall straight to the numeric "#N" walk.
   const win = windowName?.trim().replace(/[#\s]+/g, "-");
+  // `startsWith(rawName + "#")` identifies same-base suffixed siblings — but only
+  // soundly when rawName itself has no "#" (else "obs#5" would over-match the
+  // unrelated "obs#50"). Operator-supplied names can contain "#", so guard it.
   const sameBaseInSameWindow = win
-    ? live.some(r => (r.name === rawName || r.name.startsWith(`${rawName}#`)) && (r.win?.trim().replace(/[#\s]+/g, "-")) === win)
+    ? live.some(r => (r.name === rawName || (!rawName.includes("#") && r.name.startsWith(`${rawName}#`))) && (r.win?.trim().replace(/[#\s]+/g, "-")) === win)
     : false;
   if (win && !sameBaseInSameWindow) {
     const byWindow = `${rawName}#${win}`;

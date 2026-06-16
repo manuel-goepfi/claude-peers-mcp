@@ -747,11 +747,50 @@ export function publishBrokerIdentityToTmux(identity: {
 // human-pinned label for the pane (the next occupant's own register/heartbeat will
 // overwrite it via updateOperatorLabel), and clearing it would blank the border in
 // the gap before the new session mirrors.
-function clearBrokerIdentityFromTmux(paneTarget: string): void {
-  for (const opt of ["@peer_id", "@peer_label", "@peer_resolved_name", "@peer_client_type", "@peer_receiver_mode"]) {
-    // -u unsets the pane-scoped option; failure is non-fatal (pane may be gone).
-    runTmux(["set-option", "-p", "-t", paneTarget, "-u", opt]);
+//
+// Returns the options whose unset FAILED (non-empty = the pane still exists but the
+// clear was rejected → the stale stamp may persist; the caller must surface this
+// rather than log an unconditional "cleared"). An empty array means all unsets
+// succeeded OR the pane is gone (both acceptable — a gone pane advertises nothing).
+const PEER_TMUX_OPTIONS = ["@peer_id", "@peer_label", "@peer_resolved_name", "@peer_client_type", "@peer_receiver_mode"];
+function clearBrokerIdentityFromTmux(paneTarget: string): string[] {
+  const failed: string[] = [];
+  for (const opt of PEER_TMUX_OPTIONS) {
+    // -u unsets the pane-scoped option. runTmux returns null on non-zero exit /
+    // throw; an unset of an ALREADY-unset option still exits 0, so a null here is
+    // a genuine failure (pane gone or tmux rejected), not "nothing to clear".
+    if (runTmux(["set-option", "-p", "-t", paneTarget, "-u", opt]) === null) failed.push(opt);
   }
+  return failed;
+}
+
+// Pure decision for the heartbeat's tmux-identity maintenance — extracted so the
+// branch selection is unit-testable WITHOUT a live tmux (the two 6039612-class
+// bugs lived in exactly this kind of inline-callback branch logic). Given where
+// our stamp WAS (oldTarget), where our pane is NOW (newTarget, null if none
+// resolves this tick), and who is currently stamped on the old pane, decide:
+//   - clearOld: unset our @peer_* from oldTarget (we genuinely left it)
+//   - mirrorNew: (re)stamp our identity on newTarget
+//
+// Invariants this encodes (each is a regression the reviewers flagged):
+//   1. NEVER clear on a transient no-pane tick. newTarget===null can mean "moved
+//      away" OR "detectTmuxPane hiccuped while we still own oldTarget" — the two
+//      are indistinguishable here, so clearing would wipe our OWN live stamp on a
+//      tmux blip. We only clear when we have a CONFIRMED different newTarget.
+//   2. Only clear a pane WE still own (stampedPeerId===myId). If a different live
+//      session already reclaimed oldTarget, leave its stamp alone.
+//   3. Never mirror to a null target (no pane to stamp this tick).
+export interface MirrorPlan { clearOld: boolean; mirrorNew: boolean; }
+export function planTmuxMirrorTransition(
+  oldTarget: string | null,
+  newTarget: string | null,
+  stampedPeerId: string | null,
+  myId: string | null,
+): MirrorPlan {
+  const movedToDifferentPane = !!oldTarget && !!newTarget && oldTarget !== newTarget;
+  const clearOld = movedToDifferentPane && stampedPeerId === myId && myId !== null;
+  const mirrorNew = !!newTarget;
+  return { clearOld, mirrorNew };
 }
 
 function recordTmuxMirrorResult(context: string, result: TmuxMirrorResult): void {
@@ -2123,49 +2162,71 @@ async function main() {
   applyReceiverMetadata(myClientType, myReceiverMode, "startup");
 
   // 7. Start heartbeat
+  // Re-entry guard: the callback now has TWO awaits (brokerFetch + detectTmuxPane)
+  // straddling the mutation of module-global myTmuxInfo. setInterval does not wait
+  // for the prior async callback, so without this a slow tick could interleave with
+  // the next and clobber myTmuxInfo / make the clear decision against a torn view.
+  // Same pattern as reregisterInFlight elsewhere in this file.
+  let heartbeatInFlight = false;
   const heartbeatTimer = setInterval(async () => {
-    if (myId) {
-      try {
-        const heartbeat = await brokerFetch<HeartbeatResponse>("/heartbeat", { id: myId, client_type: myClientType, receiver_mode: myReceiverMode });
-        applyReceiverMetadata(heartbeat.client_type, heartbeat.receiver_mode, "heartbeat");
-        // Re-detect our pane every heartbeat and keep the tmux identity mirror
-        // CURRENT. Two stale-mirror failure modes this fixes (both verified live):
-        //   (1) a pane reused by a NEW session kept the dead session's @peer_*
-        //       options forever (the mirror only refreshed on a receiver-mode
-        //       change, which steady-state heartbeats don't trigger);
-        //   (2) a bg/attached session whose UI moved to a different pane kept
-        //       writing identity to its STARTUP pane (myTmuxInfo never updated),
-        //       so the operator saw the wrong seat on the pane border.
-        // If the pane changed, clear the OLD pane's @peer_* first so it does not
-        // advertise a stale identity, then mirror to the new pane.
-        // The freshly-detected pane is the ONLY valid mirror target each tick.
-        const freshTmux = await detectTmuxPane();
-        const oldTarget = brokerIdentityPaneTarget(myTmuxInfo);
-        const newTarget = brokerIdentityPaneTarget(freshTmux);
-        // If we left an identity stamp on a pane that is no longer ours (moved
-        // away, or we can resolve NO pane now — e.g. a `--resume` whose attach
-        // client is gone), clear it — but ONLY if our id is still the one stamped
-        // there. If a different live session already reclaimed the pane, leave its
-        // stamp alone. This stops an orphan from fighting the real occupant for
-        // the @peer_* mirror every heartbeat (verified live: an orphaned --resume
-        // had stamped @peer_id over the live seat's pane).
-        if (oldTarget && oldTarget !== newTarget && readTmuxPaneOption(oldTarget, "@peer_id") === myId) {
-          clearBrokerIdentityFromTmux(oldTarget);
-          log(`tmux: cleared our stale @peer_* from ${oldTarget} (now ${newTarget ?? "no pane resolves for us"})`);
+    if (!myId || heartbeatInFlight) return;
+    heartbeatInFlight = true;
+    try {
+      const heartbeat = await brokerFetch<HeartbeatResponse>("/heartbeat", { id: myId, client_type: myClientType, receiver_mode: myReceiverMode });
+      applyReceiverMetadata(heartbeat.client_type, heartbeat.receiver_mode, "heartbeat");
+      // Re-detect our pane every heartbeat and keep the tmux identity mirror
+      // CURRENT (fixes: a pane reused by a NEW session kept the dead session's
+      // @peer_* forever, since the mirror previously refreshed only on a
+      // receiver-mode change; and a session whose UI moved panes kept writing to
+      // its STARTUP pane). The decision is delegated to the pure
+      // planTmuxMirrorTransition so its branches are unit-testable.
+      const freshTmux = await detectTmuxPane();
+      const oldTarget = brokerIdentityPaneTarget(myTmuxInfo);
+      const newTarget = brokerIdentityPaneTarget(freshTmux);
+      const stampedPeerId = oldTarget ? readTmuxPaneOption(oldTarget, "@peer_id") : null;
+      const plan = planTmuxMirrorTransition(oldTarget, newTarget, stampedPeerId, myId);
+
+      if (plan.clearOld && oldTarget) {
+        const failed = clearBrokerIdentityFromTmux(oldTarget);
+        if (failed.length === 0) {
+          log(`tmux: cleared our stale @peer_* from ${oldTarget} (moved to ${newTarget})`);
+        } else {
+          // NO SILENT FALLBACKS: the unset was rejected on a pane that still
+          // exists → the stale stamp may persist. Surface it (whoami reads
+          // latestTmuxMirrorFailure) instead of logging an unconditional "cleared".
+          latestTmuxMirrorFailure = `clear: target=${oldTarget} failed=${failed.join(",")}`;
+          log(`tmux: FAILED to clear @peer_* from ${oldTarget} (${failed.join(",")}); stale stamp may persist`);
         }
-        myTmuxInfo = freshTmux;
-        // No pane → orphan/headless this tick: do not mirror (nothing to stamp).
-        if (!newTarget) return;
-        recordTmuxMirrorResult("heartbeat", publishBrokerIdentityToTmux({
-          id: myId,
-          name: myOperatorName,
-          resolved_name: myResolvedName,
-          client_type: myClientType,
-          receiver_mode: myReceiverMode,
-        }, myTmuxInfo));
-      } catch {
-        // Non-critical
       }
+
+      // Preserve myTmuxInfo on a transient no-pane tick: detectTmuxPane returning
+      // null can be a momentary tmux hiccup while we STILL own our pane — do not
+      // forget the pane (and never clear our own stamp) on a blip. Only adopt a
+      // freshly-resolved pane; the next successful tick re-detects if it was real.
+      if (freshTmux) myTmuxInfo = freshTmux;
+
+      if (!plan.mirrorNew) {
+        // No pane resolves this tick (orphan / headless / transient). Record a
+        // benign result so whoami does not keep reporting a stale prior failure,
+        // and so a "mirror skipped, no pane" tick is not silently indistinguishable
+        // from a successful mirror.
+        recordTmuxMirrorResult("heartbeat", { ok: true, target: null, failedOptions: [] });
+        return;
+      }
+      recordTmuxMirrorResult("heartbeat", publishBrokerIdentityToTmux({
+        id: myId,
+        name: myOperatorName,
+        resolved_name: myResolvedName,
+        client_type: myClientType,
+        receiver_mode: myReceiverMode,
+      }, myTmuxInfo));
+    } catch (e) {
+      // The broker POST is legitimately best-effort, but a throw in the tmux
+      // identity-maintenance block is not — log it (NO SILENT FALLBACKS) so a
+      // regression in the mirror/clear path is visible, not swallowed.
+      log(`heartbeat tick error: ${errMsg(e)}`);
+    } finally {
+      heartbeatInFlight = false;
     }
   }, HEARTBEAT_INTERVAL_MS);
 

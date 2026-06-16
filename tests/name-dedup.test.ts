@@ -36,7 +36,7 @@ function disambiguateName(
   // the window actually distinguishes (no same-base seat already live in it).
   const win = windowName?.trim().replace(/[#\s]+/g, "-");
   const sameBaseInSameWindow = win
-    ? live.some((r) => (r.name === rawName || r.name.startsWith(`${rawName}#`)) && (r.win?.trim().replace(/[#\s]+/g, "-")) === win)
+    ? live.some((r) => (r.name === rawName || (!rawName.includes("#") && r.name.startsWith(`${rawName}#`))) && (r.win?.trim().replace(/[#\s]+/g, "-")) === win)
     : false;
   if (win && !sameBaseInSameWindow) {
     const byWindow = `${rawName}#${win}`;

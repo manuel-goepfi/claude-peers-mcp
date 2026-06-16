@@ -23,6 +23,7 @@ import {
   listPeersRoutingHint,
   normalizeTmuxTargetSelector,
   publishBrokerIdentityToTmux,
+  planTmuxMirrorTransition,
   rewriteAuthBodyForPeer,
   shouldDisableBackgroundPolling,
   chooseOperatorLabel,
@@ -30,6 +31,39 @@ import {
   resolvePeerName,
   stripResolvedNameSuffix,
 } from "../server";
+
+// The heartbeat's tmux-identity maintenance delegates its branch selection to
+// this pure function so the decision is RED-when-broken without a live tmux.
+// Each case is a regression the seat-identity reviewers flagged.
+describe("planTmuxMirrorTransition", () => {
+  test("moved to a different pane WE still own → clear old + mirror new", () => {
+    expect(planTmuxMirrorTransition("%10", "%20", "me", "me")).toEqual({ clearOld: true, mirrorNew: true });
+  });
+
+  test("moved, but a DIFFERENT live session reclaimed the old pane → do NOT clear", () => {
+    // The orphaned-resume-stamped-over-the-live-seat case: dropping the
+    // stampedPeerId===myId check would clear the real occupant's stamp.
+    expect(planTmuxMirrorTransition("%10", "%20", "someoneElse", "me")).toEqual({ clearOld: false, mirrorNew: true });
+  });
+
+  test("transient no-pane tick (newTarget null) → never clear our own live stamp", () => {
+    // detectTmuxPane hiccup while we still own %10: clearing here would wipe our
+    // own live @peer_* on a tmux blip. mirrorNew false because there is no pane.
+    expect(planTmuxMirrorTransition("%10", null, "me", "me")).toEqual({ clearOld: false, mirrorNew: false });
+  });
+
+  test("steady state, same pane → no clear, re-mirror (keep the stamp current)", () => {
+    expect(planTmuxMirrorTransition("%10", "%10", "me", "me")).toEqual({ clearOld: false, mirrorNew: true });
+  });
+
+  test("first-ever resolve (no old pane) → no clear, mirror the new pane", () => {
+    expect(planTmuxMirrorTransition(null, "%20", null, "me")).toEqual({ clearOld: false, mirrorNew: true });
+  });
+
+  test("null myId never clears (defensive)", () => {
+    expect(planTmuxMirrorTransition("%10", "%20", null, null)).toEqual({ clearOld: false, mirrorNew: true });
+  });
+});
 
 describe("visible tmux pane selectors", () => {
   test("normalizes visible colon and spoken-space pane addresses", () => {
