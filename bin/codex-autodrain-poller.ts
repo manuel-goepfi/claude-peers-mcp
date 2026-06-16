@@ -59,6 +59,12 @@ const DB_PATH = process.env.CLAUDE_PEERS_DB ?? `${homedir()}/.claude-peers.db`;
 const POLL_INTERVAL_MS = envMs("POLL_INTERVAL_MS", 15_000);
 const NUDGE_COOLDOWN_MS = envMs("NUDGE_COOLDOWN_MS", 60_000);
 const DRY_RUN = process.env.DRY_RUN === "1";
+// Liveness heartbeat: the END of every tick (success OR caught-error) touches
+// this file with the current time. The watchdog (~/bin/ensure-codex-autodrain)
+// restarts the poller if this file goes stale — a process that is alive but no
+// longer TICKING (the 'silent for 16h' zombie) passes a bare pgrep check but
+// fails the freshness check. mtime is the signal; the body is human-readable.
+const HEARTBEAT_PATH = process.env.CLAUDE_PEERS_AUTODRAIN_HEARTBEAT ?? `${homedir()}/.claude-peers-autodrain.heartbeat`;
 const NUDGE_TEXT = "check your peer inbox and handle any pending messages";
 // Give up nudging a lane after this many consecutive attempts with mail still
 // unread — a lane whose drain hook is broken must NOT be keystroke-bombed
@@ -497,11 +503,45 @@ function tick(db: Database): void {
   }
 }
 
+// Touch the heartbeat file (mtime = "last completed a tick"). Best-effort: a
+// write failure must never break the poll loop, so it is caught and logged once.
+let heartbeatWriteWarned = false;
+function writeHeartbeat(): void {
+  try {
+    require("node:fs").writeFileSync(HEARTBEAT_PATH, `${new Date().toISOString()}\n`);
+  } catch (e) {
+    if (!heartbeatWriteWarned) {
+      heartbeatWriteWarned = true;
+      log(`heartbeat write failed (${HEARTBEAT_PATH}): ${e instanceof Error ? e.message : String(e)} — watchdog may false-restart`);
+    }
+  }
+}
+
+// One scheduled iteration: run the tick, then ALWAYS touch the heartbeat — even
+// if tick() threw past its own per-lane guards. The try/finally guarantees the
+// liveness signal reflects "the loop is still cycling", and an unexpected tick
+// throw is logged instead of silently stopping the timer.
+function scheduledTick(db: Database): void {
+  try {
+    tick(db);
+  } catch (e) {
+    log(`tick threw at top level: ${e instanceof Error ? e.message : String(e)} (loop continues)`);
+  } finally {
+    writeHeartbeat();
+  }
+}
+
 function main(): void {
-  log(`starting: db=${DB_PATH} interval=${POLL_INTERVAL_MS}ms cooldown=${NUDGE_COOLDOWN_MS}ms${DRY_RUN ? " DRY_RUN" : ""}`);
+  log(`starting: db=${DB_PATH} interval=${POLL_INTERVAL_MS}ms cooldown=${NUDGE_COOLDOWN_MS}ms heartbeat=${HEARTBEAT_PATH}${DRY_RUN ? " DRY_RUN" : ""}`);
+  // A stray unhandled rejection must NOT kill the process (which would strand the
+  // watchdog with a dead poller that never writes its heartbeat — though the
+  // watchdog would then restart it; logging here makes the cause visible).
+  process.on("unhandledRejection", (reason) => {
+    log(`unhandledRejection: ${reason instanceof Error ? reason.message : String(reason)}`);
+  });
   const db = new Database(DB_PATH, { readonly: true });
-  tick(db);
-  setInterval(() => tick(db), POLL_INTERVAL_MS);
+  scheduledTick(db);
+  setInterval(() => scheduledTick(db), POLL_INTERVAL_MS);
 }
 
 // Run the daemon only when executed directly — importing this module (e.g. from
