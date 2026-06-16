@@ -22,13 +22,26 @@ function disambiguateName(
   rawName: string | null,
   selfId: string,
   livePidCheck: (pid: number) => boolean,
+  windowName?: string | null,
 ): string | null {
   if (!rawName) return null;
   const rows = db
-    .query("SELECT pid, name FROM peers WHERE name IS NOT NULL AND id != ?")
-    .all(selfId) as { pid: number; name: string }[];
-  const liveNames = new Set(rows.filter((r) => livePidCheck(r.pid)).map((r) => r.name));
+    .query("SELECT pid, name, tmux_window_name AS win FROM peers WHERE name IS NOT NULL AND id != ?")
+    .all(selfId) as { pid: number; name: string; win: string | null }[];
+  const live = rows.filter((r) => livePidCheck(r.pid));
+  const liveNames = new Set(live.map((r) => r.name));
   if (!liveNames.has(rawName)) return rawName;
+  // Window-name disambiguator preferred over "#N" (see broker.ts for rationale):
+  // self-documenting suffix so two live seats are tellable apart — BUT only when
+  // the window actually distinguishes (no same-base seat already live in it).
+  const win = windowName?.trim().replace(/[#\s]+/g, "-");
+  const sameBaseInSameWindow = win
+    ? live.some((r) => (r.name === rawName || r.name.startsWith(`${rawName}#`)) && (r.win?.trim().replace(/[#\s]+/g, "-")) === win)
+    : false;
+  if (win && !sameBaseInSameWindow) {
+    const byWindow = `${rawName}#${win}`;
+    if (!liveNames.has(byWindow)) return byWindow;
+  }
   let n = 2;
   while (liveNames.has(`${rawName}#${n}`)) n++;
   return `${rawName}#${n}`;
@@ -43,7 +56,7 @@ describe("broker name de-duplication", () => {
   beforeEach(() => {
     db = new Database(":memory:");
     db.run(
-      "CREATE TABLE peers (id TEXT PRIMARY KEY, pid INTEGER NOT NULL, name TEXT)",
+      "CREATE TABLE peers (id TEXT PRIMARY KEY, pid INTEGER NOT NULL, name TEXT, tmux_window_name TEXT)",
     );
     alive = new Set();
   });
@@ -139,6 +152,47 @@ describe("broker name de-duplication", () => {
     expect(disambiguateName(db, "different'name", "self", isAlive)).toBe(
       "different'name",
     );
+  });
+
+  // --- window-name disambiguator (replaces meaningless #N when it actually helps) ---
+
+  test("collision, DIFFERENT window → suffixes the window, not #2", () => {
+    // holder is in window 'lane-seo'; registrant is in 'orchA' → window distinguishes.
+    db.run("INSERT INTO peers (id, pid, name, tmux_window_name) VALUES ('a', 100, 'coding.1', 'lane-seo')");
+    alive.add(100);
+    expect(disambiguateName(db, "coding.1", "self", isAlive, "orchA")).toBe("coding.1#orchA");
+  });
+
+  test("collision, SAME window → window doesn't help, falls back to #2", () => {
+    // both seats in window 'orchA' → "#orchA" tells them apart no better than "#2".
+    db.run("INSERT INTO peers (id, pid, name, tmux_window_name) VALUES ('a', 100, 'coding.1', 'orchA')");
+    alive.add(100);
+    expect(disambiguateName(db, "coding.1", "self", isAlive, "orchA")).toBe("coding.1#2");
+  });
+
+  test("collision WITHOUT a window name → falls back to #2", () => {
+    db.run("INSERT INTO peers (id, pid, name, tmux_window_name) VALUES ('a', 100, 'coding.1', 'lane-seo')");
+    alive.add(100);
+    expect(disambiguateName(db, "coding.1", "self", isAlive, null)).toBe("coding.1#2");
+    expect(disambiguateName(db, "coding.1", "self", isAlive, undefined)).toBe("coding.1#2");
+  });
+
+  test("no collision → window name is NOT appended (bare name kept)", () => {
+    db.run("INSERT INTO peers (id, pid, name, tmux_window_name) VALUES ('a', 100, 'other', 'orchA')");
+    alive.add(100);
+    expect(disambiguateName(db, "coding.1", "self", isAlive, "orchA")).toBe("coding.1");
+  });
+
+  test("window name with whitespace / '#' is sanitized to hyphens", () => {
+    db.run("INSERT INTO peers (id, pid, name, tmux_window_name) VALUES ('a', 100, 'coding.1', 'orchA')");
+    alive.add(100);
+    expect(disambiguateName(db, "coding.1", "self", isAlive, "lane seo#x")).toBe("coding.1#lane-seo-x");
+  });
+
+  test("empty/whitespace-only window name → treated as absent, falls back to #2", () => {
+    db.run("INSERT INTO peers (id, pid, name, tmux_window_name) VALUES ('a', 100, 'coding.1', 'orchA')");
+    alive.add(100);
+    expect(disambiguateName(db, "coding.1", "self", isAlive, "   ")).toBe("coding.1#2");
   });
 
   test("real process.kill liveness — current pid alive, max int dead", () => {

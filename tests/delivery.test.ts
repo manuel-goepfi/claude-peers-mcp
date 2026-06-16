@@ -2059,7 +2059,9 @@ describe("Live broker delivery features", () => {
     expect(send.candidates?.length).toBe(2);
     expect(send.candidates?.every((c) => c.name === "infra.4")).toBe(true);
     expect(send.candidates?.every((c) => typeof c.id === "string" && c.id.length > 0)).toBe(true);
-    expect(send.candidates?.map((c) => c.resolved_name).sort()).toEqual(["infra.4", "infra.4#2"]);
+    // Window-name disambiguator: seat B is in window "two" (seat A in "one"), so
+    // its resolved_name is the self-documenting "infra.4#two", not a bare "#2".
+    expect(send.candidates?.map((c) => c.resolved_name).sort()).toEqual(["infra.4", "infra.4#two"]);
     expect(send.candidates?.map((c) => c.tmux_session).sort()).toEqual(["infra", "infra"]);
     expect(send.candidates?.map((c) => c.tmux_pane_id).sort()).toEqual(["%41", "%42"]);
     expect(send.candidates?.every((c) => c.client_type === "unknown")).toBe(true);
@@ -2088,16 +2090,17 @@ describe("Live broker delivery features", () => {
       pid: childB.pid, cwd: "/resolved-b", git_root: null, tty: null, name: "codex.9",
       tmux_session: "codex", tmux_window_index: "2", tmux_window_name: "two", tmux_pane_id: "%92", summary: "",
     });
-    expect(second.resolved_name).toBe("codex.9#2");
+    // Window-name disambiguator: seat B is in window "two" → resolved "codex.9#two".
+    expect(second.resolved_name).toBe("codex.9#two");
 
     const send = await brokerFetch<{ ok: boolean; target?: { id: string; resolved_name: string | null } }>("/send-to-peer", {
       from_id: sender.id,
-      selector: { resolved_name: "codex.9#2" },
+      selector: { resolved_name: "codex.9#two" },
       text: "resolved route",
     });
     expect(send.ok).toBe(true);
     expect(send.target?.id).toBe(second.id);
-    expect(send.target?.resolved_name).toBe("codex.9#2");
+    expect(send.target?.resolved_name).toBe("codex.9#two");
 
     const poll = await brokerFetch<{ messages: { text: string }[] }>("/poll-messages", { id: second.id });
     expect(poll.messages.filter((m) => m.text === "resolved route")).toHaveLength(1);

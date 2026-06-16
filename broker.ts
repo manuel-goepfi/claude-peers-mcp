@@ -867,7 +867,7 @@ function handleRegister(body: RegisterRequest): RegisterResult {
   // Runtime-name de-dupe: keep the operator-facing name unchanged, but assign
   // a broker-unique resolved_name for diagnostics and exact process identity.
   const requestedName = body.name ?? null;
-  const finalName = disambiguateName(requestedName, id);
+  const finalName = disambiguateName(requestedName, id, body.tmux_window_name);
   let receiverMode = initialReceiverModeFromRegistration(body.receiver_mode, clientType);
   if (existing?.id === id && receiverMode === "manual-drain") {
     const currentMode = validReceiverMode(existing.receiver_mode, clientType);
@@ -967,7 +967,9 @@ function handleSetName(body: SetNameRequest): { name: string | null; resolved_na
   // Empty string clears the name (stored as NULL for join-friendliness
   // with list_peers output which treats null as "unnamed").
   const desired = body.name.length > 0 ? body.name : null;
-  const final = disambiguateName(desired, body.id);
+  // set-name has no tmux context in its payload → window-suffix unavailable here;
+  // disambiguateName falls back to "#N" (an explicit rename rarely collides anyway).
+  const final = disambiguateName(desired, body.id, null);
   updateName.run(desired, final, body.id);
   return { name: desired, resolved_name: final };
 }
@@ -985,15 +987,33 @@ function handleSetName(body: SetNameRequest): { name: string | null; resolved_na
 // in handleRegister run in one JS turn with no await boundary — atomic by
 // virtue of the event loop, no transaction needed. If the broker ever moves
 // to multi-process / async sqlite, wrap this in db.transaction(...).
-function disambiguateName(rawName: string | null, selfId: string): string | null {
+function disambiguateName(rawName: string | null, selfId: string, windowName?: string | null): string | null {
   if (!rawName) return null;
   const rows = db.query(
-    "SELECT pid, COALESCE(resolved_name, name) AS name FROM peers WHERE COALESCE(resolved_name, name) IS NOT NULL AND id != ?"
-  ).all(selfId) as { pid: number; name: string }[];
-  const liveNames = new Set(
-    rows.filter(r => isPidAlive(r.pid)).map(r => r.name)
-  );
+    "SELECT pid, COALESCE(resolved_name, name) AS name, tmux_window_name AS win FROM peers WHERE COALESCE(resolved_name, name) IS NOT NULL AND id != ?"
+  ).all(selfId) as { pid: number; name: string; win: string | null }[];
+  const live = rows.filter(r => isPidAlive(r.pid));
+  const liveNames = new Set(live.map(r => r.name));
   if (!liveNames.has(rawName)) return rawName;
+  // Self-documenting disambiguator: when two LIVE seats share an operator name,
+  // suffix with the registrant's tmux WINDOW name (e.g. "coding.1#orchA") rather
+  // than a meaningless "#2", so the operator can tell which seat is which at a
+  // glance. The bare operator `name` is untouched — only resolved_name carries
+  // the suffix. Sanitize the window token (strip whitespace/`#`) so it can't
+  // break suffix parsing.
+  //
+  // BUT only when the window actually DISAMBIGUATES: if a same-base seat is
+  // already live in this same window (e.g. two co-tenants of one window, or an
+  // orphaned-resume squatter), "#window" gives both the same suffix and tells
+  // them apart no better than "#N" — so fall straight to the numeric "#N" walk.
+  const win = windowName?.trim().replace(/[#\s]+/g, "-");
+  const sameBaseInSameWindow = win
+    ? live.some(r => (r.name === rawName || r.name.startsWith(`${rawName}#`)) && (r.win?.trim().replace(/[#\s]+/g, "-")) === win)
+    : false;
+  if (win && !sameBaseInSameWindow) {
+    const byWindow = `${rawName}#${win}`;
+    if (!liveNames.has(byWindow)) return byWindow;
+  }
   let n = 2;
   while (liveNames.has(`${rawName}#${n}`)) n++;
   return `${rawName}#${n}`;

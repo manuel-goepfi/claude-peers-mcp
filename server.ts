@@ -741,6 +741,19 @@ export function publishBrokerIdentityToTmux(identity: {
   return { ok, target: paneTarget, failedOptions };
 }
 
+// Clear this session's broker-identity options from a pane it no longer occupies,
+// so a pane reused by another (or no) session does not keep advertising our stale
+// @peer_id / @peer_resolved_name. @operator_label is intentionally LEFT — it is the
+// human-pinned label for the pane (the next occupant's own register/heartbeat will
+// overwrite it via updateOperatorLabel), and clearing it would blank the border in
+// the gap before the new session mirrors.
+function clearBrokerIdentityFromTmux(paneTarget: string): void {
+  for (const opt of ["@peer_id", "@peer_label", "@peer_resolved_name", "@peer_client_type", "@peer_receiver_mode"]) {
+    // -u unsets the pane-scoped option; failure is non-fatal (pane may be gone).
+    runTmux(["set-option", "-p", "-t", paneTarget, "-u", opt]);
+  }
+}
+
 function recordTmuxMirrorResult(context: string, result: TmuxMirrorResult): void {
   if (!result.target) return;
   if (result.ok) {
@@ -2114,15 +2127,42 @@ async function main() {
     if (myId) {
       try {
         const heartbeat = await brokerFetch<HeartbeatResponse>("/heartbeat", { id: myId, client_type: myClientType, receiver_mode: myReceiverMode });
-        if (applyReceiverMetadata(heartbeat.client_type, heartbeat.receiver_mode, "heartbeat")) {
-          recordTmuxMirrorResult("heartbeat", publishBrokerIdentityToTmux({
-            id: myId,
-            name: myOperatorName,
-            resolved_name: myResolvedName,
-            client_type: myClientType,
-            receiver_mode: myReceiverMode,
-          }));
+        applyReceiverMetadata(heartbeat.client_type, heartbeat.receiver_mode, "heartbeat");
+        // Re-detect our pane every heartbeat and keep the tmux identity mirror
+        // CURRENT. Two stale-mirror failure modes this fixes (both verified live):
+        //   (1) a pane reused by a NEW session kept the dead session's @peer_*
+        //       options forever (the mirror only refreshed on a receiver-mode
+        //       change, which steady-state heartbeats don't trigger);
+        //   (2) a bg/attached session whose UI moved to a different pane kept
+        //       writing identity to its STARTUP pane (myTmuxInfo never updated),
+        //       so the operator saw the wrong seat on the pane border.
+        // If the pane changed, clear the OLD pane's @peer_* first so it does not
+        // advertise a stale identity, then mirror to the new pane.
+        // The freshly-detected pane is the ONLY valid mirror target each tick.
+        const freshTmux = await detectTmuxPane();
+        const oldTarget = brokerIdentityPaneTarget(myTmuxInfo);
+        const newTarget = brokerIdentityPaneTarget(freshTmux);
+        // If we left an identity stamp on a pane that is no longer ours (moved
+        // away, or we can resolve NO pane now — e.g. a `--resume` whose attach
+        // client is gone), clear it — but ONLY if our id is still the one stamped
+        // there. If a different live session already reclaimed the pane, leave its
+        // stamp alone. This stops an orphan from fighting the real occupant for
+        // the @peer_* mirror every heartbeat (verified live: an orphaned --resume
+        // had stamped @peer_id over the live seat's pane).
+        if (oldTarget && oldTarget !== newTarget && readTmuxPaneOption(oldTarget, "@peer_id") === myId) {
+          clearBrokerIdentityFromTmux(oldTarget);
+          log(`tmux: cleared our stale @peer_* from ${oldTarget} (now ${newTarget ?? "no pane resolves for us"})`);
         }
+        myTmuxInfo = freshTmux;
+        // No pane → orphan/headless this tick: do not mirror (nothing to stamp).
+        if (!newTarget) return;
+        recordTmuxMirrorResult("heartbeat", publishBrokerIdentityToTmux({
+          id: myId,
+          name: myOperatorName,
+          resolved_name: myResolvedName,
+          client_type: myClientType,
+          receiver_mode: myReceiverMode,
+        }, myTmuxInfo));
       } catch {
         // Non-critical
       }
