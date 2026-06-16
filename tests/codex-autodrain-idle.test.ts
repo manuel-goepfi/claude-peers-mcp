@@ -229,3 +229,77 @@ describe("everyVisibleCharIsDim", () => {
     expect(everyVisibleCharIsDim(`${E}[2mone ${E}[2mtwo${E}[0m`)).toBe(true);
   });
 });
+
+// --- resolveLanePane wiring (the integration the two 6039612 bugs lived in) ---
+// The leaf matchers (sessionIdFromEnvironText, attachIdInTree) are tested above,
+// but the BUGS were in the WIRING: (1) environ id must win over the spare .sock
+// id, and (2) the returned attachId must be non-null on the bg path so tick picks
+// paneOwnedByAttachId. These tests drive resolveLanePane directly with a synthetic
+// snapshot + an injected environ reader — no /proc, no live tmux. Without them, an
+// inverted environ/fallback order or a dropped attachId would pass the whole suite.
+import { resolveLanePane } from "../bin/codex-autodrain-poller.ts";
+import { bgSessionIdFromPtyHostArgs } from "../shared/tmux.ts";
+
+const SPARE_ID = "fdf1dffd";     // the pre-warm spare slot id (in the .sock ancestry)
+const PROMOTED_ID = "719595a7";  // the promoted session id the attach client uses
+
+// Build a snapshot where: the lane's MCP server (pid 500) sits under a bg-pty-host
+// (pid 400) whose args carry the SPARE id; a `claude attach <PROMOTED_ID>` client
+// (pid 700) lives in a tmux pane (pane_pid 600 → pane %wt). resolveBgAttachPane
+// keys on the PROMOTED id, so the lane resolves only if environ supplies it.
+function bgSnapshot() {
+  const procs = [
+    { pid: 500, ppid: 400, args: "bun /home/manzo/claude-peers-mcp/server.ts" },
+    { pid: 400, ppid: 300, args: "/v/2.1.177 --bg-pty-host /tmp/cc-daemon-1000/d/spare/fdf1dffd.pty.sock 200 50" },
+    { pid: 700, ppid: 600, args: "claude attach 719595a7" },     // attach client in the pane
+    { pid: 600, ppid: 1,   args: "-bash" },                        // pane shell (pane_pid)
+  ];
+  // parseTmuxPanes is keyed by pane_pid; one pane %wt owned by shell pid 600.
+  const paneMap = new Map([[600, { session: "1", pane_id: "%wt" }]]) as any;
+  return { procs, paneMap, paneByPid: new Map([["%wt", 600]]) } as any;
+}
+function bgLane(id: string) {
+  return { id, name: id, pid: 500, client_type: "claude", tmux_pane_id: null, unread: 1 } as any;
+}
+
+describe("resolveLanePane wiring", () => {
+  test("premise: the ancestry .sock yields the SPARE id, not the promoted id", () => {
+    // Confirms the snapshot is set up so environ and ancestry genuinely DISAGREE —
+    // otherwise the environ-wins test below would pass trivially.
+    const ptyHostArgs = bgSnapshot().procs.find((p: any) => p.pid === 400).args;
+    expect(bgSessionIdFromPtyHostArgs(ptyHostArgs)).toBe(SPARE_ID);
+    expect(SPARE_ID).not.toBe(PROMOTED_ID);
+  });
+
+  test("environ id WINS over the spare .sock id (Bug-1 regression)", () => {
+    // environ returns the PROMOTED id; ancestry walk would return the SPARE id.
+    const r = resolveLanePane(bgLane("L1"), bgSnapshot(), () => PROMOTED_ID);
+    expect(r.paneId).toBe("%wt");            // resolved via the promoted id
+    expect(r.attachId).toBe(PROMOTED_ID);    // NOT the spare id → tick uses attach-id ownership
+  });
+
+  test("falls back to .sock ancestry walk when environ is null", () => {
+    // With environ null, the only id available is the SPARE id from the ancestry.
+    // The attach client runs the PROMOTED id, so resolveBgAttachPane finds NO pane
+    // → empty pane (this is exactly why the spare id is the wrong source, and why
+    // environ-first matters). attachId stays null when no pane resolves.
+    const r = resolveLanePane(bgLane("L2"), bgSnapshot(), () => null);
+    expect(r.paneId).toBe("");               // spare id can't match the promoted attach client
+    expect(r.attachId).toBeNull();
+  });
+
+  test("environ-first ordering is observable: same lane resolves with environ, fails without", () => {
+    const snap = bgSnapshot();
+    const withEnviron = resolveLanePane(bgLane("L3a"), snap, () => PROMOTED_ID);
+    const withoutEnviron = resolveLanePane(bgLane("L3b"), snap, () => null);
+    expect(withEnviron.paneId).toBe("%wt");  // environ path resolves
+    expect(withoutEnviron.paneId).toBe("");  // fallback path can't (spare id ≠ attach id)
+  });
+
+  test("a directly-registered lane (tmux_pane_id set) returns attachId=null → tick uses pid ownership", () => {
+    const lane = { id: "L4", name: "codex.1", pid: 9, client_type: "codex", tmux_pane_id: "%5", unread: 1 } as any;
+    const r = resolveLanePane(lane, bgSnapshot(), () => "deadbeef");
+    expect(r.paneId).toBe("%5");
+    expect(r.attachId).toBeNull();           // null → paneOwnedByPid branch, not attach-id
+  });
+});

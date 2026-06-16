@@ -154,13 +154,13 @@ function lanesWithUnread(db: Database): Lane[] {
 //     of the pane — the pane's legitimate occupant is the `claude attach
 //     <sessionId>` client. Validate by requiring that attach client in the pane
 //     subtree (the same binding resolveLanePane used to find the pane).
-function paneOwnedByPid(paneId: string, pid: number): boolean {
-  const tree = paneSubtree(paneId);
+function paneOwnedByPid(paneId: string, pid: number, snap: TickSnapshot): boolean {
+  const tree = paneSubtree(paneId, snap);
   if (!tree) return false;
   return tree.panePid === pid || tree.text.includes(`(${pid})`);
 }
-function paneOwnedByAttachId(paneId: string, sessionId: string): boolean {
-  const tree = paneSubtree(paneId);
+function paneOwnedByAttachId(paneId: string, sessionId: string, snap: TickSnapshot): boolean {
+  const tree = paneSubtree(paneId, snap);
   if (!tree) return false;
   return attachIdInTree(tree.text, sessionId);
 }
@@ -181,13 +181,12 @@ export function attachIdInTree(treeText: string, sessionId: string): boolean {
   if (!/^[0-9a-f]{8}$/.test(sessionId)) return false;
   return new RegExp(`attach ${sessionId}(\\s|$)`, "m").test(treeText);
 }
-function paneSubtree(paneId: string): { panePid: number; text: string } | null {
-  const { ok, out } = sh(["tmux", "list-panes", "-a", "-F", "#{pane_id} #{pane_pid}"]);
-  if (!ok) return null;
-  const line = out.split("\n").find((l) => l.startsWith(`${paneId} `));
-  if (!line) return null; // pane gone
-  const panePid = Number(line.split(" ")[1]);
-  if (!Number.isInteger(panePid)) return null;
+function paneSubtree(paneId: string, snap: TickSnapshot): { panePid: number; text: string } | null {
+  // pane_pid comes from the per-tick snapshot — no extra `tmux list-panes` here
+  // (takeSnapshot already captured it). Only the pstree must stay live per-lane,
+  // since process subtrees change between the snapshot and the ownership check.
+  const panePid = snap.paneByPid.get(paneId);
+  if (panePid === undefined) return null;          // pane gone since the snapshot
   const tree = sh(["pstree", "-pa", String(panePid)]);  // -a: include args so `claude attach <id>` is visible
   if (!tree.ok) return null;
   return { panePid, text: tree.out };
@@ -277,7 +276,7 @@ function paneIsIdle(paneId: string, profile: IdleProfile): boolean {
 // tick (cheap relative to the interval) so it never goes stale within a tick.
 interface TickSnapshot {
   procs: ProcLike[];
-  paneByPid: Map<number, string>;          // pane_pid → pane_id
+  paneByPid: Map<string, number>;          // pane_id → pane_pid (for paneSubtree)
   paneMap: ReturnType<typeof parseTmuxPanes>;
 }
 function takeSnapshot(): TickSnapshot | null {
@@ -290,15 +289,18 @@ function takeSnapshot(): TickSnapshot | null {
     if (m) procs.push({ pid: Number(m[1]), ppid: Number(m[2]), args: m[3]! });
   }
   const paneMap = parseTmuxPanes(paneOut.out);
-  const paneByPid = new Map<number, string>();
-  for (const [panePid, info] of paneMap) if (info.pane_id) paneByPid.set(panePid, info.pane_id);
+  const paneByPid = new Map<string, number>();
+  for (const [panePid, info] of paneMap) if (info.pane_id) paneByPid.set(info.pane_id, panePid);
   return { procs, paneByPid, paneMap };
 }
 
 // Memoized lane-id → pane-id. A bg-claude lane's session→pane mapping is stable
 // for the life of the attach (changes only on re-attach), so we resolve it once
-// and reuse. The cache self-invalidates: paneOwnedByPid() runs before every nudge
-// and a stale entry fails that check, dropping the lane back to re-resolution.
+// and reuse. Only bg-claude lanes are cached (resolveLanePane writes here only on
+// the bg-attach path), so the cache self-invalidates via paneOwnedByAttachId():
+// it runs before every nudge and a stale entry (re-attached elsewhere → the old
+// pane no longer runs `attach <id>`) fails that check, which deletes the entry
+// and drops the lane back to re-resolution next tick.
 const paneCache = new Map<string, string>();   // peer id → pane id
 
 // Resolve a lane's pane. Codex/gemini register WITH a pane → return it directly.
@@ -339,14 +341,22 @@ function sessionIdFromEnviron(pid: number): string | null {
 // resolved via the bg-attach path (null for a directly-registered pane). The
 // tick uses attachId to pick the correct ownership check — a bg lane's MCP
 // server is NOT in its pane subtree, so the lane-pid check would wrongly reject.
-interface ResolvedPane { paneId: string; attachId: string | null; }
-function resolveLanePane(lane: Lane, snap: TickSnapshot): ResolvedPane {
+export interface ResolvedPane { paneId: string; attachId: string | null; }
+// `readEnviron` is injectable ONLY so the environ-first / .sock-fallback ordering
+// and the attachId branch selection can be unit-tested without /proc or live tmux
+// (the two bugs fixed in 6039612 lived in this ordering + the tick's ownership
+// ternary, not in the leaf matchers). Production always uses the real reader.
+export function resolveLanePane(
+  lane: Lane,
+  snap: TickSnapshot,
+  readEnviron: (pid: number) => string | null = sessionIdFromEnviron,
+): ResolvedPane {
   if (lane.tmux_pane_id) return { paneId: lane.tmux_pane_id, attachId: null }; // codex/gemini/attached
   const cached = paneCache.get(lane.id);
   // Primary: the promoted session id from the MCP server's environ (correct for
   // spare-hosted bg sessions). Fallback: walk ancestry for the pty-host `.sock`
   // id (correct only for pty-hosted, but harmless to try when environ is absent).
-  let bgId: string | null = sessionIdFromEnviron(lane.pid);
+  let bgId: string | null = readEnviron(lane.pid);
   if (!bgId) {
     const ppidMap = new Map<number, number>();
     for (const p of snap.procs) ppidMap.set(p.pid, p.ppid);
@@ -439,7 +449,7 @@ function tick(db: Database): void {
       if (!paneId) continue;                                     // bg lane not attached anywhere → unreachable, skip
       // Ownership: bg lane → require its attach client in the pane subtree (its
       // MCP server is daemon-hosted, not under the pane). Else → lane pid in subtree.
-      const owned = attachId ? paneOwnedByAttachId(paneId, attachId) : paneOwnedByPid(paneId, lane.pid);
+      const owned = attachId ? paneOwnedByAttachId(paneId, attachId, snap) : paneOwnedByPid(paneId, lane.pid, snap);
       if (!owned) { paneCache.delete(lane.id); continue; }       // pane gone/reused → drop cache
       if (!paneIsIdle(paneId, profileFor(lane.client_type))) continue; // busy or has queued input — never disturb
       nudge(lane, paneId);
