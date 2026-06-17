@@ -127,6 +127,7 @@ interface Lane {
   client_type: string;
   tmux_pane_id: string | null;  // empty/null for a bg-claude lane → resolved lazily
   unread: number;
+  last_hook_seen_at: string | null;  // NULL = drain hook never attached (needs bootstrap nudge)
 }
 
 // Read-only: every nudgeable peer (codex, gemini, AND claude) with unread mail.
@@ -139,13 +140,22 @@ interface Lane {
 const NUDGEABLE_CLIENTS = ["codex", "gemini", "claude"];
 function lanesWithUnread(db: Database): Lane[] {
   const placeholders = NUDGEABLE_CLIENTS.map(() => "?").join(", ");
+  // LEFT JOIN (not JOIN) + the HAVING clause below surface two kinds of lane:
+  //   1. lanes with undelivered mail (unread > 0) — the normal case;
+  //   2. lanes whose drain hook has NEVER attached (last_hook_seen_at IS NULL)
+  //      even at unread=0. Without (2) a freshly-registered seat with a broken/
+  //      unattached hook and no mail yet is never nudged, so its hook never
+  //      attaches — the chicken-and-egg "deaf fresh seat" bug. One bootstrap
+  //      nudge lets the hook bind. Both are bounded by MAX_NUDGE_ATTEMPTS in the
+  //      caller, so a permanently-stuck seat is not keystroke-bombed forever.
   return db.query(`
-    SELECT p.id, p.name, p.pid, p.client_type, p.tmux_pane_id, COUNT(m.id) AS unread
+    SELECT p.id, p.name, p.pid, p.client_type, p.tmux_pane_id, p.last_hook_seen_at,
+           COUNT(m.id) AS unread
     FROM peers p
-    JOIN messages m ON m.to_id = p.id AND m.delivered = 0
+    LEFT JOIN messages m ON m.to_id = p.id AND m.delivered = 0
     WHERE p.client_type IN (${placeholders})
     GROUP BY p.id
-    HAVING unread > 0
+    HAVING unread > 0 OR p.last_hook_seen_at IS NULL
   `).all(...NUDGEABLE_CLIENTS) as Lane[];
 }
 
