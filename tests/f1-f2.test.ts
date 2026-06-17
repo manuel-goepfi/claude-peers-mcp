@@ -698,13 +698,16 @@ describe("F1+F2 live broker integration", () => {
       expect(first.name).toBe("codex.2");
       expect(first.resolved_name).toBe("codex.2");
       expect(second.name).toBe("codex.2");
-      expect(second.resolved_name).toBe("codex.2#2");
+      // Lane-ordinal allocation: a colliding "<lane>.<ordinal>" name takes the
+      // next free ordinal (codex.2 -> codex.3), a real routable seat, not the
+      // opaque "codex.2#2" that re-collides with find_peer(name='codex.2').
+      expect(second.resolved_name).toBe("codex.3");
 
       const active = await brokerFetch<Peer[]>("/list-peers", { id: second.id, scope: "machine", cwd: "/", git_root: null });
       const diagnostic = await brokerFetch<Peer[]>("/list-peers", { id: second.id, scope: "machine", cwd: "/", git_root: null, include_inactive: true });
       expect(active.filter((p) => p.name === "codex.2")).toHaveLength(1);
       expect(diagnostic.filter((p) => p.name === "codex.2")).toHaveLength(2);
-      expect(diagnostic.map((p) => p.resolved_name).sort()).toContain("codex.2#2");
+      expect(diagnostic.map((p) => p.resolved_name).sort()).toContain("codex.3");
     } finally {
       childA.kill();
       childB.kill();

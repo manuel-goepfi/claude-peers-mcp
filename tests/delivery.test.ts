@@ -2620,7 +2620,13 @@ describe("Live broker delivery features", () => {
     fresh.kill();
   });
 
-  test("rehydration: stale peer (>1h last_seen) does NOT inherit", async () => {
+  test("rehydration: CONFIRMED-DEAD stale peer (>1h last_seen) DOES inherit (dead-PID reclaim, any age)", async () => {
+    // A confirmed-dead seat is inheritable regardless of age: a live proc
+    // re-claiming a pane whose only occupant is a long-dead tombstone must
+    // inherit it to recover the seat's stranded undelivered mail. Previously the
+    // 1h age gate ran before the liveness check, so this seat was skipped and the
+    // new proc got a fresh id — leaving the seat permanently deaf+mute. Liveness
+    // now precedes age; a dead candidate inherits at any age.
     const dead = spawnSleep();
     const a = await brokerFetch<{ id: string }>("/register", {
       pid: dead.pid, cwd: "/rehydrate-4", git_root: null, tty: null,
@@ -2630,8 +2636,8 @@ describe("Live broker delivery features", () => {
     dead.kill();
     await dead.exited;
 
-    // Backdate last_seen so the candidate is older than the 1h window.
-    // Requires a read-write DB handle; WAL allows one writer.
+    // Backdate last_seen well past the 1h window. Requires a read-write DB
+    // handle; WAL allows one writer.
     const rw = new Database(TEST_DB);
     rw.run(
       "UPDATE peers SET last_seen = ? WHERE id = ?",
@@ -2645,7 +2651,7 @@ describe("Live broker delivery features", () => {
       name: "b-new", tmux_session: "rh4", tmux_window_index: "0",
       tmux_window_name: "claude", summary: "",
     });
-    expect(b.id).not.toBe(a.id);
+    expect(b.id).toBe(a.id); // inherits the dead seat (and its mail) despite >1h age
     fresh.kill();
   });
 

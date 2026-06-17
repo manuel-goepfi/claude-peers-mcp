@@ -42,6 +42,15 @@ function disambiguateName(
     const byWindow = `${rawName}#${win}`;
     if (!liveNames.has(byWindow)) return byWindow;
   }
+  // Lane-ordinal allocation for "<lane>.<ordinal>" names (infra.1 -> infra.3),
+  // mirroring broker.ts. Non-lane names keep the legacy "#N" walk.
+  const laneMatch = rawName.match(/^(.*)\.(\d+)$/);
+  if (laneMatch) {
+    const base = laneMatch[1];
+    let ord = Number(laneMatch[2]) + 1;
+    while (liveNames.has(`${base}.${ord}`)) ord++;
+    return `${base}.${ord}`;
+  }
   let n = 2;
   while (liveNames.has(`${rawName}#${n}`)) n++;
   return `${rawName}#${n}`;
@@ -67,12 +76,46 @@ describe("broker name de-duplication", () => {
     expect(disambiguateName(db, "beta", "self", isAlive)).toBe("beta");
   });
 
-  test("appends #2 on first collision against a live peer", () => {
+  test("lane.ordinal name allocates next free ordinal, not #N (manzocontrol.3 -> manzocontrol.4)", () => {
+    // Regression for the seat-collision bug: a "<lane>.<ordinal>" name that
+    // collides must become a real routable lane seat (next free ordinal), NOT
+    // an ambiguous "manzocontrol.3#2" that re-collides with find_peer.
     db.run("INSERT INTO peers (id, pid, name) VALUES ('a', 100, 'manzocontrol.3')");
     alive.add(100);
     expect(disambiguateName(db, "manzocontrol.3", "self", isAlive)).toBe(
-      "manzocontrol.3#2",
+      "manzocontrol.4",
     );
+  });
+
+  test("lane-ordinal walk skips occupied ordinals (infra.1 with infra.2,3 live -> infra.4)", () => {
+    // The exact live-repro shape: infra.1 collides while infra.2 and infra.3 are
+    // also live in the same window -> must land on infra.4, never infra.1#2.
+    db.run("INSERT INTO peers (id, pid, name) VALUES ('a', 100, 'infra.1')");
+    db.run("INSERT INTO peers (id, pid, name) VALUES ('b', 101, 'infra.2')");
+    db.run("INSERT INTO peers (id, pid, name) VALUES ('c', 102, 'infra.3')");
+    alive.add(100); alive.add(101); alive.add(102);
+    const got = disambiguateName(db, "infra.1", "self", isAlive);
+    expect(got).toBe("infra.4");
+    expect(got).not.toContain("#"); // never the opaque #N suffix
+  });
+
+  test("non-lane names (no .ordinal) keep the legacy #N walk", () => {
+    // 'obs' has no "<lane>.<ordinal>" shape, so the lane-ordinal branch must NOT
+    // fire — it falls through to #N. Guards against the regex over-matching.
+    db.run("INSERT INTO peers (id, pid, name) VALUES ('a', 100, 'obs')");
+    alive.add(100);
+    expect(disambiguateName(db, "obs", "self", isAlive)).toBe("obs#2");
+  });
+
+  test("multi-dot lane name: greedy regex treats trailing .N as the ordinal (a.b.1 -> a.b.2)", () => {
+    // Locks the GREEDY-regex contract /^(.*)\.(\d+)$/: base='a.b', ord=1 -> 'a.b.2'.
+    // Without this, a future change to a lazy group (.*?) would silently re-home
+    // 'a.b.1' to 'a.2' and no other test would catch it.
+    db.run("INSERT INTO peers (id, pid, name) VALUES ('a', 100, 'proj.v1.2')");
+    alive.add(100);
+    const got = disambiguateName(db, "proj.v1.2", "self", isAlive);
+    expect(got).toBe("proj.v1.3");
+    expect(got!.startsWith("proj.v1.")).toBe(true); // dotted prefix preserved as the lane base
   });
 
   test("walks to #3, #4, … when lower suffixes are already live", () => {
@@ -163,18 +206,20 @@ describe("broker name de-duplication", () => {
     expect(disambiguateName(db, "coding.1", "self", isAlive, "orchA")).toBe("coding.1#orchA");
   });
 
-  test("collision, SAME window → window doesn't help, falls back to #2", () => {
-    // both seats in window 'orchA' → "#orchA" tells them apart no better than "#2".
+  test("collision, SAME window → window doesn't help, falls back to next lane ordinal", () => {
+    // both seats in window 'orchA' → "#orchA" tells them apart no better than "#N",
+    // so it falls through to the numeric tail. For a "<lane>.<ordinal>" name that
+    // tail now allocates the next free ordinal (coding.1 -> coding.2), not "#2".
     db.run("INSERT INTO peers (id, pid, name, tmux_window_name) VALUES ('a', 100, 'coding.1', 'orchA')");
     alive.add(100);
-    expect(disambiguateName(db, "coding.1", "self", isAlive, "orchA")).toBe("coding.1#2");
+    expect(disambiguateName(db, "coding.1", "self", isAlive, "orchA")).toBe("coding.2");
   });
 
-  test("collision WITHOUT a window name → falls back to #2", () => {
+  test("collision WITHOUT a window name → falls back to next lane ordinal", () => {
     db.run("INSERT INTO peers (id, pid, name, tmux_window_name) VALUES ('a', 100, 'coding.1', 'lane-seo')");
     alive.add(100);
-    expect(disambiguateName(db, "coding.1", "self", isAlive, null)).toBe("coding.1#2");
-    expect(disambiguateName(db, "coding.1", "self", isAlive, undefined)).toBe("coding.1#2");
+    expect(disambiguateName(db, "coding.1", "self", isAlive, null)).toBe("coding.2");
+    expect(disambiguateName(db, "coding.1", "self", isAlive, undefined)).toBe("coding.2");
   });
 
   test("no collision → window name is NOT appended (bare name kept)", () => {
@@ -189,10 +234,10 @@ describe("broker name de-duplication", () => {
     expect(disambiguateName(db, "coding.1", "self", isAlive, "lane seo#x")).toBe("coding.1#lane-seo-x");
   });
 
-  test("empty/whitespace-only window name → treated as absent, falls back to #2", () => {
+  test("empty/whitespace-only window name → treated as absent, falls back to next lane ordinal", () => {
     db.run("INSERT INTO peers (id, pid, name, tmux_window_name) VALUES ('a', 100, 'coding.1', 'orchA')");
     alive.add(100);
-    expect(disambiguateName(db, "coding.1", "self", isAlive, "   ")).toBe("coding.1#2");
+    expect(disambiguateName(db, "coding.1", "self", isAlive, "   ")).toBe("coding.2");
   });
 
   test("real process.kill liveness — current pid alive, max int dead", () => {

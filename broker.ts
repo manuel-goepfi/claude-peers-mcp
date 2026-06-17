@@ -798,18 +798,24 @@ function handleRegister(body: RegisterRequest): RegisterResult {
     for (const c of candidates) {
       const lastSeenMs = new Date(c.last_seen).getTime();
       if (!Number.isFinite(lastSeenMs)) continue;
-      const ageMs = Date.now() - lastSeenMs;
-      if (ageMs > REHYDRATE_WINDOW_MS) continue;
-      // Skip if the candidate's PID is still alive OR owned by a different UID
-      // (EPERM path — PID got recycled to a non-us process). Only ESRCH ("No
-      // such process") means the slot is genuinely dead and inheritable.
+      const ageMs = Date.now() - lastSeenMs; // for the inherit log only; NOT gated
+      // Liveness gate (NO age gate). Skip if the candidate's PID is still alive
+      // OR owned by a different UID (EPERM — PID recycled to a non-us process).
+      // Only ESRCH ("No such process") / undefined means the slot is genuinely
+      // dead. A CONFIRMED-DEAD seat occupying this pane is inheritable regardless
+      // of age: a live proc (e.g. a --resume'd session with a new pid) re-claiming
+      // a pane whose only occupant is a dead tombstone MUST inherit it to recover
+      // its stranded undelivered mail (which liveAndFreshPeers now preserves past
+      // the 1h reap when pending). Gating inheritance on the 1h window left such
+      // seats permanently deaf+mute (the dead-PID-reclaim bug). Control flow makes
+      // the dead-only path explicit: both live branches `continue` before inherit.
       try {
         process.kill(c.pid, 0);
-        continue; // alive — skip
+        continue; // alive — never inherit (would hijack a live peer's id)
       } catch (e) {
         const code = (e as { code?: string } | undefined)?.code;
         if (code === "EPERM") continue; // alive-under-different-uid — don't inherit
-        // ESRCH or undefined → dead → inherit (fall through)
+        // ESRCH / undefined → dead → inherit at any age (fall through)
       }
       inheritedId = c.id;
       deletePeer.run(c.id);
@@ -1017,6 +1023,19 @@ function disambiguateName(rawName: string | null, selfId: string, windowName?: s
     const byWindow = `${rawName}#${win}`;
     if (!liveNames.has(byWindow)) return byWindow;
   }
+  // Numeric fallback when the window can't disambiguate. Prefer allocating the
+  // next FREE LANE ORDINAL (infra.1 collides -> infra.3) over an opaque "#N"
+  // suffix (infra.1#2): a real lane name is a routable seat the operator and
+  // send_to_peer understand, whereas "infra.1#2" is ambiguous and re-collides
+  // with find_peer(name='infra.1'). Only when rawName is a "<lane>.<ordinal>"
+  // shape do we walk ordinals; otherwise keep the legacy "#N" walk.
+  const laneMatch = rawName.match(/^(.*)\.(\d+)$/);
+  if (laneMatch) {
+    const base = laneMatch[1]; // e.g. "infra"
+    let ord = Number(laneMatch[2]) + 1; // start at the next ordinal after the collision
+    while (liveNames.has(`${base}.${ord}`)) ord++;
+    return `${base}.${ord}`;
+  }
   let n = 2;
   while (liveNames.has(`${rawName}#${n}`)) n++;
   return `${rawName}#${n}`;
@@ -1066,11 +1085,36 @@ function shouldPermanentlyReapPeer(peer: Peer, now: number): boolean {
   return !dead || ageMs > REHYDRATE_WINDOW_MS;
 }
 
+// Count undelivered mail for a peer id (cheap, indexed on to_id).
+const countUndelivered = db.prepare(
+  "SELECT COUNT(*) AS n FROM messages WHERE to_id = ? AND delivered = 0",
+);
+
 function liveAndFreshPeers(peers: Peer[]): Peer[] {
   const now = Date.now();
   return peers.filter((p) => {
     if (isReapable(p, isPidAlive, now, PEER_GHOST_AFTER_MS)) {
       if (!shouldPermanentlyReapPeer(p, now)) return false;
+      // Decouple mail-reap from row-reap: a DEAD seat that still holds
+      // undelivered mail is a RECOVERABLE INBOX, not garbage. The rehydrate
+      // path inherits a confirmed-dead seat at ANY age (the deaf-seat fix) and
+      // surfaces that mail to the re-registering session — but only if the mail
+      // still exists. Deleting it here at the 1h mark defeats that recovery
+      // (the bug adversarial review caught). So preserve the row+mail when there
+      // IS pending mail; reap normally (row + buckets) when the inbox is empty,
+      // which still bounds tombstone growth — only seats with unrecovered mail
+      // persist, and they are exactly what we must not silently drop (6154e28).
+      //
+      // BUT only preserve a seat with a VALID last_seen. A malformed/corrupt
+      // timestamp (NaN → reapable-by-age) signals untrustworthy state; preserving
+      // it on pending-mail would leak corrupt tombstones forever. Those reap
+      // normally even with mail (a deliberately narrow exception).
+      const lastSeenValid = Number.isFinite(new Date(p.last_seen).getTime());
+      const pending = lastSeenValid ? (countUndelivered.get(p.id) as { n: number }).n : 0;
+      if (pending > 0) {
+        buckets.delete(p.id);   // drop the live SSE bucket; keep row + mail on disk
+        return false;            // still not an active peer — just a retained inbox
+      }
       deletePeer.run(p.id);
       db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [p.id]);
       buckets.delete(p.id);
