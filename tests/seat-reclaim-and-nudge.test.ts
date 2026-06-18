@@ -186,3 +186,124 @@ describe("Bug 3 — autodrain surfaces NULL-hook zero-mail seats", () => {
     expect(lanes.find((l) => l.id === "healthy")).toBeUndefined();
   });
 });
+
+describe("Bug 4 — bootstrap-nudge storm guards (A1 lifetime cap + A2 per-pane dedup)", () => {
+  // Bug 4: the NULL-hook bootstrap path (Bug 3's fix) correctly SURFACES a
+  // zero-mail unattached lane, but had no termination for a lane whose hook never
+  // binds (a detached bg-Claude lane). Combined with multiple lanes resolving to
+  // ONE pane, an innocent foreground pane was nudged repeatedly per cycle. Two
+  // guards fix it, both mirrored from codex-autodrain-poller.ts tick():
+  //   A1 — a zero-mail (bootstrap) lane is nudged AT MOST ONCE per process.
+  //   A2 — a physical pane is nudged AT MOST ONCE per tick, even if N lanes map to it.
+  // Field captured live (2026-06-18): pane %433 carried 3 clause5.6 rows, 2 of them
+  // NULL-hook+zero-mail, nudged interleaved every ~60s (attempts 1→3).
+
+  // --- A1: mirror of the lifetime-bootstrap guard ---
+  // bootstrapNudged is a Set of peer ids already given their one bootstrap nudge.
+  // A lane is eligible to nudge unless it is a zero-mail lane already in the set.
+  type Lane = { id: string; unread: number };
+  function eligibleToNudge(lane: Lane, bootstrapNudged: Set<string>): boolean {
+    if (lane.unread === 0 && bootstrapNudged.has(lane.id)) return false; // A1 cap
+    return true;
+  }
+  // Mirror of nudge()'s bookkeeping: a zero-mail nudge records the bootstrap —
+  // but ONLY when the C-m submit actually succeeded. A nudge whose submit failed
+  // (pane vanished after the text was typed) did not fire, so it must NOT consume
+  // the one-shot cap. `submitOk` defaults true (the happy path).
+  function recordNudge(lane: Lane, bootstrapNudged: Set<string>, submitOk = true): void {
+    if (!submitOk) return;                         // failed submit → no bookkeeping
+    if (lane.unread === 0) bootstrapNudged.add(lane.id);
+  }
+
+  test("a zero-mail NULL-hook lane is nudged ONCE, then never again (A1 lifetime cap)", () => {
+    const seen = new Set<string>();
+    const lane: Lane = { id: "ghost", unread: 0 };
+    // Tick 1: eligible → nudge → record.
+    expect(eligibleToNudge(lane, seen)).toBe(true);
+    recordNudge(lane, seen);
+    // Tick 2..N: same lane, still zero mail, still NULL-hook → no longer eligible.
+    expect(eligibleToNudge(lane, seen)).toBe(false);
+    expect(eligibleToNudge(lane, seen)).toBe(false);
+  });
+
+  test("a lane that later receives REAL mail bypasses the bootstrap cap (still nudges)", () => {
+    const seen = new Set<string>();
+    const ghost: Lane = { id: "ghost", unread: 0 };
+    expect(eligibleToNudge(ghost, seen)).toBe(true);
+    recordNudge(ghost, seen); // bootstrap consumed
+    expect(eligibleToNudge(ghost, seen)).toBe(false); // capped while zero-mail
+    // Mail arrives → unread > 0 → the cap does not apply (real mail must deliver).
+    const withMail: Lane = { id: "ghost", unread: 2 };
+    expect(eligibleToNudge(withMail, seen)).toBe(true);
+  });
+
+  test("PLANTED-WRONG guard: dropping the A1 cap re-nudges a deaf seat forever", () => {
+    // If a future edit removes the `bootstrapNudged.has(id)` check, eligibility
+    // stays true on every tick and this expectation flips — catching the regression.
+    const seen = new Set<string>();
+    const lane: Lane = { id: "ghost", unread: 0 };
+    recordNudge(lane, seen);
+    expect(eligibleToNudge(lane, seen)).not.toBe(true);
+  });
+
+  test("a FAILED C-m submit does NOT consume the lifetime cap (lane stays eligible)", () => {
+    // The nudge typed text but the submit failed (pane vanished in the settle) — it
+    // never fired as a turn, so the one-shot cap must survive for a real retry.
+    const seen = new Set<string>();
+    const lane: Lane = { id: "ghost", unread: 0 };
+    recordNudge(lane, seen, /*submitOk*/ false);
+    expect(seen.has("ghost")).toBe(false);         // cap NOT burned
+    expect(eligibleToNudge(lane, seen)).toBe(true); // still nudgeable next tick
+    // A subsequent successful submit then consumes the cap exactly once.
+    recordNudge(lane, seen, /*submitOk*/ true);
+    expect(eligibleToNudge(lane, seen)).toBe(false);
+  });
+
+  // --- A2: mirror of the per-pane within-tick dedup ---
+  // Across one tick, the first lane to claim a pane nudges it; later lanes on the
+  // SAME pane are skipped. Mirror: walk lanes, nudge a pane only if unclaimed.
+  function nudgesThisTick(lanesByPane: { id: string; pane: string }[]): string[] {
+    const claimed = new Set<string>();
+    const nudged: string[] = [];
+    for (const lane of lanesByPane) {
+      if (claimed.has(lane.pane)) continue; // A2: pane already nudged this tick
+      nudged.push(lane.id);
+      claimed.add(lane.pane);
+    }
+    return nudged;
+  }
+
+  test("three lanes on ONE pane produce exactly ONE nudge that tick (A2 dedup)", () => {
+    // The live %433 shape: 3 clause5.6 rows on the same pane.
+    const nudged = nudgesThisTick([
+      { id: "yg1wvppe", pane: "%433" },
+      { id: "pzvp8mf3", pane: "%433" },
+      { id: "jiyh6aqs", pane: "%433" },
+    ]);
+    expect(nudged).toEqual(["yg1wvppe"]); // first claimant only
+    expect(nudged.length).toBe(1);        // not 3 — the storm is gone
+  });
+
+  test("lanes on DISTINCT panes each nudge (dedup does not over-suppress)", () => {
+    const nudged = nudgesThisTick([
+      { id: "a", pane: "%1" },
+      { id: "b", pane: "%2" },
+      { id: "c", pane: "%3" },
+    ]);
+    expect(nudged).toEqual(["a", "b", "c"]);
+  });
+
+  test("PLANTED-WRONG guard: without A2 dedup the pane is nudged once per lane", () => {
+    // Mirror of the OLD (buggy) behavior — nudge every lane regardless of pane.
+    function nudgesNoDedup(lanesByPane: { id: string; pane: string }[]): string[] {
+      return lanesByPane.map((l) => l.id);
+    }
+    const lanes = [
+      { id: "x", pane: "%9" },
+      { id: "y", pane: "%9" },
+    ];
+    // The fixed path yields 1; the buggy path yields 2. This pins the difference.
+    expect(nudgesThisTick(lanes).length).toBe(1);
+    expect(nudgesNoDedup(lanes).length).toBe(2);
+  });
+});

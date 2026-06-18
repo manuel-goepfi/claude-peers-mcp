@@ -103,6 +103,15 @@ export function profileFor(clientType: string): IdleProfile {
 
 const lastNudge = new Map<string, number>();  // peer id -> epoch ms of last nudge
 const nudgeAttempts = new Map<string, number>(); // peer id -> consecutive nudge count
+// A lane selected purely by the NULL-hook bootstrap path (zero unread mail, hook
+// never attached) gets ONE lifetime bootstrap nudge — then never again from the
+// bootstrap path, even across poller restarts within this process. Without this,
+// a permanently-deaf seat (a registration row whose drain hook never binds — e.g.
+// a detached bg-Claude lane) is re-nudged every MAX_NUDGE_ATTEMPTS window because
+// nudgeAttempts resets when the lane briefly leaves the set. A bootstrap nudge has
+// no mail to deliver, so one attempt to wake the hook is all that is ever useful.
+// NOT pruned by the unread-clear sweep (that is what makes it a LIFETIME cap).
+const bootstrapNudged = new Set<string>();       // peer id -> already got its one bootstrap nudge
 
 function log(msg: string): void {
   console.error(`[codex-autodrain] ${new Date().toISOString()} ${msg}`);
@@ -444,9 +453,22 @@ function nudge(lane: Lane, paneId: string): void {
   const sent = sh(["tmux", "send-keys", "-l", "-t", paneId, NUDGE_TEXT]);
   if (!sent.ok) { log(`nudge send-keys failed for ${tag} — pane gone? skipping`); return; }
   Bun.spawnSync(["sleep", "0.3"]); // let the TUI commit the typed text before Enter
-  sh(["tmux", "send-keys", "-t", paneId, "C-m"]);
+  const submitted = sh(["tmux", "send-keys", "-t", paneId, "C-m"]);
+  if (!submitted.ok) {
+    // Text typed but the C-m submit failed (pane vanished in the 0.3s settle). The
+    // keystroke was never delivered as a turn, so this nudge did NOT happen: do not
+    // burn the A1 lifetime bootstrap cap or the attempt budget on it. Next tick
+    // re-evaluates the lane cleanly. (Gating the cap on submit success is what makes
+    // A1 safe — a one-shot cap must only be consumed by a nudge that actually fired.)
+    log(`nudge C-m submit failed for ${tag} — pane gone after type? not counting`);
+    return;
+  }
   lastNudge.set(lane.id, Date.now());
   nudgeAttempts.set(lane.id, (nudgeAttempts.get(lane.id) ?? 0) + 1);
+  // A zero-mail nudge is a bootstrap (hook-wake) nudge — record it so the lane is
+  // never bootstrap-nudged again (A1 lifetime cap). A real-mail nudge does NOT set
+  // this, so a lane that later receives actual mail still nudges normally.
+  if (lane.unread === 0) bootstrapNudged.add(lane.id);
   log(`nudged ${tag} (${lane.unread} unread, attempt ${nudgeAttempts.get(lane.id)})`);
 }
 
@@ -470,8 +492,20 @@ function tick(db: Database): void {
   for (const id of nudgeAttempts.keys()) if (!active.has(id)) nudgeAttempts.delete(id);
   for (const id of lastNudge.keys()) if (!active.has(id)) lastNudge.delete(id);
   for (const id of paneCache.keys()) if (!active.has(id)) paneCache.delete(id);
+  // bootstrapNudged is pruned ONLY when the lane leaves the set entirely (session
+  // gone / hook finally attached → no longer NULL-hook). It is deliberately NOT
+  // pruned on the unread-clear path above — that retention is what enforces the A1
+  // lifetime cap. Pruning here keeps the Set bounded over a multi-day run.
+  for (const id of bootstrapNudged) if (!active.has(id)) bootstrapNudged.delete(id);
 
   if (lanes.length === 0) return;
+
+  // A2: at most ONE nudge per physical pane per tick. Multiple lanes can resolve
+  // to the same pane — a foreground seat and one or more bg-Claude lanes whose
+  // attach client lives in that pane all map to it. Nudging once per lane would
+  // keystroke-bomb that single pane N times per cycle. Track panes already nudged
+  // this tick and skip any later lane that lands on one.
+  const nudgedPanesThisTick = new Set<string>();
 
   // ONE process+pane snapshot for the whole tick — shared across every lane's
   // pane resolution and ownership check (see takeSnapshot). Without this the
@@ -496,16 +530,29 @@ function tick(db: Database): void {
         }
         continue;
       }
+      // A1: a zero-mail lane is here only via the NULL-hook bootstrap path. Nudge
+      // it AT MOST ONCE in this process lifetime — one keystroke to try to wake an
+      // unattached drain hook is all that is ever useful (there is no mail to
+      // deliver). A lane that is still here after its bootstrap nudge has a hook
+      // that did not bind; re-nudging it just bombs the pane. (A lane that later
+      // gets real mail has unread > 0 and bypasses this guard entirely.)
+      if (lane.unread === 0 && bootstrapNudged.has(lane.id)) continue;
       const since = Date.now() - (lastNudge.get(lane.id) ?? 0);
       if (since < NUDGE_COOLDOWN_MS) continue;                   // recently nudged — give it time to drain
       const { paneId, attachId } = resolveLanePane(lane, snap);
       if (!paneId) continue;                                     // bg lane not attached anywhere → unreachable, skip
+      // A2: this pane was already nudged this tick by an earlier lane (a foreground
+      // seat + bg lanes can all resolve to the same pane). One nudge per pane per
+      // cycle — skip without consuming this lane's cooldown/attempt budget so it is
+      // re-evaluated cleanly next tick if it is still the rightful occupant.
+      if (nudgedPanesThisTick.has(paneId)) continue;
       // Ownership: bg lane → require its attach client in the pane subtree (its
       // MCP server is daemon-hosted, not under the pane). Else → lane pid in subtree.
       const owned = attachId ? paneOwnedByAttachId(paneId, attachId, snap) : paneOwnedByPid(paneId, lane.pid, snap);
       if (!owned) { paneCache.delete(lane.id); continue; }       // pane gone/reused → drop cache
       if (!paneIsIdle(paneId, profileFor(lane.client_type))) continue; // busy or has queued input — never disturb
       nudge(lane, paneId);
+      nudgedPanesThisTick.add(paneId);                           // A2: claim the pane for the rest of this tick
     } catch (e) {
       log(`tick: error handling lane ${lane.name ?? lane.id} — ${e instanceof Error ? e.message : String(e)} (continuing)`);
     }
