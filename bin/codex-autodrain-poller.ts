@@ -139,15 +139,37 @@ interface Lane {
   last_hook_seen_at: string | null;  // NULL = drain hook never attached (needs bootstrap nudge)
 }
 
-// Read-only: every nudgeable peer (codex, gemini, AND claude) with unread mail.
-// No drain — detect only. A claude bg-spare lane registers with an EMPTY
-// tmux_pane_id (its pane only exists once `claude attach <id>` runs, AFTER the
-// MCP server's one-shot detectTmuxPane()), so we must NOT gate on a non-empty
-// pane here — the pane is resolved lazily at nudge time instead (resolveLanePane),
-// when the attach client is guaranteed to exist. Codex/gemini lanes register WITH
-// a pane, so for them the lazy step is a no-op passthrough.
-const NUDGEABLE_CLIENTS = ["codex", "gemini", "claude"];
+// Which client types the poller will auto-nudge. DEFAULT IS EMPTY — no lane is
+// auto-woken. Rationale (operator decision 2026-06-18): an auto-nudge types a
+// prompt into an idle session, which FORCES a turn. For Claude that is redundant
+// (a Claude lane piggyback-drains pending mail on its own next turn via the MCP
+// tool-response path, costing no extra turn). For Codex/Gemini it is real delivery
+// but it wakes idle autonomous lanes into quota-costing turns to drain mostly
+// low-value chatter ("inbox checked, nothing actionable"). Net: auto-nudging an
+// idle fleet burns Claude usage + OpenAI quota for little benefit, so it is OFF.
+//
+// Mail still flows — it is delivered when a lane next takes a turn (piggyback for
+// Claude, the lane's own drain hook on its next prompt for Codex/Gemini) or when
+// the operator re-engages the lane. Auto-nudge is now opt-in, not automatic.
+//
+// To opt a client back in for a session, set NUDGE_CLIENTS, e.g.
+//   NUDGE_CLIENTS=codex,gemini   (comma-separated; only codex/gemini/claude honored)
+// The whole resolution + idle-detection machinery below is kept intact so opting
+// a client back in is a one-env-var change, not a code revert.
+// Exported + raw-injectable so the parse rules (empty default, allowlist filter,
+// dedup, case/space normalization) are unit-testable without mutating process.env.
+export function parseNudgeClients(raw: string | undefined = process.env.NUDGE_CLIENTS): string[] {
+  if (!raw) return []; // DEFAULT: nudge nobody
+  const allowed = new Set(["codex", "gemini", "claude"]);
+  const picked = raw.split(",").map((s) => s.trim().toLowerCase()).filter((s) => allowed.has(s));
+  return [...new Set(picked)];
+}
+const NUDGEABLE_CLIENTS = parseNudgeClients();
 function lanesWithUnread(db: Database): Lane[] {
+  // No nudgeable client types → nothing to nudge. Return empty WITHOUT building a
+  // `WHERE ... IN ()` (invalid SQL in SQLite) — and the tick() caller short-circuits
+  // before this on the same condition, so this is just a defensive second guard.
+  if (NUDGEABLE_CLIENTS.length === 0) return [];
   const placeholders = NUDGEABLE_CLIENTS.map(() => "?").join(", ");
   // LEFT JOIN (not JOIN) + the HAVING clause below surface two kinds of lane:
   //   1. lanes with undelivered mail (unread > 0) — the normal case;
@@ -481,6 +503,10 @@ const TICK_WARN_MS = Math.min(10_000, POLL_INTERVAL_MS * 0.66);
 
 function tick(db: Database): void {
   const tickStart = Date.now();
+  // Auto-nudge disabled (no opted-in client types) → do no work this tick. The loop
+  // still runs (heartbeat keeps the watchdog happy) but never touches a pane. This
+  // is the steady state by default; opt a client in via NUDGE_CLIENTS to re-enable.
+  if (NUDGEABLE_CLIENTS.length === 0) return;
   let lanes: Lane[];
   try { lanes = lanesWithUnread(db); } catch (e) {
     log(`DB read failed: ${e instanceof Error ? e.message : String(e)}`); return;
@@ -593,7 +619,10 @@ function scheduledTick(db: Database): void {
 }
 
 function main(): void {
-  log(`starting: db=${DB_PATH} interval=${POLL_INTERVAL_MS}ms cooldown=${NUDGE_COOLDOWN_MS}ms heartbeat=${HEARTBEAT_PATH}${DRY_RUN ? " DRY_RUN" : ""}`);
+  const nudgeState = NUDGEABLE_CLIENTS.length
+    ? `nudge=${NUDGEABLE_CLIENTS.join(",")}`
+    : "nudge=DISABLED (set NUDGE_CLIENTS to enable)";
+  log(`starting: db=${DB_PATH} interval=${POLL_INTERVAL_MS}ms cooldown=${NUDGE_COOLDOWN_MS}ms ${nudgeState} heartbeat=${HEARTBEAT_PATH}${DRY_RUN ? " DRY_RUN" : ""}`);
   // A stray unhandled rejection must NOT kill the process (which would strand the
   // watchdog with a dead poller that never writes its heartbeat — though the
   // watchdog would then restart it; logging here makes the cause visible).

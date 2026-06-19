@@ -397,3 +397,49 @@ describe("writeHeartbeat", () => {
     expect(ts).toBeGreaterThanOrEqual(before - 1000); // freshly written
   });
 });
+
+// --- parseNudgeClients (auto-nudge opt-in gate) ---
+// Operator decision 2026-06-18: auto-nudge is OFF by default — no idle lane is
+// keystroke-woken (Claude piggyback-drains for free; idle Codex/Gemini wakes burn
+// quota for low-value chatter). NUDGE_CLIENTS opts a client back in. These tests
+// pin the default-empty behavior + the allowlist/normalization parse rules.
+import { parseNudgeClients } from "../bin/codex-autodrain-poller.ts";
+
+describe("parseNudgeClients (auto-nudge default OFF)", () => {
+  test("undefined env → empty set (nudge NOBODY by default)", () => {
+    expect(parseNudgeClients(undefined)).toEqual([]);
+  });
+
+  test("empty string → empty set", () => {
+    expect(parseNudgeClients("")).toEqual([]);
+  });
+
+  test("PLANTED-WRONG guard: the default must NOT silently include claude/codex", () => {
+    // If a future edit restores the old `["codex","gemini","claude"]` default, this
+    // flips and fails — the whole point of the change is that idle lanes are quiet.
+    const def = parseNudgeClients(undefined);
+    expect(def).not.toContain("claude");
+    expect(def).not.toContain("codex");
+    expect(def.length).toBe(0);
+  });
+
+  test("opt-in: NUDGE_CLIENTS=codex,gemini enables exactly those", () => {
+    expect(parseNudgeClients("codex,gemini").sort()).toEqual(["codex", "gemini"]);
+  });
+
+  test("normalizes case + whitespace", () => {
+    expect(parseNudgeClients(" Codex , GEMINI ").sort()).toEqual(["codex", "gemini"]);
+  });
+
+  test("filters unknown client types (allowlist only)", () => {
+    expect(parseNudgeClients("codex,bogus,sh,rm").sort()).toEqual(["codex"]);
+  });
+
+  test("dedups repeats", () => {
+    expect(parseNudgeClients("claude,claude,claude")).toEqual(["claude"]);
+  });
+
+  test("a fully-invalid list → empty (not a crash, not a silent all-on)", () => {
+    expect(parseNudgeClients("nonsense,whatever")).toEqual([]);
+  });
+});
