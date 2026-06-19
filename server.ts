@@ -52,6 +52,27 @@ const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 const POLL_INTERVAL_MS = 1000;
 // Env override exists for tests only (lifecycle tests need sub-second ticks).
 const HEARTBEAT_INTERVAL_MS = parseInt(process.env.CLAUDE_PEERS_HEARTBEAT_MS ?? "15000", 10);
+// Re-detect our tmux pane only every Nth heartbeat, NOT every tick. detectTmuxPane()
+// runs `tmux list-panes -a` — an O(all-panes) server-wide scan. With N server
+// instances each scanning every heartbeat, the single tmux server saturates
+// (measured: a scan that nominally takes ~1s blocked 18-21s under a 32-server
+// fleet, starving pane repaint → visible input lag + cursor jitter). The scan only
+// catches RARE events (a pane reused by a new session, a UI pane-move), so ~120s
+// freshness is ample. On the skipped ticks we still re-publish our identity to the
+// LAST-KNOWN pane (cheap O(1) set-option writes), so the mirror stays stamped; we
+// just don't re-scan. Default 8 ticks × 15s ≈ 120s. Min 1 (every tick = old
+// behavior) for tests. Env override for tuning/tests.
+const TMUX_REDETECT_EVERY = Math.max(1, parseInt(process.env.CLAUDE_PEERS_TMUX_REDETECT_EVERY ?? "8", 10) || 8);
+
+// Pure throttle decision (exported for unit testing). True on the ticks where the
+// expensive pane re-detect should run. `jitter` is a per-server startup offset that
+// de-phases the fleet so N servers don't all re-detect on the same tick. With
+// every=1 this returns true every tick (old behavior, used by tests). Guards
+// every<1 to avoid a modulo-by-zero/negative producing a never-true schedule.
+export function shouldRedetectTmux(tick: number, jitter: number, every: number): boolean {
+  const n = Math.max(1, Math.floor(every));
+  return (tick + jitter) % n === 0;
+}
 const BROKER_SCRIPT = new URL("./broker.ts", import.meta.url).pathname;
 const BROKER_LOG = `${process.env.HOME}/.claude-peers-broker.log`;
 const BROKER_LOG_MAX_BYTES = 10 * 1024 * 1024; // 10MB
@@ -2120,21 +2141,52 @@ async function main() {
   // the next and clobber myTmuxInfo / make the clear decision against a torn view.
   // Same pattern as reregisterInFlight elsewhere in this file.
   let heartbeatInFlight = false;
+  // Per-server jittered tick counter for the tmux re-detect throttle. The random
+  // start offset de-phases re-detect ticks across the fleet so N servers do NOT all
+  // run their `list-panes -a` scan on the same heartbeat (which would re-create the
+  // very thundering-herd this throttle exists to prevent). Math.random at startup
+  // only — no per-tick randomness. heartbeatTick increments every tick; a re-detect
+  // happens when (heartbeatTick + jitter) % TMUX_REDETECT_EVERY === 0.
+  let heartbeatTick = 0;
+  const redetectJitter = Math.floor(Math.random() * TMUX_REDETECT_EVERY);
   const heartbeatTimer = setInterval(async () => {
     if (!myId || heartbeatInFlight) return;
     heartbeatInFlight = true;
     try {
       const heartbeat = await brokerFetch<HeartbeatResponse>("/heartbeat", { id: myId, client_type: myClientType, receiver_mode: myReceiverMode });
       applyReceiverMetadata(heartbeat.client_type, heartbeat.receiver_mode, "heartbeat");
-      // Re-detect our pane every heartbeat and keep the tmux identity mirror
-      // CURRENT (fixes: a pane reused by a NEW session kept the dead session's
-      // @peer_* forever, since the mirror previously refreshed only on a
-      // receiver-mode change; and a session whose UI moved panes kept writing to
-      // its STARTUP pane). The decision is delegated to the pure
-      // planTmuxMirrorTransition so its branches are unit-testable.
-      const freshTmux = await detectTmuxPane();
+      // THROTTLED pane re-detect (see TMUX_REDETECT_EVERY). detectTmuxPane() is the
+      // expensive `tmux list-panes -a` scan, so we only run it every Nth tick to
+      // catch the RARE pane-move / pane-reuse events. On the in-between ticks we
+      // SKIP the scan (freshTmux stays undefined) and fall through to re-publish our
+      // identity to the last-known pane (myTmuxInfo) — cheap O(1) set-option writes
+      // that keep the stamp fresh without touching the whole tmux server. The
+      // clear/move transition logic only runs on a re-detect tick, where freshTmux
+      // is a real value. planTmuxMirrorTransition stays the unit-testable decision.
+      const isRedetectTick = shouldRedetectTmux(heartbeatTick++, redetectJitter, TMUX_REDETECT_EVERY);
+      const freshTmux = isRedetectTick ? await detectTmuxPane() : undefined;
+
+      // SKIP tick: no scan ran. Re-publish identity to our known pane and return —
+      // do NOT run the clear/transition logic (it needs a fresh detection to compare
+      // against, and there is no move to react to on a non-scan tick).
+      if (!isRedetectTick) {
+        if (brokerIdentityPaneTarget(myTmuxInfo)) {
+          recordTmuxMirrorResult("heartbeat", publishBrokerIdentityToTmux({
+            id: myId,
+            name: myOperatorName,
+            resolved_name: myResolvedName,
+            client_type: myClientType,
+            receiver_mode: myReceiverMode,
+          }, myTmuxInfo));
+        }
+        return;
+      }
+
       const oldTarget = brokerIdentityPaneTarget(myTmuxInfo);
-      const newTarget = brokerIdentityPaneTarget(freshTmux);
+      // freshTmux is TmuxPaneInfo | null here (this line is only reached on a
+      // re-detect tick, after the skip-tick early-return above). Coalesce the
+      // type-level `undefined` to null — both mean "no fresh pane resolved".
+      const newTarget = brokerIdentityPaneTarget(freshTmux ?? null);
       const stampedPeerId = oldTarget ? readTmuxPaneOption(oldTarget, "@peer_id") : null;
       const plan = planTmuxMirrorTransition(oldTarget, newTarget, stampedPeerId, myId);
 
