@@ -95,6 +95,28 @@ let reregisterInFlight: Promise<void> | null = null;
 // reregister-after-unregister "resurrection" races during shutdown.
 let shuttingDown = false;
 
+// Orphan self-reap: count CONSECUTIVE broker calls that 401 even AFTER the
+// re-register+retry recovery path (i.e. recovery did not restore a valid auth).
+// A genuinely orphaned server — its session re-spawned a NEW MCP server, leaving
+// THIS process running with a token the broker reclaimed — will 401 on every
+// heartbeat forever and re-register into rows that dedup immediately reclaims,
+// flooding the broker log (observed: 21 ghosts → 387k auth-fails / 24MB log).
+// After ORPHAN_EXIT_THRESHOLD such failures (~N heartbeats), this process exits:
+// it cannot recover and should die rather than loop. Any SUCCESSFUL broker call
+// resets the counter, so a transient broker restart (which recovery DOES fix)
+// never trips it. Env-overridable for tests.
+let consecutive401Failures = 0;
+const ORPHAN_EXIT_THRESHOLD = Math.max(2, parseInt(process.env.CLAUDE_PEERS_ORPHAN_EXIT_THRESHOLD ?? "10", 10) || 10);
+
+// Pure orphan-exit decision (exported for unit testing). True when the count of
+// consecutive unrecoverable 401s has reached the threshold → the server is
+// orphaned and should exit. Guards threshold<2 (never exit on a single transient
+// 401 — recovery handles those). tick/heartbeat increments the counter on each
+// unrecoverable 401 and resets it to 0 on any successful broker call.
+export function shouldOrphanExit(consecutive401s: number, threshold: number): boolean {
+  return consecutive401s >= Math.max(2, threshold);
+}
+
 const PEER_ID_BODY_PATHS = new Set([
   "/heartbeat",
   "/set-summary",
@@ -154,10 +176,24 @@ async function brokerFetch<T>(path: string, body: unknown, _retry = false): Prom
     }
     return brokerFetch<T>(path, rewriteAuthBodyForPeer(path, body, attemptPeerId, myId), true);
   }
+  // Orphan self-reap: a 401 that reaches here is one the recovery path could NOT
+  // fix — either the retried call ALSO 401'd (_retry=true), or recovery is
+  // suppressed (shuttingDown). Count consecutive such failures; if we cross the
+  // threshold we are orphaned and must exit rather than flood the broker forever.
+  if (res.status === 401 && !shuttingDown) {
+    consecutive401Failures += 1;
+    if (shouldOrphanExit(consecutive401Failures, ORPHAN_EXIT_THRESHOLD)) {
+      log(`orphaned: ${consecutive401Failures} consecutive 401s after re-register recovery on ${path} — exiting (our registration was reclaimed; another MCP server owns this session)`);
+      shuttingDown = true;
+      process.exit(0);
+    }
+  }
   if (!res.ok) {
     const err = await res.text();
     throw new Error(`Broker error (${path}): ${res.status} ${err}`);
   }
+  // Any successful broker call proves our auth is valid → reset the orphan counter.
+  consecutive401Failures = 0;
   return res.json() as Promise<T>;
 }
 
