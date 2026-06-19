@@ -104,13 +104,16 @@ export function profileFor(clientType: string): IdleProfile {
 const lastNudge = new Map<string, number>();  // peer id -> epoch ms of last nudge
 const nudgeAttempts = new Map<string, number>(); // peer id -> consecutive nudge count
 // A lane selected purely by the NULL-hook bootstrap path (zero unread mail, hook
-// never attached) gets ONE lifetime bootstrap nudge — then never again from the
-// bootstrap path, even across poller restarts within this process. Without this,
-// a permanently-deaf seat (a registration row whose drain hook never binds — e.g.
-// a detached bg-Claude lane) is re-nudged every MAX_NUDGE_ATTEMPTS window because
-// nudgeAttempts resets when the lane briefly leaves the set. A bootstrap nudge has
-// no mail to deliver, so one attempt to wake the hook is all that is ever useful.
-// NOT pruned by the unread-clear sweep (that is what makes it a LIFETIME cap).
+// never attached) gets ONE bootstrap nudge for the LIFE OF THIS PROCESS — then
+// never again from the bootstrap path. This Set is in-memory, so the cap does NOT
+// survive a poller restart (a fresh process starts with an empty Set); the restart
+// backstops are MAX_NUDGE_ATTEMPTS + the systemd StartLimitBurst, not this Set.
+// Without this, a permanently-deaf seat (a registration row whose drain hook never
+// binds — e.g. a detached bg-Claude lane) is re-nudged every MAX_NUDGE_ATTEMPTS
+// window because nudgeAttempts resets when the lane briefly leaves the set. A
+// bootstrap nudge has no mail to deliver, so one attempt to wake the hook is all
+// that is ever useful. NOT pruned by the unread-clear sweep (that is what makes it
+// a process-lifetime cap rather than a per-window one).
 const bootstrapNudged = new Set<string>();       // peer id -> already got its one bootstrap nudge
 
 function log(msg: string): void {
