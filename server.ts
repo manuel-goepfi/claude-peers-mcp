@@ -2149,6 +2149,17 @@ async function main() {
   // happens when (heartbeatTick + jitter) % TMUX_REDETECT_EVERY === 0.
   let heartbeatTick = 0;
   const redetectJitter = Math.floor(Math.random() * TMUX_REDETECT_EVERY);
+  // Re-stamp our broker identity onto our current pane. Used by BOTH heartbeat
+  // paths (the skip-tick re-publish and the normal end-of-tick mirror) — one
+  // closure so the identity object never drifts between the two call sites.
+  const republishIdentityToCurrentPane = () =>
+    recordTmuxMirrorResult("heartbeat", publishBrokerIdentityToTmux({
+      id: myId!,
+      name: myOperatorName,
+      resolved_name: myResolvedName,
+      client_type: myClientType,
+      receiver_mode: myReceiverMode,
+    }, myTmuxInfo));
   const heartbeatTimer = setInterval(async () => {
     if (!myId || heartbeatInFlight) return;
     heartbeatInFlight = true;
@@ -2170,15 +2181,7 @@ async function main() {
       // do NOT run the clear/transition logic (it needs a fresh detection to compare
       // against, and there is no move to react to on a non-scan tick).
       if (!isRedetectTick) {
-        if (brokerIdentityPaneTarget(myTmuxInfo)) {
-          recordTmuxMirrorResult("heartbeat", publishBrokerIdentityToTmux({
-            id: myId,
-            name: myOperatorName,
-            resolved_name: myResolvedName,
-            client_type: myClientType,
-            receiver_mode: myReceiverMode,
-          }, myTmuxInfo));
-        }
+        if (brokerIdentityPaneTarget(myTmuxInfo)) republishIdentityToCurrentPane();
         return;
       }
 
@@ -2217,13 +2220,7 @@ async function main() {
         recordTmuxMirrorResult("heartbeat", { ok: true, target: null, failedOptions: [] });
         return;
       }
-      recordTmuxMirrorResult("heartbeat", publishBrokerIdentityToTmux({
-        id: myId,
-        name: myOperatorName,
-        resolved_name: myResolvedName,
-        client_type: myClientType,
-        receiver_mode: myReceiverMode,
-      }, myTmuxInfo));
+      republishIdentityToCurrentPane();
     } catch (e) {
       // The broker POST is legitimately best-effort, but a throw in the tmux
       // identity-maintenance block is not — log it (NO SILENT FALLBACKS) so a

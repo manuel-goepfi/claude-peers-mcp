@@ -21,6 +21,7 @@
 
 import { describe, test, expect, beforeEach } from "bun:test";
 import { Database } from "bun:sqlite";
+import { bootstrapCapBlocks, paneAlreadyNudgedThisTick } from "../bin/codex-autodrain-poller.ts";
 
 const REHYDRATE_WINDOW_MS = 3600_000; // 1h — mirror of broker.ts
 
@@ -192,83 +193,73 @@ describe("Bug 4 — bootstrap-nudge storm guards (A1 lifetime cap + A2 per-pane 
   // zero-mail unattached lane, but had no termination for a lane whose hook never
   // binds (a detached bg-Claude lane). Combined with multiple lanes resolving to
   // ONE pane, an innocent foreground pane was nudged repeatedly per cycle. Two
-  // guards fix it, both mirrored from codex-autodrain-poller.ts tick():
-  //   A1 — a zero-mail (bootstrap) lane is nudged AT MOST ONCE per process.
-  //   A2 — a physical pane is nudged AT MOST ONCE per tick, even if N lanes map to it.
+  // guards fix it, both now PURE EXPORTED functions in codex-autodrain-poller.ts
+  // that tick() calls directly (so these tests exercise the real prod decision, not
+  // an in-test copy):
+  //   A1 — bootstrapCapBlocks: a zero-mail (bootstrap) lane is nudged AT MOST ONCE.
+  //   A2 — paneAlreadyNudgedThisTick: one physical pane is nudged AT MOST ONCE/tick.
   // Field captured live (2026-06-18): pane %433 carried 3 clause5.6 rows, 2 of them
   // NULL-hook+zero-mail, nudged interleaved every ~60s (attempts 1→3).
 
-  // --- A1: mirror of the lifetime-bootstrap guard ---
-  // bootstrapNudged is a Set of peer ids already given their one bootstrap nudge.
-  // A lane is eligible to nudge unless it is a zero-mail lane already in the set.
-  type Lane = { id: string; unread: number };
-  function eligibleToNudge(lane: Lane, bootstrapNudged: Set<string>): boolean {
-    if (lane.unread === 0 && bootstrapNudged.has(lane.id)) return false; // A1 cap
-    return true;
-  }
-  // Mirror of nudge()'s bookkeeping: a zero-mail nudge records the bootstrap —
-  // but ONLY when the C-m submit actually succeeded. A nudge whose submit failed
-  // (pane vanished after the text was typed) did not fire, so it must NOT consume
-  // the one-shot cap. `submitOk` defaults true (the happy path).
-  function recordNudge(lane: Lane, bootstrapNudged: Set<string>, submitOk = true): void {
+  // recordBootstrap mirrors ONLY nudge()'s bookkeeping (a zero-mail nudge records
+  // the id, but only on a successful submit). The DECISION under test —
+  // bootstrapCapBlocks — is the real prod export, so a regression in tick()'s guard
+  // is caught here. submitOk defaults true (the happy path).
+  function recordBootstrap(unread: number, id: string, seen: Set<string>, submitOk = true): void {
     if (!submitOk) return;                         // failed submit → no bookkeeping
-    if (lane.unread === 0) bootstrapNudged.add(lane.id);
+    if (unread === 0) seen.add(id);
   }
 
   test("a zero-mail NULL-hook lane is nudged ONCE, then never again (A1 lifetime cap)", () => {
     const seen = new Set<string>();
-    const lane: Lane = { id: "ghost", unread: 0 };
-    // Tick 1: eligible → nudge → record.
-    expect(eligibleToNudge(lane, seen)).toBe(true);
-    recordNudge(lane, seen);
-    // Tick 2..N: same lane, still zero mail, still NULL-hook → no longer eligible.
-    expect(eligibleToNudge(lane, seen)).toBe(false);
-    expect(eligibleToNudge(lane, seen)).toBe(false);
+    // Tick 1: not blocked → nudge → record.
+    expect(bootstrapCapBlocks(0, seen.has("ghost"))).toBe(false);
+    recordBootstrap(0, "ghost", seen);
+    // Tick 2..N: same lane, still zero mail, still NULL-hook → now blocked.
+    expect(bootstrapCapBlocks(0, seen.has("ghost"))).toBe(true);
+    expect(bootstrapCapBlocks(0, seen.has("ghost"))).toBe(true);
   });
 
   test("a lane that later receives REAL mail bypasses the bootstrap cap (still nudges)", () => {
     const seen = new Set<string>();
-    const ghost: Lane = { id: "ghost", unread: 0 };
-    expect(eligibleToNudge(ghost, seen)).toBe(true);
-    recordNudge(ghost, seen); // bootstrap consumed
-    expect(eligibleToNudge(ghost, seen)).toBe(false); // capped while zero-mail
+    expect(bootstrapCapBlocks(0, seen.has("ghost"))).toBe(false);
+    recordBootstrap(0, "ghost", seen);             // bootstrap consumed
+    expect(bootstrapCapBlocks(0, seen.has("ghost"))).toBe(true); // capped while zero-mail
     // Mail arrives → unread > 0 → the cap does not apply (real mail must deliver).
-    const withMail: Lane = { id: "ghost", unread: 2 };
-    expect(eligibleToNudge(withMail, seen)).toBe(true);
+    expect(bootstrapCapBlocks(2, seen.has("ghost"))).toBe(false);
   });
 
-  test("PLANTED-WRONG guard: dropping the A1 cap re-nudges a deaf seat forever", () => {
-    // If a future edit removes the `bootstrapNudged.has(id)` check, eligibility
-    // stays true on every tick and this expectation flips — catching the regression.
+  test("PLANTED-WRONG guard: real export blocks a re-bootstrapped deaf seat", () => {
+    // bootstrapCapBlocks is the actual tick() guard. If a future edit weakens it so
+    // a recorded zero-mail lane is no longer blocked, this expectation flips —
+    // catching a real prod regression (not just an in-test copy).
     const seen = new Set<string>();
-    const lane: Lane = { id: "ghost", unread: 0 };
-    recordNudge(lane, seen);
-    expect(eligibleToNudge(lane, seen)).not.toBe(true);
+    recordBootstrap(0, "ghost", seen);
+    expect(bootstrapCapBlocks(0, seen.has("ghost"))).toBe(true);
   });
 
   test("a FAILED C-m submit does NOT consume the lifetime cap (lane stays eligible)", () => {
     // The nudge typed text but the submit failed (pane vanished in the settle) — it
     // never fired as a turn, so the one-shot cap must survive for a real retry.
     const seen = new Set<string>();
-    const lane: Lane = { id: "ghost", unread: 0 };
-    recordNudge(lane, seen, /*submitOk*/ false);
-    expect(seen.has("ghost")).toBe(false);         // cap NOT burned
-    expect(eligibleToNudge(lane, seen)).toBe(true); // still nudgeable next tick
+    recordBootstrap(0, "ghost", seen, /*submitOk*/ false);
+    expect(seen.has("ghost")).toBe(false);                       // cap NOT burned
+    expect(bootstrapCapBlocks(0, seen.has("ghost"))).toBe(false); // still nudgeable
     // A subsequent successful submit then consumes the cap exactly once.
-    recordNudge(lane, seen, /*submitOk*/ true);
-    expect(eligibleToNudge(lane, seen)).toBe(false);
+    recordBootstrap(0, "ghost", seen, /*submitOk*/ true);
+    expect(bootstrapCapBlocks(0, seen.has("ghost"))).toBe(true);
   });
 
-  // --- A2: mirror of the per-pane within-tick dedup ---
-  // Across one tick, the first lane to claim a pane nudges it; later lanes on the
-  // SAME pane are skipped. Mirror: walk lanes, nudge a pane only if unclaimed.
+  // --- A2: drive the real paneAlreadyNudgedThisTick export ---
+  // Replicate ONLY tick()'s loop scaffolding (claim-after-nudge); the DECISION
+  // (paneAlreadyNudgedThisTick) is the real prod export under test.
   function nudgesThisTick(lanesByPane: { id: string; pane: string }[]): string[] {
     const claimed = new Set<string>();
     const nudged: string[] = [];
     for (const lane of lanesByPane) {
-      if (claimed.has(lane.pane)) continue; // A2: pane already nudged this tick
+      if (paneAlreadyNudgedThisTick(lane.pane, claimed)) continue; // A2 — real export
       nudged.push(lane.id);
-      claimed.add(lane.pane);
+      claimed.add(lane.pane);                                      // claim-after-nudge (tick() scaffolding)
     }
     return nudged;
   }
@@ -293,17 +284,14 @@ describe("Bug 4 — bootstrap-nudge storm guards (A1 lifetime cap + A2 per-pane 
     expect(nudged).toEqual(["a", "b", "c"]);
   });
 
-  test("PLANTED-WRONG guard: without A2 dedup the pane is nudged once per lane", () => {
-    // Mirror of the OLD (buggy) behavior — nudge every lane regardless of pane.
-    function nudgesNoDedup(lanesByPane: { id: string; pane: string }[]): string[] {
-      return lanesByPane.map((l) => l.id);
-    }
-    const lanes = [
-      { id: "x", pane: "%9" },
-      { id: "y", pane: "%9" },
-    ];
-    // The fixed path yields 1; the buggy path yields 2. This pins the difference.
-    expect(nudgesThisTick(lanes).length).toBe(1);
-    expect(nudgesNoDedup(lanes).length).toBe(2);
+  test("PLANTED-WRONG guard: the real export blocks a second lane on a claimed pane", () => {
+    // paneAlreadyNudgedThisTick is the actual tick() guard. A claimed pane must
+    // block the next lane; without it the pane is nudged once per lane (the storm).
+    const claimed = new Set<string>(["%9"]);
+    expect(paneAlreadyNudgedThisTick("%9", claimed)).toBe(true);   // claimed → blocked
+    expect(paneAlreadyNudgedThisTick("%8", claimed)).toBe(false);  // unclaimed → allowed
+    // End-to-end via the loop: two lanes on one pane → exactly one nudge.
+    const nudged = nudgesThisTick([{ id: "x", pane: "%9" }, { id: "y", pane: "%9" }]);
+    expect(nudged.length).toBe(1);
   });
 });

@@ -116,6 +116,25 @@ const nudgeAttempts = new Map<string, number>(); // peer id -> consecutive nudge
 // a process-lifetime cap rather than a per-window one).
 const bootstrapNudged = new Set<string>();       // peer id -> already got its one bootstrap nudge
 
+// A1 nudge-storm guard (pure, exported for unit testing). A zero-mail lane is in
+// the nudge set only via the NULL-hook bootstrap path; once it has had its one
+// bootstrap nudge, block it (re-nudging a still-deaf lane just bombs the pane). A
+// lane carrying real mail (unread > 0) is never blocked by this — the bootstrap cap
+// applies only to the zero-mail bootstrap path. tick() calls this with the lane's
+// live unread count and `bootstrapNudged.has(lane.id)`.
+export function bootstrapCapBlocks(unread: number, alreadyBootstrapNudged: boolean): boolean {
+  return unread === 0 && alreadyBootstrapNudged;
+}
+
+// A2 nudge-storm guard (pure, exported for unit testing). At most ONE nudge per
+// physical pane per tick: when several lanes (a foreground seat + bg-Claude lanes
+// whose attach client lives in that pane) resolve to the same pane, the first to
+// claim it nudges and the rest are blocked this tick. tick() calls this with the
+// resolved paneId and the per-tick `nudgedPanesThisTick` set.
+export function paneAlreadyNudgedThisTick(paneId: string, nudgedPanesThisTick: Set<string>): boolean {
+  return nudgedPanesThisTick.has(paneId);
+}
+
 function log(msg: string): void {
   console.error(`[codex-autodrain] ${new Date().toISOString()} ${msg}`);
 }
@@ -565,7 +584,7 @@ function tick(db: Database): void {
       // deliver). A lane that is still here after its bootstrap nudge has a hook
       // that did not bind; re-nudging it just bombs the pane. (A lane that later
       // gets real mail has unread > 0 and bypasses this guard entirely.)
-      if (lane.unread === 0 && bootstrapNudged.has(lane.id)) continue;
+      if (bootstrapCapBlocks(lane.unread, bootstrapNudged.has(lane.id))) continue;
       const since = Date.now() - (lastNudge.get(lane.id) ?? 0);
       if (since < NUDGE_COOLDOWN_MS) continue;                   // recently nudged — give it time to drain
       const { paneId, attachId } = resolveLanePane(lane, snap);
@@ -574,7 +593,7 @@ function tick(db: Database): void {
       // seat + bg lanes can all resolve to the same pane). One nudge per pane per
       // cycle — skip without consuming this lane's cooldown/attempt budget so it is
       // re-evaluated cleanly next tick if it is still the rightful occupant.
-      if (nudgedPanesThisTick.has(paneId)) continue;
+      if (paneAlreadyNudgedThisTick(paneId, nudgedPanesThisTick)) continue;
       // Ownership: bg lane → require its attach client in the pane subtree (its
       // MCP server is daemon-hosted, not under the pane). Else → lane pid in subtree.
       const owned = attachId ? paneOwnedByAttachId(paneId, attachId, snap) : paneOwnedByPid(paneId, lane.pid, snap);
