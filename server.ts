@@ -95,26 +95,34 @@ let reregisterInFlight: Promise<void> | null = null;
 // reregister-after-unregister "resurrection" races during shutdown.
 let shuttingDown = false;
 
-// Orphan self-reap: count CONSECUTIVE broker calls that 401 even AFTER the
-// re-register+retry recovery path (i.e. recovery did not restore a valid auth).
-// A genuinely orphaned server — its session re-spawned a NEW MCP server, leaving
-// THIS process running with a token the broker reclaimed — will 401 on every
-// heartbeat forever and re-register into rows that dedup immediately reclaims,
-// flooding the broker log (observed: 21 ghosts → 387k auth-fails / 24MB log).
-// After ORPHAN_EXIT_THRESHOLD such failures (~N heartbeats), this process exits:
-// it cannot recover and should die rather than loop. Any SUCCESSFUL broker call
-// resets the counter, so a transient broker restart (which recovery DOES fix)
-// never trips it. Env-overridable for tests.
-let consecutive401Failures = 0;
-const ORPHAN_EXIT_THRESHOLD = Math.max(2, parseInt(process.env.CLAUDE_PEERS_ORPHAN_EXIT_THRESHOLD ?? "10", 10) || 10);
+// Orphan self-reap. A genuinely orphaned server — its session re-spawned a NEW
+// MCP server, leaving THIS process running with a token the broker reclaimed —
+// 401s on every heartbeat forever and re-registers into rows that dedup
+// immediately reclaims, flooding the broker log (observed 2026-06-19: 21 ghosts →
+// 387k auth-fails / 24MB log). Such a server cannot recover and should exit.
+//
+// The decision is TIME-BASED, not count-based, on purpose. brokerFetch is driven
+// by THREE call streams at very different cadences — the 15s heartbeat, the 1s
+// background poll (Claude clients), and ad-hoc user tool calls — so a raw failure
+// COUNT would cross a small threshold in seconds on the 1s poll, risking a mass
+// false self-kill of HEALTHY servers during a transient broker restart/flap. A
+// wall-clock grace window is cadence-independent: we exit only after auth has been
+// continuously broken for ORPHAN_EXIT_GRACE_MS, which a transient blip (recovered
+// by the re-register path, which lands a SUCCESS and clears the streak) never
+// reaches. We record the START of an unrecoverable-401 streak; any successful
+// broker call clears it. Env-overridable for tests.
+let firstUnrecoverable401At: number | null = null;
+const ORPHAN_EXIT_GRACE_MS = Math.max(60_000, parseInt(process.env.CLAUDE_PEERS_ORPHAN_EXIT_GRACE_MS ?? "300000", 10) || 300_000);
 
-// Pure orphan-exit decision (exported for unit testing). True when the count of
-// consecutive unrecoverable 401s has reached the threshold → the server is
-// orphaned and should exit. Guards threshold<2 (never exit on a single transient
-// 401 — recovery handles those). tick/heartbeat increments the counter on each
-// unrecoverable 401 and resets it to 0 on any successful broker call.
-export function shouldOrphanExit(consecutive401s: number, threshold: number): boolean {
-  return consecutive401s >= Math.max(2, threshold);
+// Pure orphan-exit decision (exported for unit testing). Given the epoch-ms when
+// the current unrecoverable-401 streak began (null = no active streak), the
+// current time, and the grace window, returns true iff auth has been continuously
+// broken for at least the grace window → the server is orphaned and should exit.
+// Floor of 60s on the grace window guards a misconfigured env from making a
+// healthy server exit on a transient blip.
+export function shouldOrphanExit(streakStartedAt: number | null, now: number, graceMs: number): boolean {
+  if (streakStartedAt === null) return false;
+  return now - streakStartedAt >= Math.max(60_000, graceMs);
 }
 
 const PEER_ID_BODY_PATHS = new Set([
@@ -176,24 +184,22 @@ async function brokerFetch<T>(path: string, body: unknown, _retry = false): Prom
     }
     return brokerFetch<T>(path, rewriteAuthBodyForPeer(path, body, attemptPeerId, myId), true);
   }
-  // Orphan self-reap: a 401 that reaches here is one the recovery path could NOT
-  // fix — either the retried call ALSO 401'd (_retry=true), or recovery is
-  // suppressed (shuttingDown). Count consecutive such failures; if we cross the
-  // threshold we are orphaned and must exit rather than flood the broker forever.
+  // Orphan self-reap (record only — NEVER exit here). A 401 that reaches this
+  // point is one the recovery path could NOT fix (the retried call also 401'd, or
+  // recovery is suppressed during shutdown). Stamp the START of the unrecoverable-
+  // 401 streak; the heartbeat timer (NOT this function) decides when to exit, so a
+  // user tool call (send_message / check_messages also go through brokerFetch)
+  // never dies mid-request — it returns its error normally and the reap happens
+  // off the request path on the next heartbeat tick.
   if (res.status === 401 && !shuttingDown) {
-    consecutive401Failures += 1;
-    if (shouldOrphanExit(consecutive401Failures, ORPHAN_EXIT_THRESHOLD)) {
-      log(`orphaned: ${consecutive401Failures} consecutive 401s after re-register recovery on ${path} — exiting (our registration was reclaimed; another MCP server owns this session)`);
-      shuttingDown = true;
-      process.exit(0);
-    }
+    if (firstUnrecoverable401At === null) firstUnrecoverable401At = Date.now();
   }
   if (!res.ok) {
     const err = await res.text();
     throw new Error(`Broker error (${path}): ${res.status} ${err}`);
   }
-  // Any successful broker call proves our auth is valid → reset the orphan counter.
-  consecutive401Failures = 0;
+  // Any successful broker call proves our auth is valid → clear the orphan streak.
+  firstUnrecoverable401At = null;
   return res.json() as Promise<T>;
 }
 
@@ -2198,6 +2204,16 @@ async function main() {
     }, myTmuxInfo));
   const heartbeatTimer = setInterval(async () => {
     if (!myId || heartbeatInFlight) return;
+    // Orphan self-reap, evaluated HERE on the timer (off the request path) — never
+    // inside brokerFetch, so a user tool call can't die mid-request. If auth has
+    // been continuously broken past the grace window (set by brokerFetch on each
+    // unrecoverable 401, cleared on any success), this server is orphaned and
+    // exits cleanly. Time-based so the 1s poll cadence can't accelerate it.
+    if (!shuttingDown && shouldOrphanExit(firstUnrecoverable401At, Date.now(), ORPHAN_EXIT_GRACE_MS)) {
+      log(`orphaned: auth continuously rejected for >=${ORPHAN_EXIT_GRACE_MS}ms (our registration was reclaimed; another MCP server owns this session) — exiting`);
+      shuttingDown = true;
+      process.exit(0);
+    }
     heartbeatInFlight = true;
     try {
       const heartbeat = await brokerFetch<HeartbeatResponse>("/heartbeat", { id: myId, client_type: myClientType, receiver_mode: myReceiverMode });
