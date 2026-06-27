@@ -100,15 +100,20 @@ describe("Bug 1 (full fix) — reaper decouples mail-reap from row-reap", () => 
   // with ZERO mail is reaped normally (bounds tombstone growth). Without this,
   // the reaper deleted the mail at 1h and the any-age inherit recovered nothing.
   type ReapAction = "reap" | "preserve-inbox" | "keep-active";
+  const DEAD_MAIL_TTL_MS = 24 * 3600_000; // mirror of broker.ts default (24h)
   // lastSeenValid mirrors prod's guard: a malformed/corrupt last_seen
   // (Number.isFinite === false) means untrustworthy state — such a seat reaps
   // normally even WITH mail, so corrupt tombstones never leak forever.
+  // The dead-with-mail PRESERVE path now has a TTL ceiling: mail is kept only
+  // within DEAD_MAIL_TTL_MS (floored at REHYDRATE_WINDOW_MS); past it the row +
+  // stranded mail are reaped instead of preserved forever.
   function reapDecision(deadPidAlive: boolean, ageMs: number, pendingMail: number, lastSeenValid = true): ReapAction {
     if (deadPidAlive && ageMs <= REHYDRATE_WINDOW_MS) return "keep-active"; // not reapable yet
     const reapable = !deadPidAlive || ageMs > REHYDRATE_WINDOW_MS;
     if (!reapable) return "keep-active";
-    if (pendingMail > 0 && lastSeenValid) return "preserve-inbox"; // dead + mail + valid ts → keep row+mail
-    return "reap"; // dead + (empty OR malformed ts) → delete row+mail
+    const mailExpired = ageMs > Math.max(REHYDRATE_WINDOW_MS, DEAD_MAIL_TTL_MS);
+    if (pendingMail > 0 && lastSeenValid && !mailExpired) return "preserve-inbox"; // dead + mail + valid ts + within TTL → keep
+    return "reap"; // dead + (empty OR malformed ts OR mail past TTL) → delete row+mail
   }
 
   test("DEAD seat >1h WITH pending mail is PRESERVED (mail survives for inheritance)", () => {
@@ -125,9 +130,21 @@ describe("Bug 1 (full fix) — reaper decouples mail-reap from row-reap", () => 
     expect(reapDecision(false, 2 * 3600_000, 3, /*lastSeenValid*/ false)).toBe("reap");
   });
 
-  test("PLANTED-WRONG guard: a dead seat with mail (valid ts) must NOT be reaped (regression of the full fix)", () => {
-    // If a future edit re-deletes mail at the 1h mark, this flips to "reap" and fails.
+  test("PLANTED-WRONG guard: a dead seat with mail (valid ts) WITHIN the TTL must NOT be reaped", () => {
+    // 5h < 24h TTL → still a recoverable inbox. If a future edit re-deletes mail at
+    // the 1h mark (drops the preserve path), this flips to "reap" and fails.
     expect(reapDecision(false, 5 * 3600_000, 1)).not.toBe("reap");
+  });
+
+  test("DEAD seat with mail PAST the 24h TTL is REAPED (the forever-leak is closed)", () => {
+    // The real leak: a session dead 6 days with unread mail was preserved forever.
+    expect(reapDecision(false, 6 * 24 * 3600_000, 1)).toBe("reap");
+  });
+
+  test("PLANTED-WRONG guard: dropping the TTL ceiling re-opens the forever-leak", () => {
+    // If a future edit removes the mailExpired check, a 6-day dead-with-mail seat
+    // goes back to "preserve-inbox" and this flips red.
+    expect(reapDecision(false, 6 * 24 * 3600_000, 1)).not.toBe("preserve-inbox");
   });
 });
 
@@ -361,5 +378,53 @@ describe("Bug 5 — seat-supersede: a live older same-seat duplicate is told to 
     const alive = (_pid: number) => false;
     const dups = [{ id: "deadseat", pid: 999 }];
     expect(liveDuplicatesToSupersede(dups, alive)).not.toContain("deadseat");
+  });
+});
+
+describe("Bug 6 — delivered-message TTL purge (bounds unbounded DB growth)", () => {
+  // delivered=1 rows are only ever MARKED, never deleted, so they accumulate
+  // forever (observed 2026-06-27: 5,180 delivered msgs, oldest 2026-04-07, ~9.2MB
+  // of a 12MB db). The reaper now purges delivered mail older than
+  // DELIVERED_MSG_TTL_MS on its 30s tick. Mirror of the prod DELETE (broker.ts is
+  // not import-safe). Undelivered mail and recent delivered mail are untouched.
+  let db: Database;
+  const DELIVERED_MSG_TTL_MS = 7 * 24 * 3600_000; // 7d (mirror of broker default)
+
+  beforeEach(() => {
+    db = new Database(":memory:");
+    db.run("CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, to_id TEXT, delivered INTEGER, delivered_at TEXT)");
+  });
+
+  // Mirror of the cleanStalePeers delivered-purge DELETE.
+  function purgeDelivered(nowMs: number): number {
+    const cutoffIso = new Date(nowMs - DELIVERED_MSG_TTL_MS).toISOString();
+    return db.run("DELETE FROM messages WHERE delivered = 1 AND delivered_at IS NOT NULL AND delivered_at < ?", [cutoffIso]).changes;
+  }
+
+  test("an OLD delivered message (past TTL) is purged", () => {
+    const old = new Date(Date.now() - 30 * 24 * 3600_000).toISOString(); // 30 days
+    db.run("INSERT INTO messages (to_id, delivered, delivered_at) VALUES ('a', 1, ?)", [old]);
+    expect(purgeDelivered(Date.now())).toBe(1);
+    expect(db.query("SELECT COUNT(*) AS n FROM messages").get()).toEqual({ n: 0 });
+  });
+
+  test("a RECENT delivered message (within TTL) is kept", () => {
+    const recent = new Date(Date.now() - 60_000).toISOString(); // 1 min ago
+    db.run("INSERT INTO messages (to_id, delivered, delivered_at) VALUES ('a', 1, ?)", [recent]);
+    expect(purgeDelivered(Date.now())).toBe(0);
+    expect(db.query("SELECT COUNT(*) AS n FROM messages").get()).toEqual({ n: 1 });
+  });
+
+  test("UNDELIVERED mail is NEVER purged by this sweep (delivered=0), regardless of age", () => {
+    // even an ancient undelivered row stays — it's a different sweep's concern.
+    db.run("INSERT INTO messages (to_id, delivered, delivered_at) VALUES ('a', 0, NULL)");
+    expect(purgeDelivered(Date.now())).toBe(0);
+    expect(db.query("SELECT COUNT(*) AS n FROM messages").get()).toEqual({ n: 1 });
+  });
+
+  test("PLANTED-WRONG guard: a delivered=0 row must survive (never purge undelivered)", () => {
+    db.run("INSERT INTO messages (to_id, delivered, delivered_at) VALUES ('a', 0, NULL)");
+    purgeDelivered(Date.now());
+    expect((db.query("SELECT COUNT(*) AS n FROM messages").get() as { n: number }).n).toBe(1);
   });
 });

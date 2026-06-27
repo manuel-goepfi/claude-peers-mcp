@@ -65,7 +65,7 @@ import { Database } from "bun:sqlite";
 // imported (top-level Bun.serve at line ~930), but the predicate was
 // hoisted into a side-effect-free shared module specifically so the
 // predicate tests below test load-bearing prod code, not a copy.
-import { isReapable, PEER_GHOST_AFTER_MS } from "../shared/reaper";
+import { isReapable, deadSeatMailExpired, PEER_GHOST_AFTER_MS } from "../shared/reaper";
 
 type TestPeer = { id: string; pid: number; last_seen: string };
 
@@ -381,5 +381,48 @@ describe("Phase B D3 — cold-start grace schedule (source-grep sentinel)", () =
     // anchor catches the regression.
     const bareCalls = moduleInitSlice.match(/^cleanStalePeers\(\);$/gm) ?? [];
     expect(bareCalls.length).toBe(0);
+  });
+});
+
+// --- deadSeatMailExpired: TTL ceiling on preserving a dead-with-mail seat ---
+// The real predicate (imported from shared/reaper). A dead seat holding unread
+// mail is preserved as a recoverable inbox WITHIN the TTL; past it the row + mail
+// are reaped, closing the forever-leak (5 dead seats from 2026-06-21 held 13
+// stranded msgs, shielded from both sweeps). graceMs is floored at floorMs (the
+// rehydrate window) so a misconfigured env can't reap a seat too early.
+describe("deadSeatMailExpired", () => {
+  const DAY = 24 * 3600_000;
+  const HOUR = 3600_000;
+
+  test("within the TTL → NOT expired (still a recoverable inbox)", () => {
+    expect(deadSeatMailExpired(1 * HOUR, DAY, HOUR)).toBe(false);
+    expect(deadSeatMailExpired(DAY - 1, DAY, HOUR)).toBe(false); // 1ms short
+  });
+
+  test("past the TTL → expired (reap row + stranded mail)", () => {
+    expect(deadSeatMailExpired(DAY + 1, DAY, HOUR)).toBe(true);
+    expect(deadSeatMailExpired(6 * DAY, DAY, HOUR)).toBe(true); // the real 6-day leak case
+  });
+
+  test("exactly at the TTL → NOT expired (strict >, mirrors isReapable boundary)", () => {
+    expect(deadSeatMailExpired(DAY, DAY, HOUR)).toBe(false);
+  });
+
+  test("floor clamp: a sub-floor graceMs can't reap before the rehydrate window", () => {
+    // env sets graceMs=0/tiny → must still preserve for at least floorMs (1h).
+    expect(deadSeatMailExpired(30 * 60_000, 0, HOUR)).toBe(false);     // 30min < 1h floor
+    expect(deadSeatMailExpired(2 * HOUR, 0, HOUR)).toBe(true);         // 2h > 1h floor → expired
+    expect(deadSeatMailExpired(2 * HOUR, 60_000, HOUR)).toBe(true);    // graceMs 1min clamped to 1h
+  });
+
+  test("NaN/non-finite age (corrupt last_seen) → NOT expired here (caller's lastSeenValid handles it)", () => {
+    expect(deadSeatMailExpired(NaN, DAY, HOUR)).toBe(false);
+    expect(deadSeatMailExpired(Infinity, DAY, HOUR)).toBe(false);
+  });
+
+  test("PLANTED-WRONG guard: a 6-day-old dead-with-mail seat MUST expire (the leak is closed)", () => {
+    // If a future edit drops the ceiling (always returns false), this flips and
+    // the forever-leak silently returns.
+    expect(deadSeatMailExpired(6 * DAY, DAY, HOUR)).not.toBe(false);
   });
 });

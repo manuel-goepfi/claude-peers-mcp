@@ -10,7 +10,7 @@
  */
 
 import { Database } from "bun:sqlite";
-import { readFileSync, writeFileSync, renameSync, chmodSync } from "node:fs";
+import { readFileSync, writeFileSync, renameSync, chmodSync, statSync, existsSync } from "node:fs";
 import { timingSafeEqual } from "node:crypto";
 // L6: top-level node:fs import (was inline require() in verifyPidUid hot path).
 import type {
@@ -46,7 +46,7 @@ import type {
 // on port 7899). Full broker.ts module-extraction is a separate larger
 // follow-up; this narrow extraction unlocks load-bearing test mirrors
 // for the reap predicate without touching the broker's startup shape.
-import { isReapable, PEER_GHOST_AFTER_MS } from "./shared/reaper.ts";
+import { isReapable, deadSeatMailExpired, PEER_GHOST_AFTER_MS } from "./shared/reaper.ts";
 
 const PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const DB_PATH = process.env.CLAUDE_PEERS_DB ?? `${process.env.HOME}/.claude-peers.db`;
@@ -94,6 +94,22 @@ const BRIDGE_RATE_KEY = "__bridge__";  // dedicated rate-limit bucket
 // inherit its ID so orphaned mail (addressed to the old ID) surfaces. Window
 // is (last_seen age) < REHYDRATE_WINDOW_MS AND PID no longer alive.
 const REHYDRATE_WINDOW_MS = 3600_000;  // 1h
+// TTL ceiling on preserving a DEAD seat that still holds undelivered mail. Past
+// this, the row + its stranded mail are reaped instead of kept forever (the
+// mutual-protection leak: reaper won't drop a row with mail, orphan-sweep won't
+// drop mail whose to_id still has a row). Default 24h; a session gone a full day
+// isn't returning to inherit. Floored at REHYDRATE_WINDOW_MS so a seat is always
+// inheritable for >= the rehydrate window. Env-overridable.
+const DEAD_MAIL_TTL_MS = parseInt(process.env.CLAUDE_PEERS_DEAD_MAIL_TTL_MS ?? "86400000", 10) || 86_400_000;
+// TTL on DELIVERED messages. delivered=1 rows are otherwise never purged (they
+// only ever get marked, never deleted) → unbounded DB growth. Default 7 days of
+// retained history (audit/debug), then swept on the periodic reaper tick.
+const DELIVERED_MSG_TTL_MS = parseInt(process.env.CLAUDE_PEERS_DELIVERED_MSG_TTL_MS ?? "604800000", 10) || 604_800_000;
+// Cap the broker's OWN log file. The register hook rotates on register; this
+// bounds it on the periodic reaper tick too, so the log can't grow unbounded
+// during a flood with no new registrations (how it reached 24MB on 2026-06-19).
+const BROKER_LOG_MAX_BYTES = 10 * 1024 * 1024; // 10MB (mirrors the register hook)
+const BROKER_LOG_PATH = `${process.env.HOME}/.claude-peers-broker.log`;
 const MY_UID = process.getuid?.() ?? -1;
 
 // M3: warn loudly if we can't enforce S3 (non-Linux dev environment).
@@ -220,6 +236,34 @@ function cleanStalePeers() {
   const orphaned = db.run("DELETE FROM messages WHERE delivered = 0 AND to_id NOT IN (SELECT id FROM peers)");
   if (orphaned.changes > 0) {
     console.error(`[broker] orphan-mail sweep: removed ${orphaned.changes} undelivered message(s) with no live peer`);
+  }
+  // Delivered-mail TTL: delivered=1 rows are only ever marked, never deleted, so
+  // they accumulate forever (unbounded DB growth). Purge delivered mail older than
+  // DELIVERED_MSG_TTL_MS — keeps a window of history for audit/debug, then drops it.
+  const cutoffIso = new Date(Date.now() - DELIVERED_MSG_TTL_MS).toISOString();
+  const purged = db.run("DELETE FROM messages WHERE delivered = 1 AND delivered_at IS NOT NULL AND delivered_at < ?", [cutoffIso]);
+  if (purged.changes > 0) {
+    console.error(`[broker] delivered-mail TTL: purged ${purged.changes} delivered message(s) older than ${DELIVERED_MSG_TTL_MS}ms`);
+  }
+  rotateBrokerLogIfLarge();
+}
+
+// Cap the broker's own log on the periodic tick (the register hook only rotates
+// at register time, so a flood with no new registrations grows it unbounded —
+// how it reached 24MB on 2026-06-19). Rename to .old when over the cap; the next
+// write reopens a fresh file. Best-effort: a rotation failure must never break the
+// sweep, so it is caught and logged once.
+let brokerLogRotateWarned = false;
+function rotateBrokerLogIfLarge() {
+  try {
+    if (!existsSync(BROKER_LOG_PATH)) return;
+    if (statSync(BROKER_LOG_PATH).size <= BROKER_LOG_MAX_BYTES) return;
+    renameSync(BROKER_LOG_PATH, `${BROKER_LOG_PATH}.old`);
+  } catch (e) {
+    if (!brokerLogRotateWarned) {
+      brokerLogRotateWarned = true;
+      console.error(`[broker] log rotation failed (${BROKER_LOG_PATH}): ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
 }
 
@@ -1143,7 +1187,11 @@ function liveAndFreshPeers(peers: Peer[]): Peer[] {
       // normally even with mail (a deliberately narrow exception).
       const lastSeenValid = Number.isFinite(new Date(p.last_seen).getTime());
       const pending = lastSeenValid ? (countUndelivered.get(p.id) as { n: number }).n : 0;
-      if (pending > 0) {
+      // Preserve a dead-with-mail seat as a recoverable inbox — but only WITHIN the
+      // TTL. Past DEAD_MAIL_TTL_MS the session has not returned to inherit (24h+);
+      // reap the row + its stranded mail instead of keeping it forever (the leak).
+      const ageMs = now - new Date(p.last_seen).getTime();
+      if (pending > 0 && !deadSeatMailExpired(ageMs, DEAD_MAIL_TTL_MS, REHYDRATE_WINDOW_MS)) {
         buckets.delete(p.id);   // drop the live SSE bucket; keep row + mail on disk
         return false;            // still not an active peer — just a retained inbox
       }

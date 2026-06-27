@@ -153,6 +153,15 @@ bun cli.ts kill-broker       # stop the broker
 | `CLAUDE_PEERS_PORT`  | `7899`               | Broker port                           |
 | `CLAUDE_PEERS_DB`    | `~/.claude-peers.db` | SQLite database path                  |
 | `OPENAI_API_KEY`     | —                    | Enables auto-summary via gpt-5.4-nano |
+| `CLAUDE_PEERS_DEAD_MAIL_TTL_MS` | `86400000` (24h) | How long a dead seat's undelivered mail is preserved (inheritable by a returning session) before the row + mail are reaped. Floored at 1h. |
+| `CLAUDE_PEERS_DELIVERED_MSG_TTL_MS` | `604800000` (7d) | How long delivered messages are retained before the periodic sweep purges them. |
+
+## Diagnosing orphans / "broker down"
+
+A peer reporting "broker is down" is usually **not** a broker outage — check `/health` first (`curl -s http://127.0.0.1:7899/health`); the broker normally runs for days. The two real failure modes:
+
+- **Orphan flood:** a session re-spawned its MCP server without killing the old one, and the old one's token was reclaimed → it 401s on every heartbeat. **The reliable signal is the auth-fail rate in `~/.claude-peers-broker.log`** (`grep -c 'auth fail'`), not a process count. A leftover server now self-reaps after continuous 401s; a same-seat live duplicate is superseded on the next register.
+- Do **not** use "live `server.ts` pids not in the peers table" as a ghost count — it over-counts, because one session legitimately spawns several `bun server.ts`-matching processes and only one is the registered pid.
 
 ## Requirements
 

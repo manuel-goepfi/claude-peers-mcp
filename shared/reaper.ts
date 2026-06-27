@@ -40,3 +40,24 @@ export function isReapable(
   if (Number.isNaN(lastSeenMs)) return false; // graceful: invalid timestamp not auto-reaped
   return now - lastSeenMs > ttlMs;
 }
+
+/**
+ * TTL ceiling on the "preserve a DEAD seat that still holds undelivered mail"
+ * rule (liveAndFreshPeers preserve branch). A dead seat's inbox is recoverable
+ * by a returning session via the rehydrate/inherit path — but only worth keeping
+ * for a bounded window. Without this ceiling a session that dies with unread mail
+ * and never returns keeps its row + mail FOREVER (the reaper won't drop the row
+ * because it has mail; the orphan-mail sweep won't drop the mail because the row
+ * still exists — a mutual-protection deadlock).
+ *
+ * Returns true when the dead-with-mail seat has aged past graceMs and should now
+ * be reaped (row + stranded mail) instead of preserved. `graceMs` is floored at
+ * `floorMs` (the rehydrate window) so a seat is ALWAYS inheritable for at least
+ * that long regardless of a misconfigured env override. A non-finite/NaN ageMs
+ * (corrupt last_seen) returns false here — those rows are handled by the caller's
+ * existing lastSeenValid guard, not this one.
+ */
+export function deadSeatMailExpired(ageMs: number, graceMs: number, floorMs: number): boolean {
+  if (!Number.isFinite(ageMs)) return false;
+  return ageMs > Math.max(floorMs, graceMs);
+}
