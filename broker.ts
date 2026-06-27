@@ -10,7 +10,7 @@
  */
 
 import { Database } from "bun:sqlite";
-import { readFileSync, writeFileSync, renameSync, chmodSync, statSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, renameSync, chmodSync, statSync, existsSync, truncateSync } from "node:fs";
 import { timingSafeEqual } from "node:crypto";
 // L6: top-level node:fs import (was inline require() in verifyPidUid hot path).
 import type {
@@ -46,7 +46,7 @@ import type {
 // on port 7899). Full broker.ts module-extraction is a separate larger
 // follow-up; this narrow extraction unlocks load-bearing test mirrors
 // for the reap predicate without touching the broker's startup shape.
-import { isReapable, deadSeatMailExpired, PEER_GHOST_AFTER_MS } from "./shared/reaper.ts";
+import { isReapable, deadSeatMailExpired, shouldRotateLog, PEER_GHOST_AFTER_MS } from "./shared/reaper.ts";
 
 const PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const DB_PATH = process.env.CLAUDE_PEERS_DB ?? `${process.env.HOME}/.claude-peers.db`;
@@ -94,17 +94,32 @@ const BRIDGE_RATE_KEY = "__bridge__";  // dedicated rate-limit bucket
 // inherit its ID so orphaned mail (addressed to the old ID) surfaces. Window
 // is (last_seen age) < REHYDRATE_WINDOW_MS AND PID no longer alive.
 const REHYDRATE_WINDOW_MS = 3600_000;  // 1h
+// Parse a POSITIVE-millisecond env override, falling back to `def` for any value
+// that isn't a finite number > 0. A bare `parseInt(...) || def` does NOT catch a
+// NEGATIVE override (negatives are truthy), and a negative TTL makes the purge
+// cutoff land in the FUTURE → `delivered_at < cutoff` matches every row → a full
+// history wipe from one fat-fingered env var. This rejects <= 0 and NaN, logs the
+// rejection (no silent swallow of an explicit operator value), and keeps ONE
+// default literal (no string-vs-numeric drift hazard).
+function positiveEnvMs(name: string, def: number): number {
+  const raw = process.env[name];
+  if (raw === undefined) return def;
+  const n = parseInt(raw, 10);
+  if (Number.isFinite(n) && n > 0) return n;
+  console.error(`[broker] invalid ${name}="${raw}" (must be a positive integer ms) — using default ${def}`);
+  return def;
+}
 // TTL ceiling on preserving a DEAD seat that still holds undelivered mail. Past
 // this, the row + its stranded mail are reaped instead of kept forever (the
 // mutual-protection leak: reaper won't drop a row with mail, orphan-sweep won't
 // drop mail whose to_id still has a row). Default 24h; a session gone a full day
 // isn't returning to inherit. Floored at REHYDRATE_WINDOW_MS so a seat is always
 // inheritable for >= the rehydrate window. Env-overridable.
-const DEAD_MAIL_TTL_MS = parseInt(process.env.CLAUDE_PEERS_DEAD_MAIL_TTL_MS ?? "86400000", 10) || 86_400_000;
+const DEAD_MAIL_TTL_MS = positiveEnvMs("CLAUDE_PEERS_DEAD_MAIL_TTL_MS", 86_400_000);
 // TTL on DELIVERED messages. delivered=1 rows are otherwise never purged (they
 // only ever get marked, never deleted) → unbounded DB growth. Default 7 days of
 // retained history (audit/debug), then swept on the periodic reaper tick.
-const DELIVERED_MSG_TTL_MS = parseInt(process.env.CLAUDE_PEERS_DELIVERED_MSG_TTL_MS ?? "604800000", 10) || 604_800_000;
+const DELIVERED_MSG_TTL_MS = positiveEnvMs("CLAUDE_PEERS_DELIVERED_MSG_TTL_MS", 604_800_000);
 // Cap the broker's OWN log file. The register hook rotates on register; this
 // bounds it on the periodic reaper tick too, so the log can't grow unbounded
 // during a flood with no new registrations (how it reached 24MB on 2026-06-19).
@@ -250,19 +265,28 @@ function cleanStalePeers() {
 
 // Cap the broker's own log on the periodic tick (the register hook only rotates
 // at register time, so a flood with no new registrations grows it unbounded —
-// how it reached 24MB on 2026-06-19). Rename to .old when over the cap; the next
-// write reopens a fresh file. Best-effort: a rotation failure must never break the
-// sweep, so it is caught and logged once.
+// how it reached 24MB on 2026-06-19).
+//
+// TRUNCATE-IN-PLACE, not rename. The broker's stdout/stderr are the systemd
+// `StandardOutput=append:` fd, opened ONCE at process start and held for the
+// process lifetime. A `renameSync` would move the file to `.old` while that held
+// fd keeps writing to the SAME inode → systemd appends to `.old`, no fresh log is
+// created, and disk still grows (a silent no-op — the bug code review caught).
+// `truncateSync(path, 0)` resets the SAME inode the held fd points at, so the next
+// append lands at offset 0 and disk is freed immediately. Cost: the current tail
+// is lost (acceptable for a cap-on-flood backstop). Best-effort: a failure must
+// never break the sweep, so it is caught and logged once.
 let brokerLogRotateWarned = false;
 function rotateBrokerLogIfLarge() {
   try {
     if (!existsSync(BROKER_LOG_PATH)) return;
-    if (statSync(BROKER_LOG_PATH).size <= BROKER_LOG_MAX_BYTES) return;
-    renameSync(BROKER_LOG_PATH, `${BROKER_LOG_PATH}.old`);
+    if (!shouldRotateLog(statSync(BROKER_LOG_PATH).size, BROKER_LOG_MAX_BYTES)) return;
+    truncateSync(BROKER_LOG_PATH, 0);
+    console.error(`[broker] log truncated: exceeded ${BROKER_LOG_MAX_BYTES} bytes (in-place; systemd append fd preserved)`);
   } catch (e) {
     if (!brokerLogRotateWarned) {
       brokerLogRotateWarned = true;
-      console.error(`[broker] log rotation failed (${BROKER_LOG_PATH}): ${e instanceof Error ? e.message : String(e)}`);
+      console.error(`[broker] log truncate failed (${BROKER_LOG_PATH}): ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 }

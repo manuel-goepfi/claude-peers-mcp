@@ -61,3 +61,16 @@ export function deadSeatMailExpired(ageMs: number, graceMs: number, floorMs: num
   if (!Number.isFinite(ageMs)) return false;
   return ageMs > Math.max(floorMs, graceMs);
 }
+
+/**
+ * Pure size-cap decision for the broker's own log (rotateBrokerLogIfLarge).
+ * Extracted here for the same reason as isReapable/deadSeatMailExpired —
+ * broker.ts is not import-safe, so the predicate lives in this side-effect-free
+ * module and the fs orchestration (statSync → truncateSync) stays in the broker.
+ * Returns true when the log should be truncated (strictly over the cap; a log
+ * exactly at the cap is not rotated, mirroring the strict-`>` boundary used
+ * elsewhere in this module).
+ */
+export function shouldRotateLog(sizeBytes: number, maxBytes: number): boolean {
+  return sizeBytes > maxBytes;
+}

@@ -65,7 +65,7 @@ import { Database } from "bun:sqlite";
 // imported (top-level Bun.serve at line ~930), but the predicate was
 // hoisted into a side-effect-free shared module specifically so the
 // predicate tests below test load-bearing prod code, not a copy.
-import { isReapable, deadSeatMailExpired, PEER_GHOST_AFTER_MS } from "../shared/reaper";
+import { isReapable, deadSeatMailExpired, shouldRotateLog, PEER_GHOST_AFTER_MS } from "../shared/reaper";
 
 type TestPeer = { id: string; pid: number; last_seen: string };
 
@@ -424,5 +424,81 @@ describe("deadSeatMailExpired", () => {
     // If a future edit drops the ceiling (always returns false), this flips and
     // the forever-leak silently returns.
     expect(deadSeatMailExpired(6 * DAY, DAY, HOUR)).not.toBe(false);
+  });
+});
+
+// --- shouldRotateLog: pure size-cap decision for the broker log ---
+// Extracted to shared/reaper.ts (real import) so the size gate is testable. The
+// fs orchestration (statSync → truncateSync) stays in broker.ts behind it.
+describe("shouldRotateLog", () => {
+  const CAP = 10 * 1024 * 1024;
+  test("under the cap → no rotate", () => {
+    expect(shouldRotateLog(0, CAP)).toBe(false);
+    expect(shouldRotateLog(CAP - 1, CAP)).toBe(false);
+  });
+  test("exactly at the cap → no rotate (strict >)", () => {
+    expect(shouldRotateLog(CAP, CAP)).toBe(false);
+  });
+  test("over the cap → rotate", () => {
+    expect(shouldRotateLog(CAP + 1, CAP)).toBe(true);
+    expect(shouldRotateLog(24 * 1024 * 1024, CAP)).toBe(true); // the real 24MB incident
+  });
+});
+
+// --- positiveEnvMs: reject non-positive TTL env overrides ---
+// Mirror of the broker.ts helper (broker.ts is not import-safe). The load-bearing
+// case: a NEGATIVE override must NOT pass through (a bare `parseInt || def` lets it,
+// and a negative TTL makes the purge cutoff land in the future → wipes all rows).
+describe("positiveEnvMs (mirror) — rejects non-positive TTL overrides", () => {
+  function positiveEnvMs(raw: string | undefined, def: number): number {
+    if (raw === undefined) return def;
+    const n = parseInt(raw, 10);
+    if (Number.isFinite(n) && n > 0) return n;
+    return def;
+  }
+  test("absent → default", () => expect(positiveEnvMs(undefined, 86_400_000)).toBe(86_400_000));
+  test("valid positive → parsed", () => expect(positiveEnvMs("3600000", 86_400_000)).toBe(3_600_000));
+  test("NEGATIVE → default (the full-wipe footgun is closed)", () => {
+    expect(positiveEnvMs("-86400000", 604_800_000)).toBe(604_800_000);
+  });
+  test("zero → default (not a silent 'purge everything')", () => {
+    expect(positiveEnvMs("0", 604_800_000)).toBe(604_800_000);
+  });
+  test("garbage → default", () => expect(positiveEnvMs("foo", 86_400_000)).toBe(86_400_000));
+  test("PLANTED-WRONG guard: a negative override must never be returned verbatim", () => {
+    // If the guard regresses to `parseInt(raw,10) || def`, this returns -1 and flips.
+    expect(positiveEnvMs("-1", 86_400_000)).toBeGreaterThan(0);
+  });
+});
+
+// --- WIRING SENTINELS: prove the broker CALLS each control (dead-guard fix) ---
+// Code review (mutation test) showed all 3 controls' call sites could be unwired
+// with tests staying green — the logic was tested but not its invocation. These
+// source-grep sentinels go RED when a call site is removed, the same pattern as
+// the cold-start-grace sentinel above (block 6).
+describe("reaper controls are WIRED into the broker (source-grep sentinels)", () => {
+  test("liveAndFreshPeers preserve branch CALLS deadSeatMailExpired", async () => {
+    const src = await Bun.file(`${import.meta.dir}/../broker.ts`).text();
+    // pending>0 AND not-expired → preserve; dropping the deadSeatMailExpired clause
+    // reopens the forever-leak. Tolerant of whitespace, pins the arg order.
+    expect(src).toMatch(/pending\s*>\s*0\s*&&\s*!deadSeatMailExpired\(\s*ageMs\s*,\s*DEAD_MAIL_TTL_MS\s*,\s*REHYDRATE_WINDOW_MS\s*\)/);
+  });
+  test("cleanStalePeers CALLS the delivered-purge DELETE and rotateBrokerLogIfLarge", async () => {
+    const src = await Bun.file(`${import.meta.dir}/../broker.ts`).text();
+    const body = (src.split("function cleanStalePeers()")[1] ?? "").split("\nfunction ")[0];
+    expect(body).toMatch(/DELETE FROM messages WHERE delivered = 1/);
+    expect(body).toMatch(/rotateBrokerLogIfLarge\(\)/);
+  });
+  test("rotateBrokerLogIfLarge TRUNCATES in place (not rename — systemd append fd)", async () => {
+    const src = await Bun.file(`${import.meta.dir}/../broker.ts`).text();
+    const body = (src.split("function rotateBrokerLogIfLarge()")[1] ?? "").split("\nfunction ")[0];
+    // Must truncate the SAME inode; a renameSync here would be the silent no-op bug.
+    expect(body).toMatch(/truncateSync\(\s*BROKER_LOG_PATH\s*,\s*0\s*\)/);
+    expect(body).not.toMatch(/renameSync/);
+  });
+  test("both TTL consts use positiveEnvMs (negative-override guard wired)", async () => {
+    const src = await Bun.file(`${import.meta.dir}/../broker.ts`).text();
+    expect(src).toMatch(/DEAD_MAIL_TTL_MS\s*=\s*positiveEnvMs\(/);
+    expect(src).toMatch(/DELIVERED_MSG_TTL_MS\s*=\s*positiveEnvMs\(/);
   });
 });
