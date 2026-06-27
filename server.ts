@@ -2217,6 +2217,16 @@ async function main() {
     heartbeatInFlight = true;
     try {
       const heartbeat = await brokerFetch<HeartbeatResponse>("/heartbeat", { id: myId, client_type: myClientType, receiver_mode: myReceiverMode });
+      // Seat-supersede: a NEWER process registered for our exact tmux seat (our
+      // session was `--resume`d / replaced but we kept running). We are the stale
+      // leftover causing seat churn → exit cleanly so the seat resolves to the one
+      // live registration. On the heartbeat timer = off the request path, so no
+      // user tool call dies mid-request.
+      if (heartbeat.superseded && !shuttingDown) {
+        log(`superseded: a newer process took our tmux seat — exiting cleanly so the seat has one live registration`);
+        shuttingDown = true;
+        process.exit(0);
+      }
       applyReceiverMetadata(heartbeat.client_type, heartbeat.receiver_mode, "heartbeat");
       // THROTTLED pane re-detect (see TMUX_REDETECT_EVERY). detectTmuxPane() is the
       // expensive `tmux list-panes -a` scan, so we only run it every Nth tick to

@@ -590,6 +590,28 @@ function authPeer(req: Request, claimedId: string | undefined, path: string): { 
   return { ok: true, id: row.id };
 }
 
+// --- Seat-supersede signal ---
+// When a NEWER process registers for an existing peer's exact tmux seat (same
+// session + pane_id + name, different pid) and the older peer is STILL ALIVE, the
+// old server is a leftover (its session was `--resume`d / replaced but its MCP
+// server kept running). Two live registrations on one seat make the broker
+// ping-pong `last_seen` between them → unreliable 1:1 delivery ("seat churn").
+// We mark the older peer's id here; its NEXT /heartbeat returns superseded:true,
+// and the old server exits cleanly. One-shot per id (cleared on send). In-memory:
+// a broker restart simply re-derives the state on the next register.
+const supersededPeerIds = new Set<string>();
+
+// Pure decision (exported for unit testing). Given the same-seat self-duplicate
+// rows (newest-first, EXCLUDING the registering pid) and a liveness oracle, return
+// the ids of LIVE older duplicates that must be told to step down. Dead rows are
+// left for the rehydration/dedup paths; only LIVE leftovers are superseded.
+export function liveDuplicatesToSupersede(
+  dups: { id: string; pid: number }[],
+  isAlive: (pid: number) => boolean,
+): string[] {
+  return dups.filter((d) => isAlive(d.pid)).map((d) => d.id);
+}
+
 // --- S5: token-bucket rate limit (in-memory, per peer) ---
 type Bucket = { reqs: number[]; msgs: number[] };
 const buckets = new Map<string, Bucket>();
@@ -748,6 +770,16 @@ function handleRegister(body: RegisterRequest): RegisterResult {
   // recovery path still owns it.
   if (body.tmux_session && body.tmux_pane_id && body.name) {
     const dups = selectSamePaneSelfDuplicates.all(body.tmux_session, body.tmux_pane_id, body.cwd, body.name, body.pid) as { id: string; pid: number }[];
+    // Seat-supersede: any LIVE older duplicate on this exact seat is a leftover
+    // server (its session was resumed/replaced but its MCP process kept running).
+    // body.pid is the newest registrant → authoritative. Mark the live leftovers
+    // to be told to step down on their next heartbeat (they exit cleanly), so the
+    // seat collapses to one live registration and 1:1 delivery stops ping-ponging.
+    const toSupersede = liveDuplicatesToSupersede(dups, isPidAlive);
+    for (const id of toSupersede) supersededPeerIds.add(id);
+    if (toSupersede.length > 0) {
+      console.error(`[broker] seat-supersede: pid=${body.pid} (newest) flagged ${toSupersede.length} LIVE older self-dup(s) to step down on ${body.tmux_session}:${body.tmux_pane_id} (name=${body.name})`);
+    }
     let purged = 0;
     let keptNewestDead = false; // the first (newest) dead row is left for rehydration
     for (const d of dups) {
@@ -1794,6 +1826,14 @@ const server = Bun.serve({
               client_type: clientType,
               receiver_mode: validReceiverMode(target?.receiver_mode, clientType),
             };
+            // Seat-supersede (one-shot): a newer process took this peer's exact
+            // tmux seat → tell this old server to step down. Cleared on send so the
+            // signal fires exactly once; if the old server ignores it (already
+            // exiting / hung) it simply won't heartbeat again.
+            if (supersededPeerIds.delete(auth.id)) {
+              response.superseded = true;
+              console.error(`[broker] seat-supersede: told ${auth.id} to step down (superseded by a newer same-seat registrant)`);
+            }
             return Response.json(response);
           }
         case "/set-summary": {

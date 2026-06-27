@@ -92,6 +92,12 @@ export interface HeartbeatResponse {
   ok: true;
   client_type: ClientType;
   receiver_mode: ReceiverMode;
+  // Set true when a NEWER process has registered for this peer's exact tmux seat
+  // (same session + pane_id + name, different pid) — i.e. this server has been
+  // superseded (its session was `--resume`d / replaced, but this old MCP server
+  // kept running). The receiving server must exit cleanly so the seat resolves to
+  // a single live registration. One-shot: the broker clears the flag after sending.
+  superseded?: true;
 }
 
 export interface SetSummaryRequest {

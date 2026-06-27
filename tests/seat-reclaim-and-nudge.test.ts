@@ -295,3 +295,71 @@ describe("Bug 4 — bootstrap-nudge storm guards (A1 lifetime cap + A2 per-pane 
     expect(nudged.length).toBe(1);
   });
 });
+
+describe("Bug 5 — seat-supersede: a live older same-seat duplicate is told to step down", () => {
+  // Root cause of the "seat churn" (xkcf84xp <-> ltv3gknh ping-pong, 2026-06-27):
+  // a `claude --resume` / bg-spare / MCP re-init spawns a NEW server.ts for a pane
+  // while the OLD server for that same pane keeps running. Both have valid tokens,
+  // so neither 401s — the broker ping-pongs `last_seen` between two live
+  // registrations on one seat → unreliable 1:1 delivery. The old seat-dedup left a
+  // LIVE duplicate untouched ("a live row is not stale — never touch it"); that's
+  // the gap. Fix: the newest registrant is authoritative, so every LIVE older
+  // same-seat self-dup is flagged superseded → told to step down on its next
+  // heartbeat → exits → one live registration remains.
+  //
+  // Mirror of broker.ts liveDuplicatesToSupersede (broker.ts is not import-safe —
+  // top-level Bun.serve + Database; the repo mirrors broker decisions in tests).
+  function liveDuplicatesToSupersede(
+    dups: { id: string; pid: number }[],
+    isAlive: (pid: number) => boolean,
+  ): string[] {
+    return dups.filter((d) => isAlive(d.pid)).map((d) => d.id);
+  }
+
+  // selectSamePaneSelfDuplicates returns rows for the SAME seat with a DIFFERENT
+  // pid than the registrant (newest-first), so the registrant is never in `dups`.
+  test("a LIVE older duplicate on the same seat is superseded (the churn fix)", () => {
+    const alive = (pid: number) => pid === 383761; // the old live leftover
+    const dups = [{ id: "xkcf84xp", pid: 383761 }]; // older live row on pane %5
+    expect(liveDuplicatesToSupersede(dups, alive)).toEqual(["xkcf84xp"]);
+  });
+
+  test("a DEAD older duplicate is NOT superseded (dead-row paths own it)", () => {
+    const alive = (_pid: number) => false; // the old row's pid is dead
+    const dups = [{ id: "deadseat", pid: 999 }];
+    expect(liveDuplicatesToSupersede(dups, alive)).toEqual([]); // dedup/rehydrate handle dead rows
+  });
+
+  test("ALL live older dups are superseded (newest registrant wins over every leftover)", () => {
+    const alive = (_pid: number) => true; // every leftover still running
+    const dups = [
+      { id: "a", pid: 100 },
+      { id: "b", pid: 200 },
+      { id: "c", pid: 300 },
+    ];
+    expect(liveDuplicatesToSupersede(dups, alive).sort()).toEqual(["a", "b", "c"]);
+  });
+
+  test("mixed live/dead: only the LIVE leftovers are superseded", () => {
+    const alive = (pid: number) => pid === 100 || pid === 300; // 200 is dead
+    const dups = [
+      { id: "live1", pid: 100 },
+      { id: "dead", pid: 200 },
+      { id: "live2", pid: 300 },
+    ];
+    expect(liveDuplicatesToSupersede(dups, alive).sort()).toEqual(["live1", "live2"]);
+  });
+
+  test("no duplicates → nobody superseded (the common, healthy case)", () => {
+    expect(liveDuplicatesToSupersede([], () => true)).toEqual([]);
+  });
+
+  test("PLANTED-WRONG guard: superseding DEAD rows would corrupt the rehydration path", () => {
+    // If a future edit drops the liveness filter (supersedes every dup incl. dead
+    // ones), this flips — and dead rows would be wrongly told to step down,
+    // stealing the rehydration/inherit path's recoverable-mail tombstone.
+    const alive = (_pid: number) => false;
+    const dups = [{ id: "deadseat", pid: 999 }];
+    expect(liveDuplicatesToSupersede(dups, alive)).not.toContain("deadseat");
+  });
+});
