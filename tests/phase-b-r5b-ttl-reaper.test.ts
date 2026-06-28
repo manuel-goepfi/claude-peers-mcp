@@ -489,6 +489,29 @@ describe("reaper controls are WIRED into the broker (source-grep sentinels)", ()
     expect(body).toMatch(/DELETE FROM messages WHERE delivered = 1/);
     expect(body).toMatch(/rotateBrokerLogIfLarge\(\)/);
   });
+  test("cleanStalePeers CALLS the undelivered-mail TTL DELETE gated on receiver_mode='unknown'", async () => {
+    const src = await Bun.file(`${import.meta.dir}/../broker.ts`).text();
+    const body = (src.split("function cleanStalePeers()")[1] ?? "").split("\nfunction ")[0] ?? "";
+    // The undelivered cap must (a) target delivered=0 by sent_at, and (b) be gated
+    // on receiver_mode='unknown' so it never drops a real idle peer's mail. Dropping
+    // EITHER half reopens a leak (no cap) or breaks the non-lossy guarantee.
+    expect(body).toMatch(/DELETE FROM messages WHERE delivered = 0 AND sent_at < \?/);
+    expect(body).toMatch(/SELECT id FROM peers WHERE receiver_mode = 'unknown'/);
+    // Must live AFTER the delivered-purge DELETE (i.e. inside the same mail-purge
+    // try-stage, not a new unguarded stage).
+    const delIdx = body.indexOf("DELETE FROM messages WHERE delivered = 1");
+    const undelIdx = body.indexOf("DELETE FROM messages WHERE delivered = 0 AND sent_at");
+    expect(delIdx).toBeGreaterThanOrEqual(0);
+    expect(undelIdx).toBeGreaterThan(delIdx);
+  });
+  test("selectBroadcastTargets EXCLUDES receiver_mode='unknown' peers (B1 leak fix wired)", async () => {
+    const src = await Bun.file(`${import.meta.dir}/../broker.ts`).text();
+    const stmt = (src.split("const selectBroadcastTargets = db.prepare(`")[1] ?? "").split("`)")[0] ?? "";
+    // A broadcast must never queue mail to a no-receive-path peer (the pieces-bridge
+    // leak). Removing this conjunct reopens it. Pinned to the broadcast stmt only —
+    // direct send_message is intentionally NOT filtered this way.
+    expect(stmt).toMatch(/receiver_mode\s*!=\s*'unknown'/);
+  });
   test("rotateBrokerLogIfLarge TRUNCATES in place (not rename — systemd append fd)", async () => {
     const src = await Bun.file(`${import.meta.dir}/../broker.ts`).text();
     const body = (src.split("function rotateBrokerLogIfLarge()")[1] ?? "").split("\nfunction ")[0];
@@ -496,10 +519,11 @@ describe("reaper controls are WIRED into the broker (source-grep sentinels)", ()
     expect(body).toMatch(/truncateSync\(\s*BROKER_LOG_PATH\s*,\s*0\s*\)/);
     expect(body).not.toMatch(/renameSync/);
   });
-  test("both TTL consts use positiveEnvMs (negative-override guard wired)", async () => {
+  test("all three TTL consts use positiveEnvMs (negative-override guard wired)", async () => {
     const src = await Bun.file(`${import.meta.dir}/../broker.ts`).text();
     expect(src).toMatch(/DEAD_MAIL_TTL_MS\s*=\s*positiveEnvMs\(/);
     expect(src).toMatch(/DELIVERED_MSG_TTL_MS\s*=\s*positiveEnvMs\(/);
+    expect(src).toMatch(/UNDELIVERED_MSG_TTL_MS\s*=\s*positiveEnvMs\(/);
   });
   test("cleanStalePeers ISOLATES the reap and mail-purge stages in separate try/catch", async () => {
     const src = await Bun.file(`${import.meta.dir}/../broker.ts`).text();

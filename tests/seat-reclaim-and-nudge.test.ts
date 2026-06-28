@@ -428,3 +428,77 @@ describe("Bug 6 — delivered-message TTL purge (bounds unbounded DB growth)", (
     expect((db.query("SELECT COUNT(*) AS n FROM messages").get() as { n: number }).n).toBe(1);
   });
 });
+
+describe("Bug 7 — undelivered-mail TTL for live-but-non-draining peers (receiver_mode='unknown')", () => {
+  // A peer that heartbeats (row never goes stale) but never drains
+  // (receiver_mode='unknown' — a send-only / misregistered client like a one-way
+  // bridge) traps undelivered mail forever: the orphan sweep skips it (to_id is a
+  // live row), the dead-seat TTL skips it (seat is alive), and the delivered TTL
+  // skips it (delivered=0). The reaper now caps such mail by absolute age, GATED on
+  // receiver_mode='unknown' so a real but idle Claude/Codex/Gemini peer is never
+  // affected. Live proof 2026-06-28: pieces-bridge.linux trapped 7 broadcasts for
+  // up to 7 days. Mirror of the prod DELETE (broker.ts is not import-safe).
+  let db: Database;
+  const UNDELIVERED_MSG_TTL_MS = 7 * 24 * 3600_000; // 7d (mirror of broker default)
+
+  beforeEach(() => {
+    db = new Database(":memory:");
+    db.run("CREATE TABLE peers (id TEXT PRIMARY KEY, receiver_mode TEXT NOT NULL DEFAULT 'unknown')");
+    db.run("CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, to_id TEXT, delivered INTEGER, sent_at TEXT)");
+  });
+
+  // Mirror of the cleanStalePeers undelivered-mail-TTL DELETE.
+  function purgeStaleUndelivered(nowMs: number): number {
+    const cutoffIso = new Date(nowMs - UNDELIVERED_MSG_TTL_MS).toISOString();
+    return db.run(
+      `DELETE FROM messages WHERE delivered = 0 AND sent_at < ?
+         AND to_id IN (SELECT id FROM peers WHERE receiver_mode = 'unknown')`,
+      [cutoffIso],
+    ).changes;
+  }
+
+  const OLD = new Date(Date.now() - 30 * 24 * 3600_000).toISOString(); // 30d
+  const RECENT = new Date(Date.now() - 60_000).toISOString(); // 1 min
+
+  test("HAPPY: old undelivered mail to an UNKNOWN-receiver peer is dropped", () => {
+    db.run("INSERT INTO peers (id, receiver_mode) VALUES ('bridge', 'unknown')");
+    db.run("INSERT INTO messages (to_id, delivered, sent_at) VALUES ('bridge', 0, ?)", [OLD]);
+    expect(purgeStaleUndelivered(Date.now())).toBe(1);
+    expect(db.query("SELECT COUNT(*) AS n FROM messages").get()).toEqual({ n: 0 });
+  });
+
+  test("EDGE recent: a within-TTL undelivered row to an unknown peer is KEPT", () => {
+    db.run("INSERT INTO peers (id, receiver_mode) VALUES ('bridge', 'unknown')");
+    db.run("INSERT INTO messages (to_id, delivered, sent_at) VALUES ('bridge', 0, ?)", [RECENT]);
+    expect(purgeStaleUndelivered(Date.now())).toBe(0);
+    expect(db.query("SELECT COUNT(*) AS n FROM messages").get()).toEqual({ n: 1 });
+  });
+
+  test("NON-LOSSY GATE: old undelivered mail to a REAL receiver (claude-channel) is KEPT", () => {
+    // This is the load-bearing guard: a real but idle peer past the TTL must NOT
+    // lose mail. Only no-receive-path (unknown) recipients are capped.
+    db.run("INSERT INTO peers (id, receiver_mode) VALUES ('claude-x', 'claude-channel')");
+    db.run("INSERT INTO messages (to_id, delivered, sent_at) VALUES ('claude-x', 0, ?)", [OLD]);
+    expect(purgeStaleUndelivered(Date.now())).toBe(0);
+    expect(db.query("SELECT COUNT(*) AS n FROM messages").get()).toEqual({ n: 1 });
+  });
+
+  test("EDGE delivered: a delivered=1 row past the TTL is NOT this sweep's concern", () => {
+    // The delivered-mail TTL (Bug 6) owns delivered=1; this sweep only touches delivered=0.
+    db.run("INSERT INTO peers (id, receiver_mode) VALUES ('bridge', 'unknown')");
+    db.run("INSERT INTO messages (to_id, delivered, sent_at) VALUES ('bridge', 1, ?)", [OLD]);
+    expect(purgeStaleUndelivered(Date.now())).toBe(0);
+    expect(db.query("SELECT COUNT(*) AS n FROM messages").get()).toEqual({ n: 1 });
+  });
+
+  test("VoV (planted error): dropping the receiver_mode='unknown' gate would purge the real receiver's mail", () => {
+    // Prove the gate is load-bearing: run the UNGATED variant and confirm it WOULD
+    // delete the real-receiver row that the gated version keeps. If this expectation
+    // ever flips, the non-lossy guarantee is broken.
+    db.run("INSERT INTO peers (id, receiver_mode) VALUES ('claude-x', 'claude-channel')");
+    db.run("INSERT INTO messages (to_id, delivered, sent_at) VALUES ('claude-x', 0, ?)", [OLD]);
+    const cutoffIso = new Date(Date.now() - UNDELIVERED_MSG_TTL_MS).toISOString();
+    const ungatedDeleted = db.run("DELETE FROM messages WHERE delivered = 0 AND sent_at < ?", [cutoffIso]).changes;
+    expect(ungatedDeleted).toBe(1); // ungated WOULD drop the real receiver's mail — that's why the gate exists
+  });
+});

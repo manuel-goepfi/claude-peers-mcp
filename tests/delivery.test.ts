@@ -1879,14 +1879,17 @@ describe("Live broker delivery features", () => {
     const childDead = spawnSleep();
     const childLive = spawnSleep();
     const sender = await brokerFetch<{ id: string }>("/register", {
+      client_type: "claude",
       pid: childS.pid, cwd: "/read-reap-s", git_root: null, tty: null, name: "read-reap-s",
       tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
     });
     const recoverable = await brokerFetch<{ id: string }>("/register", {
+      client_type: "claude",
       pid: childDead.pid, cwd: "/read-reap-rehydrate", git_root: "/repo-read-reap", tty: null, name: "read-reap-old",
       tmux_session: "read-reap", tmux_window_index: "4", tmux_window_name: "four", tmux_pane_id: "%404", summary: "",
     });
     await brokerFetch<{ id: string }>("/register", {
+      client_type: "claude",
       pid: childLive.pid, cwd: "/read-reap-live", git_root: null, tty: null, name: "read-reap-live",
       tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
     });
@@ -1915,6 +1918,7 @@ describe("Live broker delivery features", () => {
 
     const fresh = spawnSleep();
     const relaunched = await brokerFetch<{ id: string }>("/register", {
+      client_type: "claude",
       pid: fresh.pid, cwd: "/read-reap-rehydrate", git_root: "/repo-read-reap", tty: null, name: "read-reap-new",
       tmux_session: "read-reap", tmux_window_index: "4", tmux_window_name: "four", tmux_pane_id: "%404", summary: "",
     });
@@ -2196,18 +2200,22 @@ describe("Live broker delivery features", () => {
     const childC = spawnSleep();
     const childSender = spawnSleep();
     const a = await brokerFetch<{ id: string }>("/register", {
+      client_type: "claude",
       pid: childA.pid, cwd: "/bc1", git_root: null, tty: null, name: "a",
       tmux_session: "bcast1", tmux_window_index: "0", tmux_window_name: "claude", summary: "",
     });
     const b = await brokerFetch<{ id: string }>("/register", {
+      client_type: "claude",
       pid: childB.pid, cwd: "/bc2", git_root: null, tty: null, name: "b",
       tmux_session: "bcast1", tmux_window_index: "1", tmux_window_name: "claude", summary: "",
     });
     const c = await brokerFetch<{ id: string }>("/register", {
+      client_type: "claude",
       pid: childC.pid, cwd: "/bc3", git_root: null, tty: null, name: "c",
       tmux_session: "bcast-other", tmux_window_index: "0", tmux_window_name: "claude", summary: "",
     });
     const sender = await brokerFetch<{ id: string }>("/register", {
+      client_type: "claude",
       pid: childSender.pid, cwd: "/bc-sender", git_root: null, tty: null, name: "sender",
       tmux_session: "bcast-sender", tmux_window_index: "0", tmux_window_name: "claude", summary: "",
     });
@@ -2232,10 +2240,12 @@ describe("Live broker delivery features", () => {
     const childA = spawnSleep();
     const childSender = spawnSleep();
     const a = await brokerFetch<{ id: string }>("/register", {
+      client_type: "claude",
       pid: childA.pid, cwd: "/bc-self-a", git_root: null, tty: null, name: "a",
       tmux_session: "bcast2", tmux_window_index: "0", tmux_window_name: "claude", summary: "",
     });
     const sender = await brokerFetch<{ id: string }>("/register", {
+      client_type: "claude",
       pid: childSender.pid, cwd: "/bc-self-s", git_root: null, tty: null, name: "sender",
       // Sender in the SAME scope as the target
       tmux_session: "bcast2", tmux_window_index: "1", tmux_window_name: "claude", summary: "",
@@ -2273,18 +2283,22 @@ describe("Live broker delivery features", () => {
     const childC = spawnSleep();
     const childSender = spawnSleep();
     const a = await brokerFetch<{ id: string }>("/register", {
+      client_type: "claude",
       pid: childA.pid, cwd: "/bc-nl-a", git_root: null, tty: null,
       name: "reviewer.1", tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
     });
     const b = await brokerFetch<{ id: string }>("/register", {
+      client_type: "claude",
       pid: childB.pid, cwd: "/bc-nl-b", git_root: null, tty: null,
       name: "REVIEWER.2", tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
     });
     const c = await brokerFetch<{ id: string }>("/register", {
+      client_type: "claude",
       pid: childC.pid, cwd: "/bc-nl-c", git_root: null, tty: null,
       name: "coder.1", tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
     });
     const sender = await brokerFetch<{ id: string }>("/register", {
+      client_type: "claude",
       pid: childSender.pid, cwd: "/bc-nl-s", git_root: null, tty: null, name: "s",
       tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
     });
@@ -2819,14 +2833,17 @@ describe("Live broker delivery features", () => {
     const b = spawnSleep();
     const s = spawnSleep();
     const peerA = await brokerFetch<{ id: string }>("/register", {
+      client_type: "claude",
       pid: a.pid, cwd: "/git-a", git_root: "/home/proj-X", tty: null, name: "a",
       tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
     });
     const peerB = await brokerFetch<{ id: string }>("/register", {
+      client_type: "claude",
       pid: b.pid, cwd: "/git-b", git_root: "/home/proj-Y", tty: null, name: "b",
       tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
     });
     const sender = await brokerFetch<{ id: string }>("/register", {
+      client_type: "claude",
       pid: s.pid, cwd: "/git-s", git_root: "/home/proj-X", tty: null, name: "s",
       tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
     });
@@ -2847,21 +2864,25 @@ describe("Live broker delivery features", () => {
     const onlyName = spawnSleep();
     const s = spawnSleep();
     const mPeer = await brokerFetch<{ id: string }>("/register", {
+      client_type: "claude",
       pid: match.pid, cwd: "/m", git_root: null, tty: null,
       name: "reviewer.m", tmux_session: "review-tmux", tmux_window_index: "0",
       tmux_window_name: "claude", summary: "",
     });
     const tPeer = await brokerFetch<{ id: string }>("/register", {
+      client_type: "claude",
       pid: onlyTmux.pid, cwd: "/t", git_root: null, tty: null,
       name: "coder.t", tmux_session: "review-tmux", tmux_window_index: "1",
       tmux_window_name: "claude", summary: "",
     });
     const nPeer = await brokerFetch<{ id: string }>("/register", {
+      client_type: "claude",
       pid: onlyName.pid, cwd: "/n", git_root: null, tty: null,
       name: "reviewer.n", tmux_session: "other-tmux", tmux_window_index: "0",
       tmux_window_name: "claude", summary: "",
     });
     const sender = await brokerFetch<{ id: string }>("/register", {
+      client_type: "claude",
       pid: s.pid, cwd: "/s", git_root: null, tty: null, name: "sender",
       tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
     });
@@ -2915,6 +2936,7 @@ describe("Live broker delivery features", () => {
       const proc = spawnSleep();
       receivers.push(proc);
       const p = await brokerFetch<{ id: string }>("/register", {
+        client_type: "claude",
         pid: proc.pid, cwd: `/b2-r${i}`, git_root: null, tty: null,
         name: `r${i}`, tmux_session: "b2-tmux", tmux_window_index: String(i),
         tmux_window_name: "claude", summary: "",
@@ -2923,6 +2945,7 @@ describe("Live broker delivery features", () => {
     }
     const successSenderProc = spawnSleep();
     const successSender = await brokerFetch<{ id: string }>("/register", {
+      client_type: "claude",
       pid: successSenderProc.pid, cwd: "/b2-success-s", git_root: null, tty: null, name: "s-ok",
       tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
     });
@@ -2944,6 +2967,7 @@ describe("Live broker delivery features", () => {
 
     const s = spawnSleep();
     const sender = await brokerFetch<{ id: string }>("/register", {
+      client_type: "claude",
       pid: s.pid, cwd: "/b2-s", git_root: null, tty: null, name: "s",
       tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
     });

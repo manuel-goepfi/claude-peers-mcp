@@ -120,6 +120,16 @@ const DEAD_MAIL_TTL_MS = positiveEnvMs("CLAUDE_PEERS_DEAD_MAIL_TTL_MS", 86_400_0
 // only ever get marked, never deleted) → unbounded DB growth. Default 7 days of
 // retained history (audit/debug), then swept on the periodic reaper tick.
 const DELIVERED_MSG_TTL_MS = positiveEnvMs("CLAUDE_PEERS_DELIVERED_MSG_TTL_MS", 604_800_000);
+// TTL on UNDELIVERED messages to a peer with NO resolved receive path
+// (receiver_mode='unknown' — a send-only or misregistered client like a one-way
+// bridge). Such a peer can heartbeat (so its row never goes stale and the reaper
+// never reaps it) yet never drain, trapping mail forever: the orphan sweep skips
+// it (its to_id IS a live row), the dead-seat TTL skips it (the seat is alive),
+// and the delivered TTL skips it (the row is delivered=0). This is the only bound
+// on that mail. Gated on receiver_mode='unknown' so a real but merely-idle
+// Claude/Codex/Gemini peer NEVER loses mail — real clients resolve receiver_mode
+// within seconds of their first hook/drain, far inside this window. Default 7d.
+const UNDELIVERED_MSG_TTL_MS = positiveEnvMs("CLAUDE_PEERS_UNDELIVERED_MSG_TTL_MS", 604_800_000);
 // Cap the broker's OWN log file. The register hook rotates on register; this
 // bounds it on the periodic reaper tick too, so the log can't grow unbounded
 // during a flood with no new registrations (how it reached 24MB on 2026-06-19).
@@ -275,6 +285,20 @@ function cleanStalePeers() {
     const purged = db.run("DELETE FROM messages WHERE delivered = 1 AND delivered_at IS NOT NULL AND delivered_at < ?", [cutoffIso]);
     if (purged.changes > 0) {
       console.error(`[broker] delivered-mail TTL: purged ${purged.changes} delivered message(s) older than ${DELIVERED_MSG_TTL_MS}ms`);
+    }
+    // Undelivered-mail TTL for no-receive-path peers: a peer with
+    // receiver_mode='unknown' (send-only / misregistered, e.g. a one-way bridge)
+    // heartbeats but never drains → its mail is bounded by nothing else here. Cap
+    // it by absolute age, scoped to receiver_mode='unknown' so a real idle peer is
+    // never affected. See UNDELIVERED_MSG_TTL_MS for the full leak rationale.
+    const undelivCutoff = new Date(Date.now() - UNDELIVERED_MSG_TTL_MS).toISOString();
+    const staleUndeliv = db.run(
+      `DELETE FROM messages WHERE delivered = 0 AND sent_at < ?
+         AND to_id IN (SELECT id FROM peers WHERE receiver_mode = 'unknown')`,
+      [undelivCutoff],
+    );
+    if (staleUndeliv.changes > 0) {
+      console.error(`[broker] undelivered-mail TTL: dropped ${staleUndeliv.changes} message(s) older than ${UNDELIVERED_MSG_TTL_MS}ms to non-draining peer(s)`);
     }
   } catch (e) {
     if (!mailPurgeStageWarned) {
@@ -542,9 +566,19 @@ const selectSamePaneSelfDuplicates = db.prepare(`
 // with ESCAPE '\'. Without this, a caller passing name_like='%' bypasses
 // the "at least one scope filter" guard (the % becomes a SQL wildcard
 // matching everything, defeating the scope requirement).
+//
+// receiver_mode != 'unknown': exclude peers with no resolved receive path
+// (send-only / misregistered clients like a one-way bridge). They heartbeat so
+// handleBroadcast's active-peer filter passes them, but they NEVER drain — a
+// broadcast to them queues mail that nothing can deliver (the leak fixed
+// 2026-06-28: pieces-bridge.linux trapped 7 broadcasts for up to 7 days). Direct
+// send_message (by explicit id) is intentionally NOT filtered this way — a 1:1
+// send to a known peer mid-registration should still land; UNDELIVERED_MSG_TTL_MS
+// is the backstop for that rarer case.
 const selectBroadcastTargets = db.prepare(`
   SELECT id FROM peers
   WHERE id != ?
+    AND receiver_mode != 'unknown'
     AND (? IS NULL OR tmux_session = ?)
     AND (? IS NULL OR git_root = ?)
     AND (? IS NULL OR lower(COALESCE(name,'')) LIKE '%' || lower(?) || '%' ESCAPE '\\')
