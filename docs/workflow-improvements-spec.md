@@ -553,6 +553,65 @@ Low priority — single-machine user, only matters when onboarding a second mach
 
 ---
 
+## #8 — Undelivered-mail TTL for LIVE-but-non-draining peers (CORRECTNESS GAP)
+
+### Problem
+
+The 2026-06 reaper hardening bounded undelivered mail on **dead** seats (`deadSeatMailExpired` — a dead seat with pending mail is preserved for `DEAD_MAIL_TTL_MS` then reaped, row + mail). It did **not** bound mail to a peer whose row stays **alive** but **never drains**.
+
+A peer can heartbeat (keeping `last_seen` fresh, so the reaper never reaps its row) while having no receive path at all — `receiver_mode = unknown`, `client_type = unknown`, `last_drain_at` empty. Mail addressed to it is then trapped in a three-way no-man's-land:
+
+- the reaper won't reap the **row** (it heartbeats — not stale, not pid-dead),
+- the orphan-mail sweep won't delete the **mail** (`to_id` IS a live peer row),
+- the `deadSeatMailExpired` TTL never fires (the seat isn't dead),
+- the delivered-mail TTL never fires (these rows are `delivered = 0`).
+
+Result: **undelivered mail to a live-but-non-draining peer has no upper bound.**
+
+Live evidence (2026-06-28): `pieces-bridge.linux` (`scripts/clause5-pieces-bridge/daemon.ts`, a one-way Pieces→claude-peers bridge) registered a receivable seat and heartbeats, but never drains. 7 messages (mostly stale fleet broadcasts, oldest 2026-06-21 — 7 days) sat at `delivered = 0` with no mechanism able to clear them. Purged manually; the mechanism is unfixed.
+
+### Solution
+
+Two independent levers — (B) is the real root-cause fix; (A) is the safety-net backstop. Either alone helps; both is correct.
+
+**(A) Undelivered-mail age cap (backstop).** In `cleanStalePeers`, after the orphan-mail sweep, also delete undelivered mail older than a TTL **regardless of recipient liveness**:
+
+```ts
+// Undelivered-mail age cap: a peer that heartbeats but never drains (receiver_mode
+// unknown, no hook) traps mail forever — the orphan sweep skips it (row is live)
+// and the dead-seat TTL skips it (seat is alive). Bound it by absolute age.
+const undelivCutoff = new Date(Date.now() - UNDELIVERED_MSG_TTL_MS).toISOString();
+const stale = db.run(
+  "DELETE FROM messages WHERE delivered = 0 AND sent_at < ?",
+  [undelivCutoff]
+);
+if (stale.changes > 0) {
+  console.error(`[broker] undelivered-mail TTL: dropped ${stale.changes} message(s) older than ${UNDELIVERED_MSG_TTL_MS}ms (recipient never drained)`);
+}
+```
+
+New constant near the other TTLs, env-overridable via `positiveEnvMs` (the established pattern), default e.g. 7d:
+```ts
+const UNDELIVERED_MSG_TTL_MS = positiveEnvMs("CLAUDE_PEERS_UNDELIVERED_MSG_TTL_MS", 604_800_000);
+```
+This must sit **inside the mail-purge try/catch stage** of `cleanStalePeers` so a throw is crash-isolated (the per-mechanism isolation added 2026-06-28). **Trade-off to weigh before shipping:** this is a *lossy* cap — it drops mail a genuinely-busy-but-slow recipient hasn't pulled yet. 7d is generous enough that only never-draining recipients hit it, but the value must be ≥ the longest legitimate idle-then-return window. Consider gating the delete on `receiver_mode = 'unknown'` (only cap mail to peers with no known receive path) to make it non-lossy for real Claude/Codex/Gemini peers — at the cost of leaving mail to a *temporarily* mis-detected peer.
+
+**(B) Don't route broadcasts to non-receiving peers (root cause).** A one-way bridge that only *publishes* should not register a *receivable* seat, or `handleBroadcast` (#5) should exclude `receiver_mode = 'unknown'` / `client_type = 'unknown'` peers from its target set. Fixing this stops the accumulation at the source — no mail is ever queued to a dead-end recipient in the first place. Cheaper and non-lossy. The bridge's own registration (`scripts/clause5-pieces-bridge/daemon.ts`) is the place to either skip registration or mark itself send-only.
+
+### Tests
+- **(A)** `:memory:` DB test: an undelivered row with `sent_at` older than the TTL is dropped on the sweep; a recent undelivered row and any delivered row are preserved. Planted-error VoV: dropping the TTL clause leaves the stale row (test goes red).
+- **(A) wiring sentinel** (matches the existing block in `phase-b-r5b-ttl-reaper.test.ts`): assert `cleanStalePeers` source contains the `DELETE FROM messages WHERE delivered = 0 AND sent_at` clause AND that it lives inside the mail-purge try-stage.
+- **(B)** broadcast test: a peer with `receiver_mode = 'unknown'` is excluded from `handleBroadcast` targets; a normal peer is included.
+
+### Rollout
+Broker restart activates (A) (lives in the reaper, same as the other TTLs). (B) needs the bridge daemon restart and/or a `handleBroadcast` change + broker restart. Backward-compatible; additive.
+
+### Risk
+- **(A) over-eager drop**: a real recipient idle > TTL loses mail. Mitigation: generous default (7d) and/or the `receiver_mode = 'unknown'` gate above.
+- **(B) under-detection**: a peer mis-classified as `unknown` (e.g. a Claude that registered before its receiver_mode resolved) would be wrongly excluded from broadcasts. Mitigation: only exclude peers whose `receiver_mode` has been `unknown` for longer than one heartbeat interval, or treat `unknown` as receivable but cap its mail via (A).
+
+---
+
 ## Ship order recommendation
 
 | Phase | Items | Rationale |
@@ -561,6 +620,7 @@ Low priority — single-machine user, only matters when onboarding a second mach
 | **Soon** | #1 (greeting) + #4 (doctor) | Daily UX + diagnostic gold. ~1.5h combined. |
 | **When needed** | #5 (broadcast) | Natural when you actually want cross-session blast. ~1h. |
 | **Blocked on #7** | #2 (delivery confirmation) | Needs rehydration to be meaningful — until then, status lies when target peer crashed. ~30min. |
+| **Ship next (correctness)** | #8 (undelivered-mail TTL) | Closes the live-but-non-draining-peer leak (pieces-bridge, 2026-06-28). Backstop (A) ~30min; root-cause (B) ~30min. |
 | **Defer** | #6 (setup.sh) | Single-machine use; only when onboarding second machine. ~1.5h. |
 
 **Total implementation budget** (excluding #6): ~4h for items that make your daily workflow materially better.
