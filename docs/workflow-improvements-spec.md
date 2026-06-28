@@ -555,6 +555,8 @@ Low priority — single-machine user, only matters when onboarding a second mach
 
 ## #8 — Undelivered-mail TTL for LIVE-but-non-draining peers (CORRECTNESS GAP)
 
+> **STATUS: SHIPPED** — `f6952f1` to `manzo/main` (2026-06-28). Lever A (undelivered-mail TTL gated on `receiver_mode='unknown'`) + Lever B1 (broadcast excludes `receiver_mode='unknown'`) live after broker restart. Lever B2 resolved to **B2b — no daemon change** (the pieces-bridge is send-only by design; A+B1 fully close the leak). Live-verified: bridge is the sole `unknown`-receiver peer and is excluded from broadcast targets; 0 undelivered mail to unknown-receivers. Full suite 516 pass / 0 fail. The implementation matches the design below; the lossy-cap risk was retired by the `receiver_mode='unknown'` gate (real idle peers never lose mail).
+
 ### Problem
 
 The 2026-06 reaper hardening bounded undelivered mail on **dead** seats (`deadSeatMailExpired` — a dead seat with pending mail is preserved for `DEAD_MAIL_TTL_MS` then reaped, row + mail). It did **not** bound mail to a peer whose row stays **alive** but **never drains**.
