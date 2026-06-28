@@ -501,4 +501,18 @@ describe("reaper controls are WIRED into the broker (source-grep sentinels)", ()
     expect(src).toMatch(/DEAD_MAIL_TTL_MS\s*=\s*positiveEnvMs\(/);
     expect(src).toMatch(/DELIVERED_MSG_TTL_MS\s*=\s*positiveEnvMs\(/);
   });
+  test("cleanStalePeers ISOLATES the reap and mail-purge stages in separate try/catch", async () => {
+    const src = await Bun.file(`${import.meta.dir}/../broker.ts`).text();
+    const body = (src.split("function cleanStalePeers()")[1] ?? "").split("\nfunction ")[0] ?? "";
+    // Per-mechanism crash isolation: a throw in the reap stage must not abort the
+    // mail-purge stage, and vice versa. Collapsing the two into one try/catch (or
+    // removing the isolation) reopens the "poison row starves every other sweep"
+    // regression. Assert TWO try blocks and both once-per-failure latch names so a
+    // single-wrapper rewrite goes RED.
+    const tryCount = (body.match(/\btry\s*\{/g) ?? []).length;
+    expect(tryCount).toBeGreaterThanOrEqual(2);
+    expect(body).toMatch(/liveAndFreshPeers\(selectAllPeers\.all\(\) as Peer\[\]\);/);
+    expect(body).toMatch(/reapStageWarned/);
+    expect(body).toMatch(/mailPurgeStageWarned/);
+  });
 });

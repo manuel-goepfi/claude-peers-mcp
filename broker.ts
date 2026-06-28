@@ -241,27 +241,54 @@ for (const col of messageMigrationColumns) {
 // undelivered messages, bucket cleanup) are what the periodic sweep needs;
 // the returned "live" list is unused here.
 function cleanStalePeers() {
-  liveAndFreshPeers(selectAllPeers.all() as Peer[]);
-  // Orphan-mail backstop: delete undelivered messages whose target peer row no
-  // longer exists. liveAndFreshPeers cleans a peer's mail at the moment it
-  // reaps the ROW, but mail can outlive its peer by other paths (a re-register
-  // that assigned a new id and abandoned the old row, a crash between delete
-  // and cleanup). Without this sweep those rows live forever — unbounded
-  // messages-table growth. Bounded, indexed by to_id; runs on the same 30s tick.
-  const orphaned = db.run("DELETE FROM messages WHERE delivered = 0 AND to_id NOT IN (SELECT id FROM peers)");
-  if (orphaned.changes > 0) {
-    console.error(`[broker] orphan-mail sweep: removed ${orphaned.changes} undelivered message(s) with no live peer`);
+  // Per-mechanism crash isolation. The three mechanisms below (peer reap /
+  // orphan+delivered mail purge / log rotation) are independent — a throw in one
+  // must not abort the others on this tick, nor recur into starving them on every
+  // future tick. A poison row that makes liveAndFreshPeers throw would otherwise
+  // permanently disable the mail purge and log cap. Each stage catches its own
+  // throw and logs once-per-failure (the rate is bounded by the 30s tick).
+  // rotateBrokerLogIfLarge is already self-guarding (its own try/catch), so it is
+  // not re-wrapped here.
+  try {
+    liveAndFreshPeers(selectAllPeers.all() as Peer[]);
+  } catch (e) {
+    if (!reapStageWarned) {
+      reapStageWarned = true;
+      console.error(`[broker] peer-reap stage failed (sweep continues): ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
-  // Delivered-mail TTL: delivered=1 rows are only ever marked, never deleted, so
-  // they accumulate forever (unbounded DB growth). Purge delivered mail older than
-  // DELIVERED_MSG_TTL_MS — keeps a window of history for audit/debug, then drops it.
-  const cutoffIso = new Date(Date.now() - DELIVERED_MSG_TTL_MS).toISOString();
-  const purged = db.run("DELETE FROM messages WHERE delivered = 1 AND delivered_at IS NOT NULL AND delivered_at < ?", [cutoffIso]);
-  if (purged.changes > 0) {
-    console.error(`[broker] delivered-mail TTL: purged ${purged.changes} delivered message(s) older than ${DELIVERED_MSG_TTL_MS}ms`);
+  try {
+    // Orphan-mail backstop: delete undelivered messages whose target peer row no
+    // longer exists. liveAndFreshPeers cleans a peer's mail at the moment it
+    // reaps the ROW, but mail can outlive its peer by other paths (a re-register
+    // that assigned a new id and abandoned the old row, a crash between delete
+    // and cleanup). Without this sweep those rows live forever — unbounded
+    // messages-table growth. Bounded, indexed by to_id; runs on the same 30s tick.
+    const orphaned = db.run("DELETE FROM messages WHERE delivered = 0 AND to_id NOT IN (SELECT id FROM peers)");
+    if (orphaned.changes > 0) {
+      console.error(`[broker] orphan-mail sweep: removed ${orphaned.changes} undelivered message(s) with no live peer`);
+    }
+    // Delivered-mail TTL: delivered=1 rows are only ever marked, never deleted, so
+    // they accumulate forever (unbounded DB growth). Purge delivered mail older than
+    // DELIVERED_MSG_TTL_MS — keeps a window of history for audit/debug, then drops it.
+    const cutoffIso = new Date(Date.now() - DELIVERED_MSG_TTL_MS).toISOString();
+    const purged = db.run("DELETE FROM messages WHERE delivered = 1 AND delivered_at IS NOT NULL AND delivered_at < ?", [cutoffIso]);
+    if (purged.changes > 0) {
+      console.error(`[broker] delivered-mail TTL: purged ${purged.changes} delivered message(s) older than ${DELIVERED_MSG_TTL_MS}ms`);
+    }
+  } catch (e) {
+    if (!mailPurgeStageWarned) {
+      mailPurgeStageWarned = true;
+      console.error(`[broker] mail-purge stage failed (sweep continues): ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
   rotateBrokerLogIfLarge();
 }
+// Once-per-failure latches for the two sweep stages (mirrors brokerLogRotateWarned).
+// Bounded by the 30s tick; reset only on broker restart. Keeps a recurring poison
+// row from flooding the log every 30s while still surfacing the first occurrence.
+let reapStageWarned = false;
+let mailPurgeStageWarned = false;
 
 // Cap the broker's own log on the periodic tick (the register hook only rotates
 // at register time, so a flood with no new registrations grows it unbounded —
