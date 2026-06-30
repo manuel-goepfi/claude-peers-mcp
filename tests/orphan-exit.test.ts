@@ -171,9 +171,15 @@ describe("churn streak is WIRED into brokerFetch + the heartbeat timer (source-g
 
   test("heartbeat timer ORs the churn streak into the orphan-exit decision", () => {
     const body = src();
-    expect(body).toMatch(/shouldOrphanExit\(\s*firstUnrecoverable401At\s*,\s*Date\.now\(\)\s*,\s*ORPHAN_EXIT_GRACE_MS\s*\)\s*\|\|/);
-    expect(body).toMatch(/shouldOrphanExit\(\s*firstReregisterChurnAt\s*,\s*Date\.now\(\)\s*,\s*ORPHAN_EXIT_GRACE_MS\s*\)/);
-    expect(body).toMatch(/if\s*\(\s*!shuttingDown\s*&&/); // exit suppressed during shutdown (no mid-shutdown self-kill)
+    // Both streaks must feed shouldOrphanExit and be OR-combined into the exit; the
+    // timestamp arg is matched loosely (Date.now()/a hoisted now-var) so a cosmetic
+    // refactor doesn't false-fail, but the two distinct streak vars + the OR are the
+    // load-bearing wiring and stay strict.
+    expect(body).toMatch(/shouldOrphanExit\(\s*firstUnrecoverable401At\s*,\s*\w+(?:\.now\(\))?\s*,\s*ORPHAN_EXIT_GRACE_MS\s*\)/);
+    expect(body).toMatch(/shouldOrphanExit\(\s*firstReregisterChurnAt\s*,\s*\w+(?:\.now\(\))?\s*,\s*ORPHAN_EXIT_GRACE_MS\s*\)/);
+    // The two checks are OR-combined and gated on !shuttingDown (no mid-shutdown self-kill).
+    expect(body).toMatch(/unrecExpired\s*\|\|\s*churnExpired/);
+    expect(body).toMatch(/if\s*\(\s*!shuttingDown\s*&&/);
   });
 });
 

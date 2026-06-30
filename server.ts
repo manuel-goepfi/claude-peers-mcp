@@ -98,8 +98,8 @@ let shuttingDown = false;
 // Orphan self-reap. A genuinely orphaned server — its session re-spawned a NEW
 // MCP server, leaving THIS process running with a token the broker reclaimed —
 // 401s on every heartbeat forever and re-registers into rows that dedup
-// immediately reclaims, flooding the broker log (observed 2026-06-19: 21 ghosts →
-// 387k auth-fails / 24MB log). Such a server cannot recover and should exit.
+// immediately reclaims, flooding the broker log. Such a server cannot recover
+// and should exit.
 //
 // The decision is TIME-BASED, not count-based, on purpose. brokerFetch is driven
 // by THREE call streams at very different cadences — the 15s heartbeat, the 1s
@@ -131,10 +131,8 @@ export function shouldOrphanExit(streakStartedAt: number | null, now: number, gr
 // identity. A genuinely orphaned server (its seat reclaimed by a newer process)
 // 401s on every heartbeat, re-registers, briefly succeeds, gets reclaimed again,
 // and repeats forever — each cycle clearing firstUnrecoverable401At before the
-// grace window elapses, so the plain streak never fires. (Observed 2026-06-30: one
-// Codex session leaked 7 such server.ts orphans flooding 78k+ /heartbeat 401s; the
-// plain self-reap never exited them.) This streak tracks WHEN continuous
-// recovery-by-re-register churn began; a success that did NOT require a re-register
+// grace window elapses, so the plain streak never fires. This streak tracks WHEN
+// continuous recovery-by-re-register churn began; a success that did NOT require a re-register
 // this cycle clears it (proof of a stable seat), a success that DID require one does
 // not. shouldOrphanExit applies the same grace window to it.
 let firstReregisterChurnAt: number | null = null;
@@ -2261,12 +2259,16 @@ async function main() {
     //       streak (1) never catches this because each cycle's post-re-register
     //       retry SUCCEEDS and clears it; the churn streak (2) survives because it
     //       only clears on a no-recovery success. Same grace window for both.
-    if (!shuttingDown && (
-      shouldOrphanExit(firstUnrecoverable401At, Date.now(), ORPHAN_EXIT_GRACE_MS) ||
-      shouldOrphanExit(firstReregisterChurnAt, Date.now(), ORPHAN_EXIT_GRACE_MS)
-    )) {
-      const reason = firstUnrecoverable401At !== null ? "auth continuously rejected" : "auth churning (re-register loop; seat reclaimed)";
-      log(`orphaned: ${reason} for >=${ORPHAN_EXIT_GRACE_MS}ms (another MCP server owns this session) — exiting`);
+    const reapNow = Date.now();
+    const unrecExpired = shouldOrphanExit(firstUnrecoverable401At, reapNow, ORPHAN_EXIT_GRACE_MS);
+    const churnExpired = shouldOrphanExit(firstReregisterChurnAt, reapNow, ORPHAN_EXIT_GRACE_MS);
+    if (!shuttingDown && (unrecExpired || churnExpired)) {
+      // Name the streak(s) that actually crossed the grace window, not merely the
+      // one whose timer is set — both can be live at once and the diagnoses differ.
+      const causes = [];
+      if (unrecExpired) causes.push("auth continuously rejected");
+      if (churnExpired) causes.push("auth churning (re-register loop; seat reclaimed)");
+      log(`orphaned: ${causes.join(" + ")} for >=${ORPHAN_EXIT_GRACE_MS}ms (another MCP server owns this session) — exiting`);
       shuttingDown = true;
       process.exit(0);
     }
