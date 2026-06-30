@@ -233,11 +233,17 @@ async function brokerFetch<T>(path: string, body: unknown, _retry = false): Prom
   // Any successful broker call proves our auth is valid → clear the plain streak.
   firstUnrecoverable401At = null;
   // The churn streak is cleared ONLY by a success that did NOT come through the
-  // recovery path this call (_retry === false). A success on the post-re-register
-  // retry (_retry === true) is exactly the orphan-churn pattern — leave the streak
-  // running so the grace window can elapse and the heartbeat timer reaps us. A
-  // genuine healthy call (direct success, no 401, no recovery) clears it.
-  firstReregisterChurnAt = nextChurnStreak(firstReregisterChurnAt, _retry, true, Date.now());
+  // recovery path this call. Two kinds of success are recovery activity, NOT proof
+  // of a stable identity, and must NOT clear the streak:
+  //   (1) _retry === true   — the post-re-register retry of the original call.
+  //   (2) path === "/register" — the re-register call ITSELF (reregisterPeer's
+  //       brokerFetch("/register") runs with the default _retry=false, so without
+  //       this guard its success would clear the streak the enclosing recovery just
+  //       set — wiping it every cycle and defeating the reaper for the exact
+  //       recover-every-cycle orphan it exists to catch).
+  // Only a genuine healthy call (direct success, no 401, not a /register) clears it.
+  const successIsRecoveryActivity = _retry || path === "/register";
+  firstReregisterChurnAt = nextChurnStreak(firstReregisterChurnAt, successIsRecoveryActivity, true, Date.now());
   return res.json() as Promise<T>;
 }
 

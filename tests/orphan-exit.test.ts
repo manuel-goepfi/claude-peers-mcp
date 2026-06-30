@@ -21,6 +21,7 @@
  * user tool call never dies mid-request.
  */
 import { describe, test, expect } from "bun:test";
+import { readFileSync } from "node:fs";
 import { shouldOrphanExit, nextChurnStreak } from "../server.ts";
 
 const T0 = 1_000_000_000_000; // fixed base epoch (Date.now is banned in some harnesses; use literals)
@@ -137,5 +138,87 @@ describe("nextChurnStreak (re-register churn detection)", () => {
     streak = nextChurnStreak(streak, false, true, T0 + 15_000); // next heartbeat: DIRECT success
     expect(streak).toBe(null);                                // cleared — healthy again
     expect(shouldOrphanExit(streak, T0 + 999_999, GRACE)).toBe(false);
+  });
+});
+
+/**
+ * Churn-streak WIRING sentinels + the nested-/register regression.
+ *
+ * The pure nextChurnStreak tests above pass regardless of whether brokerFetch and
+ * the heartbeat timer actually CALL it correctly. brokerFetch closes over module
+ * state and can't be imported, so — per the repo's established source-grep sentinel
+ * pattern (client-detection.test.ts) — these assert the production wiring in
+ * server.ts source. A blind code-review (2026-06-30) found the original wiring was
+ * defeated: reregisterPeer's brokerFetch("/register") success (default _retry=false)
+ * cleared the very streak the enclosing recovery had just set, so the streak reset
+ * every cycle and the recover-every-cycle orphan was never reaped. The fix routes a
+ * /register success through the recovery branch (does NOT clear). These sentinels
+ * lock that wiring; dropping any one re-opens the defect with green unit tests.
+ */
+describe("churn streak is WIRED into brokerFetch + the heartbeat timer (source-grep sentinels)", () => {
+  const src = () => readFileSync(new URL("../server.ts", import.meta.url), "utf8");
+
+  test("recovery path STARTS the churn streak (recovered=true, succeeded=false)", () => {
+    expect(src()).toMatch(/firstReregisterChurnAt\s*=\s*nextChurnStreak\(\s*firstReregisterChurnAt\s*,\s*true\s*,\s*false\s*,\s*Date\.now\(\)\s*\)/);
+  });
+
+  test("success path treats _retry OR /register as recovery activity (the B1 fix)", () => {
+    // The load-bearing guard: a /register success must NOT clear the streak.
+    const body = src();
+    expect(body).toMatch(/successIsRecoveryActivity\s*=\s*_retry\s*\|\|\s*path\s*===\s*["']\/register["']/);
+    expect(body).toMatch(/firstReregisterChurnAt\s*=\s*nextChurnStreak\(\s*firstReregisterChurnAt\s*,\s*successIsRecoveryActivity\s*,\s*true\s*,\s*Date\.now\(\)\s*\)/);
+  });
+
+  test("heartbeat timer ORs the churn streak into the orphan-exit decision", () => {
+    const body = src();
+    expect(body).toMatch(/shouldOrphanExit\(\s*firstUnrecoverable401At\s*,\s*Date\.now\(\)\s*,\s*ORPHAN_EXIT_GRACE_MS\s*\)\s*\|\|/);
+    expect(body).toMatch(/shouldOrphanExit\(\s*firstReregisterChurnAt\s*,\s*Date\.now\(\)\s*,\s*ORPHAN_EXIT_GRACE_MS\s*\)/);
+    expect(body).toMatch(/if\s*\(\s*!shuttingDown\s*&&/); // exit suppressed during shutdown (no mid-shutdown self-kill)
+  });
+});
+
+/**
+ * Behavioral regression for the nested-/register defeat (B1). Models the EXACT
+ * sequence brokerFetch executes on each orphan cycle — recovery stamp → nested
+ * /register success → outer retry success — and asserts the streak's start time
+ * never moves, so a real orphan's grace window finally elapses. Goes RED if the
+ * /register success is allowed to clear the streak (the pre-fix behavior).
+ */
+describe("nextChurnStreak: nested /register success must NOT reset the churn window (B1)", () => {
+  // One orphan cycle as brokerFetch wires it. successIsRecoveryActivity = _retry || path==="/register".
+  function realOrphanCycle(streak: number | null, t: number): number | null {
+    streak = nextChurnStreak(streak, true, false, t);  // outer /heartbeat 401 → recovery stamp
+    // nested reregisterPeer → brokerFetch("/register"): _retry=false BUT path==="/register"
+    // → successIsRecoveryActivity = true (the B1 fix). Pre-fix this was `false` → cleared.
+    streak = nextChurnStreak(streak, true, true, t);   // /register success — recovery activity, KEEPS streak
+    streak = nextChurnStreak(streak, true, true, t);   // outer retry success (_retry=true), KEEPS streak
+    return streak;
+  }
+
+  test("streak start stays anchored across churn cycles (does not slide forward)", () => {
+    let streak: number | null = null;
+    let t = T0;
+    for (let c = 0; c < 25; c++) {
+      streak = realOrphanCycle(streak, t);
+      expect(streak).toBe(T0);   // anchored at the FIRST cycle — never reset by the /register success
+      t += 15_000;
+    }
+    // ~375s of churn → grace elapsed → orphan reaps. (Pre-fix: streak == latest t → never elapses.)
+    expect(shouldOrphanExit(streak, t, GRACE)).toBe(true);
+  });
+
+  test("VoV: the OLD clear-on-/register-success logic would NEVER reap (planted-error)", () => {
+    // Reproduce the pre-fix wiring: /register success passed recovered=false → cleared.
+    function brokenCycle(streak: number | null, t: number): number | null {
+      streak = nextChurnStreak(streak, true, false, t);
+      streak = nextChurnStreak(streak, false, true, t);  // BUG: /register success cleared it
+      streak = nextChurnStreak(streak, true, true, t);   // retry re-starts at t
+      return streak;
+    }
+    let streak: number | null = null;
+    let t = T0;
+    for (let c = 0; c < 50; c++) { streak = brokenCycle(streak, t); t += 15_000; }
+    // streak always == latest t → age ~0 → never reaps. Proves the fix is load-bearing.
+    expect(shouldOrphanExit(streak, t, GRACE)).toBe(false);
   });
 });
