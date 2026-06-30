@@ -21,7 +21,7 @@
  * user tool call never dies mid-request.
  */
 import { describe, test, expect } from "bun:test";
-import { shouldOrphanExit } from "../server.ts";
+import { shouldOrphanExit, nextChurnStreak } from "../server.ts";
 
 const T0 = 1_000_000_000_000; // fixed base epoch (Date.now is banned in some harnesses; use literals)
 const GRACE = 300_000;        // 5 min default
@@ -67,5 +67,75 @@ describe("shouldOrphanExit (time-based)", () => {
     // After any successful broker call brokerFetch sets firstUnrecoverable401At=null;
     // a later check must see no streak.
     expect(shouldOrphanExit(null, T0 + 999_999_999, GRACE)).toBe(false);
+  });
+});
+
+/**
+ * Re-register CHURN streak (nextChurnStreak) — the 2026-06-30 fix.
+ *
+ * The plain firstUnrecoverable401At streak is cleared by ANY success, including the
+ * SUCCESS on the post-re-register retry. A genuinely orphaned server 401s → recovers
+ * by re-registering into a fresh token → that retry SUCCEEDS (clearing the plain
+ * streak) → the new token is reclaimed → 401 again → loop forever, never reaching the
+ * grace window. (Observed live: one Codex session leaked 7 such orphans flooding 78k+
+ * /heartbeat 401s; the plain self-reap never fired.) The churn streak survives a
+ * post-recovery success and only clears on a NO-recovery success, so a real orphan's
+ * grace window finally elapses and the heartbeat timer reaps it.
+ */
+describe("nextChurnStreak (re-register churn detection)", () => {
+  test("first recovery STARTS the streak", () => {
+    // recovered=true, succeeded=false (the recovery branch stamps before the retry)
+    expect(nextChurnStreak(null, true, false, T0)).toBe(T0);
+  });
+
+  test("a direct (no-recovery) success CLEARS the streak", () => {
+    expect(nextChurnStreak(T0, false, true, T0 + 5_000)).toBe(null);
+    expect(nextChurnStreak(null, false, true, T0 + 5_000)).toBe(null);
+  });
+
+  test("THE FIX: a post-re-register success LEAVES the streak running (orphan-churn)", () => {
+    // This is the exact case the old code got wrong: it cleared on this success.
+    // recovered=true, succeeded=true → keep the ORIGINAL start time, do not reset.
+    expect(nextChurnStreak(T0, true, true, T0 + 15_000)).toBe(T0);
+  });
+
+  test("a continuing recovery keeps the ORIGINAL start (does not slide the window)", () => {
+    // Each subsequent 401-recovery must not reset the clock — else it never elapses.
+    expect(nextChurnStreak(T0, true, false, T0 + 30_000)).toBe(T0);
+    expect(nextChurnStreak(T0, true, true, T0 + 45_000)).toBe(T0);
+  });
+
+  test("a non-recovery, non-success (e.g. a non-401 error) leaves the streak as-is", () => {
+    expect(nextChurnStreak(T0, false, false, T0 + 1_000)).toBe(T0);
+    expect(nextChurnStreak(null, false, false, T0 + 1_000)).toBe(null);
+  });
+
+  test("END-TO-END orphan loop: streak survives N churn cycles and finally exits", () => {
+    // Simulate the real loop: 401→recover→success, repeated, each ~15s apart.
+    let streak: number | null = null;
+    let t = T0;
+    for (let cycle = 0; cycle < 25; cycle++) {       // 25 cycles × 15s = 375s > GRACE
+      streak = nextChurnStreak(streak, true, false, t);   // 401 triggers recovery
+      t += 100;
+      streak = nextChurnStreak(streak, true, true, t);    // post-re-register retry succeeds
+      t += 14_900;
+      // The OLD code cleared here → never exits. The fix keeps the streak.
+      expect(streak).toBe(T0);                            // start never moves
+    }
+    // After ~375s of churn the grace window has elapsed → orphan exits.
+    expect(shouldOrphanExit(streak, t, GRACE)).toBe(true);
+  });
+
+  test("REGRESSION GUARD: a transient blip that genuinely recovers does NOT trip it", () => {
+    // One 401 → recover → then HEALTHY direct successes (no more recovery). The
+    // churn streak must clear on the first no-recovery success so a real recovery
+    // is never mistaken for an orphan.
+    let streak: number | null = null;
+    streak = nextChurnStreak(streak, true, false, T0);        // blip: 401 recovery starts streak
+    streak = nextChurnStreak(streak, true, true, T0 + 50);    // recovery retry succeeds (streak still set)
+    expect(streak).toBe(T0);
+    streak = nextChurnStreak(streak, false, true, T0 + 15_000); // next heartbeat: DIRECT success
+    expect(streak).toBe(null);                                // cleared — healthy again
+    expect(shouldOrphanExit(streak, T0 + 999_999, GRACE)).toBe(false);
   });
 });

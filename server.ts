@@ -125,6 +125,33 @@ export function shouldOrphanExit(streakStartedAt: number | null, now: number, gr
   return now - streakStartedAt >= Math.max(60_000, graceMs);
 }
 
+// Re-register CHURN streak. The plain unrecoverable-401 streak above is cleared by
+// ANY successful broker call — but a "success" that only happened because the 401
+// recovery path RE-REGISTERED into a fresh id+token is NOT proof of a stable
+// identity. A genuinely orphaned server (its seat reclaimed by a newer process)
+// 401s on every heartbeat, re-registers, briefly succeeds, gets reclaimed again,
+// and repeats forever — each cycle clearing firstUnrecoverable401At before the
+// grace window elapses, so the plain streak never fires. (Observed 2026-06-30: one
+// Codex session leaked 7 such server.ts orphans flooding 78k+ /heartbeat 401s; the
+// plain self-reap never exited them.) This streak tracks WHEN continuous
+// recovery-by-re-register churn began; a success that did NOT require a re-register
+// this cycle clears it (proof of a stable seat), a success that DID require one does
+// not. shouldOrphanExit applies the same grace window to it.
+let firstReregisterChurnAt: number | null = null;
+
+// Pure state-transition for the churn streak (exported for unit testing). Mirrors
+// the brokerFetch logic so it can be tested without the module-scope closure:
+//   - a 401 that triggers recovery (recovered=true) STARTS the streak if not started
+//   - a direct success (recovered=false) CLEARS the streak (stable identity proven)
+//   - a post-re-register success (recovered=true) LEAVES the streak running (this is
+//     the orphan-churn pattern — keep counting toward the grace window)
+// `recovered` = "this call went through the 401→re-register recovery path".
+export function nextChurnStreak(prev: number | null, recovered: boolean, succeeded: boolean, now: number): number | null {
+  if (recovered) return prev ?? now;      // any recovery (start or continue) keeps/starts the streak
+  if (succeeded) return null;             // a clean, no-recovery success clears it
+  return prev;                            // a non-recovery failure (non-401) leaves it as-is
+}
+
 const PEER_ID_BODY_PATHS = new Set([
   "/heartbeat",
   "/set-summary",
@@ -172,6 +199,11 @@ async function brokerFetch<T>(path: string, body: unknown, _retry = false): Prom
     // 401 path context — the previous code threw the raw register error, which
     // looked unrelated to the call that triggered recovery.
     log(`Broker returned 401 on ${path} — re-registering`);
+    // Churn streak: a 401 that triggers recovery means our token was invalid. If
+    // this keeps happening, recovery-by-re-register is masking a reclaimed seat
+    // (orphan), so a later "success" must NOT be treated as a healthy heartbeat.
+    // Stamp the start of the churn streak here (first recovery), before the retry.
+    firstReregisterChurnAt = nextChurnStreak(firstReregisterChurnAt, true, false, Date.now());
     if (myId === attemptPeerId && !reregisterInFlight) {
       reregisterInFlight = (async () => {
         try { await reregisterPeer(); } finally { reregisterInFlight = null; }
@@ -198,8 +230,14 @@ async function brokerFetch<T>(path: string, body: unknown, _retry = false): Prom
     const err = await res.text();
     throw new Error(`Broker error (${path}): ${res.status} ${err}`);
   }
-  // Any successful broker call proves our auth is valid → clear the orphan streak.
+  // Any successful broker call proves our auth is valid → clear the plain streak.
   firstUnrecoverable401At = null;
+  // The churn streak is cleared ONLY by a success that did NOT come through the
+  // recovery path this call (_retry === false). A success on the post-re-register
+  // retry (_retry === true) is exactly the orphan-churn pattern — leave the streak
+  // running so the grace window can elapse and the heartbeat timer reaps us. A
+  // genuine healthy call (direct success, no 401, no recovery) clears it.
+  firstReregisterChurnAt = nextChurnStreak(firstReregisterChurnAt, _retry, true, Date.now());
   return res.json() as Promise<T>;
 }
 
@@ -2209,8 +2247,20 @@ async function main() {
     // been continuously broken past the grace window (set by brokerFetch on each
     // unrecoverable 401, cleared on any success), this server is orphaned and
     // exits cleanly. Time-based so the 1s poll cadence can't accelerate it.
-    if (!shuttingDown && shouldOrphanExit(firstUnrecoverable401At, Date.now(), ORPHAN_EXIT_GRACE_MS)) {
-      log(`orphaned: auth continuously rejected for >=${ORPHAN_EXIT_GRACE_MS}ms (our registration was reclaimed; another MCP server owns this session) — exiting`);
+    //
+    // TWO independent orphan signals, either sufficient:
+    //   (1) firstUnrecoverable401At — auth 401s the recovery path can't even fix.
+    //   (2) firstReregisterChurnAt — auth "recovers" every cycle via re-register
+    //       but immediately loses the new token again (reclaimed seat). The plain
+    //       streak (1) never catches this because each cycle's post-re-register
+    //       retry SUCCEEDS and clears it; the churn streak (2) survives because it
+    //       only clears on a no-recovery success. Same grace window for both.
+    if (!shuttingDown && (
+      shouldOrphanExit(firstUnrecoverable401At, Date.now(), ORPHAN_EXIT_GRACE_MS) ||
+      shouldOrphanExit(firstReregisterChurnAt, Date.now(), ORPHAN_EXIT_GRACE_MS)
+    )) {
+      const reason = firstUnrecoverable401At !== null ? "auth continuously rejected" : "auth churning (re-register loop; seat reclaimed)";
+      log(`orphaned: ${reason} for >=${ORPHAN_EXIT_GRACE_MS}ms (another MCP server owns this session) — exiting`);
       shuttingDown = true;
       process.exit(0);
     }
