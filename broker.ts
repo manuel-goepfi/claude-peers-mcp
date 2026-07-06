@@ -629,16 +629,23 @@ function mintBridgeToken(): string {
   return Buffer.from(buf).toString("base64url");
 }
 const BRIDGE_TOKEN = mintBridgeToken();
-try {
+
+function publishBridgeTokenFile(): void {
   // Atomic write: tmp + chmod + rename. Avoids partial-token race during read.
+  //
+  // Publish only after Bun.serve successfully binds below. A failed second broker
+  // start on the same port must not clobber the live broker's token file while the
+  // original process keeps its in-memory token.
   const tmp = `${BRIDGE_TOKEN_FILE}.tmp`;
-  writeFileSync(tmp, BRIDGE_TOKEN, { mode: 0o600 });
-  chmodSync(tmp, 0o600);  // belt-and-braces: writeFileSync mode is umask-affected
-  renameSync(tmp, BRIDGE_TOKEN_FILE);
-  console.error(`[broker] bridge token written to ${BRIDGE_TOKEN_FILE}`);
-} catch (e) {
-  console.error(`[broker] FATAL: cannot write bridge token to ${BRIDGE_TOKEN_FILE}:`, e);
-  process.exit(2);
+  try {
+    writeFileSync(tmp, BRIDGE_TOKEN, { mode: 0o600 });
+    chmodSync(tmp, 0o600);  // belt-and-braces: writeFileSync mode is umask-affected
+    renameSync(tmp, BRIDGE_TOKEN_FILE);
+    console.error(`[broker] bridge token written to ${BRIDGE_TOKEN_FILE}`);
+  } catch (e) {
+    console.error(`[broker] FATAL: cannot write bridge token to ${BRIDGE_TOKEN_FILE}:`, e);
+    process.exit(2);
+  }
 }
 
 // S3: verify the claimed PID is alive and owned by this broker's UID.
@@ -2033,4 +2040,5 @@ if (server.hostname !== "127.0.0.1") {
   process.exit(2);
 }
 
+publishBridgeTokenFile();
 console.error(`[claude-peers broker] listening on ${server.hostname}:${PORT} (db: ${DB_PATH}, uid: ${MY_UID})`);

@@ -204,4 +204,43 @@ describe("AP-063 token regeneration on restart", () => {
     try { unlinkSync(TEST_DB_2); } catch { /* ignore */ }
     try { unlinkSync(TEST_TOKEN_FILE_2); } catch { /* ignore */ }
   });
+
+  test("failed second broker start does not overwrite the live broker token file", async () => {
+    const TEST_DB_3 = "/tmp/claude-peers-test-ap063-collision.db";
+    const TEST_TOKEN_FILE_3 = "/tmp/.claude-peers-bridge-test-ap063-collision.token";
+    const PORT_3 = 7907;
+
+    if (existsSync(TEST_DB_3)) unlinkSync(TEST_DB_3);
+    if (existsSync(TEST_TOKEN_FILE_3)) unlinkSync(TEST_TOKEN_FILE_3);
+
+    let proc1: ReturnType<typeof Bun.spawn> | null = null;
+    let proc2: ReturnType<typeof Bun.spawn> | null = null;
+    try {
+      proc1 = Bun.spawn(["bun", BROKER_SCRIPT], {
+        env: { ...process.env, CLAUDE_PEERS_PORT: String(PORT_3), CLAUDE_PEERS_DB: TEST_DB_3, CLAUDE_PEERS_BRIDGE_TOKEN_FILE: TEST_TOKEN_FILE_3 },
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      await waitForHealth(`http://127.0.0.1:${PORT_3}`);
+      const token1 = readFileSync(TEST_TOKEN_FILE_3, "utf8").trim();
+
+      proc2 = Bun.spawn(["bun", BROKER_SCRIPT], {
+        env: { ...process.env, CLAUDE_PEERS_PORT: String(PORT_3), CLAUDE_PEERS_DB: TEST_DB_3, CLAUDE_PEERS_BRIDGE_TOKEN_FILE: TEST_TOKEN_FILE_3 },
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      const code = await Promise.race([
+        proc2.exited,
+        new Promise<number>((_, reject) => setTimeout(() => reject(new Error("second broker did not exit")), 3000)),
+      ]);
+
+      expect(code).not.toBe(0);
+      expect(readFileSync(TEST_TOKEN_FILE_3, "utf8").trim()).toBe(token1);
+    } finally {
+      try { proc2?.kill(); } catch { /* ignore */ }
+      try { proc1?.kill(); } catch { /* ignore */ }
+      try { unlinkSync(TEST_DB_3); } catch { /* ignore */ }
+      try { unlinkSync(TEST_TOKEN_FILE_3); } catch { /* ignore */ }
+    }
+  });
 });
