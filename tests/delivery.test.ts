@@ -687,10 +687,31 @@ describe("Live broker delivery features", () => {
     return { status: res.status, json };
   }
 
+  test("/health advertises the prompt-hook drain contract", async () => {
+    const res = await fetch(`${brokerUrl}/health`);
+    expect(res.status).toBe(200);
+    const body = await res.json() as {
+      version?: string;
+      capabilities?: {
+        hookDrain?: {
+          pollByPid?: boolean;
+          claimByPid?: boolean;
+          ackByPid?: boolean;
+          hookHeartbeatByPid?: boolean;
+        };
+      };
+    };
+    expect(body.version).toMatch(/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/);
+    expect(body.capabilities?.hookDrain?.pollByPid).toBe(true);
+    expect(body.capabilities?.hookDrain?.claimByPid).toBe(true);
+    expect(body.capabilities?.hookDrain?.ackByPid).toBe(true);
+    expect(body.capabilities?.hookDrain?.hookHeartbeatByPid).toBe(true);
+  });
+
   test("broker startup migrates an old peer/message schema", async () => {
     const dbPath = "/tmp/claude-peers-old-schema-migration.db";
     const tokenPath = "/tmp/claude-peers-old-schema-bridge.token";
-    const port = BROKER_PORT + 1;
+    const port = await findFreeBrokerPort();
     Bun.spawnSync(["rm", "-f", dbPath]);
     Bun.spawnSync(["rm", "-f", tokenPath]);
     const old = new Database(dbPath);
@@ -1157,6 +1178,198 @@ describe("Live broker delivery features", () => {
     child.kill();
   });
 
+  test("/hook-heartbeat-by-pid refreshes last_seen so exact-name routing stays live", async () => {
+    const childS = spawnSleep();
+    const childT = spawnSleep();
+    const sender = await brokerFetch<{ id: string }>("/register", {
+      pid: childS.pid, cwd: "/hook-live-s", git_root: null, tty: null, name: "hook-live-s",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
+    });
+    const target = await brokerFetch<{ id: string }>("/register", {
+      pid: childT.pid, cwd: "/hook-live-t", git_root: null, tty: null, name: "hook-live-target",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null,
+      client_type: "codex", receiver_mode: "manual-drain", summary: "",
+    });
+
+    const staleIso = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+    const rw = new Database(TEST_DB);
+    rw.run("UPDATE peers SET last_seen = ? WHERE id = ?", [staleIso, target.id]);
+    rw.close();
+
+    const hb = await rawPost("/hook-heartbeat-by-pid", {
+      pid: childT.pid,
+      caller_pid: process.pid,
+      status: "ok",
+      drained: 0,
+    });
+    expect(hb.status).toBe(200);
+
+    const send = await brokerFetch<{ ok: boolean; id?: number; code?: string; error?: string; target?: { id: string } }>("/send-to-peer", {
+      from_id: sender.id,
+      selector: { name: "hook-live-target" },
+      text: "hook liveness probe",
+    });
+    expect(send.ok).toBe(true);
+    expect(send.target?.id).toBe(target.id);
+
+    const ro = new Database(TEST_DB, { readonly: true });
+    const row = ro.query("SELECT last_seen FROM peers WHERE id = ?").get(target.id) as { last_seen: string };
+    ro.close();
+    expect(new Date(row.last_seen).getTime()).toBeGreaterThan(new Date(staleIso).getTime());
+    childS.kill();
+    childT.kill();
+  });
+
+  test("send_to_peer keeps stale but alive hook-backed Codex rows routable", async () => {
+    const childS = spawnSleep();
+    const childT = spawnSleep();
+    const sender = await brokerFetch<{ id: string }>("/register", {
+      pid: childS.pid, cwd: "/hook-idle-s", git_root: null, tty: null, name: "hook-idle-s",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
+    });
+    const target = await brokerFetch<{ id: string }>("/register", {
+      pid: childT.pid, cwd: "/hook-idle-t", git_root: null, tty: null, name: "hook-idle-target",
+      tmux_session: "pr", tmux_window_index: "1", tmux_window_name: "1", tmux_pane_id: "%125",
+      client_type: "codex", receiver_mode: "codex-hook", summary: "",
+    });
+    const hb = await rawPost("/hook-heartbeat-by-pid", {
+      pid: childT.pid,
+      caller_pid: process.pid,
+      status: "ok",
+      drained: 0,
+    });
+    expect(hb.status).toBe(200);
+    const staleIso = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+    const rw = new Database(TEST_DB);
+    rw.run("UPDATE peers SET last_seen = ?, last_hook_seen_at = ? WHERE id = ?", [staleIso, staleIso, target.id]);
+    rw.close();
+
+    const send = await brokerFetch<{ ok: boolean; id?: number; code?: string; error?: string; target?: { id: string; seat_key: string } }>("/send-to-peer", {
+      from_id: sender.id,
+      selector: { name: "hook-idle-target" },
+      text: "idle hook target should still route",
+    });
+
+    expect(send.ok).toBe(true);
+    expect(send.target?.id).toBe(target.id);
+    expect(send.target?.seat_key).toBe("pane:pr:%125");
+    childS.kill();
+    childT.kill();
+  });
+
+  test("send_to_peer rejects stale hook-backed Codex rows without a visible seat", async () => {
+    const childS = spawnSleep();
+    const childT = spawnSleep();
+    const sender = await brokerFetch<{ id: string }>("/register", {
+      pid: childS.pid, cwd: "/hook-headless-s", git_root: null, tty: null, name: "hook-headless-s",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
+    });
+    const target = await brokerFetch<{ id: string }>("/register", {
+      pid: childT.pid, cwd: "/hook-headless-t", git_root: null, tty: null, name: "hook-headless-target",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null, tmux_pane_id: null,
+      client_type: "codex", receiver_mode: "codex-hook", summary: "",
+    });
+    const hb = await rawPost("/hook-heartbeat-by-pid", {
+      pid: childT.pid,
+      caller_pid: process.pid,
+      status: "ok",
+      drained: 0,
+    });
+    expect(hb.status).toBe(200);
+    const staleIso = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+    const rw = new Database(TEST_DB);
+    rw.run("UPDATE peers SET last_seen = ?, last_hook_seen_at = ? WHERE id = ?", [staleIso, staleIso, target.id]);
+    rw.close();
+
+    const send = await brokerFetch<{ ok: boolean; code?: string; error?: string }>("/send-to-peer", {
+      from_id: sender.id,
+      selector: { name: "hook-headless-target" },
+      text: "headless stale hook target should not route",
+    });
+
+    expect(send.ok).toBe(false);
+    expect(send.code).toBe("PEER_NOT_FOUND");
+    childS.kill();
+    childT.kill();
+  });
+
+  test("send_to_peer keeps stale but alive hook-backed Gemini rows routable", async () => {
+    const childS = spawnSleep();
+    const childT = spawnSleep();
+    const sender = await brokerFetch<{ id: string }>("/register", {
+      pid: childS.pid, cwd: "/gemini-hook-idle-s", git_root: null, tty: null, name: "gemini-hook-idle-s",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
+    });
+    const target = await brokerFetch<{ id: string }>("/register", {
+      pid: childT.pid, cwd: "/gemini-hook-idle-t", git_root: null, tty: null, name: "gemini-hook-idle-target",
+      tmux_session: "gem", tmux_window_index: "1", tmux_window_name: "1", tmux_pane_id: "%225",
+      client_type: "gemini", receiver_mode: "gemini-hook", summary: "",
+    });
+    const hb = await rawPost("/hook-heartbeat-by-pid", {
+      pid: childT.pid,
+      caller_pid: process.pid,
+      client_type: "gemini",
+      receiver_mode: "gemini-hook",
+      status: "ok",
+      drained: 0,
+    });
+    expect(hb.status).toBe(200);
+    const staleIso = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+    const rw = new Database(TEST_DB);
+    rw.run("UPDATE peers SET last_seen = ?, last_hook_seen_at = ? WHERE id = ?", [staleIso, staleIso, target.id]);
+    rw.close();
+
+    const send = await brokerFetch<{ ok: boolean; target?: { id: string; seat_key: string } }>("/send-to-peer", {
+      from_id: sender.id,
+      selector: { name: "gemini-hook-idle-target" },
+      text: "idle gemini hook target should still route",
+    });
+
+    expect(send.ok).toBe(true);
+    expect(send.target?.id).toBe(target.id);
+    expect(send.target?.seat_key).toBe("pane:gem:%225");
+    childS.kill();
+    childT.kill();
+  });
+
+  test("send_to_peer rejects stale hook-backed Gemini rows without a visible seat", async () => {
+    const childS = spawnSleep();
+    const childT = spawnSleep();
+    const sender = await brokerFetch<{ id: string }>("/register", {
+      pid: childS.pid, cwd: "/gemini-hook-headless-s", git_root: null, tty: null, name: "gemini-hook-headless-s",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
+    });
+    const target = await brokerFetch<{ id: string }>("/register", {
+      pid: childT.pid, cwd: "/gemini-hook-headless-t", git_root: null, tty: null, name: "gemini-hook-headless-target",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null, tmux_pane_id: null,
+      client_type: "gemini", receiver_mode: "gemini-hook", summary: "",
+    });
+    const hb = await rawPost("/hook-heartbeat-by-pid", {
+      pid: childT.pid,
+      caller_pid: process.pid,
+      client_type: "gemini",
+      receiver_mode: "gemini-hook",
+      status: "ok",
+      drained: 0,
+    });
+    expect(hb.status).toBe(200);
+    const staleIso = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+    const rw = new Database(TEST_DB);
+    rw.run("UPDATE peers SET last_seen = ?, last_hook_seen_at = ? WHERE id = ?", [staleIso, staleIso, target.id]);
+    rw.close();
+
+    const send = await brokerFetch<{ ok: boolean; code?: string }>("/send-to-peer", {
+      from_id: sender.id,
+      selector: { name: "gemini-hook-headless-target" },
+      text: "headless stale gemini hook target should not route",
+    });
+
+    expect(send.ok).toBe(false);
+    expect(send.code).toBe("PEER_NOT_FOUND");
+    childS.kill();
+    childT.kill();
+  });
+
   test("/hook-heartbeat-by-pid promotes Gemini peer to gemini-hook mode", async () => {
     const child = spawnSleep();
     const peer = await brokerFetch<{ id: string }>("/register", {
@@ -1255,6 +1468,57 @@ describe("Live broker delivery features", () => {
     expect(second.receiver_mode).toBe("manual-drain");
     const poll = await brokerFetch<{ messages: { text: string }[] }>("/poll-messages", { id: first.id });
     expect(poll.messages.map((m) => m.text)).toContain("survives unknown same-pid register");
+    child.kill();
+  });
+
+  test("/register: same-PID metadata enrichment preserves peer id", async () => {
+    const child = spawnSleep();
+    const first = await brokerFetch<{ id: string; token: string }>("/register", {
+      pid: child.pid, cwd: "/same-pid-enrichment", git_root: "/same-pid-enrichment", absolute_git_dir: null,
+      tty: "/dev/pts/27", name: "same-pid-enrichment", tmux_session: "enrich", tmux_window_index: "0",
+      tmux_window_name: null, client_type: "codex", receiver_mode: "manual-drain", summary: "old metadata",
+    });
+    await brokerFetch("/send-message", {
+      from_id: first.id,
+      to_id: first.id,
+      text: "survives same-pid metadata enrichment",
+    });
+    const second = await brokerFetch<{ id: string; token: string }>("/register", {
+      pid: child.pid, cwd: "/same-pid-enrichment", git_root: "/same-pid-enrichment", absolute_git_dir: "/same-pid-enrichment/.git",
+      tty: "pts/27", name: "same-pid-enrichment", tmux_session: "enrich", tmux_window_index: "1",
+      tmux_window_name: "node", tmux_pane_id: "%125", client_type: "codex", receiver_mode: "codex-hook",
+      preserve_token: true, summary: "enriched metadata",
+    });
+
+    expect(second.id).toBe(first.id);
+    expect(second.token).toBe(first.token);
+    const poll = await brokerFetch<{ messages: { text: string }[] }>("/poll-messages", { id: first.id });
+    expect(poll.messages.map((m) => m.text)).toContain("survives same-pid metadata enrichment");
+    child.kill();
+  });
+
+  test("/register: same-PID sparse refresh preserves known stable metadata", async () => {
+    const child = spawnSleep();
+    const first = await brokerFetch<{ id: string }>("/register", {
+      pid: child.pid, cwd: "/same-pid-sparse-refresh", git_root: "/same-pid-sparse-refresh", absolute_git_dir: "/same-pid-sparse-refresh/.git",
+      tty: "pts/27", name: "same-pid-sparse-refresh", tmux_session: "sparse", tmux_window_index: "0",
+      tmux_window_name: "codex", client_type: "codex", receiver_mode: "manual-drain", summary: "rich metadata",
+    });
+    const second = await brokerFetch<{ id: string }>("/register", {
+      pid: child.pid, cwd: "/same-pid-sparse-refresh", git_root: null, absolute_git_dir: null,
+      tty: null, name: "same-pid-sparse-refresh", tmux_session: "sparse", tmux_window_index: "0",
+      tmux_window_name: "codex", client_type: "codex", receiver_mode: "manual-drain", summary: "sparse metadata",
+    });
+
+    expect(second.id).toBe(first.id);
+    const peers = await brokerFetch<Array<{ id: string; git_root: string | null; absolute_git_dir: string | null; tty: string | null }>>(
+      "/list-peers",
+      { id: first.id, scope: "machine", cwd: "/", git_root: null, include_inactive: true }
+    );
+    const row = peers.find((p) => p.id === first.id)!;
+    expect(row.git_root).toBe("/same-pid-sparse-refresh");
+    expect(row.absolute_git_dir).toBe("/same-pid-sparse-refresh/.git");
+    expect(row.tty).toBe("pts/27");
     child.kill();
   });
 

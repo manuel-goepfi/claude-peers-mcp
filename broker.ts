@@ -79,6 +79,21 @@ const MAX_BROADCAST_TARGETS = RATE_MAX_MSGS; // hard cap = 60 — ties fanout to
 const CLAIM_TTL_MS = 30_000;
 const CLAIM_MAX_MESSAGES = 25;
 const CLAIM_MAX_BYTES = 64 * 1024;
+const BROKER_VERSION = "0.1.0";
+const BROKER_CAPABILITIES = {
+  hookDrain: {
+    pollByPid: true,
+    claimByPid: true,
+    ackByPid: true,
+    hookHeartbeatByPid: true,
+  },
+  bridge: {
+    messagesSinceId: true,
+  },
+  delivery: {
+    sendToPeer: true,
+  },
+} as const;
 
 // --- S7: ghost reaping ---
 // PEER_GHOST_AFTER_MS now imported from ./shared/reaper.ts (#7 narrow).
@@ -426,7 +441,8 @@ const updateHeartbeatSeen = db.prepare(`
 
 const updateReceiverHealth = db.prepare(`
   UPDATE peers
-  SET client_type = ?,
+  SET last_seen = ?,
+      client_type = ?,
       receiver_mode = ?,
       last_hook_seen_at = ?,
       last_drain_at = COALESCE(?, last_drain_at),
@@ -845,6 +861,24 @@ function hookMetadata(peerId: string, body: { client_type?: ClientType; receiver
   return { clientType: "unknown", receiverMode: validReceiverMode(current?.receiver_mode, "unknown") };
 }
 
+function nullableStableValueCompatible(existingValue: string | null | undefined, incomingValue: string | null | undefined): boolean {
+  const existing = existingValue ?? null;
+  const incoming = incomingValue ?? null;
+  return existing === incoming || existing === null || incoming === null;
+}
+
+function normalizedTtyForIdentity(value: string | null | undefined): string | null {
+  const trimmed = value?.trim();
+  if (!trimmed) return null;
+  return trimmed.replace(/^\/dev\//, "");
+}
+
+function ttyCompatibleForSamePid(existingValue: string | null | undefined, incomingValue: string | null | undefined): boolean {
+  const existing = normalizedTtyForIdentity(existingValue);
+  const incoming = normalizedTtyForIdentity(incomingValue);
+  return existing === incoming || existing === null || incoming === null;
+}
+
 function claimCutoffIso(nowMs = Date.now()): string {
   return new Date(nowMs - CLAIM_TTL_MS).toISOString();
 }
@@ -1021,20 +1055,23 @@ function handleRegister(body: RegisterRequest): RegisterResult {
   // Same-pid refresh: a live peer re-registering (e.g. 401 recovery after a
   // broker restart) must KEEP its broker id so mail addressed to that id still
   // resolves. The gate is the STABLE identity of the process: pid (already
-  // matched by the `existing`-by-pid lookup), cwd, git_root, absolute_git_dir,
-  // tty. The tmux LOCATION fields (session/window/pane_id) are deliberately NOT
-  // in the gate — a pid is one process is one peer regardless of which pane it
-  // is currently displayed in, and a bg lane's pane_id is unstable (null until
-  // resolved, then a real %id; can shift on re-attach). Gating on pane_id made a
-  // bg lane get a fresh generateId() on re-register, whose dedup-delete then
-  // wiped the old id's undelivered mail (the "re-registration race" that forced
-  // a manual nudge). The location fields still UPDATE on the refresh (the UPDATE
-  // path binds the new tmux_* values) — they just no longer break id stability.
+  // matched by the `existing`-by-pid lookup), cwd, compatible git metadata, and
+  // compatible tty metadata. Older rows may lack absolute_git_dir and different
+  // clients report the same tty as either /dev/pts/N or pts/N; those enrichment
+  // differences must not mint a fresh id for the same live process. The tmux
+  // LOCATION fields (session/window/pane_id) are deliberately NOT in the gate —
+  // a pid is one process is one peer regardless of which pane it is currently
+  // displayed in, and a bg lane's pane_id is unstable (null until resolved, then
+  // a real %id; can shift on re-attach). Gating on pane_id made a bg lane get a
+  // fresh generateId() on re-register, whose dedup-delete then wiped the old id's
+  // undelivered mail (the "re-registration race" that forced a manual nudge).
+  // The location fields still UPDATE on the refresh (the UPDATE path binds the
+  // new tmux_* values) — they just no longer break id stability.
   const samePidRefresh = Boolean(existing && inheritedId === null &&
     existing.cwd === body.cwd &&
-    existing.git_root === body.git_root &&
-    existing.absolute_git_dir === (body.absolute_git_dir ?? null) &&
-    existing.tty === body.tty &&
+    nullableStableValueCompatible(existing.git_root, body.git_root) &&
+    nullableStableValueCompatible(existing.absolute_git_dir, body.absolute_git_dir ?? null) &&
+    ttyCompatibleForSamePid(existing.tty, body.tty) &&
     (requestedClientType === "unknown" || existingClientType === "unknown" || existingClientType === clientType));
   const id = inheritedId ?? (samePidRefresh ? existing!.id : null) ?? generateId();
 
@@ -1064,6 +1101,10 @@ function handleRegister(body: RegisterRequest): RegisterResult {
   // on a not-yet-summarized session.
   const ttyValue = body.tty ?? null;
   const summaryValue = body.summary ?? "";
+  const preserveKnownSamePidMetadata = samePidRefresh && existing?.id === id;
+  const gitRootValue = preserveKnownSamePidMetadata ? (body.git_root ?? existing.git_root) : body.git_root;
+  const absoluteGitDirValue = preserveKnownSamePidMetadata ? (body.absolute_git_dir ?? existing.absolute_git_dir) : (body.absolute_git_dir ?? null);
+  const ttyWriteValue = preserveKnownSamePidMetadata ? (ttyValue ?? existing.tty) : ttyValue;
   // ENC-08 (no silent failure): a DB write that throws here would otherwise
   // fall through to the route-level generic 500 ("internal error") with no
   // signal to the registering peer about WHY it failed — which is exactly how
@@ -1090,9 +1131,9 @@ function handleRegister(body: RegisterRequest): RegisterResult {
         db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [existing.id]);
       }
       if (existing?.id === id) {
-        updatePeerRegistration.run(body.pid, body.cwd, body.git_root, body.absolute_git_dir ?? null, ttyValue, requestedName, finalName, body.tmux_session ?? null, body.tmux_window_index ?? null, body.tmux_window_name ?? null, body.tmux_pane_id ?? null, clientType, receiverMode, summaryValue, now, issuedToken, id);
+        updatePeerRegistration.run(body.pid, body.cwd, gitRootValue, absoluteGitDirValue, ttyWriteValue, requestedName, finalName, body.tmux_session ?? null, body.tmux_window_index ?? null, body.tmux_window_name ?? null, body.tmux_pane_id ?? null, clientType, receiverMode, summaryValue, now, issuedToken, id);
       } else {
-        insertPeer.run(id, body.pid, body.cwd, body.git_root, body.absolute_git_dir ?? null, ttyValue, requestedName, finalName, body.tmux_session ?? null, body.tmux_window_index ?? null, body.tmux_window_name ?? null, body.tmux_pane_id ?? null, clientType, receiverMode, summaryValue, now, now, issuedToken);
+        insertPeer.run(id, body.pid, body.cwd, gitRootValue, absoluteGitDirValue, ttyWriteValue, requestedName, finalName, body.tmux_session ?? null, body.tmux_window_index ?? null, body.tmux_window_name ?? null, body.tmux_pane_id ?? null, clientType, receiverMode, summaryValue, now, now, issuedToken);
       }
     })();
     if (existing && existing.id !== id) {
@@ -1232,6 +1273,25 @@ function activePeerKey(peer: Peer): string {
   return `id:${peer.id}`;
 }
 
+function isHookBackedClientPeer(peer: Pick<Peer, "client_type" | "receiver_mode" | "tty" | "tmux_session" | "tmux_pane_id">): boolean {
+  const hasVisibleSeat = !!peer.tty || !!(peer.tmux_session && peer.tmux_pane_id);
+  if (!hasVisibleSeat) return false;
+  return (
+    (peer.client_type === "codex" && peer.receiver_mode === "codex-hook") ||
+    (peer.client_type === "gemini" && peer.receiver_mode === "gemini-hook")
+  );
+}
+
+function peerIsReapable(peer: Peer, now: number): boolean {
+  // For hook-backed Codex/Gemini rows, `pid` is the visible client process,
+  // not a long-running MCP server. An idle lane may not heartbeat until its next
+  // prompt hook, but if the client PID is still alive it can receive queued mail
+  // on the next hook/autodrain nudge. Keep visible rows routable by PID
+  // liveness, but still reap headless/app-server-shaped rows on stale last_seen.
+  if (isHookBackedClientPeer(peer) && isPidAlive(peer.pid)) return false;
+  return isReapable(peer, isPidAlive, now, PEER_GHOST_AFTER_MS);
+}
+
 // Single source of truth for "is this peer reapable, and if so, what cleanup
 // fires?" Called by handleListPeers and handleBroadcast (per-request hot
 // path) and by cleanStalePeers (periodic sweep). Two reap conditions, either
@@ -1246,7 +1306,7 @@ function activePeerKey(peer: Peer): string {
 // handlers now do one extra DELETE per reaped peer they encounter. Reaps
 // are rare; cost is microseconds.
 function shouldPermanentlyReapPeer(peer: Peer, now: number): boolean {
-  if (!isReapable(peer, isPidAlive, now, PEER_GHOST_AFTER_MS)) return false;
+  if (!peerIsReapable(peer, now)) return false;
   const dead = !isPidAlive(peer.pid);
   const lastSeenMs = new Date(peer.last_seen).getTime();
   const ageMs = Number.isNaN(lastSeenMs) ? Infinity : now - lastSeenMs;
@@ -1261,7 +1321,7 @@ const countUndelivered = db.prepare(
 function liveAndFreshPeers(peers: Peer[]): Peer[] {
   const now = Date.now();
   return peers.filter((p) => {
-    if (isReapable(p, isPidAlive, now, PEER_GHOST_AFTER_MS)) {
+    if (peerIsReapable(p, now)) {
       if (!shouldPermanentlyReapPeer(p, now)) return false;
       // Decouple mail-reap from row-reap: a DEAD seat that still holds
       // undelivered mail is a RECOVERABLE INBOX, not garbage. The rehydrate
@@ -1298,7 +1358,7 @@ function liveAndFreshPeers(peers: Peer[]): Peer[] {
 
 function livePeersForResolution(peers: Peer[]): Peer[] {
   const now = Date.now();
-  return peers.filter((p) => !isReapable(p, isPidAlive, now, PEER_GHOST_AFTER_MS));
+  return peers.filter((p) => !peerIsReapable(p, now));
 }
 
 function activeOnly(peers: Peer[]): Peer[] {
@@ -1675,6 +1735,7 @@ function handleHookHeartbeatByPid(body: HookHeartbeatByPidRequest): { ok: boolea
   const status = body.status === "error" ? "error" : "ok";
   const { clientType, receiverMode } = hookMetadata(auth.id, body);
   updateReceiverHealth.run(
+    now,
     clientType,
     receiverMode,
     now,
@@ -1722,7 +1783,7 @@ function handleClaimByPid(body: ClaimByPidRequest): ClaimByPidResponse {
     }
   })();
 
-  updateReceiverHealth.run(clientType, receiverMode, now, null, null, auth.id);
+  updateReceiverHealth.run(now, clientType, receiverMode, now, null, null, auth.id);
   return { ok: true, peer_id: auth.id, drain_id: drainId, messages: claimedMessages };
 }
 
@@ -1754,7 +1815,7 @@ function handleAckByPid(body: AckByPidRequest): { ok: boolean; peer_id?: string;
   const drainError = ids.length > 0 && acked !== ids.length
     ? `ack mismatch: requested ${ids.length}, acked ${acked}`
     : null;
-  updateReceiverHealth.run(clientType, receiverMode, nowIso, acked > 0 ? nowIso : null, drainError, auth.id);
+  updateReceiverHealth.run(nowIso, clientType, receiverMode, nowIso, acked > 0 ? nowIso : null, drainError, auth.id);
   return { ok: true, peer_id: auth.id, acked };
 }
 
@@ -1821,7 +1882,12 @@ const server = Bun.serve({
 
     if (req.method !== "POST") {
       if (path === "/health") {
-        return Response.json({ status: "ok", peers: (selectAllPeers.all() as Peer[]).length });
+        return Response.json({
+          status: "ok",
+          peers: (selectAllPeers.all() as Peer[]).length,
+          version: BROKER_VERSION,
+          capabilities: BROKER_CAPABILITIES,
+        });
       }
       // AP-063: bridge cursor read. Bridge daemon polls this every 2s.
       if (path === "/messages-since-id") {

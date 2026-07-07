@@ -40,7 +40,13 @@ import type {
   PeerTarget,
   TmuxPaneSnapshot,
 } from "./shared/types.ts";
-import { detectClientFromProcessChain, findBgSpareAncestor, findClientPidFromProcessChain, initialReceiverMode, type ProcessInfo } from "./shared/client.ts";
+import { detectClientFromProcessChain, findBgSpareAncestor, findClientPidFromProcessChain, initialReceiverMode, isClientProcess, isCodexAppServerProcess, type ProcessInfo } from "./shared/client.ts";
+import { findNearestVisibleCodexProcessByStart, findSingleVisibleCodexProcess } from "./shared/visible-codex.ts";
+import {
+  brokerIdentityPaneTarget as sharedBrokerIdentityPaneTarget,
+  publishBrokerIdentityToTmux as sharedPublishBrokerIdentityToTmux,
+  type TmuxMirrorResult,
+} from "./shared/tmux-identity.ts";
 import { frameUntrusted, renderInboundLine } from "./shared/render.ts";
 export { frameUntrusted, renderInboundLine } from "./shared/render.ts";
 import { parseTmuxPanes, composeTmuxFromEnv, prepareTmuxPaneText, tmuxPaneTarget, bgSessionIdFromPtyHostArgs, resolveBgAttachPane, type TmuxPaneInfo } from "./shared/tmux.ts";
@@ -76,6 +82,8 @@ export function shouldRedetectTmux(tick: number, jitter: number, every: number):
 const BROKER_SCRIPT = new URL("./broker.ts", import.meta.url).pathname;
 const BROKER_LOG = `${process.env.HOME}/.claude-peers-broker.log`;
 const BROKER_LOG_MAX_BYTES = 10 * 1024 * 1024; // 10MB
+const BROKER_SYSTEMD_UNIT_PATH = `${process.env.HOME}/.config/systemd/user/claude-peers-broker.service`;
+const SYSTEMD_START_TIMEOUT_SECONDS = "3";
 const TMUX_CAPTURE_DEFAULT_LINES = 80;
 const TMUX_CAPTURE_MAX_LINES = 200;
 const TMUX_CAPTURE_MAX_BYTES = 8 * 1024;
@@ -299,10 +307,37 @@ function rotateBrokerLogIfLarge(): void {
   }
 }
 
+function startBrokerViaSystemd(): boolean {
+  if (!existsSync(BROKER_SYSTEMD_UNIT_PATH)) return false;
+  try {
+    const proc = Bun.spawnSync(["timeout", SYSTEMD_START_TIMEOUT_SECONDS, "systemctl", "--user", "start", "claude-peers-broker.service"], {
+      stdout: "ignore",
+      stderr: "pipe",
+    });
+    if (proc.exitCode === 0) return true;
+    const stderr = new TextDecoder().decode(proc.stderr).trim();
+    log(`systemd broker start failed; falling back to direct spawn${stderr ? `: ${stderr}` : ""}`);
+  } catch (e) {
+    log(`systemd broker start failed; falling back to direct spawn: ${errMsg(e)}`);
+  }
+  return false;
+}
+
 async function ensureBroker(): Promise<void> {
   if (await isBrokerAlive()) {
     log("Broker already running");
     return;
+  }
+
+  if (startBrokerViaSystemd()) {
+    for (let i = 0; i < 30; i++) {
+      await new Promise((r) => setTimeout(r, 200));
+      if (await isBrokerAlive()) {
+        log("Broker started via systemd");
+        return;
+      }
+    }
+    log("systemd broker start did not become healthy; falling back to direct spawn");
   }
 
   rotateBrokerLogIfLarge();
@@ -434,6 +469,58 @@ function cwdOf(pid: number): string | null {
   }
 }
 
+function environOf(pid: number): Record<string, string | undefined> {
+  try {
+    const text = readFileSync(`/proc/${pid}/environ`, "utf8");
+    const env: Record<string, string | undefined> = {};
+    for (const entry of text.split("\0")) {
+      const idx = entry.indexOf("=");
+      if (idx <= 0) continue;
+      env[entry.slice(0, idx)] = entry.slice(idx + 1);
+    }
+    return env;
+  } catch {
+    return {};
+  }
+}
+
+export interface VisibleCodexSession {
+  pid: number;
+  cwd: string;
+  tty: string;
+  env: Record<string, string | undefined>;
+}
+
+export interface VisibleCodexSessionReaders {
+  getTty?: (pid: number) => string | null;
+  cwdOf?: (pid: number) => string | null;
+  environOf?: (pid: number) => Record<string, string | undefined>;
+}
+
+export function findVisibleCodexSession(
+  processes: Map<number, ProcessInfo>,
+  cwdHint: string,
+  readers: VisibleCodexSessionReaders = {},
+): VisibleCodexSession | null {
+  return findSingleVisibleCodexProcess(processes, cwdHint, {
+    getTty: readers.getTty ?? getTty,
+    cwdOf: readers.cwdOf ?? cwdOf,
+    environOf: readers.environOf ?? environOf,
+  });
+}
+
+export function findCodexAppServerAncestor(startPid: number, processes: Map<number, ProcessInfo>): ProcessInfo | null {
+  let current = startPid;
+  for (let i = 0; i < 30; i++) {
+    const row = processes.get(current);
+    if (!row) return null;
+    if (isCodexAppServerProcess(row)) return row;
+    if (row.ppid <= 1 || row.ppid === row.pid) return null;
+    current = row.ppid;
+  }
+  return null;
+}
+
 export interface RegistrationCwdResult {
   cwd: string;
   source: "process" | "client" | "process-fallback";
@@ -489,15 +576,11 @@ function processTable(): Map<number, ProcessInfo> {
   return result;
 }
 
-function detectClientType(): ClientType {
-  return detectClientFromProcessChain(process.ppid, processTable(), process.env);
-}
-
 // --- F2: Process-ancestry tmux detection ---
 // Pure parsing helpers live in shared/tmux.ts so tests can import them without
 // triggering this file's top-level main() side effects.
 
-async function detectTmuxPane(): Promise<TmuxPaneInfo | null> {
+async function detectTmuxPane(startPid = process.ppid): Promise<TmuxPaneInfo | null> {
   try {
     // 1. Get all tmux panes with their pane_pid.
     // Tab delimiter so session and window names with spaces parse correctly.
@@ -527,7 +610,7 @@ async function detectTmuxPane(): Promise<TmuxPaneInfo | null> {
 
     // 3. Walk upward from process.ppid (the MCP server itself is never a tmux
     //    pane; its parent or further ancestor will be).
-    let currentPid = process.ppid;
+    let currentPid = startPid;
     for (let i = 0; i < 20; i++) {
       if (paneMap.has(currentPid)) {
         return paneMap.get(currentPid)!;
@@ -549,7 +632,7 @@ async function detectTmuxPane(): Promise<TmuxPaneInfo | null> {
     //    (bgSessionIdFromPtyHostArgs returns null otherwise), so interactive
     //    and non-attached sessions are unaffected. Reuses the step-2 snapshot.
     let bgId: string | null = null;
-    let walk: number | undefined = process.ppid;
+    let walk: number | undefined = startPid;
     for (let i = 0; i < 20 && walk !== undefined; i++) {
       const info = procs.get(walk);
       if (info) {
@@ -681,6 +764,45 @@ async function ackAndDedup(ids: number[], context: string): Promise<void> {
   for (const id of ids) confirmedDeliveredIds.add(id);
 }
 
+interface PollByPidResponse {
+  peer_id?: string;
+  messages?: Message[];
+  acked?: number;
+}
+
+function resolveVisibleCodexPidForManualCheck(): number | null {
+  if (myClientType !== "codex" || myRegisterPid !== process.pid) return null;
+  const table = processTable();
+  const appServer = findCodexAppServerAncestor(process.ppid, table);
+  if (!appServer) return null;
+  const visibleCwdHint = cwdOf(appServer.pid);
+  if (!visibleCwdHint) return null;
+  const visible = findNearestVisibleCodexProcessByStart(table, visibleCwdHint, process.pid, {
+    getTty,
+    cwdOf,
+    environOf,
+  });
+  return visible?.pid ?? null;
+}
+
+async function drainVisibleCodexPidForManualCheck(): Promise<Message[]> {
+  const visiblePid = resolveVisibleCodexPidForManualCheck();
+  if (!visiblePid) return [];
+  try {
+    const result = await brokerFetch<PollByPidResponse>("/poll-by-pid", {
+      pid: visiblePid,
+      caller_pid: process.pid,
+    });
+    if ((result.messages?.length ?? 0) > 0) {
+      log(`check_messages: drained ${result.messages!.length} message(s) via visible Codex pid=${visiblePid}`);
+    }
+    return result.messages ?? [];
+  } catch (e) {
+    log(`check_messages: visible Codex pid fallback failed — ${errMsg(e)}`);
+    return [];
+  }
+}
+
 /**
  * #11 (2026-05-14): Resolve the peer name from the launch environment.
  *
@@ -763,6 +885,33 @@ function runTmux(args: string[]): string | null {
   }
 }
 
+async function runTmuxTimed(args: string[], timeoutMs: number): Promise<string | null> {
+  try {
+    const proc = Bun.spawn(["tmux", ...args], { stdout: "pipe", stderr: "ignore" });
+    void proc.exited.catch(() => {});
+    let timeout: ReturnType<typeof setTimeout> | null = null;
+    const completed = Promise.all([
+      proc.exited,
+      proc.stdout ? new Response(proc.stdout).text() : Promise.resolve(""),
+    ]).then(([code, stdout]) => code === 0 ? stdout.trim() : null);
+    const timedOut = new Promise<null>((resolve) => {
+      timeout = setTimeout(() => {
+        try {
+          proc.kill("SIGTERM");
+        } catch {
+          // Process may have already exited.
+        }
+        resolve(null);
+      }, timeoutMs);
+    });
+    const result = await Promise.race([completed, timedOut]);
+    if (timeout) clearTimeout(timeout);
+    return result;
+  } catch {
+    return null;
+  }
+}
+
 function readTmuxPaneOption(target: string, optionName: string): string | null {
   return cleanTmuxOptionValue(runTmux(["show-options", "-p", "-t", target, "-v", optionName]));
 }
@@ -802,12 +951,57 @@ function resolveTmuxTargetSelector(value: string | null | undefined): { tmux_ses
   return { tmux_session, tmux_pane_id };
 }
 
-type TmuxMirrorResult = { ok: boolean; target: string | null; failedOptions: string[] };
+export function tmuxOnlyPeerHintFromList(
+  selector: (Pick<PeerSelector, "name" | "resolved_name" | "tmux_session" | "tmux_pane_id"> & { name_like?: string }) | undefined,
+  paneList: string | null,
+): string {
+  const wantedName = selector?.name ?? selector?.resolved_name ?? null;
+  const wantedNameLike = selector?.name_like?.toLowerCase() ?? null;
+  const wantedSession = selector?.tmux_session ?? null;
+  const wantedPaneId = selector?.tmux_pane_id ?? null;
+  if (!wantedName && !wantedNameLike && !wantedSession && !wantedPaneId) return "";
+  if (!paneList) return "";
+
+  const cleanHintValue = (value: string): string =>
+    value.replace(/[\x00-\x1F\x7F]/g, " ").replace(/\s+/g, " ").trim().slice(0, 80);
+
+  const matches = paneList.trim().split("\n")
+    .map((line) => line.split("\t"))
+    .filter((parts) => parts.length >= 7)
+    .filter(([session, windowIndex, paneIndex, paneId, operatorLabel]) => {
+      const sessionMatches = !wantedSession || session === wantedSession;
+      if (wantedPaneId && paneId === wantedPaneId && sessionMatches) return true;
+      if (wantedName && sessionMatches && operatorLabel === wantedName) return true;
+      if (wantedName && sessionMatches && `${session}.${paneIndex}` === wantedName) return true;
+      if (wantedName && sessionMatches && `${session}:${windowIndex}.${paneIndex}` === wantedName) return true;
+      if (wantedNameLike && sessionMatches && operatorLabel.toLowerCase().includes(wantedNameLike)) return true;
+      if (wantedNameLike && sessionMatches && `${session}.${paneIndex}`.toLowerCase().includes(wantedNameLike)) return true;
+      if (wantedNameLike && sessionMatches && `${session}:${windowIndex}.${paneIndex}`.toLowerCase().includes(wantedNameLike)) return true;
+      if (wantedSession && !wantedPaneId && !wantedName && sessionMatches) return true;
+      return false;
+    })
+    .map(([session, windowIndex, paneIndex, _paneId, operatorLabel]) =>
+      `${session}:${windowIndex}.${paneIndex}${operatorLabel ? ` label=${cleanHintValue(operatorLabel)}` : ""}`
+    );
+
+  if (matches.length === 0) return "";
+  const shown = matches.slice(0, 3).join("; ");
+  const more = matches.length > 3 ? ` (+${matches.length - 3} more)` : "";
+  return `\n\nTmux-only peer hint: found ${shown}${more}, but no live broker peer row matched. The target pane likely has a closed MCP transport or missed its SessionStart registration; relaunch that pane or run its peer registration hook.`;
+}
+
+async function tmuxOnlyPeerHint(selector: (Pick<PeerSelector, "name" | "resolved_name" | "tmux_session" | "tmux_pane_id"> & { name_like?: string }) | undefined): Promise<string> {
+  const out = await runTmuxTimed([
+    "list-panes",
+    "-a",
+    "-F",
+    "#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_id}\t#{@operator_label}\t#{pane_current_command}\t#{pane_current_path}",
+  ], 750);
+  return tmuxOnlyPeerHintFromList(selector, out);
+}
 
 export function brokerIdentityPaneTarget(tmuxInfo: TmuxPaneInfo | null): string | null {
-  if (tmuxInfo?.pane_id) return tmuxInfo.pane_id;
-  if (process.env.TMUX_PANE) return process.env.TMUX_PANE;
-  return null;
+  return sharedBrokerIdentityPaneTarget(tmuxInfo);
 }
 
 export function publishBrokerIdentityToTmux(identity: {
@@ -817,28 +1011,19 @@ export function publishBrokerIdentityToTmux(identity: {
   client_type: ClientType;
   receiver_mode: ReceiverMode;
 }, tmuxInfo: TmuxPaneInfo | null = myTmuxInfo, options: { updateOperatorLabel?: boolean } = {}): TmuxMirrorResult {
-  const paneTarget = brokerIdentityPaneTarget(tmuxInfo);
-  if (!paneTarget) return { ok: true, target: null, failedOptions: [] };
-
+  const result = sharedPublishBrokerIdentityToTmux(identity, tmuxInfo, {
+    updateOperatorLabel: options.updateOperatorLabel,
+    writeOperatorLabel: true,
+    readPaneOption: readTmuxPaneOption,
+    setPaneOption: setTmuxPaneOption,
+  });
+  if (!result.target) return result;
   const displayLabel = identity.name || identity.resolved_name || identity.id;
-  const existingOperatorLabel = readTmuxPaneOption(paneTarget, "@operator_label");
-  const failedOptions: string[] = [];
-  const setOption = (optionName: string, value: string) => {
-    if (!setTmuxPaneOption(paneTarget, optionName, value)) failedOptions.push(optionName);
-  };
-  if ((options.updateOperatorLabel || !existingOperatorLabel) && displayLabel) {
-    setOption("@operator_label", displayLabel);
-  }
-  setOption("@peer_id", identity.id);
-  setOption("@peer_label", displayLabel);
-  setOption("@peer_resolved_name", identity.resolved_name ?? "");
-  setOption("@peer_client_type", identity.client_type);
-  setOption("@peer_receiver_mode", identity.receiver_mode);
-  const ok = failedOptions.length === 0;
+  const ok = result.failedOptions.length === 0;
   const verb = ok ? "mirrored" : "partially failed";
-  const failed = ok ? "" : ` failed_options=${failedOptions.join(",")}`;
-  log(`tmux broker identity ${verb}: @peer_id=${identity.id} @peer_label=${displayLabel} @peer_resolved_name=${identity.resolved_name ?? ""} (target=${paneTarget})${failed}`);
-  return { ok, target: paneTarget, failedOptions };
+  const failed = ok ? "" : ` failed_options=${result.failedOptions.join(",")}`;
+  log(`tmux broker identity ${verb}: @peer_id=${identity.id} @peer_label=${displayLabel} @peer_resolved_name=${identity.resolved_name ?? ""} (target=${result.target})${failed}`);
+  return result;
 }
 
 // Clear this session's broker-identity options from a pane it no longer occupies,
@@ -1501,8 +1686,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           text: message,
         });
         if (!result.ok) {
+          const tmuxHint = result.code === "PEER_NOT_FOUND" ? await tmuxOnlyPeerHint(effectiveSelector) : "";
           return {
-            content: [{ type: "text" as const, text: `Failed to send: ${result.error}${formatPeerCandidates(result.candidates)}` }],
+            content: [{ type: "text" as const, text: `Failed to send: ${result.error}${formatPeerCandidates(result.candidates)}${tmuxHint}` }],
             isError: true,
           };
         }
@@ -1733,8 +1919,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         });
         const pending = await drainPendingMessages();
         if (matches.length === 0) {
+          const tmuxHint = await tmuxOnlyPeerHint({ name: findName, name_like: findNameLike, tmux_session: findTmux });
           return {
-            content: [{ type: "text" as const, text: `No peers found matching${findName ? ` name="${findName}"` : ""}${findTmux ? ` tmux="${findTmux}"` : ""}${pending ?? ""}` }],
+            content: [{ type: "text" as const, text: `No peers found matching${findName ? ` name="${findName}"` : ""}${findNameLike ? ` name_like="${findNameLike}"` : ""}${findTmux ? ` tmux="${findTmux}"` : ""}${tmuxHint}${pending ?? ""}` }],
           };
         }
         const lines = matches.map((p) => {
@@ -1778,6 +1965,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             allMessages.push(m);
           }
         }
+        const alreadyDeliveredByPid: number[] = [];
+        const visibleMessages = await drainVisibleCodexPidForManualCheck();
+        for (const m of visibleMessages) {
+          if (!seen.has(m.id) && !confirmedDeliveredIds.has(m.id)) {
+            seen.add(m.id);
+            alreadyDeliveredByPid.push(m.id);
+            allMessages.push(m);
+          }
+        }
 
         if (allMessages.length === 0) {
           return {
@@ -1787,7 +1983,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
         // Display IS delivery. ackAndDedup adds to local dedup unconditionally
         // after we build the response text below.
-        await ackAndDedup(allMessages.map((m) => m.id), "check_messages");
+        const needsAck = allMessages
+          .map((m) => m.id)
+          .filter((id) => !alreadyDeliveredByPid.includes(id));
+        await ackAndDedup(needsAck, "check_messages");
+        for (const id of alreadyDeliveredByPid) confirmedDeliveredIds.add(id);
 
         // L7: same render path as drainPendingMessages — see renderInboundLine.
         const lines = allMessages.map(renderInboundLine);
@@ -1950,17 +2150,38 @@ async function main() {
 
   // 2. Gather context
   const serverCwd = process.cwd();
-  myClientType = detectClientType();
+  let identityEnv: Record<string, string | undefined> = process.env;
+  const startupProcesses = processTable();
+  myClientType = detectClientFromProcessChain(process.ppid, startupProcesses, process.env);
   myReceiverMode = initialReceiverMode(myClientType);
+  const codexAppServerAncestor = myClientType === "codex"
+    ? findCodexAppServerAncestor(process.ppid, startupProcesses)
+    : null;
   // bg-spare pre-warm sessions must not register: they inherit stale
   // CLAUDE_PEER_NAME / TMUX_PANE env from the daemon's launch shell and would
   // squat another session's seat as a ghost duplicate (see findBgSpareAncestor).
-  const spareAncestor = findBgSpareAncestor(process.ppid, processTable());
+  const spareAncestor = findBgSpareAncestor(process.ppid, startupProcesses);
   if (spareAncestor) {
     log(`bg-spare pre-warm detected (ancestor pid ${spareAncestor.pid}) — ignoring inherited env identity, deferring registration until promotion or first tool call`);
   }
   if (myClientType === "codex" || myClientType === "gemini") {
-    myRegisterPid = findClientPidFromProcessChain(process.ppid, processTable(), myClientType) ?? process.pid;
+    const chainPid = findClientPidFromProcessChain(process.ppid, startupProcesses, myClientType);
+    if (chainPid) {
+      myRegisterPid = chainPid;
+    } else if (myClientType === "codex" && codexAppServerAncestor) {
+      const visibleCwdHint = cwdOf(codexAppServerAncestor.pid) ?? serverCwd;
+      const visible = findVisibleCodexSession(startupProcesses, visibleCwdHint);
+      if (visible) {
+        myRegisterPid = visible.pid;
+        identityEnv = visible.env;
+        log(`Codex app-server identity resolved via visible TTY pid=${visible.pid} tty=${visible.tty} cwd=${visibleCwdHint}`);
+      } else {
+        log(`Codex app-server identity unresolved for cwd=${visibleCwdHint}; falling back to MCP server pid to avoid misrouting same-cwd panes`);
+        myRegisterPid = process.pid;
+      }
+    } else {
+      myRegisterPid = process.pid;
+    }
   }
   const cwdResult = registrationCwdResult(serverCwd, myRegisterPid, myClientType);
   myCwd = cwdResult.cwd;
@@ -1970,7 +2191,7 @@ async function main() {
   myGitRoot = await getGitRoot(myCwd);
   myAbsoluteGitDir = await getAbsoluteGitDir(myCwd);
   let tty = getTty(registrationTtyPid(myRegisterPid, myClientType));
-  let tmuxInfo = await detectTmuxPane();
+  let tmuxInfo = await detectTmuxPane(registrationTtyPid(myRegisterPid, myClientType));
   // Fix B (2026-05-12): if the live ancestry walk found nothing, fall back to
   // CLAUDE_PEER_TMUX_* env hints exported by the cc/ccc/cccr/cc2 bashrc
   // wrappers. This handles bg-job workers spawned under `claude daemon run`
@@ -1978,7 +2199,7 @@ async function main() {
   // was inside tmux. The env hints carry session/window/pane_id but NOT
   // pane_index — see composeTmuxFromEnv() comments for why.
   if (!tmuxInfo && !spareAncestor) {
-    const envHint = composeTmuxFromEnv(process.env);
+    const envHint = composeTmuxFromEnv(identityEnv);
     if (envHint) {
       tmuxInfo = envHint;
       // Note: window_index / window_name / pane_id may be undefined when only
@@ -1998,7 +2219,7 @@ async function main() {
   // `codex.2`, etc.) so `find_peer({ name })` follows what the operator sees.
   // The stable tmux pane_id still travels separately as `tmux_pane_id`; it is
   // not the operator-facing name unless all human-label resolution fails.
-  const envName = spareAncestor ? null : (process.env.CLAUDE_PEER_NAME ?? null);
+  const envName = spareAncestor ? null : (identityEnv.CLAUDE_PEER_NAME ?? null);
   const tmuxOperatorLabel = envName ? null : resolveTmuxOperatorLabel(tmuxInfo);
   const tmuxFallbackName =
     tmuxOperatorLabel ??
@@ -2045,7 +2266,7 @@ async function main() {
     tmux_session: tmuxInfo?.session ?? null,
     tmux_window_index: tmuxInfo?.window_index ?? null,
     tmux_window_name: tmuxInfo?.window_name ?? null,
-    tmux_pane_id: tmuxInfo?.pane_id ?? (spareAncestor ? null : (process.env.TMUX_PANE ?? null)),
+    tmux_pane_id: tmuxInfo?.pane_id ?? (spareAncestor ? null : (identityEnv.TMUX_PANE ?? null)),
     client_type: myClientType,
     receiver_mode: myReceiverMode,
     summary: initialSummary,
@@ -2061,7 +2282,7 @@ async function main() {
     myGitRoot = await getGitRoot(myCwd);
     myAbsoluteGitDir = await getAbsoluteGitDir(myCwd);
     tty = getTty(registrationTtyPid(myRegisterPid, myClientType));
-    tmuxInfo = await detectTmuxPane();
+    tmuxInfo = await detectTmuxPane(registrationTtyPid(myRegisterPid, myClientType));
     myTmuxInfo = tmuxInfo;
     const freshLabel = resolveTmuxOperatorLabel(tmuxInfo) ??
       (tmuxInfo?.pane_id ? `${tmuxInfo.session}.${tmuxInfo.pane_id}` : null);
@@ -2295,7 +2516,7 @@ async function main() {
       // clear/move transition logic only runs on a re-detect tick, where freshTmux
       // is a real value. planTmuxMirrorTransition stays the unit-testable decision.
       const isRedetectTick = shouldRedetectTmux(heartbeatTick++, redetectJitter, TMUX_REDETECT_EVERY);
-      const freshTmux = isRedetectTick ? await detectTmuxPane() : undefined;
+      const freshTmux = isRedetectTick ? await detectTmuxPane(registrationTtyPid(myRegisterPid, myClientType)) : undefined;
 
       // SKIP tick: no scan ran. Re-publish identity to our known pane and return —
       // do NOT run the clear/transition logic (it needs a fresh detection to compare

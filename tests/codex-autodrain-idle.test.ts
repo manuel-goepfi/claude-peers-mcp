@@ -443,3 +443,352 @@ describe("parseNudgeClients (auto-nudge default OFF)", () => {
     expect(parseNudgeClients("nonsense,whatever")).toEqual([]);
   });
 });
+
+// --- visible Codex seat reconciliation (app-server hook fallback) ---
+// Codex Desktop runs hooks under a centralized app-server, so hook ancestry no
+// longer points at the visible `codex resume` process in tmux. The reconciler
+// must therefore discover visible seats from the per-tick ps+tmux snapshot. The
+// critical bug case is multiple same-cwd Clause5 seats: they are ambiguous by cwd,
+// but safe when each process's env claims a tmux pane and the pid is actually in
+// that pane subtree.
+import {
+  __resetCodexSeatReconcileStateForTest,
+  envRecordFromText,
+  gitValue,
+  reconcileVisibleCodexSeats,
+  visibleCodexSeatsFromSnapshot,
+} from "../bin/codex-autodrain-poller.ts";
+
+function codexSeatSnap() {
+  return {
+    procs: [
+      { pid: 100, ppid: 1, args: "-bash" },
+      { pid: 200, ppid: 100, args: "codex resume" },
+      { pid: 110, ppid: 1, args: "-bash" },
+      { pid: 201, ppid: 110, args: "codex resume" },
+      { pid: 300, ppid: 1, args: "codex app-server --listen unix:///tmp/codex.sock" },
+    ],
+    paneByPid: new Map([["%125", 100], ["%254", 110]]),
+    paneMap: new Map([
+      [100, { session: "pr", window_index: "1", window_name: "1", pane_index: "1", pane_id: "%125" }],
+      [110, { session: "infra", window_index: "2", window_name: "2", pane_index: "1", pane_id: "%254" }],
+    ]),
+  } as any;
+}
+
+describe("visibleCodexSeatsFromSnapshot", () => {
+  test("discovers multiple same-cwd visible Codex seats by tmux pane identity", () => {
+    const seats = visibleCodexSeatsFromSnapshot(codexSeatSnap(), {
+      environOf: (pid) => pid === 200
+        ? { CLAUDE_PEER_NAME: "pr.1", TMUX_PANE: "%125", PWD: "/home/manzo/Clause5" }
+        : pid === 201
+          ? { CLAUDE_PEER_NAME: "infra.2", TMUX_PANE: "%254", PWD: "/home/manzo/Clause5" }
+          : {},
+      ttyOf: (pid) => `/dev/pts/${pid}`,
+      cwdOf: () => "/wrong",
+    });
+
+    expect(seats.map((s) => `${s.name}:${s.pid}:${s.tmux.pane_id}`).sort()).toEqual([
+      "infra.2:201:%254",
+      "pr.1:200:%125",
+    ]);
+    expect(seats.every((s) => s.cwd === "/home/manzo/Clause5")).toBe(true);
+  });
+
+  test("ignores the Codex app-server and seats missing tmux identity", () => {
+    const seats = visibleCodexSeatsFromSnapshot(codexSeatSnap(), {
+      environOf: (pid) => pid === 300
+        ? { CLAUDE_PEER_NAME: "ghost", TMUX_PANE: "%125", PWD: "/home/manzo/Clause5" }
+        : {},
+      ttyOf: () => "/dev/pts/1",
+      cwdOf: () => "/home/manzo/Clause5",
+    });
+
+    expect(seats).toEqual([]);
+  });
+
+  test("rejects a process whose env claims a pane it does not occupy", () => {
+    const snap = {
+      procs: [
+        { pid: 100, ppid: 1, args: "-bash" },
+        { pid: 200, ppid: 999, args: "codex resume" },
+      ],
+      paneByPid: new Map([["%125", 100]]),
+      paneMap: new Map([[100, { session: "pr", window_index: "1", window_name: "1", pane_id: "%125" }]]),
+    } as any;
+
+    const seats = visibleCodexSeatsFromSnapshot(snap, {
+      environOf: () => ({ CLAUDE_PEER_NAME: "pr.1", TMUX_PANE: "%125", PWD: "/home/manzo/Clause5" }),
+      ttyOf: () => "/dev/pts/27",
+      cwdOf: () => "/home/manzo/Clause5",
+    });
+
+    expect(seats).toEqual([]);
+  });
+
+  test("fails closed when duplicate Codex candidates claim the same pane/name", () => {
+    const snap = {
+      procs: [
+        { pid: 100, ppid: 1, args: "-bash" },
+        { pid: 200, ppid: 100, args: "codex resume" },
+        { pid: 201, ppid: 100, args: "codex resume" },
+      ],
+      paneByPid: new Map([["%125", 100]]),
+      paneMap: new Map([[100, { session: "pr", window_index: "1", window_name: "1", pane_id: "%125" }]]),
+    } as any;
+
+    const seats = visibleCodexSeatsFromSnapshot(snap, {
+      environOf: () => ({ CLAUDE_PEER_NAME: "pr.1", TMUX_PANE: "%125", PWD: "/home/manzo/Clause5" }),
+      ttyOf: () => "/dev/pts/27",
+      cwdOf: () => "/home/manzo/Clause5",
+    });
+
+    expect(seats).toEqual([]);
+  });
+
+  test("fails closed when same-pane Codex candidates have different inherited names", () => {
+    const snap = {
+      procs: [
+        { pid: 100, ppid: 1, args: "-bash" },
+        { pid: 200, ppid: 100, args: "codex resume" },
+        { pid: 201, ppid: 200, args: "codex exec --json" },
+      ],
+      paneByPid: new Map([["%125", 100]]),
+      paneMap: new Map([[100, { session: "pr", window_index: "1", window_name: "1", pane_id: "%125" }]]),
+    } as any;
+
+    const seats = visibleCodexSeatsFromSnapshot(snap, {
+      environOf: (pid) => ({
+        CLAUDE_PEER_NAME: pid === 200 ? "pr.1" : "ghost.1",
+        TMUX_PANE: "%125",
+        PWD: "/home/manzo/Clause5",
+      }),
+      ttyOf: () => "/dev/pts/27",
+      cwdOf: () => "/home/manzo/Clause5",
+    });
+
+    expect(seats).toEqual([]);
+  });
+
+  test("parses NUL-separated environ text for hook identity fields", () => {
+    expect(envRecordFromText("A=1\0CLAUDE_PEER_NAME=pr.1\0TMUX_PANE=%125\0").CLAUDE_PEER_NAME).toBe("pr.1");
+    expect(envRecordFromText("A=1\0BROKEN\0TMUX_PANE=%125").TMUX_PANE).toBe("%125");
+  });
+});
+
+describe("gitValue", () => {
+  test("returns trimmed stdout when the git probe exits successfully", async () => {
+    const encoder = new TextEncoder();
+    const result = await gitValue("/repo", ["rev-parse", "--show-toplevel"], 100, () => ({
+      stdout: new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encoder.encode("/repo\n"));
+          controller.close();
+        },
+      }),
+      exited: Promise.resolve(0),
+      kill: () => {},
+    }));
+
+    expect(result).toBe("/repo");
+  });
+
+  test("kills timed-out git probes and returns null", async () => {
+    let killed = false;
+    const result = await gitValue("/repo", ["rev-parse", "--show-toplevel"], 1, () => ({
+      stdout: new ReadableStream<Uint8Array>(),
+      exited: new Promise<number>(() => {}),
+      kill: () => {
+        killed = true;
+      },
+    }));
+
+    expect(result).toBeNull();
+    expect(killed).toBe(true);
+  });
+});
+
+function emptySeatSnap() {
+  return { procs: [], paneByPid: new Map(), paneMap: new Map() } as any;
+}
+
+function visibleSeat(name = "pr.1", pid = 200) {
+  return {
+    pid,
+    cwd: "/repo",
+    tty: `pts/${pid}`,
+    name,
+    tmux: { session: "pr", window_index: "1", window_name: "node", pane_index: "1", pane_id: `%${pid}` },
+  };
+}
+
+function registerResponse(name = "pr.1") {
+  return {
+    id: `peer-${name}`,
+    name,
+    resolved_name: name,
+    client_type: "codex",
+    receiver_mode: "codex-hook",
+  };
+}
+
+describe("reconcileVisibleCodexSeats", () => {
+  test("posts register then hook heartbeat and publishes the broker identity", async () => {
+    __resetCodexSeatReconcileStateForTest();
+    const posts: Array<{ path: string; body: any }> = [];
+    const publishes: Array<{ identity: any; pane: string | undefined }> = [];
+
+    await reconcileVisibleCodexSeats(emptySeatSnap(), {
+      now: () => 50_000,
+      intervalMs: 10_000,
+      visibleSeats: () => [visibleSeat()],
+      gitValue: async (_cwd, args) => {
+        if (args.includes("--show-toplevel")) return "/repo";
+        if (args.includes("--is-bare-repository")) return "false";
+        if (args.includes("--absolute-git-dir")) return "/repo/.git";
+        return null;
+      },
+      postBroker: async (path, body) => {
+        posts.push({ path, body });
+        return path === "/register" ? registerResponse() as any : { ok: true } as any;
+      },
+      publishBrokerIdentityToTmux: (identity, tmux) => {
+        publishes.push({ identity, pane: tmux?.pane_id });
+        return { ok: true, target: tmux?.pane_id ?? null, failedOptions: [] };
+      },
+    });
+
+    expect(posts.map((p) => p.path)).toEqual(["/register", "/hook-heartbeat-by-pid"]);
+    expect(posts[0]!.body).toMatchObject({
+      pid: 200,
+      cwd: "/repo",
+      git_root: "/repo",
+      absolute_git_dir: "/repo/.git",
+      name: "pr.1",
+      tmux_pane_id: "%200",
+      client_type: "codex",
+      receiver_mode: "codex-hook",
+      preserve_token: true,
+      summary: "",
+    });
+    expect(posts[1]!.body).toMatchObject({
+      pid: 200,
+      caller_pid: process.pid,
+      client_type: "codex",
+      receiver_mode: "codex-hook",
+      status: "ok",
+      drained: 0,
+    });
+    expect(publishes.map((p) => `${p.identity.id}:${p.pane}`)).toEqual(["peer-pr.1:%200", "peer-pr.1:%200"]);
+    expect(posts.map((p) => p.path).some((path) => /claim|ack/i.test(path))).toBe(false);
+  });
+
+  test("dry-run discovers seats but posts and publishes nothing", async () => {
+    __resetCodexSeatReconcileStateForTest();
+    let gitCalls = 0;
+    let postCalls = 0;
+    let publishCalls = 0;
+
+    await reconcileVisibleCodexSeats(emptySeatSnap(), {
+      now: () => 50_000,
+      intervalMs: 10_000,
+      dryRun: true,
+      visibleSeats: () => [visibleSeat()],
+      gitValue: async () => {
+        gitCalls++;
+        return null;
+      },
+      postBroker: async () => {
+        postCalls++;
+        return {} as any;
+      },
+      publishBrokerIdentityToTmux: () => {
+        publishCalls++;
+        return { ok: true, target: null, failedOptions: [] };
+      },
+    });
+
+    expect(gitCalls).toBe(0);
+    expect(postCalls).toBe(0);
+    expect(publishCalls).toBe(0);
+  });
+
+  test("one failed seat does not block the next visible seat", async () => {
+    __resetCodexSeatReconcileStateForTest();
+    const registered: string[] = [];
+
+    await reconcileVisibleCodexSeats(emptySeatSnap(), {
+      now: () => 50_000,
+      intervalMs: 10_000,
+      visibleSeats: () => [visibleSeat("bad.1", 200), visibleSeat("pr.1", 201)],
+      gitValue: async () => null,
+      postBroker: async (path, body: any) => {
+        if (path === "/register" && body.name === "bad.1") throw new Error("boom");
+        if (path === "/register") registered.push(body.name);
+        return path === "/register" ? registerResponse(body.name) as any : { ok: true } as any;
+      },
+      publishBrokerIdentityToTmux: () => ({ ok: true, target: null, failedOptions: [] }),
+    });
+
+    expect(registered).toEqual(["pr.1"]);
+  });
+
+  test("throttle skips reconciliation before the interval elapses", async () => {
+    __resetCodexSeatReconcileStateForTest();
+    let visibleCalls = 0;
+
+    const deps = {
+      intervalMs: 10_000,
+      dryRun: true,
+      visibleSeats: () => {
+        visibleCalls++;
+        return [visibleSeat()];
+      },
+    };
+
+    await reconcileVisibleCodexSeats(emptySeatSnap(), { ...deps, now: () => 50_000 });
+    await reconcileVisibleCodexSeats(emptySeatSnap(), { ...deps, now: () => 50_001 });
+
+    expect(visibleCalls).toBe(1);
+  });
+
+  test("in-flight reconciliation skips overlapping ticks", async () => {
+    __resetCodexSeatReconcileStateForTest();
+    let visibleCalls = 0;
+    let unblock!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      unblock = resolve;
+    });
+
+    const first = reconcileVisibleCodexSeats(emptySeatSnap(), {
+      now: () => 50_000,
+      intervalMs: 0,
+      visibleSeats: () => {
+        visibleCalls++;
+        return [visibleSeat()];
+      },
+      gitValue: async () => null,
+      postBroker: async (path) => {
+        if (path === "/register") await gate;
+        return path === "/register" ? registerResponse() as any : { ok: true } as any;
+      },
+      publishBrokerIdentityToTmux: () => ({ ok: true, target: null, failedOptions: [] }),
+    });
+
+    await reconcileVisibleCodexSeats(emptySeatSnap(), {
+      now: () => 50_001,
+      intervalMs: 0,
+      visibleSeats: () => {
+        visibleCalls++;
+        return [visibleSeat("c5.1", 201)];
+      },
+      gitValue: async () => null,
+      postBroker: async () => registerResponse("c5.1") as any,
+      publishBrokerIdentityToTmux: () => ({ ok: true, target: null, failedOptions: [] }),
+    });
+    unblock();
+    await first;
+
+    expect(visibleCalls).toBe(1);
+  });
+});

@@ -42,6 +42,13 @@ export function isClientProcess(row: ProcessInfo, clientType: Exclude<ClientType
   return clientType === "gemini" && (comm === "node" || comm === "bun" || comm === "npx") && hasGeminiCliLauncher(row.args);
 }
 
+export function isCodexAppServerProcess(row: ProcessInfo): boolean {
+  const comm = commandName(row.comm);
+  const firstArg = commandName(row.args);
+  if (comm !== "codex" && firstArg !== "codex") return false;
+  return /\bapp-server\b/.test(row.args);
+}
+
 export function findClientPidFromProcessChain(
   startPid: number,
   processes: Map<number, ProcessInfo>,
@@ -51,7 +58,15 @@ export function findClientPidFromProcessChain(
   for (let i = 0; i < 30; i++) {
     const p = processes.get(current);
     if (!p) break;
-    if (isClientProcess(p, clientType)) return p.pid;
+    if (isClientProcess(p, clientType)) {
+      // Codex Desktop runs MCP servers and hooks under a long-lived
+      // `codex app-server` process. That process is a transport host, not the
+      // visible tmux lane that should receive peer mail. Return null here so
+      // callers can fall back to a visible TTY Codex resolver instead of
+      // registering the app-server as a routable peer.
+      if (clientType === "codex" && isCodexAppServerProcess(p)) return null;
+      return p.pid;
+    }
     if (p.ppid <= 1 || p.ppid === current) break;
     current = p.ppid;
   }

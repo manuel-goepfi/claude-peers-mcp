@@ -26,11 +26,13 @@ import {
   planTmuxMirrorTransition,
   rewriteAuthBodyForPeer,
   shouldDisableBackgroundPolling,
+  tmuxOnlyPeerHintFromList,
   chooseOperatorLabel,
   isHumanOperatorLabel,
   resolvePeerName,
   stripResolvedNameSuffix,
 } from "../server";
+import { findClientPidFromProcessChain, isClientProcess, isCodexAppServerProcess, type ProcessInfo } from "../shared/client";
 
 // The heartbeat's tmux-identity maintenance delegates its branch selection to
 // this pure function so the decision is RED-when-broken without a live tmux.
@@ -86,6 +88,55 @@ describe("visible tmux pane selectors", () => {
     expect(source).toContain("tmux_session: resolved.tmux_session");
     expect(source).toContain("tmux_pane_id: resolved.tmux_pane_id");
   });
+
+  test("tmux-only hint explains labeled panes that lack broker rows", () => {
+    const panes = [
+      "pr\t2\t1\t%207\tpr.2\tnode\t/home/manzo/Clause5",
+      "Ops_a\t1\t1\t%121\tOps_a.1\tnode\t/home/manzo/Clause5",
+    ].join("\n");
+    const hint = tmuxOnlyPeerHintFromList({ name: "pr.2" }, panes);
+    expect(hint).toContain("Tmux-only peer hint");
+    expect(hint).toContain("pr:2.1 label=pr.2");
+    expect(hint).not.toContain("cmd=");
+    expect(hint).not.toContain("cwd=");
+    expect(hint).toContain("no live broker peer row matched");
+    expect(hint).toContain("closed MCP transport");
+  });
+
+  test("tmux-only hint can match a resolved stable pane id", () => {
+    const panes = "pr\t2\t1\t%207\tpr.2\tnode\t/home/manzo/Clause5";
+    const hint = tmuxOnlyPeerHintFromList({ tmux_session: "pr", tmux_pane_id: "%207" }, panes);
+    expect(hint).toContain("pr:2.1 label=pr.2");
+  });
+
+  test("tmux-only hint matches a session-only selector", () => {
+    const panes = [
+      "pr\t1\t2\t%148\tpr.2\tbash\t/home/manzo/Clause5",
+      "ops\t1\t1\t%121\tops.1\tnode\t/home/manzo/Clause5",
+    ].join("\n");
+    const hint = tmuxOnlyPeerHintFromList({ tmux_session: "pr" }, panes);
+    expect(hint).toContain("pr:1.2 label=pr.2");
+    expect(hint).not.toContain("ops:1.1");
+  });
+
+  test("tmux-only hint redacts control characters from operator labels", () => {
+    const panes = "pr\t2\t1\t%207\tpr.2\u001b[31m injected\tnode\t/home/manzo/Clause5";
+    const hint = tmuxOnlyPeerHintFromList({ name: "pr.2\u001b[31m injected" }, panes);
+    expect(hint).toContain("label=pr.2 [31m injected");
+    expect(hint).not.toContain("\u001b");
+    expect(hint).not.toContain("cmd=");
+    expect(hint).not.toContain("cwd=");
+  });
+
+  test("tmux-only hint matches name_like against operator labels", () => {
+    const panes = [
+      "pr\t2\t1\t%207\tpr.2\tnode\t/home/manzo/Clause5",
+      "ops\t1\t1\t%121\tops.1\tnode\t/home/manzo/Clause5",
+    ].join("\n");
+    const hint = tmuxOnlyPeerHintFromList({ name_like: "pr.2" }, panes);
+    expect(hint).toContain("pr:2.1 label=pr.2");
+    expect(hint).not.toContain("ops:1.1");
+  });
 });
 
 describe("#11 — resolvePeerName fallback chain", () => {
@@ -105,6 +156,35 @@ describe("#11 — resolvePeerName fallback chain", () => {
 
   test("env wins even when tmux is also present (env > tmux precedence)", () => {
     expect(resolvePeerName("env-name", "tmux.5", false, PID)).toBe("env-name");
+  });
+});
+
+describe("Codex Desktop app-server identity guard", () => {
+  test("detects app-server as Codex transport but not as a routable session pid", () => {
+    const appServer: ProcessInfo = {
+      pid: 100,
+      ppid: 1,
+      comm: "codex",
+      args: "/home/user/.local/bin/codex app-server --listen unix://",
+    };
+    const table = new Map<number, ProcessInfo>([[100, appServer]]);
+
+    expect(isClientProcess(appServer, "codex")).toBe(true);
+    expect(isCodexAppServerProcess(appServer)).toBe(true);
+    expect(findClientPidFromProcessChain(100, table, "codex")).toBeNull();
+  });
+
+  test("keeps interactive Codex processes routable", () => {
+    const interactive: ProcessInfo = {
+      pid: 200,
+      ppid: 99,
+      comm: "codex",
+      args: "/home/user/.local/bin/codex",
+    };
+    const table = new Map<number, ProcessInfo>([[200, interactive]]);
+
+    expect(isCodexAppServerProcess(interactive)).toBe(false);
+    expect(findClientPidFromProcessChain(200, table, "codex")).toBe(200);
   });
 });
 
@@ -220,13 +300,13 @@ describe("Operator-label fallback — human name first, pane_id metadata last", 
   });
 
   test("broker identity mirror preserves operator label and writes peer metadata", async () => {
-    const source = await Bun.file(`${import.meta.dir}/../server.ts`).text();
+    const source = await Bun.file(`${import.meta.dir}/../shared/tmux-identity.ts`).text();
 
     expect(source).toContain("function publishBrokerIdentityToTmux");
     const helperStart = source.indexOf("function publishBrokerIdentityToTmux");
-    const helperSlice = source.slice(helperStart, helperStart + 1200);
+    const helperSlice = source.slice(helperStart, helperStart + 1600);
 
-    expect(helperSlice).toContain('readTmuxPaneOption(paneTarget, "@operator_label")');
+    expect(helperSlice).toContain('readPaneOption(paneTarget, "@operator_label")');
     expect(helperSlice).toContain("options.updateOperatorLabel || !existingOperatorLabel");
     expect(helperSlice).toContain('setOption("@peer_id", identity.id)');
     expect(helperSlice).toContain('setOption("@peer_label", displayLabel)');
@@ -236,12 +316,15 @@ describe("Operator-label fallback — human name first, pane_id metadata last", 
   });
 
   test("broker identity mirror only targets stable pane ids", async () => {
-    const source = await Bun.file(`${import.meta.dir}/../server.ts`).text();
+    const source = await Bun.file(`${import.meta.dir}/../shared/tmux-identity.ts`).text();
+    const registrationStart = source.indexOf("function registrationTmuxPaneId");
+    const registrationSlice = source.slice(registrationStart, registrationStart + 420);
     const helperStart = source.indexOf("function brokerIdentityPaneTarget");
     const helperSlice = source.slice(helperStart, helperStart + 360);
 
-    expect(helperSlice).toContain("tmuxInfo?.pane_id");
-    expect(helperSlice).toContain("process.env.TMUX_PANE");
+    expect(registrationSlice).toContain("tmuxInfo?.pane_id");
+    expect(registrationSlice).toContain("env.TMUX_PANE");
+    expect(helperSlice).toContain("return registrationTmuxPaneId(tmuxInfo, env)");
     expect(helperSlice).not.toContain("tmuxInfo.session}:${tmuxInfo.window_index");
   });
 

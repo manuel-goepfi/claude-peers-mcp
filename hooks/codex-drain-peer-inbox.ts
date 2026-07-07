@@ -1,7 +1,9 @@
 #!/usr/bin/env bun
-import { readlinkSync } from "node:fs";
+import { readFileSync, readlinkSync } from "node:fs";
+import { isClientProcess as sharedIsClientProcess, isCodexAppServerProcess as sharedIsCodexAppServerProcess, type ProcessInfo } from "../shared/client.ts";
 import { renderInboundLine } from "../shared/render.ts";
 import type { ClientType, Message, ReceiverMode } from "../shared/types.ts";
+import { findSingleVisibleCodexProcess } from "../shared/visible-codex.ts";
 
 const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
@@ -13,19 +15,34 @@ const RECEIVER_MODE: Extract<ReceiverMode, "codex-hook" | "gemini-hook"> =
   CLIENT_TYPE === "gemini" ? "gemini-hook" : "codex-hook";
 const HOOK_EVENT_NAME = process.env.CLAUDE_PEERS_HOOK_EVENT_NAME ??
   (CLIENT_TYPE === "gemini" ? "BeforeAgent" : "UserPromptSubmit");
+const REGISTER_SCRIPT = new URL("./register-peer-session.ts", import.meta.url).pathname;
+const REGISTER_TIMEOUT_MS = 2_000;
 
-interface ProcRow {
-  pid: number;
-  ppid: number;
-  comm: string;
-  args: string;
-}
+type ProcRow = ProcessInfo;
 
 interface AckByPidResponse {
   ok: boolean;
   peer_id?: string;
   acked?: number;
   error?: string;
+}
+
+type ClaimResponse = { peer_id?: string; drain_id?: string; messages?: Message[] };
+type ClaimFn = (pid: number, drainId: string) => Promise<ClaimResponse>;
+interface RegistrationProcess {
+  exited: Promise<number>;
+  kill(signal?: string | number): void;
+  stderr?: ReadableStream<Uint8Array> | number | null;
+}
+
+export class BrokerHttpError extends Error {
+  constructor(
+    public readonly path: string,
+    public readonly status: number,
+    public readonly brokerError: string,
+  ) {
+    super(`${path} ${status}: ${brokerError}`);
+  }
 }
 
 function log(msg: string): void {
@@ -50,32 +67,12 @@ function processTable(): Map<number, ProcRow> {
   return table;
 }
 
-function commandName(value: string): string {
-  return value.trim().split(/\s+/)[0]?.toLowerCase().replace(/^.*\//, "") ?? "";
-}
-
-function argTokens(value: string): string[] {
-  return value.trim().split(/\s+/).filter(Boolean);
-}
-
-function isClientCommand(name: string, clientType: Extract<ClientType, "codex" | "gemini">): boolean {
-  return name === clientType || name.startsWith(`${clientType}-`);
-}
-
-function hasGeminiCliLauncher(args: string): boolean {
-  return argTokens(args).some((token) => {
-    const normalized = token.replace(/^['"]|['"]$/g, "").toLowerCase();
-    const base = normalized.replace(/^.*\//, "");
-    return normalized.includes("@google/gemini-cli/") || base === "gemini.js" || base === "gemini-cli.js";
-  });
-}
-
 function isClientProcess(row: ProcRow, clientType = CLIENT_TYPE): boolean {
-  const comm = commandName(row.comm);
-  const firstArg = commandName(row.args);
-  if (isClientCommand(comm, clientType) || isClientCommand(firstArg, clientType)) return true;
-  return clientType === "gemini" && (comm === "node" || comm === "bun" || comm === "npx") &&
-    hasGeminiCliLauncher(row.args);
+  return sharedIsClientProcess(row, clientType);
+}
+
+function isCodexAppServerProcess(row: ProcRow): boolean {
+  return sharedIsCodexAppServerProcess(row);
 }
 
 function isPeersServer(row: ProcRow): boolean {
@@ -107,12 +104,46 @@ function cwdOf(pid: number): string | null {
   }
 }
 
+function getTty(pid: number): string | null {
+  try {
+    const proc = Bun.spawnSync(["ps", "-o", "tty=", "-p", String(pid)]);
+    const tty = new TextDecoder().decode(proc.stdout).trim();
+    return tty && tty !== "?" && tty !== "??" ? tty : null;
+  } catch {
+    return null;
+  }
+}
+
+function hasPeerIdentityEnv(pid: number): boolean {
+  try {
+    const text = readFileSync(`/proc/${pid}/environ`, "utf8");
+    return text.includes("CLAUDE_PEER_NAME=") || text.includes("TMUX_PANE=");
+  } catch {
+    return false;
+  }
+}
+
 function findClientAncestor(table: Map<number, ProcRow>, startPid = process.ppid, clientType = CLIENT_TYPE): number | null {
   let current = startPid;
   for (let i = 0; i < 30; i++) {
     const row = table.get(current);
     if (!row) return null;
-    if (isClientProcess(row, clientType)) return row.pid;
+    if (isClientProcess(row, clientType)) {
+      if (clientType === "codex" && isCodexAppServerProcess(row)) return null;
+      return row.pid;
+    }
+    if (row.ppid <= 1 || row.ppid === row.pid) return null;
+    current = row.ppid;
+  }
+  return null;
+}
+
+function findCodexAppServerAncestor(table: Map<number, ProcRow>, startPid = process.ppid): ProcRow | null {
+  let current = startPid;
+  for (let i = 0; i < 30; i++) {
+    const row = table.get(current);
+    if (!row) return null;
+    if (isCodexAppServerProcess(row)) return row;
     if (row.ppid <= 1 || row.ppid === row.pid) return null;
     current = row.ppid;
   }
@@ -153,9 +184,21 @@ export function findHookPeerPidsFromTable(
   cwdReader: (pid: number) => string | null = cwdOf,
   clientType = CLIENT_TYPE,
   envPid: number | null = null,
+  identityEnvReader: (pid: number) => boolean = hasPeerIdentityEnv,
+  ttyReader: (pid: number) => string | null = getTty,
 ): { primary: number; fallbacks: number[] } | null {
   const hasEnvPid = Number.isInteger(envPid) && envPid > 1;
-  const clientPid = findClientAncestor(table, startPid, clientType);
+  let clientPid = findClientAncestor(table, startPid, clientType);
+  if (!clientPid && clientType === "codex") {
+    const appServer = findCodexAppServerAncestor(table, startPid);
+    const visibleCwd = appServer ? (cwdReader(appServer.pid) ?? hookCwd) : hookCwd;
+    const visible = findSingleVisibleCodexProcess(table, visibleCwd, {
+      cwdOf: cwdReader,
+      getTty: ttyReader,
+      environOf: (pid) => identityEnvReader(pid) ? { CLAUDE_PEER_NAME: "1" } : {},
+    });
+    clientPid = visible?.pid ?? null;
+  }
   if (!clientPid) {
     if (!hasEnvPid) log(`no ${CLIENT_TYPE} ancestor found`);
     return hasEnvPid ? { primary: envPid!, fallbacks: [] } : null;
@@ -202,9 +245,84 @@ async function post<T>(path: string, body: unknown): Promise<T> {
   const json = await res.json().catch(() => ({}));
   if (!res.ok) {
     const err = typeof json === "object" && json && "error" in json ? String((json as { error: unknown }).error) : res.statusText;
-    throw new Error(`${path} ${res.status}: ${err}`);
+    throw new BrokerHttpError(path, res.status, err);
   }
   return json as T;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function errorBody(error: unknown): string {
+  return error instanceof BrokerHttpError ? error.brokerError : errorMessage(error);
+}
+
+export function isMissingPeerClaimError(error: unknown): boolean {
+  const msg = errorBody(error);
+  return /unknown target pid|no peer|peer not found/i.test(msg);
+}
+
+export function isMissingClaimEndpointError(error: unknown): boolean {
+  if (error instanceof BrokerHttpError) {
+    return error.path === "/claim-by-pid" && error.status === 404 && !isMissingPeerClaimError(error);
+  }
+  const msg = errorMessage(error);
+  return /\/claim-by-pid\s+404:\s*(not found)?$/i.test(msg) || /cannot\s+post\s+\/claim-by-pid/i.test(msg);
+}
+
+export function shouldSelfRegisterAfterClaimError(error: unknown): boolean {
+  return isMissingPeerClaimError(error) && !isMissingClaimEndpointError(error);
+}
+
+export async function waitForRegistrationProcess(
+  proc: RegistrationProcess,
+  timeoutMs = REGISTER_TIMEOUT_MS,
+): Promise<{ code: number; stderr: string }> {
+  let timeout: ReturnType<typeof setTimeout> | null = null;
+  const stderrPromise = proc.stderr && typeof proc.stderr !== "number"
+    ? new Response(proc.stderr).text()
+    : Promise.resolve("");
+  const completed = Promise.all([proc.exited, stderrPromise]).then(([code, stderr]) => ({ code, stderr }));
+  const timedOut = new Promise<never>((_, reject) => {
+    timeout = setTimeout(() => {
+      try {
+        proc.kill("SIGTERM");
+      } catch {
+        // Process may have already exited.
+      }
+      reject(new Error(`registration timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([completed, timedOut]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
+async function registerCurrentSessionForDrain(): Promise<boolean> {
+  try {
+    const proc = Bun.spawn(["bun", REGISTER_SCRIPT], {
+      env: { ...process.env, CLAUDE_PEERS_CLIENT_TYPE: CLIENT_TYPE },
+      stdout: "ignore",
+      stderr: "pipe",
+    });
+    const { code, stderr } = await waitForRegistrationProcess(proc);
+    if (code !== 0) {
+      log(`self-registration failed with exit ${code}${stderr.trim() ? `: ${stderr.trim()}` : ""}`);
+      return false;
+    }
+    if (/registration failed|unexpected failure|no .* ancestor found/i.test(stderr)) {
+      log(`self-registration did not complete cleanly: ${stderr.trim()}`);
+      return false;
+    }
+    return true;
+  } catch (e) {
+    log(`self-registration failed: ${e instanceof Error ? e.message : String(e)}`);
+    return false;
+  }
 }
 
 async function heartbeat(pid: number, status: "ok" | "error", drained = 0, error?: string): Promise<void> {
@@ -223,7 +341,7 @@ async function heartbeat(pid: number, status: "ok" | "error", drained = 0, error
   }
 }
 
-async function claim(pid: number, drainId: string): Promise<{ peer_id?: string; drain_id?: string; messages?: Message[] }> {
+async function claim(pid: number, drainId: string): Promise<ClaimResponse> {
   return post("/claim-by-pid", {
     pid,
     caller_pid: process.pid,
@@ -233,6 +351,47 @@ async function claim(pid: number, drainId: string): Promise<{ peer_id?: string; 
     limit: MAX_MESSAGES,
     max_bytes: MAX_BYTES,
   });
+}
+
+export async function retryClaimAfterSelfRegistration(options: {
+  claimPids: number[];
+  drainId: string;
+  initialPid: number;
+  lastClaimError: string;
+  register: () => Promise<boolean>;
+  claim: ClaimFn;
+  sleep?: (ms: number) => Promise<void>;
+}): Promise<{
+  claimed: ClaimResponse | null;
+  pid: number;
+  lastClaimError: string;
+  attemptedRegistration: boolean;
+  fatalError?: string;
+}> {
+  let pid = options.initialPid;
+  let lastClaimError = options.lastClaimError;
+  if (!await options.register()) {
+    return { claimed: null, pid, lastClaimError, attemptedRegistration: true };
+  }
+
+  await (options.sleep ?? Bun.sleep)(250);
+  for (const candidatePid of options.claimPids) {
+    pid = candidatePid;
+    try {
+      return {
+        claimed: await options.claim(pid, options.drainId),
+        pid,
+        lastClaimError,
+        attemptedRegistration: true,
+      };
+    } catch (e) {
+      lastClaimError = errorMessage(e);
+      if (!shouldSelfRegisterAfterClaimError(e)) {
+        return { claimed: null, pid, lastClaimError, attemptedRegistration: true, fatalError: lastClaimError };
+      }
+    }
+  }
+  return { claimed: null, pid, lastClaimError, attemptedRegistration: true };
 }
 
 // Codex pipes the hook event JSON on stdin. Reading it is best-effort: a
@@ -281,6 +440,7 @@ async function main(): Promise<void> {
   let pid = pids.primary;
   const claimPids = [pids.primary, ...pids.fallbacks].filter((candidate, index, all) => all.indexOf(candidate) === index);
   let lastClaimError = "";
+  let sawMissingPeer = false;
   // At SessionStart the peer-register hook and MCP servers launch concurrently
   // with this drain (Codex runs same-event hooks in parallel) — retry
   // peer-not-found briefly instead of giving up on the race.
@@ -293,14 +453,43 @@ async function main(): Promise<void> {
         claimed = await claim(pid, drainId);
         break;
       } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
+        const msg = errorMessage(e);
         lastClaimError = msg;
-        if (!/unknown target pid|no peer|peer not found/i.test(msg)) {
+        if (shouldSelfRegisterAfterClaimError(e)) {
+          sawMissingPeer = true;
+          continue;
+        }
+        if (isMissingClaimEndpointError(e)) {
+          const hint = `${msg}; broker is alive but missing prompt-hook claim support, restart claude-peers-broker`;
+          log(`claim failed: ${hint}`);
+          await heartbeat(pid, "error", 0, hint);
+          return;
+        }
+        {
           log(`claim failed: ${msg}`);
           await heartbeat(pid, "error", 0, msg);
           return;
         }
       }
+    }
+  }
+  if (!claimed && sawMissingPeer) {
+    log("peer row missing during drain; attempting bounded self-registration before one retry");
+    const retry = await retryClaimAfterSelfRegistration({
+      claimPids,
+      drainId,
+      initialPid: pid,
+      lastClaimError,
+      register: registerCurrentSessionForDrain,
+      claim,
+    });
+    pid = retry.pid;
+    lastClaimError = retry.lastClaimError;
+    claimed = retry.claimed;
+    if (retry.fatalError) {
+      log(`claim retry failed: ${retry.fatalError}`);
+      await heartbeat(pid, "error", 0, retry.fatalError);
+      return;
     }
   }
   if (!claimed) {
@@ -312,27 +501,6 @@ async function main(): Promise<void> {
   const messages = claimed.messages ?? [];
   if (messages.length === 0 || !claimed.drain_id) {
     await heartbeat(pid, "ok", 0);
-    return;
-  }
-
-  try {
-    const ack = await post<AckByPidResponse>("/ack-by-pid", {
-      pid,
-      caller_pid: process.pid,
-      client_type: CLIENT_TYPE,
-      receiver_mode: RECEIVER_MODE,
-      drain_id: claimed.drain_id,
-      ids: messages.map((m) => m.id),
-      via: RECEIVER_MODE,
-    });
-    if (ack.acked !== messages.length) {
-      throw new Error(`ack mismatch: expected ${messages.length}, got ${ack.acked ?? 0}`);
-    }
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    log(`ack failed before stdout emit: ${msg}`);
-    await heartbeat(pid, "error", 0, msg);
-    process.exitCode = 1;
     return;
   }
 
@@ -358,9 +526,29 @@ async function main(): Promise<void> {
     await Bun.write(Bun.stdout, `${JSON.stringify(output)}\n`);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    log(`stdout emit failed after ack: ${msg}`);
+    log(`stdout emit failed before ack: ${msg}`);
     await heartbeat(pid, "error", 0, msg);
     process.exitCode = 1;
+    return;
+  }
+
+  try {
+    const ack = await post<AckByPidResponse>("/ack-by-pid", {
+      pid,
+      caller_pid: process.pid,
+      client_type: CLIENT_TYPE,
+      receiver_mode: RECEIVER_MODE,
+      drain_id: claimed.drain_id,
+      ids: messages.map((m) => m.id),
+      via: RECEIVER_MODE,
+    });
+    if (ack.acked !== messages.length) {
+      throw new Error(`ack mismatch: expected ${messages.length}, got ${ack.acked ?? 0}`);
+    }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    log(`ack failed after stdout emit: ${msg}`);
+    await heartbeat(pid, "error", 0, msg);
     return;
   }
   await heartbeat(pid, "ok", messages.length);

@@ -18,6 +18,8 @@
  * read-only DB count) and NUDGES. The drain stays owned by the hook.
  *
  * Safety:
+ *   - Reconciles visible Codex seats by broker /register + /hook-heartbeat-by-pid
+ *     only; it never reads, claims, or ACKs peer mail.
  *   - Reads unread count from the SQLite DB read-only (no /poll-by-pid, no drain).
  *   - Only nudges a pane that is IDLE: capture-pane must show the Codex prompt
  *     glyph and NOT a busy marker ("esc to interrupt" / "Working" / "Running").
@@ -32,12 +34,17 @@
  *      NUDGE_COOLDOWN_MS (60000), DRY_RUN=1 (log what it WOULD do, send nothing).
  */
 import { Database } from "bun:sqlite";
+import { readFileSync, readlinkSync } from "node:fs";
 import { homedir } from "node:os";
+import { publishBrokerIdentityToTmux } from "../shared/tmux-identity.ts";
+import type { RegisterResponse } from "../shared/types.ts";
+import { isVisibleCodexArgs } from "../shared/visible-codex.ts";
 import {
   parseTmuxPanes,
   bgSessionIdFromPtyHostArgs,
   resolveBgAttachPane,
   type ProcLike,
+  type TmuxPaneInfo,
 } from "../shared/tmux.ts";
 
 // Env parse with validation: a bad value must NOT silently break the daemon.
@@ -56,9 +63,14 @@ function envMs(name: string, fallback: number): number {
 }
 
 const DB_PATH = process.env.CLAUDE_PEERS_DB ?? `${homedir()}/.claude-peers.db`;
+const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
+const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 const POLL_INTERVAL_MS = envMs("POLL_INTERVAL_MS", 15_000);
+const CODEX_SEAT_RECONCILE_INTERVAL_MS = envMs("CODEX_SEAT_RECONCILE_INTERVAL_MS", 30_000);
+const CODEX_SEAT_GIT_TIMEOUT_MS = envMs("CODEX_SEAT_GIT_TIMEOUT_MS", 2_000);
 const NUDGE_COOLDOWN_MS = envMs("NUDGE_COOLDOWN_MS", 60_000);
 const DRY_RUN = process.env.DRY_RUN === "1";
+const RECONCILE_CODEX_SEATS = process.env.RECONCILE_CODEX_SEATS !== "0";
 // Liveness heartbeat: the END of every tick (success OR caught-error) touches
 // this file with the current time. The watchdog (~/bin/ensure-codex-autodrain)
 // restarts the poller if this file goes stale — a process that is alive but no
@@ -142,6 +154,47 @@ function log(msg: string): void {
 function sh(cmd: string[]): { ok: boolean; out: string } {
   const p = Bun.spawnSync(cmd);
   return { ok: p.exitCode === 0, out: new TextDecoder().decode(p.stdout) };
+}
+
+function cwdOfPid(pid: number): string | null {
+  try {
+    return readlinkSync(`/proc/${pid}/cwd`);
+  } catch {
+    return null;
+  }
+}
+
+function ttyOfPid(pid: number): string | null {
+  try {
+    const fd0 = readlinkSync(`/proc/${pid}/fd/0`);
+    if (fd0.startsWith("/dev/")) return fd0;
+  } catch {
+    // Fall through to ps, which gives a short tty label when fd/0 is not useful.
+  }
+  try {
+    const tty = sh(["ps", "-o", "tty=", "-p", String(pid)]).out.trim();
+    return tty && tty !== "?" && tty !== "??" ? tty : null;
+  } catch {
+    return null;
+  }
+}
+
+export function envRecordFromText(text: string): Record<string, string | undefined> {
+  const env: Record<string, string | undefined> = {};
+  for (const entry of text.split("\0")) {
+    const idx = entry.indexOf("=");
+    if (idx <= 0) continue;
+    env[entry.slice(0, idx)] = entry.slice(idx + 1);
+  }
+  return env;
+}
+
+function environOfPid(pid: number): Record<string, string | undefined> {
+  try {
+    return envRecordFromText(readFileSync(`/proc/${pid}/environ`, "utf8"));
+  } catch {
+    return {};
+  }
 }
 
 function isPidAlive(pid: number): boolean {
@@ -385,7 +438,7 @@ export interface TickSnapshot {
   paneByPid: Map<string, number>;          // pane_id → pane_pid (for paneSubtree)
   paneMap: ReturnType<typeof parseTmuxPanes>;
 }
-function takeSnapshot(): TickSnapshot | null {
+export function takeSnapshot(): TickSnapshot | null {
   const psOut = sh(["ps", "-eo", "pid=,ppid=,args="]);
   const paneOut = sh(["tmux", "list-panes", "-a", "-F", "#{pane_pid}\t#{session_name}\t#{window_index}\t#{window_name}\t#{pane_index}\t#{pane_id}"]);
   if (!psOut.ok || !paneOut.ok) return null;
@@ -398,6 +451,214 @@ function takeSnapshot(): TickSnapshot | null {
   const paneByPid = new Map<string, number>();
   for (const [panePid, info] of paneMap) if (info.pane_id) paneByPid.set(info.pane_id, panePid);
   return { procs, paneByPid, paneMap };
+}
+
+export interface VisibleCodexSeat {
+  pid: number;
+  cwd: string;
+  tty: string | null;
+  name: string;
+  tmux: TmuxPaneInfo;
+}
+
+export interface VisibleCodexSeatReaders {
+  environOf?: (pid: number) => Record<string, string | undefined>;
+  cwdOf?: (pid: number) => string | null;
+  ttyOf?: (pid: number) => string | null;
+}
+
+export function tmuxInfoByPaneId(snap: TickSnapshot, paneId: string): TmuxPaneInfo | null {
+  for (const info of snap.paneMap.values()) {
+    if (info.pane_id === paneId) return info;
+  }
+  return null;
+}
+
+export function visibleCodexSeatsFromSnapshot(
+  snap: TickSnapshot,
+  readers: VisibleCodexSeatReaders = {},
+): VisibleCodexSeat[] {
+  const envReader = readers.environOf ?? environOfPid;
+  const cwdReader = readers.cwdOf ?? cwdOfPid;
+  const ttyReader = readers.ttyOf ?? ttyOfPid;
+  const grouped = new Map<string, VisibleCodexSeat[]>();
+
+  for (const proc of snap.procs) {
+    if (!isVisibleCodexArgs(proc.args)) continue;
+
+    const env = envReader(proc.pid);
+    const name = env.CLAUDE_PEER_NAME?.trim();
+    const paneId = env.TMUX_PANE?.trim();
+    if (!name || !paneId?.startsWith("%")) continue;
+
+    const tmux = tmuxInfoByPaneId(snap, paneId);
+    if (!tmux) continue;
+    if (!paneOwnedByPid(paneId, proc.pid, snap)) continue;
+
+    const cwd = env.PWD?.startsWith("/") ? env.PWD : cwdReader(proc.pid);
+    if (!cwd) continue;
+
+    const seat: VisibleCodexSeat = {
+      pid: proc.pid,
+      cwd,
+      tty: ttyReader(proc.pid),
+      name,
+      tmux,
+    };
+    const key = tmux.pane_id ?? paneId;
+    const existing = grouped.get(key);
+    if (existing) existing.push(seat);
+    else grouped.set(key, [seat]);
+  }
+
+  const seats: VisibleCodexSeat[] = [];
+  for (const group of grouped.values()) {
+    if (group.length === 1) seats.push(group[0]!);
+  }
+  return seats.sort((a, b) => a.pid - b.pid);
+}
+
+interface GitProbeProcess {
+  stdout: ReadableStream<Uint8Array> | null;
+  exited: Promise<number>;
+  kill(signal?: string | number): void;
+}
+
+type GitProbeSpawner = (cmd: string[], options: {
+  cwd: string;
+  stdout: "pipe";
+  stderr: "ignore";
+}) => GitProbeProcess;
+
+export async function gitValue(
+  cwd: string,
+  args: string[],
+  timeoutMs = CODEX_SEAT_GIT_TIMEOUT_MS,
+  spawnGit: GitProbeSpawner = (cmd, options) => Bun.spawn(cmd, options) as GitProbeProcess,
+): Promise<string | null> {
+  let proc: GitProbeProcess | null = null;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    proc = spawnGit(["git", ...args], { cwd, stdout: "pipe", stderr: "ignore" });
+    const value = (async () => {
+      const text = proc?.stdout ? await new Response(proc.stdout).text() : "";
+      return await proc!.exited === 0 ? text.trim() : null;
+    })().catch(() => null);
+    const timeout = new Promise<null>((resolve) => {
+      timer = setTimeout(() => {
+        try {
+          proc?.kill("SIGKILL");
+        } catch {
+          // Best-effort kill; returning null releases the reconcile in-flight guard.
+        }
+        resolve(null);
+      }, timeoutMs);
+    });
+    return await Promise.race([value, timeout]);
+  } catch {
+    return null;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function postBroker<T>(path: string, body: unknown): Promise<T> {
+  const res = await fetch(`${BROKER_URL}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(3000),
+  });
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const err = typeof json === "object" && json && "error" in json ? String((json as { error: unknown }).error) : res.statusText;
+    throw new Error(`${path} ${res.status}: ${err}`);
+  }
+  return json as T;
+}
+
+let lastCodexSeatReconcileAt = 0;
+let codexSeatReconcileInFlight = false;
+
+type PostBrokerFn = <T>(path: string, body: unknown) => Promise<T>;
+type PublishIdentityFn = typeof publishBrokerIdentityToTmux;
+
+export interface ReconcileVisibleCodexSeatsDeps {
+  enabled?: boolean;
+  dryRun?: boolean;
+  now?: () => number;
+  intervalMs?: number;
+  visibleSeats?: (snap: TickSnapshot) => VisibleCodexSeat[];
+  gitValue?: typeof gitValue;
+  postBroker?: PostBrokerFn;
+  publishBrokerIdentityToTmux?: PublishIdentityFn;
+}
+
+export function __resetCodexSeatReconcileStateForTest(): void {
+  lastCodexSeatReconcileAt = 0;
+  codexSeatReconcileInFlight = false;
+}
+
+export async function reconcileVisibleCodexSeats(snap: TickSnapshot, deps: ReconcileVisibleCodexSeatsDeps = {}): Promise<void> {
+  if (!(deps.enabled ?? RECONCILE_CODEX_SEATS)) return;
+  if (codexSeatReconcileInFlight) return;
+  const now = deps.now?.() ?? Date.now();
+  const intervalMs = deps.intervalMs ?? CODEX_SEAT_RECONCILE_INTERVAL_MS;
+  if (now - lastCodexSeatReconcileAt < intervalMs) return;
+  lastCodexSeatReconcileAt = now;
+  codexSeatReconcileInFlight = true;
+
+  try {
+    const seats = (deps.visibleSeats ?? visibleCodexSeatsFromSnapshot)(snap);
+    const git = deps.gitValue ?? gitValue;
+    const post = deps.postBroker ?? postBroker;
+    const publish = deps.publishBrokerIdentityToTmux ?? publishBrokerIdentityToTmux;
+    for (const seat of seats) {
+      try {
+        if (deps.dryRun ?? DRY_RUN) {
+          log(`DRY_RUN would reconcile codex seat ${seat.name} pid=${seat.pid} pane=${seat.tmux.pane_id ?? "?"}`);
+          continue;
+        }
+        const gitRoot = await git(seat.cwd, ["rev-parse", "--show-toplevel"]);
+        const bare = await git(seat.cwd, ["rev-parse", "--is-bare-repository"]);
+        const absoluteGitDir = bare === "true" ? null : await git(seat.cwd, ["rev-parse", "--absolute-git-dir"]);
+        const reg = await post<RegisterResponse>("/register", {
+          pid: seat.pid,
+          cwd: seat.cwd,
+          git_root: gitRoot,
+          absolute_git_dir: absoluteGitDir,
+          tty: seat.tty,
+          name: seat.name,
+          tmux_session: seat.tmux.session,
+          tmux_window_index: seat.tmux.window_index ?? null,
+          tmux_window_name: seat.tmux.window_name ?? null,
+          tmux_pane_id: seat.tmux.pane_id ?? null,
+          client_type: "codex",
+          receiver_mode: "codex-hook",
+          preserve_token: true,
+          summary: "",
+        });
+        publish(reg, seat.tmux);
+        await post("/hook-heartbeat-by-pid", {
+          pid: seat.pid,
+          caller_pid: process.pid,
+          client_type: "codex",
+          receiver_mode: "codex-hook",
+          status: "ok",
+          drained: 0,
+        });
+        publish({
+          ...reg,
+          client_type: "codex",
+          receiver_mode: "codex-hook",
+        }, seat.tmux);
+      } catch (e) {
+        log(`codex seat reconcile failed for ${seat.name} pid=${seat.pid} pane=${seat.tmux.pane_id ?? "?"}: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+  } finally {
+    codexSeatReconcileInFlight = false;
+  }
 }
 
 // Memoized lane-id → pane-id. A bg-claude lane's session→pane mapping is stable
@@ -523,7 +784,7 @@ function nudge(lane: Lane, paneId: string): void {
 // envelope and the nudge loop should be made concurrent (see decision-log).
 const TICK_WARN_MS = Math.min(10_000, POLL_INTERVAL_MS * 0.66);
 
-function tick(db: Database): void {
+function tick(db: Database, snapOverride?: TickSnapshot): void {
   const tickStart = Date.now();
   // Auto-nudge disabled (no opted-in client types) → do no work this tick. The loop
   // still runs (heartbeat keeps the watchdog happy) but never touches a pane. This
@@ -559,7 +820,7 @@ function tick(db: Database): void {
   // pane resolution and ownership check (see takeSnapshot). Without this the
   // per-lane `ps -ww` made a 12-lane tick ~12s; with it the tick's resolution
   // cost is a single ps regardless of lane count.
-  const snap = takeSnapshot();
+  const snap = snapOverride ?? takeSnapshot();
   if (!snap) { log("tick: snapshot (ps/tmux) failed — skipping this tick"); return; }
 
   for (const lane of lanes) {
@@ -632,7 +893,15 @@ export function writeHeartbeat(): void {
 // throw is logged instead of silently stopping the timer.
 function scheduledTick(db: Database): void {
   try {
-    tick(db);
+    const snap = takeSnapshot();
+    if (snap) {
+      void reconcileVisibleCodexSeats(snap).catch((e) => {
+        log(`codex seat reconcile threw: ${e instanceof Error ? e.message : String(e)} (loop continues)`);
+      });
+      tick(db, snap);
+    } else {
+      tick(db);
+    }
   } catch (e) {
     log(`tick threw at top level: ${e instanceof Error ? e.message : String(e)} (loop continues)`);
   } finally {

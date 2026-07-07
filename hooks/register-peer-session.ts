@@ -1,14 +1,23 @@
 #!/usr/bin/env bun
-import { closeSync, existsSync, openSync, readlinkSync, statSync } from "node:fs";
-import type { ProcessInfo } from "../shared/client.ts";
+import { closeSync, existsSync, openSync, readFileSync, readlinkSync, statSync } from "node:fs";
+import { isClientProcess as sharedIsClientProcess, isCodexAppServerProcess, type ProcessInfo } from "../shared/client.ts";
+import {
+  brokerIdentityPaneTarget as sharedBrokerIdentityPaneTarget,
+  publishBrokerIdentityToTmux as sharedPublishBrokerIdentityToTmux,
+  registrationTmuxPaneId as sharedRegistrationTmuxPaneId,
+  type TmuxMirrorResult,
+} from "../shared/tmux-identity.ts";
 import type { ClientType, ReceiverMode, RegisterResponse } from "../shared/types.ts";
 import { composeTmuxFromEnv, parsePsTree, parseTmuxPanes, type TmuxPaneInfo } from "../shared/tmux.ts";
+import { findSingleVisibleCodexProcess } from "../shared/visible-codex.ts";
 
 const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 const BROKER_SCRIPT = new URL("../broker.ts", import.meta.url).pathname;
 const BROKER_LOG = `${process.env.HOME}/.claude-peers-broker.log`;
 const BROKER_LOG_MAX_BYTES = 10 * 1024 * 1024;
+const BROKER_SYSTEMD_UNIT_PATH = `${process.env.HOME}/.config/systemd/user/claude-peers-broker.service`;
+const SYSTEMD_START_TIMEOUT_SECONDS = "3";
 const CLIENT_TYPE: Extract<ClientType, "codex" | "gemini"> =
   process.env.CLAUDE_PEERS_CLIENT_TYPE === "gemini" ? "gemini" : "codex";
 const RECEIVER_MODE: Extract<ReceiverMode, "codex-hook" | "gemini-hook"> =
@@ -22,6 +31,7 @@ interface RegisterMetadata {
   tty: string | null;
   name: string;
   tmux: TmuxPaneInfo | null;
+  identity_env: Record<string, string | undefined>;
 }
 
 function log(msg: string): void {
@@ -46,30 +56,6 @@ function processTable(): Map<number, ProcessInfo> {
   return table;
 }
 
-function commandName(value: string): string {
-  return value.trim().split(/\s+/)[0]?.toLowerCase().replace(/^.*\//, "") ?? "";
-}
-
-function argTokens(value: string): string[] {
-  return value.trim().split(/\s+/).filter(Boolean);
-}
-
-function hasGeminiCliLauncher(args: string): boolean {
-  return argTokens(args).some((token) => {
-    const normalized = token.replace(/^['"]|['"]$/g, "").toLowerCase();
-    const base = normalized.replace(/^.*\//, "");
-    return normalized.includes("@google/gemini-cli/") || base === "gemini.js" || base === "gemini-cli.js";
-  });
-}
-
-function isClientProcess(row: ProcessInfo, clientType: Extract<ClientType, "codex" | "gemini">): boolean {
-  const comm = commandName(row.comm);
-  const firstArg = commandName(row.args);
-  if (comm === clientType || comm.startsWith(`${clientType}-`)) return true;
-  if (firstArg === clientType || firstArg.startsWith(`${clientType}-`)) return true;
-  return clientType === "gemini" && (comm === "node" || comm === "bun" || comm === "npx") && hasGeminiCliLauncher(row.args);
-}
-
 export function findClientPidFromTable(
   table: Map<number, ProcessInfo>,
   startPid = process.ppid,
@@ -79,7 +65,10 @@ export function findClientPidFromTable(
   for (let i = 0; i < 30; i++) {
     const row = table.get(current);
     if (!row) return null;
-    if (isClientProcess(row, clientType)) return row.pid;
+    if (sharedIsClientProcess(row, clientType)) {
+      if (clientType === "codex" && isCodexAppServerProcess(row)) return null;
+      return row.pid;
+    }
     if (row.ppid <= 1 || row.ppid === row.pid) return null;
     current = row.ppid;
   }
@@ -124,7 +113,35 @@ function getTty(pid: number): string | null {
   }
 }
 
-function detectTmuxPane(pid: number): TmuxPaneInfo | null {
+function environOf(pid: number): Record<string, string | undefined> {
+  try {
+    const text = readFileSync(`/proc/${pid}/environ`, "utf8");
+    const env: Record<string, string | undefined> = {};
+    for (const entry of text.split("\0")) {
+      const idx = entry.indexOf("=");
+      if (idx <= 0) continue;
+      env[entry.slice(0, idx)] = entry.slice(idx + 1);
+    }
+    return env;
+  } catch {
+    return {};
+  }
+}
+
+function findCodexAppServerAncestor(startPid: number, table: Map<number, ProcessInfo>): ProcessInfo | null {
+  let current = startPid;
+  for (let i = 0; i < 30; i++) {
+    const row = table.get(current);
+    if (!row) return null;
+    if (isCodexAppServerProcess(row)) return row;
+    if (row.ppid <= 1 || row.ppid === row.pid) return null;
+    current = row.ppid;
+  }
+  return null;
+}
+
+
+function detectTmuxPane(pid: number, env: Record<string, string | undefined> = process.env): TmuxPaneInfo | null {
   try {
     const listProc = Bun.spawnSync([
       "tmux",
@@ -133,10 +150,10 @@ function detectTmuxPane(pid: number): TmuxPaneInfo | null {
       "-F",
       "#{pane_pid}\t#{session_name}\t#{window_index}\t#{window_name}\t#{pane_index}\t#{pane_id}",
     ]);
-    if (listProc.exitCode !== 0) return composeTmuxFromEnv(process.env);
+    if (listProc.exitCode !== 0) return composeTmuxFromEnv(env);
     const paneMap = parseTmuxPanes(new TextDecoder().decode(listProc.stdout));
     const psProc = Bun.spawnSync(["ps", "-eo", "pid,ppid"]);
-    if (psProc.exitCode !== 0) return composeTmuxFromEnv(process.env);
+    if (psProc.exitCode !== 0) return composeTmuxFromEnv(env);
     const ppidMap = parsePsTree(new TextDecoder().decode(psProc.stdout));
 
     let current = pid;
@@ -150,11 +167,38 @@ function detectTmuxPane(pid: number): TmuxPaneInfo | null {
   } catch {
     // Fall through to env hints.
   }
-  return composeTmuxFromEnv(process.env);
+  return composeTmuxFromEnv(env);
 }
 
-function peerName(clientType: Extract<ClientType, "codex" | "gemini">, pid: number, tmux: TmuxPaneInfo | null): string {
-  const envName = process.env.CLAUDE_PEER_NAME?.trim();
+export function registrationTmuxPaneId(tmuxInfo: TmuxPaneInfo | null, env: Record<string, string | undefined> = process.env): string | null {
+  return sharedRegistrationTmuxPaneId(tmuxInfo, env);
+}
+
+export function brokerIdentityPaneTarget(tmuxInfo: TmuxPaneInfo | null, env: Record<string, string | undefined> = process.env): string | null {
+  return sharedBrokerIdentityPaneTarget(tmuxInfo, env);
+}
+
+export function publishBrokerIdentityToTmux(identity: {
+  id: string;
+  name: string | null;
+  resolved_name: string | null;
+  client_type: ClientType;
+  receiver_mode: ReceiverMode;
+}, tmuxInfo: TmuxPaneInfo | null, env: Record<string, string | undefined> = process.env): TmuxMirrorResult {
+  const result = sharedPublishBrokerIdentityToTmux(identity, tmuxInfo, {
+    env,
+    writeOperatorLabel: false,
+  });
+  if (!result.target) return result;
+  const displayLabel = identity.name || identity.resolved_name || identity.id;
+  const ok = result.failedOptions.length === 0;
+  const failed = ok ? "" : ` failed_options=${result.failedOptions.join(",")}`;
+  log(`tmux broker identity ${ok ? "mirrored" : "partially failed"} from hook: @peer_id=${identity.id} @peer_label=${displayLabel} (target=${result.target})${failed}`);
+  return result;
+}
+
+function peerName(clientType: Extract<ClientType, "codex" | "gemini">, pid: number, tmux: TmuxPaneInfo | null, env: Record<string, string | undefined>): string {
+  const envName = env.CLAUDE_PEER_NAME?.trim();
   if (envName) return envName;
   if (tmux?.session && tmux.pane_index) return `${tmux.session}.${tmux.pane_index}`;
   if (tmux?.session && tmux.window_index) return `${tmux.session}.${tmux.window_index}`;
@@ -163,21 +207,33 @@ function peerName(clientType: Extract<ClientType, "codex" | "gemini">, pid: numb
 
 async function metadata(): Promise<RegisterMetadata | null> {
   const table = processTable();
-  const pid = findClientPidFromTable(table);
+  let identityEnv: Record<string, string | undefined> = process.env;
+  let pid = findClientPidFromTable(table);
+  if (!pid && CLIENT_TYPE === "codex") {
+    const appServer = findCodexAppServerAncestor(process.ppid, table);
+    const visibleCwdHint = appServer ? (cwdOf(appServer.pid) ?? process.cwd()) : process.cwd();
+    const visible = findSingleVisibleCodexProcess(table, visibleCwdHint, { getTty, cwdOf, environOf });
+    if (visible) {
+      pid = visible.pid;
+      identityEnv = visible.env;
+      log(`app-server hook identity resolved via visible TTY pid=${pid} cwd=${visibleCwdHint}`);
+    }
+  }
   if (!pid) {
     log(`no ${CLIENT_TYPE} ancestor found`);
     return null;
   }
   const cwd = cwdOf(pid) ?? process.cwd();
-  const tmux = detectTmuxPane(pid);
+  const tmux = detectTmuxPane(pid, identityEnv);
   return {
     pid,
     cwd,
     git_root: await getGitRoot(cwd),
     absolute_git_dir: await getAbsoluteGitDir(cwd),
     tty: getTty(pid),
-    name: peerName(CLIENT_TYPE, pid, tmux),
+    name: peerName(CLIENT_TYPE, pid, tmux, identityEnv),
     tmux,
+    identity_env: identityEnv,
   };
 }
 
@@ -215,8 +271,31 @@ function rotateBrokerLogIfLarge(): void {
   }
 }
 
+function startBrokerViaSystemd(): boolean {
+  if (!existsSync(BROKER_SYSTEMD_UNIT_PATH)) return false;
+  try {
+    const proc = Bun.spawnSync(["timeout", SYSTEMD_START_TIMEOUT_SECONDS, "systemctl", "--user", "start", "claude-peers-broker.service"], {
+      stdout: "ignore",
+      stderr: "pipe",
+    });
+    if (proc.exitCode === 0) return true;
+    const stderr = new TextDecoder().decode(proc.stderr).trim();
+    log(`systemd broker start failed; falling back to direct spawn${stderr ? `: ${stderr}` : ""}`);
+  } catch (e) {
+    log(`systemd broker start failed; falling back to direct spawn: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  return false;
+}
+
 async function ensureBroker(): Promise<void> {
   if (await isBrokerAlive()) return;
+  if (startBrokerViaSystemd()) {
+    for (let i = 0; i < 15; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      if (await isBrokerAlive()) return;
+    }
+    log("systemd broker start did not become healthy; falling back to direct spawn");
+  }
   rotateBrokerLogIfLarge();
   const logFd = openSync(BROKER_LOG, "a");
   try {
@@ -236,16 +315,13 @@ async function ensureBroker(): Promise<void> {
 async function main(): Promise<void> {
   const meta = await metadata();
   if (!meta) {
+    process.exitCode = 1;
     return;
   }
 
-  const summary = meta.tmux?.session
-    ? `[tmux ${meta.tmux.window_name ? `${meta.tmux.session}:${meta.tmux.window_name}` : meta.tmux.session}] ${CLIENT_TYPE} startup registered`
-    : `${CLIENT_TYPE} startup registered`;
-
   try {
     await ensureBroker();
-    await post<RegisterResponse>("/register", {
+    const reg = await post<RegisterResponse>("/register", {
       pid: meta.pid,
       cwd: meta.cwd,
       git_root: meta.git_root,
@@ -255,12 +331,13 @@ async function main(): Promise<void> {
       tmux_session: meta.tmux?.session ?? null,
       tmux_window_index: meta.tmux?.window_index ?? null,
       tmux_window_name: meta.tmux?.window_name ?? null,
-      tmux_pane_id: meta.tmux?.pane_id ?? (process.env.TMUX_PANE ?? null),
+      tmux_pane_id: registrationTmuxPaneId(meta.tmux, meta.identity_env),
       client_type: CLIENT_TYPE,
       receiver_mode: RECEIVER_MODE,
       preserve_token: true,
-      summary,
+      summary: "",
     });
+    publishBrokerIdentityToTmux(reg, meta.tmux, meta.identity_env);
     await post("/hook-heartbeat-by-pid", {
       pid: meta.pid,
       caller_pid: process.pid,
@@ -269,7 +346,13 @@ async function main(): Promise<void> {
       status: "ok",
       drained: 0,
     });
+    publishBrokerIdentityToTmux({
+      ...reg,
+      client_type: CLIENT_TYPE,
+      receiver_mode: RECEIVER_MODE,
+    }, meta.tmux, meta.identity_env);
   } catch (e) {
+    process.exitCode = 1;
     log(`registration failed: ${e instanceof Error ? e.message : String(e)}`);
   }
 

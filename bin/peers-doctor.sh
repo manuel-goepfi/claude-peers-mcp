@@ -21,9 +21,28 @@ printf "claude-peers doctor — %s\n\n" "$(date -Iseconds)"
 # can miss brokers launched as `bun broker.ts` without a full path).
 HEALTH=$(curl -sf -m 2 http://127.0.0.1:7899/health 2>/dev/null || echo "")
 if [[ -n "$HEALTH" ]]; then
-  PEER_COUNT=$(echo "$HEALTH" | jq -r '.peers // 0' 2>/dev/null || echo "?")
+  CAPS_KNOWN=false
+  if command -v jq >/dev/null 2>&1; then
+    CAPS_KNOWN=true
+    PEER_COUNT=$(echo "$HEALTH" | jq -r '.peers // 0' 2>/dev/null || echo "?")
+    CLAIM_CAP=$(echo "$HEALTH" | jq -r '.capabilities.hookDrain.claimByPid // false' 2>/dev/null || echo "false")
+    ACK_CAP=$(echo "$HEALTH" | jq -r '.capabilities.hookDrain.ackByPid // false' 2>/dev/null || echo "false")
+    HEARTBEAT_CAP=$(echo "$HEALTH" | jq -r '.capabilities.hookDrain.hookHeartbeatByPid // false' 2>/dev/null || echo "false")
+  else
+    PEER_COUNT="?"
+    CLAIM_CAP="unknown"
+    ACK_CAP="unknown"
+    HEARTBEAT_CAP="unknown"
+  fi
   BROKER_PID=$(pgrep -f 'bun.*broker\.ts' 2>/dev/null | head -1)
   ok "broker /health responding (${PEER_COUNT} peers${BROKER_PID:+, pid $BROKER_PID})"
+  if [[ "$CAPS_KNOWN" != "true" ]]; then
+    warn "broker capability flags not parsed" "install jq or inspect /health manually; doctor will verify /claim-by-pid directly when this pane has an MCP PID"
+  elif [[ "$CLAIM_CAP" == "true" && "$ACK_CAP" == "true" && "$HEARTBEAT_CAP" == "true" ]]; then
+    ok "broker advertises prompt-hook drain capabilities"
+  else
+    fail "broker /health is alive but missing prompt-hook drain capabilities" "systemctl --user restart claude-peers-broker; stale brokers cannot autodrain Codex/Gemini peers"
+  fi
 else
   fail "broker /health not responding on 127.0.0.1:7899" "systemctl --user restart claude-peers-broker (managed unit with memory cap — do NOT spawn bun broker.ts manually)"
 fi
@@ -92,9 +111,12 @@ if [[ -n "$MY_MCP" ]]; then
   RESP=$(curl -s -m 2 -w '\n%{http_code}' -X POST http://127.0.0.1:7899/poll-by-pid \
     -H 'Content-Type: application/json' \
     -d "{\"pid\":${MY_MCP},\"caller_pid\":$$}" 2>/dev/null)
+  BODY=$(printf '%s\n' "$RESP" | sed '$d')
   STATUS=$(printf '%s\n' "$RESP" | tail -n1)
-  if [[ "$STATUS" == "200" ]]; then
+  if [[ "$STATUS" == "200" && "$BODY" =~ \"peer_id\":\"[^\"]+\" ]]; then
     ok "/poll-by-pid responds 200 for this session's MCP"
+  elif [[ "$STATUS" == "200" ]]; then
+    warn "/poll-by-pid endpoint reachable but this PID has no broker peer row" "relaunch this session if Claude MCP delivery should be active; Codex/Gemini prompt-drain checks below may not apply to this PID"
   else
     fail "/poll-by-pid returned ${STATUS:-no-response}" "check broker + rebuild (bun install) + restart"
   fi
@@ -106,6 +128,10 @@ if [[ -n "$MY_MCP" ]]; then
   CLAIM_STATUS=$(printf '%s\n' "$CLAIM_RESP" | tail -n1)
   if [[ "$CLAIM_STATUS" == "200" && "$CLAIM_BODY" =~ \"peer_id\":\"[^\"]+\" ]]; then
     ok "/claim-by-pid responds 200 for safe prompt-hook drain"
+  elif [[ "${CAPS_KNOWN:-false}" == "true" && "${CLAIM_CAP:-false}" != "true" ]]; then
+    fail "/claim-by-pid unavailable on this broker" "restart broker onto current code; /health lacks capabilities.hookDrain.claimByPid"
+  elif [[ "$CLAIM_STATUS" == "404" && "$CLAIM_BODY" =~ peer[[:space:]-]*not[[:space:]-]*found ]]; then
+    warn "/claim-by-pid endpoint reachable but this PID has no claimable prompt-hook row" "this is expected for some Claude MCP-only sessions; verify Codex/Gemini claim drain from their client PID or relaunch registration if this was a Codex/Gemini pane"
   else
     fail "/claim-by-pid returned ${CLAIM_STATUS:-no-response}" "restart broker so the prompt-hook endpoints are available"
   fi
