@@ -11,6 +11,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname } from "node:path";
+import { fsyncDirectory } from "./fs-durability.ts";
 
 interface Fingerprint {
   dev: number;
@@ -60,9 +61,18 @@ function ensureParent(path: string): void {
   }
 }
 
-function syncDirectory(path: string): void {
-  const fd = openSync(path, "r");
-  try { fsyncSync(fd); } finally { closeSync(fd); }
+function atomicReplace(path: string, content: string): void {
+  const tmp = `${path}.tmp-${process.pid}-${crypto.randomUUID()}`;
+  const fd = openSync(tmp, "wx", 0o600);
+  try {
+    writeFileSync(fd, content, "utf8");
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  chmodSync(tmp, 0o600);
+  renameSync(tmp, path);
+  fsyncDirectory(dirname(path));
 }
 
 export function installJsonConfig(
@@ -97,7 +107,7 @@ export function installJsonConfig(
 
   if (!contentChange) {
     chmodSync(path, 0o600);
-    syncDirectory(dirname(path));
+    fsyncDirectory(dirname(path));
     return { changed: true, needsChange: false };
   }
 
@@ -126,17 +136,7 @@ export function installJsonConfig(
     chmodSync(backupPath, 0o600);
   }
 
-  const tmp = `${path}.tmp-${process.pid}-${crypto.randomUUID()}`;
-  const fd = openSync(tmp, "wx", 0o600);
-  try {
-    writeFileSync(fd, desired, "utf8");
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
-  }
-  chmodSync(tmp, 0o600);
-  renameSync(tmp, path);
-  syncDirectory(dirname(path));
+  atomicReplace(path, desired);
   return { changed: true, needsChange: false, ...(backupPath ? { backupPath } : {}) };
 }
 
@@ -172,17 +172,7 @@ export function restoreJsonConfig(
     throw new Error(`configuration changed while restore was being prepared: ${path}`);
   }
 
-  const tmp = `${path}.tmp-${process.pid}-${crypto.randomUUID()}`;
-  const fd = openSync(tmp, "wx", 0o600);
-  try {
-    writeFileSync(fd, backupBytes, "utf8");
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
-  }
-  chmodSync(tmp, 0o600);
-  renameSync(tmp, path);
-  syncDirectory(dirname(path));
+  atomicReplace(path, backupBytes);
   return { changed: true, needsChange: false, backupPath };
 }
 

@@ -2,7 +2,8 @@
 export type PeerId = string;
 export type ClientType = "claude" | "codex" | "gemini" | "unknown";
 export type ReceiverMode = "claude-channel" | "codex-hook" | "gemini-hook" | "manual-drain" | "unknown";
-export type DeliveryState = "queued" | "claimed" | "acknowledged" | "unknown";
+export const DELIVERY_STATES = ["queued", "claimed", "acknowledged", "unknown"] as const;
+export type DeliveryState = typeof DELIVERY_STATES[number];
 
 export interface Peer {
   id: PeerId;

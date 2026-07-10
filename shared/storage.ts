@@ -14,6 +14,7 @@ import {
 } from "node:fs";
 import { createHash } from "node:crypto";
 import { dirname, resolve } from "node:path";
+import { fsyncDirectory } from "./fs-durability.ts";
 
 export const STORAGE_SCHEMA_VERSION = 1;
 
@@ -110,12 +111,12 @@ function tableExists(db: Database, table: string): boolean {
   return Boolean(db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table));
 }
 
-function columns(db: Database, table: string): Set<string> {
+export function storageTableColumns(db: Database, table: string): Set<string> {
   if (!tableExists(db, table)) return new Set();
   return new Set((db.query(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((row) => row.name));
 }
 
-function userVersion(db: Database): number {
+export function storageUserVersion(db: Database): number {
   return Number((db.query("PRAGMA user_version").get() as { user_version: number }).user_version);
 }
 
@@ -139,8 +140,8 @@ function digest(values: unknown[]): string {
 }
 
 export function storageSnapshot(db: Database): StorageSnapshot {
-  const messageCols = columns(db, "messages");
-  const peerCols = columns(db, "peers");
+  const messageCols = storageTableColumns(db, "messages");
+  const peerCols = storageTableColumns(db, "peers");
   const deliveredAt = messageCols.has("delivered_at") ? "delivered_at" : "NULL AS delivered_at";
   const claimedBy = messageCols.has("claimed_by") ? "claimed_by" : "NULL AS claimed_by";
   const claimedAt = messageCols.has("claimed_at") ? "claimed_at" : "NULL AS claimed_at";
@@ -224,7 +225,7 @@ function createPeersTable(db: Database): void {
 
 function ensurePeerColumns(db: Database): void {
   createPeersTable(db);
-  const existing = columns(db, "peers");
+  const existing = storageTableColumns(db, "peers");
   for (const column of peerColumns) {
     if (!existing.has(column.name)) db.run(`ALTER TABLE peers ADD COLUMN ${column.name} ${column.type}`);
   }
@@ -263,15 +264,6 @@ function fileSha256(path: string): string {
   return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
 
-function fsyncDirectory(path: string): void {
-  const fd = openSync(path, "r");
-  try {
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
-  }
-}
-
 function fsyncFile(path: string): void {
   const fd = openSync(path, "r");
   try {
@@ -308,7 +300,7 @@ function verifyBackup(path: string, manifest: StorageBackupManifest, expected: S
   const backup = new Database(path, { readonly: true });
   try {
     integrity(backup);
-    if (userVersion(backup) !== manifest.source_user_version) throw new Error("backup user_version mismatch");
+    if (storageUserVersion(backup) !== manifest.source_user_version) throw new Error("backup user_version mismatch");
     const snapshot = storageSnapshot(backup);
     if (!sameSnapshot(snapshot, expected) || !sameSnapshot(snapshot, manifest.snapshot)) {
       throw new Error("backup row digest or partition mismatch");
@@ -389,7 +381,7 @@ function migrateLegacy(
   db.exec("BEGIN IMMEDIATE");
   try {
     ensurePeerColumns(db);
-    const oldColumns = columns(db, "messages");
+    const oldColumns = storageTableColumns(db, "messages");
     if (oldColumns.size > 0) {
       createMessagesTable(db, "messages_v1");
       const deliveredAt = oldColumns.has("delivered_at") ? "delivered_at" : "NULL";
@@ -441,11 +433,11 @@ function createFresh(db: Database): void {
 }
 
 function validateCurrentSchema(db: Database): void {
-  const messageCols = columns(db, "messages");
+  const messageCols = storageTableColumns(db, "messages");
   for (const column of requiredMessageColumns) {
     if (!messageCols.has(column)) throw new Error(`storage v${STORAGE_SCHEMA_VERSION} is missing messages.${column}`);
   }
-  const peerCols = columns(db, "peers");
+  const peerCols = storageTableColumns(db, "peers");
   if (!peerCols.has("non_targetable")) throw new Error(`storage v${STORAGE_SCHEMA_VERSION} is missing peers.non_targetable`);
   const indexes = new Set((db.query("SELECT name FROM sqlite_master WHERE type='index'").all() as Array<{ name: string }>).map((row) => row.name));
   for (const name of Object.values(storageIndexes)) {
@@ -460,7 +452,7 @@ export function initializeStorage(db: Database, options: InitializeStorageOption
   options.onReadiness?.("starting");
   db.run("PRAGMA journal_mode = WAL");
   db.run("PRAGMA busy_timeout = 3000");
-  const version = userVersion(db);
+  const version = storageUserVersion(db);
   if (version > STORAGE_SCHEMA_VERSION) throw new Error(`database user_version ${version} is newer than supported ${STORAGE_SCHEMA_VERSION}`);
   if (version === STORAGE_SCHEMA_VERSION) {
     validateCurrentSchema(db);

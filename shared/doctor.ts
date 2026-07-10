@@ -4,7 +4,7 @@ import { basename, dirname, resolve } from "node:path";
 import { detectClientFromProcessChain, findBgSpareAncestor, findClientPidFromProcessChain, isClientProcess, isCodexAppServerProcess, type ProcessInfo } from "./client.ts";
 import { ownerProcessIsCurrent, readOwnerMetadata } from "./broker-lifecycle.ts";
 import { classifyClientHooks, type HookClassification, type HookClient } from "./hook-config.ts";
-import { STORAGE_SCHEMA_VERSION } from "./storage.ts";
+import { STORAGE_SCHEMA_VERSION, storageTableColumns, storageUserVersion } from "./storage.ts";
 
 export type SurfaceState = "current" | "stale" | "missing" | "malformed" | "unsafe";
 
@@ -198,6 +198,10 @@ export function readProcessSnapshot(procRoot = "/proc"): Map<number, ProcessInfo
   return rows;
 }
 
+function isPeerAdapterProcess(row: ProcessInfo, expectedServer: string): boolean {
+  return row.args.includes(expectedServer) || (/\bserver\.ts(?:\s|$)/.test(row.args) && /claude-peers/.test(row.args));
+}
+
 export function summarizeProcesses(processes: Map<number, ProcessInfo>, repoRoot: string): ProcessSummary {
   const clientRoots = { claude: 0, codex: 0, gemini: 0 };
   for (const row of processes.values()) {
@@ -211,8 +215,7 @@ export function summarizeProcesses(processes: Map<number, ProcessInfo>, repoRoot
   let spareParented = 0;
   const expectedServer = resolve(repoRoot, "server.ts");
   for (const row of processes.values()) {
-    const looksLikeAdapter = row.args.includes(expectedServer) || (/\bserver\.ts(?:\s|$)/.test(row.args) && /claude-peers/.test(row.args));
-    if (!looksLikeAdapter) continue;
+    if (!isPeerAdapterProcess(row, expectedServer)) continue;
     const client = detectClientFromProcessChain(row.ppid, processes, {});
     adapters[client]++;
     if (row.ppid <= 1) orphaned++;
@@ -231,12 +234,6 @@ function ownerState(dbPath: string): DatabaseReport["owner"] {
   }
 }
 
-function tableColumns(db: Database, table: string): Set<string> {
-  const exists = db.query("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table);
-  if (!exists) return new Set();
-  return new Set((db.query(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((row) => row.name));
-}
-
 function grouped(db: Database, sql: string, key: string): Record<string, number> {
   const rows = db.query(sql).all() as Array<Record<string, unknown>>;
   const result: Record<string, number> = {};
@@ -248,8 +245,7 @@ function adapterClientPids(processes: Map<number, ProcessInfo>, repoRoot: string
   const expectedServer = resolve(repoRoot, "server.ts");
   const result: Array<number | null> = [];
   for (const row of processes.values()) {
-    const looksLikeAdapter = row.args.includes(expectedServer) || (/\bserver\.ts(?:\s|$)/.test(row.args) && /claude-peers/.test(row.args));
-    if (!looksLikeAdapter) continue;
+    if (!isPeerAdapterProcess(row, expectedServer)) continue;
     const client = detectClientFromProcessChain(row.ppid, processes, {});
     result.push(client === "unknown" ? null : findClientPidFromProcessChain(row.ppid, processes, client));
   }
@@ -257,8 +253,8 @@ function adapterClientPids(processes: Map<number, ProcessInfo>, repoRoot: string
 }
 
 function decodeDatabase(db: Database, version: number, processes: Map<number, ProcessInfo>, repoRoot: string): DatabaseAggregates {
-  const peerColumns = tableColumns(db, "peers");
-  const messageColumns = tableColumns(db, "messages");
+  const peerColumns = storageTableColumns(db, "peers");
+  const messageColumns = storageTableColumns(db, "messages");
   if (!["id", "last_seen"].every((column) => peerColumns.has(column)) || !["id", "delivered"].every((column) => messageColumns.has(column))) {
     throw new Error("unsupported schema shape");
   }
@@ -327,7 +323,7 @@ export function inspectDatabase(
     const db = new Database(dbPath, { readonly: true, strict: true });
     try {
       db.run("PRAGMA query_only = ON");
-      const version = Number((db.query("PRAGMA user_version").get() as { user_version: number }).user_version);
+      const version = storageUserVersion(db);
       if (version !== 0 && version !== STORAGE_SCHEMA_VERSION) {
         return { state: "unsupported", schema_version: version, owner, aggregates: null, reason: "unsupported_schema" };
       }

@@ -13,6 +13,7 @@ import { Database } from "bun:sqlite";
 import { readFileSync, writeFileSync, renameSync, chmodSync, statSync, existsSync, truncateSync, unlinkSync } from "node:fs";
 import { timingSafeEqual } from "node:crypto";
 // L6: top-level node:fs import (was inline require() in verifyPidUid hot path).
+import { DELIVERY_STATES } from "./shared/types.ts";
 import type {
   RegisterRequest,
   RegisterResponse,
@@ -176,7 +177,7 @@ const BROKER_CAPABILITIES = {
   delivery: {
     sendToPeer: true,
     states: true,
-    vocabulary: ["queued", "claimed", "acknowledged", "unknown"],
+    vocabulary: DELIVERY_STATES,
   },
   cli: {
     registerCli: true,
@@ -430,7 +431,7 @@ const insertCliPeer = db.prepare(`
 `);
 
 const deleteCliPeerByPid = db.prepare(`
-  DELETE FROM peers WHERE pid = ? AND non_targetable = 1
+  DELETE FROM peers WHERE pid = ? AND non_targetable = 1 RETURNING id
 `);
 
 const updatePeerRegistration = db.prepare(`
@@ -527,6 +528,10 @@ const selectAllPeers = db.prepare(`
 
 const selectAllTargetablePeers = db.prepare(`
   SELECT * FROM peers WHERE non_targetable = 0
+`);
+
+const selectTargetablePeerCount = db.prepare(`
+  SELECT COUNT(*) AS count FROM peers WHERE non_targetable = 0
 `);
 
 const selectPeersByDirectory = db.prepare(`
@@ -660,9 +665,10 @@ const selectBroadcastTargets = db.prepare(`
 // /message-status: sender-scoped status lookup. Only the ORIGINAL sender
 // can read a message's delivery state — otherwise a peer could enumerate
 // another peer's message history by guessing ids.
-const selectMessageStatus = db.prepare(`
+const selectMessageStatuses = db.prepare(`
   SELECT id, delivered, delivered_at, claimed_by, claimed_at
-  FROM messages WHERE id = ? AND from_id = ?
+  FROM messages
+  WHERE from_id = ? AND id IN (SELECT value FROM json_each(?))
 `);
 
 // AP-063: bridge cursor read. Returns ALL messages with id > cursor, regardless
@@ -986,13 +992,15 @@ function handleRegisterCli(body: Record<string, unknown>): RegisterCliResult {
   const id = generateId();
   const token = generateToken();
   const now = new Date().toISOString();
-  db.transaction(() => {
+  const replacedIds = db.transaction(() => {
     // A previous hard-killed CLI can leave a non-targetable row until the
     // reaper runs. PID reuse is safe to collapse because these rows can never
     // receive mail and ordinary session rows are excluded by the flag.
-    deleteCliPeerByPid.run(request.pid);
+    const replaced = deleteCliPeerByPid.all(request.pid) as Array<{ id: string }>;
     insertCliPeer.run(id, request.pid, now, now, token);
+    return replaced.map((row) => row.id);
   })();
+  for (const replacedId of replacedIds) buckets.delete(replacedId);
   return {
     ok: true,
     value: {
@@ -1699,10 +1707,14 @@ function handleSendToPeer(authedFromId: string, body: SendToPeerRequest): SendMe
 function handleMessageStatus(authedFromId: string, body: { ids: number[] }):
   { ok: boolean; statuses: { id: number; state: DeliveryState; delivered: boolean; delivered_at: string | null }[] } {
   if (!Array.isArray(body.ids)) return { ok: true, statuses: [] };
+  const rows = selectMessageStatuses.all(authedFromId, JSON.stringify(body.ids)) as Array<
+    { id: number; delivered: number; delivered_at: string | null; claimed_by: string | null; claimed_at: string | null }
+  >;
+  const rowsById = new Map(rows.map((row) => [row.id, row]));
+  const claimCutoff = claimCutoffIso();
   const statuses = body.ids.map((id) => {
-    const row = selectMessageStatus.get(id, authedFromId) as
-      { id: number; delivered: number; delivered_at: string | null; claimed_by: string | null; claimed_at: string | null } | null;
-    const activeClaim = Boolean(row?.claimed_by && row.claimed_at && row.claimed_at >= claimCutoffIso());
+    const row = rowsById.get(id);
+    const activeClaim = Boolean(row?.claimed_by && row.claimed_at && row.claimed_at >= claimCutoff);
     return row
       ? {
           id: row.id,
@@ -2012,10 +2024,11 @@ requestHandler = async (req: Request) => {
 
     if (req.method !== "POST") {
       if (path === "/health") {
+        const targetable = selectTargetablePeerCount.get() as { count: number };
         return Response.json({
           status: "ok",
           ready: true,
-          peers: (selectAllTargetablePeers.all() as Peer[]).length,
+          peers: targetable.count,
           version: PEERS_VERSION,
           schema_version: storage.version,
           capabilities: BROKER_CAPABILITIES,
@@ -2187,7 +2200,7 @@ requestHandler = async (req: Request) => {
             return Response.json(response);
           }
         case "/metrics":
-          return Response.json(runtimeMetrics.snapshot());
+          return Response.json({ ...runtimeMetrics.snapshot(), rate_limit_buckets: buckets.size });
         case "/set-summary": {
           const summary = String(body.summary ?? "");
           if (utf8Bytes(summary) > MAX_SUMMARY_BYTES) {

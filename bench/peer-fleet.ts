@@ -4,18 +4,16 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { summarizeLatency, type LatencySummary } from "../shared/runtime-metrics.ts";
 import { startTestBroker, type TestBroker } from "../tests/helpers/test-broker.ts";
 
-export type BenchmarkStage = "baseline" | "instrumented" | "tmux-suppressed" | "adaptive";
-export type BenchmarkScenario = "all-idle" | "one-active" | "randomized-phase";
+export const BENCHMARK_STAGES = ["baseline", "instrumented", "tmux-suppressed", "adaptive"] as const;
+export const BENCHMARK_SCENARIOS = ["all-idle", "one-active", "randomized-phase"] as const;
+export type BenchmarkStage = typeof BENCHMARK_STAGES[number];
+export type BenchmarkScenario = typeof BENCHMARK_SCENARIOS[number];
 type ReceiverState = "active" | "idle";
 
-export interface LatencyStats {
-  count: number;
-  p50_ms: number | null;
-  p95_ms: number | null;
-  max_ms: number | null;
-}
+export type LatencyStats = LatencySummary;
 
 export interface WindowRecord {
   index: number;
@@ -64,21 +62,9 @@ interface AdapterHandle { client: Client; transport: StdioClientTransport }
 
 const repoRoot = resolve(import.meta.dir, "..");
 const serverScript = join(repoRoot, "server.ts");
-const scenarios: BenchmarkScenario[] = ["all-idle", "one-active", "randomized-phase"];
-
-function delay(ms: number): Promise<void> {
-  return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
-}
-
-function percentile(values: number[], fraction: number): number | null {
-  if (values.length === 0) return null;
-  const sorted = [...values].sort((a, b) => a - b);
-  return sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * fraction) - 1)]!;
-}
-
 export function latencyStats(samples: LatencySample[], state: ReceiverState): LatencyStats {
   const values = samples.filter((sample) => sample.state === state).map((sample) => sample.milliseconds);
-  return { count: values.length, p50_ms: percentile(values, 0.5), p95_ms: percentile(values, 0.95), max_ms: values.length ? Math.max(...values) : null };
+  return summarizeLatency(values);
 }
 
 function mulberry32(seed: number): () => number {
@@ -421,7 +407,7 @@ async function runFleet(options: {
     };
     activityTimer = setInterval(() => void tickScenario().catch(failScenario), 1_000);
     await tickScenario();
-    await Promise.race([delay(options.warmupMs), scenarioFailure]);
+    await Promise.race([Bun.sleep(options.warmupMs), scenarioFailure]);
 
     const pids = [broker.proc.pid, ...adapters.map((adapter) => adapter.transport.pid).filter((pid): pid is number => pid !== null)];
     const brokerCpuStart = processCpuTicks(broker.proc.pid);
@@ -431,14 +417,14 @@ async function runFleet(options: {
     const samplePss = () => pssSamples.push(pids.reduce((sum, pid) => sum + processPssKb(pid), 0));
     samplePss();
     const pssTimer = setInterval(samplePss, Math.min(5_000, Math.max(1_000, options.windowMs / 2)));
-    await Promise.race([delay(options.steadyMs), scenarioFailure]);
+    await Promise.race([Bun.sleep(options.steadyMs), scenarioFailure]);
     clearInterval(pssTimer);
     samplePss();
     const brokerCpuEnd = processCpuTicks(broker.proc.pid);
     const adapterCpuEnd = pids.slice(1).reduce((sum, pid) => sum + processCpuTicks(pid), 0);
     if (activityTimer) clearInterval(activityTimer);
     activityTimer = null;
-    while (activityBusy) await delay(10);
+    while (activityBusy) await Bun.sleep(10);
     if (scenarioError) throw scenarioError;
 
     const adapterProofs = await Promise.all(adapters.map((adapter) => adapter.client.callTool({ name: "whoami", arguments: {} })));
@@ -509,7 +495,7 @@ export function evaluateCampaign(records: FleetRunRecord[], quick = false): Camp
   const checks: CampaignCheck[] = [];
   const coordinateCounts = new Map<string, number>();
   const byStage = new Map<BenchmarkStage, Map<string, FleetRunRecord>>();
-  for (const stage of ["baseline", "instrumented", "tmux-suppressed", "adaptive"] as BenchmarkStage[]) byStage.set(stage, new Map());
+  for (const stage of BENCHMARK_STAGES) byStage.set(stage, new Map());
   for (const record of records) {
     const coordinate = `${record.stage}|${pairKey(record)}`;
     coordinateCounts.set(coordinate, (coordinateCounts.get(coordinate) ?? 0) + 1);
@@ -521,16 +507,16 @@ export function evaluateCampaign(records: FleetRunRecord[], quick = false): Camp
 
   if (!quick) {
     checks.push({ name: "exact campaign record count", passed: records.length === 108, actual: records.length, limit: 108 });
-    for (const stage of ["baseline", "instrumented", "tmux-suppressed", "adaptive"] as BenchmarkStage[]) {
+    for (const stage of BENCHMARK_STAGES) {
       const count = records.filter((record) => record.stage === stage).length;
       checks.push({ name: `${stage} stage record count`, passed: count === 27, actual: count, limit: 27 });
     }
     const expectedCoordinates = new Set<string>();
-    for (const stage of ["baseline", "instrumented", "tmux-suppressed", "adaptive"] as BenchmarkStage[]) {
+    for (const stage of BENCHMARK_STAGES) {
       for (const fleetSize of [1, 10, 50]) {
-        for (const scenario of scenarios) {
+        for (const scenario of BENCHMARK_SCENARIOS) {
           for (let repetition = 1; repetition <= 3; repetition++) {
-            const seed = fleetSize * 100_000 + scenarios.indexOf(scenario) * 1_000 + repetition;
+            const seed = fleetSize * 100_000 + BENCHMARK_SCENARIOS.indexOf(scenario) * 1_000 + repetition;
             expectedCoordinates.add(`${stage}|${fleetSize}|${scenario}|${repetition}|${seed}`);
           }
         }
@@ -610,8 +596,8 @@ export function evaluateCampaign(records: FleetRunRecord[], quick = false): Camp
   for (const record of records) {
     checks.push({ name: `no request errors ${record.stage} ${pairKey(record)}`, passed: record.errors === 0 && record.rate_limited === 0, actual: `${record.errors}/${record.rate_limited}`, limit: "0/0" });
   }
-  for (const stage of ["baseline", "instrumented", "tmux-suppressed", "adaptive"] as BenchmarkStage[]) {
-    for (const scenario of scenarios) {
+  for (const stage of BENCHMARK_STAGES) {
+    for (const scenario of BENCHMARK_SCENARIOS) {
       for (let repetition = 1; repetition <= 3; repetition++) {
         const scaling = records.filter((record) => record.stage === stage && record.scenario === scenario && record.repetition === repetition).sort((a, b) => a.fleet_size - b.fleet_size);
         if (scaling.length < 2) continue;
@@ -635,8 +621,8 @@ async function main(args = process.argv.slice(2)): Promise<number> {
   const quick = args.includes("--quick");
   const fleets = argValue(args, "--peers", "1,10,50").split(",").map(Number);
   const repetitions = Number(argValue(args, "--repetitions", quick ? "1" : "3"));
-  const stages = argValue(args, "--stages", "baseline,instrumented,tmux-suppressed,adaptive").split(",") as BenchmarkStage[];
-  const selectedScenarios = argValue(args, "--scenarios", scenarios.join(",")).split(",") as BenchmarkScenario[];
+  const stages = argValue(args, "--stages", BENCHMARK_STAGES.join(",")).split(",") as BenchmarkStage[];
+  const selectedScenarios = argValue(args, "--scenarios", BENCHMARK_SCENARIOS.join(",")).split(",") as BenchmarkScenario[];
   const warmupMs = Number(argValue(args, "--warmup-ms", quick ? "2000" : "30000"));
   const steadyMs = Number(argValue(args, "--steady-ms", quick ? "6000" : "180000"));
   const windowMs = Number(argValue(args, "--window-ms", quick ? "2000" : "60000"));
@@ -644,13 +630,13 @@ async function main(args = process.argv.slice(2)): Promise<number> {
   if (!quick && Bun.version !== "1.3.11") throw new Error(`release campaign requires Bun 1.3.11, found ${Bun.version}`);
   if (!quick && Bun.spawnSync(["git", "diff", "--quiet", "HEAD", "--"]).exitCode !== 0) throw new Error("release campaign requires a clean tracked worktree");
   if (!quick && JSON.stringify(fleets) !== JSON.stringify([1, 10, 50])) throw new Error("release campaign requires peer fleets 1,10,50 in canonical order");
-  if (!quick && JSON.stringify(stages) !== JSON.stringify(["baseline", "instrumented", "tmux-suppressed", "adaptive"])) throw new Error("release campaign requires all four stages in canonical order");
-  if (!quick && JSON.stringify(selectedScenarios) !== JSON.stringify(scenarios)) throw new Error("release campaign requires all three scenarios in canonical order");
+  if (!quick && JSON.stringify(stages) !== JSON.stringify(BENCHMARK_STAGES)) throw new Error("release campaign requires all four stages in canonical order");
+  if (!quick && JSON.stringify(selectedScenarios) !== JSON.stringify(BENCHMARK_SCENARIOS)) throw new Error("release campaign requires all three scenarios in canonical order");
   if (!quick && (warmupMs !== 30_000 || steadyMs !== 180_000 || windowMs !== 60_000 || repetitions !== 3)) throw new Error("release campaign requires 30s warmup, 180s steady, 60s windows, and 3 repetitions");
   if (steadyMs / windowMs !== 3) throw new Error("campaign must contain exactly three steady-state windows");
   if (fleets.some((value) => !Number.isInteger(value) || value < 1) || repetitions < 1) throw new Error("invalid fleet or repetition count");
-  if (stages.some((stage) => !["baseline", "instrumented", "tmux-suppressed", "adaptive"].includes(stage))) throw new Error("invalid benchmark stage");
-  if (selectedScenarios.some((scenario) => !scenarios.includes(scenario))) throw new Error("invalid benchmark scenario");
+  if (stages.some((stage) => !(BENCHMARK_STAGES as readonly string[]).includes(stage))) throw new Error("invalid benchmark stage");
+  if (selectedScenarios.some((scenario) => !(BENCHMARK_SCENARIOS as readonly string[]).includes(scenario))) throw new Error("invalid benchmark scenario");
   const revision = commandText("git", ["rev-parse", "HEAD"]);
   const clockTicks = Number(commandText("getconf", ["CLK_TCK"])) || 100;
   const output = resolve(argValue(args, "--output", join(repoRoot, "bench/results", new Date().toISOString().replace(/[:.]/g, "-"))));
@@ -661,7 +647,7 @@ async function main(args = process.argv.slice(2)): Promise<number> {
     for (const fleetSize of fleets) {
       for (const scenario of selectedScenarios) {
         for (let repetition = 1; repetition <= repetitions; repetition++) {
-          const seed = fleetSize * 100_000 + scenarios.indexOf(scenario) * 1_000 + repetition;
+          const seed = fleetSize * 100_000 + BENCHMARK_SCENARIOS.indexOf(scenario) * 1_000 + repetition;
           const record = await runFleet({ fleetSize, scenario, stage, repetition, seed, warmupMs, steadyMs, windowMs, revision, clockTicks });
           records.push(record);
           const filename = `${stage}-${fleetSize}-${scenario}-r${repetition}.json`;

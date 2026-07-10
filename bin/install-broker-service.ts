@@ -22,17 +22,9 @@ import {
   type BrokerServiceConfig,
 } from "../shared/broker-service.ts";
 import { openOwnerOnlyAppendLog } from "../shared/broker-client.ts";
+import { fsyncDirectory } from "../shared/fs-durability.ts";
 
 const backupSuffix = ".pre-claude-peers";
-
-function fsyncDirectory(path: string): void {
-  const fd = openSync(path, "r");
-  try {
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
-  }
-}
 
 function ensureDirectory(path: string): void {
   mkdirSync(path, { recursive: true, mode: 0o700 });

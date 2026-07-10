@@ -15,7 +15,9 @@ import {
   acquireBrokerOwnership,
   BrokerOwnershipError,
   canonicalizeDatabasePath,
+  isBrokerLifecycleIdentity,
   readOwnerMetadata,
+  sameLifecycleIdentity,
   verifyLifecycleIdentity,
   type BrokerLifecycleIdentity,
 } from "../shared/broker-lifecycle.ts";
@@ -35,6 +37,31 @@ afterEach(() => {
 });
 
 describe("broker database lifetime ownership", () => {
+  test("validates and compares the complete public lifecycle identity contract", () => {
+    const identity: BrokerLifecycleIdentity = {
+      pid: process.pid,
+      process_start: "123",
+      instance_nonce: "nonce",
+      database_path: "/tmp/peers.db",
+      lock_path: "/tmp/peers.db.owner",
+      owner_mode: "direct",
+      executable_path: "/usr/bin/bun",
+      broker_script_path: brokerScriptPath,
+      ready: true,
+      capabilities: {
+        procSocketIdentity: true,
+        nonceProtectedOwnership: true,
+        verifiedShutdown: true,
+        storageSchema: 1,
+      },
+    };
+    expect(isBrokerLifecycleIdentity(identity, 1)).toBe(true);
+    expect(isBrokerLifecycleIdentity({ ...identity, capabilities: { ...identity.capabilities, storageSchema: 2 } }, 1)).toBe(false);
+    expect(isBrokerLifecycleIdentity({ ...identity, pid: 1 }, 1)).toBe(false);
+    expect(sameLifecycleIdentity(identity, { ...identity })).toBe(true);
+    expect(sameLifecycleIdentity(identity, { ...identity, instance_nonce: "other" })).toBe(false);
+  });
+
   test("publishes complete owner-only metadata and rejects a second live owner", () => {
     const dir = root();
     const dbPath = join(dir, "broker.db");

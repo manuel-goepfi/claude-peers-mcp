@@ -1,4 +1,4 @@
-import { chmodSync, closeSync, existsSync, lstatSync, openSync } from "node:fs";
+import { closeSync, constants, fchmodSync, fstatSync, openSync } from "node:fs";
 
 export type BrokerFailureKind = "transport" | "timeout" | "malformed" | "http";
 
@@ -77,15 +77,25 @@ export async function brokerIsReady(baseUrl: string, timeoutMs = 2000): Promise<
 
 export function openOwnerOnlyAppendLog(path: string): number {
   const uid = process.getuid?.() ?? -1;
-  if (existsSync(path)) {
-    const stat = lstatSync(path);
-    if (stat.isSymbolicLink() || !stat.isFile()) throw new Error(`broker log is not a regular file: ${path}`);
-    if (uid >= 0 && stat.uid !== uid) throw new Error(`broker log is not owned by uid ${uid}: ${path}`);
-    if ((stat.mode & 0o077) !== 0) chmodSync(path, 0o600);
+  let fd: number;
+  try {
+    fd = openSync(path, constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW, 0o600);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ELOOP") {
+      throw new Error(`broker log is not a regular file: ${path}`);
+    }
+    throw error;
   }
-  const fd = openSync(path, "a", 0o600);
-  chmodSync(path, 0o600);
-  return fd;
+  try {
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) throw new Error(`broker log is not a regular file: ${path}`);
+    if (uid >= 0 && stat.uid !== uid) throw new Error(`broker log is not owned by uid ${uid}: ${path}`);
+    if ((stat.mode & 0o777) !== 0o600) fchmodSync(fd, 0o600);
+    return fd;
+  } catch (error) {
+    closeSync(fd);
+    throw error;
+  }
 }
 
 export interface EnsureBrokerOptions {

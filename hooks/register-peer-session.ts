@@ -21,13 +21,17 @@ const BROKER_LOG_MAX_BYTES = 10 * 1024 * 1024;
 const BROKER_SYSTEMD_UNIT_PATH = `${process.env.HOME}/.config/systemd/user/claude-peers-broker.service`;
 const SYSTEMD_START_TIMEOUT_SECONDS = "3";
 type HookClientType = Extract<ClientType, "claude" | "codex" | "gemini">;
-const CLIENT_TYPE: HookClientType = process.env.CLAUDE_PEERS_CLIENT_TYPE === "claude"
-  ? "claude"
-  : process.env.CLAUDE_PEERS_CLIENT_TYPE === "gemini"
-    ? "gemini"
-    : "codex";
-const RECEIVER_MODE: Extract<ReceiverMode, "claude-channel" | "codex-hook" | "gemini-hook"> =
-  CLIENT_TYPE === "claude" ? "claude-channel" : CLIENT_TYPE === "gemini" ? "gemini-hook" : "codex-hook";
+type HookReceiverMode = Extract<ReceiverMode, "claude-channel" | "codex-hook" | "gemini-hook">;
+const receiverModeByClient: Record<HookClientType, HookReceiverMode> = {
+  claude: "claude-channel",
+  codex: "codex-hook",
+  gemini: "gemini-hook",
+};
+function hookClientType(value: string | undefined): HookClientType {
+  return value === "claude" || value === "gemini" ? value : "codex";
+}
+const CLIENT_TYPE = hookClientType(process.env.CLAUDE_PEERS_CLIENT_TYPE);
+const RECEIVER_MODE = receiverModeByClient[CLIENT_TYPE];
 
 interface RegisterMetadata {
   pid: number;

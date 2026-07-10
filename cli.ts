@@ -3,7 +3,9 @@ import { existsSync, realpathSync } from "node:fs";
 import { BrokerRequestError, ensureBrokerRunning, requestBroker } from "./shared/broker-client.ts";
 import {
   listenerPidsForLoopbackPort,
+  isBrokerLifecycleIdentity,
   processStartIdentity,
+  sameLifecycleIdentity,
   verifyLifecycleIdentity,
   type BrokerLifecycleIdentity,
 } from "./shared/broker-lifecycle.ts";
@@ -122,37 +124,11 @@ async function unregisterCli(context: CliContext): Promise<void> {
   }
 }
 
-function validateLifecycleIdentity(value: BrokerLifecycleIdentity): BrokerLifecycleIdentity {
-  if (
-    !value ||
-    !Number.isInteger(value.pid) || value.pid <= 1 ||
-    typeof value.process_start !== "string" || !value.process_start ||
-    typeof value.instance_nonce !== "string" || !value.instance_nonce ||
-    typeof value.database_path !== "string" || !value.database_path ||
-    typeof value.lock_path !== "string" || !value.lock_path ||
-    (value.owner_mode !== "direct" && value.owner_mode !== "systemd") ||
-    typeof value.executable_path !== "string" || !value.executable_path ||
-    typeof value.broker_script_path !== "string" || !value.broker_script_path ||
-    value.ready !== true ||
-    value.capabilities?.procSocketIdentity !== true ||
-    value.capabilities?.nonceProtectedOwnership !== true ||
-    value.capabilities?.verifiedShutdown !== true ||
-    value.capabilities?.storageSchema !== 1
-  ) {
+function validateLifecycleIdentity(value: unknown): BrokerLifecycleIdentity {
+  if (!isBrokerLifecycleIdentity(value, 1)) {
     throw new CliError("unsafe", "broker lifecycle identity is missing required verification fields");
   }
   return value;
-}
-
-function sameLifecycleIdentity(left: BrokerLifecycleIdentity, right: BrokerLifecycleIdentity): boolean {
-  return left.pid === right.pid &&
-    left.process_start === right.process_start &&
-    left.instance_nonce === right.instance_nonce &&
-    left.database_path === right.database_path &&
-    left.lock_path === right.lock_path &&
-    left.owner_mode === right.owner_mode &&
-    left.executable_path === right.executable_path &&
-    left.broker_script_path === right.broker_script_path;
 }
 
 async function systemctl(args: string[], timeoutMs: number): Promise<{ code: number; stdout: string }> {

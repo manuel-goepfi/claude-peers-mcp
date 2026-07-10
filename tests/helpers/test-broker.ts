@@ -27,10 +27,6 @@ export interface TestBroker {
   stop(): Promise<void>;
 }
 
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 async function readReadyLine(stream: ReadableStream<Uint8Array>): Promise<number> {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
@@ -69,7 +65,7 @@ export async function waitForBrokerHealth(url: string, timeoutMs = 8000): Promis
     } catch (error) {
       lastError = error instanceof Error ? error.message : String(error);
     }
-    await delay(50);
+    await Bun.sleep(50);
   }
   throw new Error(`broker health timeout (${lastError})`);
 }
@@ -127,7 +123,7 @@ export async function startTestBroker(options: TestBrokerOptions = {}): Promise<
     const outcome = await Promise.race([
       readReadyLine(proc.stdout).then((port) => ({ kind: "ready" as const, port })),
       proc.exited.then((code) => ({ kind: "exit" as const, code })),
-      delay(timeoutMs).then(() => ({ kind: "timeout" as const })),
+      Bun.sleep(timeoutMs).then(() => ({ kind: "timeout" as const })),
     ]);
 
     if (outcome.kind !== "ready") {
@@ -159,7 +155,7 @@ export async function startTestBroker(options: TestBrokerOptions = {}): Promise<
         proc.kill("SIGTERM");
         const exited = await Promise.race([
           proc.exited.then(() => true),
-          delay(2000).then(() => false),
+          Bun.sleep(2000).then(() => false),
         ]);
         if (!exited) {
           proc.kill("SIGKILL");

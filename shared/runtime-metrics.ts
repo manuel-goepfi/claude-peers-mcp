@@ -1,6 +1,30 @@
 const SAMPLE_CAP = 20_000;
 const BUCKET_RETENTION_SECONDS = 900;
 
+const KNOWN_ROUTES = new Set([
+  "GET /health",
+  "GET /messages-since-id",
+  "POST /register",
+  "POST /register-cli",
+  "POST /poll-by-pid",
+  "POST /claim-by-pid",
+  "POST /ack-by-pid",
+  "POST /hook-heartbeat-by-pid",
+  "POST /heartbeat",
+  "POST /metrics",
+  "POST /set-summary",
+  "POST /set-name",
+  "POST /list-peers",
+  "POST /send-message",
+  "POST /send-to-peer",
+  "POST /broadcast-message",
+  "POST /message-status",
+  "POST /lifecycle-identity",
+  "POST /poll-messages",
+  "POST /ack-messages",
+  "POST /unregister",
+]);
+
 export interface LatencySummary {
   count: number;
   p50_ms: number | null;
@@ -23,7 +47,7 @@ function percentile(sorted: number[], fraction: number): number | null {
   return sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * fraction) - 1)]!;
 }
 
-function summarize(samples: number[]): LatencySummary {
+export function summarizeLatency(samples: number[]): LatencySummary {
   if (samples.length === 0) return { count: 0, p50_ms: null, p95_ms: null, max_ms: null };
   const sorted = [...samples].sort((a, b) => a - b);
   return {
@@ -34,9 +58,29 @@ function summarize(samples: number[]): LatencySummary {
   };
 }
 
-function pushBounded(target: number[], value: number): void {
-  target.push(Math.max(0, Math.round(value)));
-  if (target.length > SAMPLE_CAP) target.splice(0, target.length - SAMPLE_CAP);
+class NumberRing {
+  private readonly samples = new Array<number>(SAMPLE_CAP);
+  private size = 0;
+  private next = 0;
+
+  push(value: number): void {
+    this.samples[this.next] = Math.max(0, Math.round(value));
+    this.next = (this.next + 1) % SAMPLE_CAP;
+    this.size = Math.min(this.size + 1, SAMPLE_CAP);
+  }
+
+  values(): number[] {
+    if (this.size < SAMPLE_CAP) return this.samples.slice(0, this.size);
+    return [...this.samples.slice(this.next), ...this.samples.slice(0, this.next)];
+  }
+}
+
+function canonicalRoute(method: string, path: string): string {
+  const normalizedMethod = method.toUpperCase();
+  const candidate = `${normalizedMethod} ${path}`;
+  if (KNOWN_ROUTES.has(candidate)) return candidate;
+  if (normalizedMethod === "GET" || normalizedMethod === "POST") return `${normalizedMethod} /unknown`;
+  return "OTHER /unknown";
 }
 
 export class RuntimeMetrics {
@@ -44,13 +88,13 @@ export class RuntimeMetrics {
   private readonly startedAt: string;
   private readonly routeTotals: Record<string, number> = Object.create(null) as Record<string, number>;
   private readonly routeBuckets = new Map<number, Record<string, number>>();
-  private readonly postRouteCache = new Map<string, string>();
-  private readonly otherRouteCache = new Map<string, string>();
   private lastPruneSecond = 0;
   private readonly bufferedIds = new Set<number>();
-  private readonly bufferOrder: number[] = [];
-  private readonly queueToBuffer: number[] = [];
-  private readonly queueToAck: number[] = [];
+  private readonly bufferOrder = new Array<number>(SAMPLE_CAP);
+  private bufferOrderSize = 0;
+  private bufferOrderNext = 0;
+  private readonly queueToBuffer = new NumberRing();
+  private readonly queueToAck = new NumberRing();
 
   constructor(enabled: boolean, now = Date.now()) {
     this.enabled = enabled;
@@ -59,12 +103,7 @@ export class RuntimeMetrics {
 
   recordRoute(method: string, path: string, now = Date.now()): void {
     if (!this.enabled) return;
-    const cache = method === "POST" ? this.postRouteCache : this.otherRouteCache;
-    let route = cache.get(path);
-    if (!route) {
-      route = `${method.toUpperCase()} ${path}`;
-      cache.set(path, route);
-    }
+    const route = canonicalRoute(method, path);
     this.routeTotals[route] = (this.routeTotals[route] ?? 0) + 1;
     const second = Math.floor(now / 1_000);
     let bucket = this.routeBuckets.get(second);
@@ -88,18 +127,20 @@ export class RuntimeMetrics {
     const sent = Date.parse(sentAt);
     if (!Number.isFinite(sent)) return;
     this.bufferedIds.add(messageId);
-    this.bufferOrder.push(messageId);
-    if (this.bufferOrder.length > SAMPLE_CAP) {
-      const removed = this.bufferOrder.splice(0, this.bufferOrder.length - SAMPLE_CAP);
-      for (const id of removed) this.bufferedIds.delete(id);
+    if (this.bufferOrderSize === SAMPLE_CAP) {
+      this.bufferedIds.delete(this.bufferOrder[this.bufferOrderNext]!);
+    } else {
+      this.bufferOrderSize++;
     }
-    pushBounded(this.queueToBuffer, now - sent);
+    this.bufferOrder[this.bufferOrderNext] = messageId;
+    this.bufferOrderNext = (this.bufferOrderNext + 1) % SAMPLE_CAP;
+    this.queueToBuffer.push(now - sent);
   }
 
   recordQueueToAck(sentAt: string, now = Date.now()): void {
     if (!this.enabled) return;
     const sent = Date.parse(sentAt);
-    if (Number.isFinite(sent)) pushBounded(this.queueToAck, now - sent);
+    if (Number.isFinite(sent)) this.queueToAck.push(now - sent);
   }
 
   snapshot(): RuntimeMetricsSnapshot {
@@ -116,8 +157,8 @@ export class RuntimeMetrics {
       started_at: this.startedAt,
       route_totals: routeTotals,
       route_buckets: routeBuckets,
-      queue_to_buffer: summarize(this.queueToBuffer),
-      queue_to_ack: summarize(this.queueToAck),
+      queue_to_buffer: summarizeLatency(this.queueToBuffer.values()),
+      queue_to_ack: summarizeLatency(this.queueToAck.values()),
     };
   }
 }

@@ -14,6 +14,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { fsyncDirectory } from "./fs-durability.ts";
 
 export type BrokerOwnerMode = "direct" | "systemd";
 
@@ -56,6 +57,35 @@ export interface BrokerLifecycleIdentity {
   };
 }
 
+export function isBrokerLifecycleIdentity(value: unknown, expectedStorageSchema: number): value is BrokerLifecycleIdentity {
+  if (!value || typeof value !== "object") return false;
+  const identity = value as Partial<BrokerLifecycleIdentity>;
+  return Number.isInteger(identity.pid) && (identity.pid ?? 0) > 1 &&
+    typeof identity.process_start === "string" && identity.process_start.length > 0 &&
+    typeof identity.instance_nonce === "string" && identity.instance_nonce.length > 0 &&
+    typeof identity.database_path === "string" && identity.database_path.length > 0 &&
+    typeof identity.lock_path === "string" && identity.lock_path.length > 0 &&
+    (identity.owner_mode === "direct" || identity.owner_mode === "systemd") &&
+    typeof identity.executable_path === "string" && identity.executable_path.length > 0 &&
+    typeof identity.broker_script_path === "string" && identity.broker_script_path.length > 0 &&
+    identity.ready === true &&
+    identity.capabilities?.procSocketIdentity === true &&
+    identity.capabilities?.nonceProtectedOwnership === true &&
+    identity.capabilities?.verifiedShutdown === true &&
+    identity.capabilities?.storageSchema === expectedStorageSchema;
+}
+
+export function sameLifecycleIdentity(left: BrokerLifecycleIdentity, right: BrokerLifecycleIdentity): boolean {
+  return left.pid === right.pid &&
+    left.process_start === right.process_start &&
+    left.instance_nonce === right.instance_nonce &&
+    left.database_path === right.database_path &&
+    left.lock_path === right.lock_path &&
+    left.owner_mode === right.owner_mode &&
+    left.executable_path === right.executable_path &&
+    left.broker_script_path === right.broker_script_path;
+}
+
 export type OwnershipCheckpoint =
   | "staging-created"
   | "metadata-written"
@@ -84,15 +114,6 @@ function randomNonce(): string {
 
 function errno(error: unknown): string | undefined {
   return (error as NodeJS.ErrnoException | undefined)?.code;
-}
-
-function fsyncDirectory(path: string): void {
-  const fd = openSync(path, "r");
-  try {
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
-  }
 }
 
 function assertOwnedDirectory(path: string, uid: number): void {
