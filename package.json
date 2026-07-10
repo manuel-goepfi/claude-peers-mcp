@@ -1,7 +1,15 @@
 {
   "name": "claude-peers",
   "version": "0.1.0",
-  "description": "Peer discovery and messaging for Claude Code instances",
+  "description": "Local peer discovery and messaging for Claude Code, Codex CLI, and Gemini CLI",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/manuel-goepfi/claude-peers-mcp.git"
+  },
+  "engines": {
+    "bun": "1.3.11"
+  },
   "module": "index.ts",
   "type": "module",
   "private": true,

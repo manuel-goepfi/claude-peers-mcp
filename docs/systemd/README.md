@@ -1,10 +1,38 @@
-# systemd unit — codex auto-drain poller
+# systemd user services
 
-Canonical copy of the user-mode systemd unit for the auto-drain poller
-(`bin/codex-autodrain-poller.ts`). The **live** copy lives at
-`~/.config/systemd/user/claude-peers-codex-autodrain.service` on the host; this
-repo copy is the source of truth so the unit (and its hardening) survives a host
-rebuild.
+## Core broker service
+
+Use the installer rather than copying the tracked template. It resolves Bun,
+the clone, state paths, and the current user's home into a 0600 unit plus a
+narrow `ReadWritePaths` drop-in, verifies the rendered unit when
+`systemd-analyze` is available, and reloads the user manager.
+
+```sh
+bun bin/install-broker-service.ts install
+bun bin/install-broker-service.ts --check
+systemctl --user enable --now claude-peers-broker.service
+```
+
+The unit is the only broker owner in managed mode. It sets
+`CLAUDE_PEERS_OWNER_MODE=systemd`; direct CLI shutdown therefore verifies the
+current systemd `MainPID` as well as the loopback socket, process start
+identity, executable/script, database owner metadata, and nonce.
+
+```sh
+systemctl --user status claude-peers-broker.service
+systemctl --user disable --now claude-peers-broker.service
+bun bin/install-broker-service.ts --uninstall
+```
+
+Uninstall removes only managed files and restores a retained operator-owned
+predecessor when one existed. See [the operations guide](../operations.md) for
+upgrade, migration, and offline recovery.
+
+## Optional codex auto-drain poller
+
+The tracked user unit runs `bin/codex-autodrain-poller.ts` from the default
+`$HOME/claude-peers-mcp` clone. If the clone or Bun lives elsewhere, edit the
+two `ExecStart` paths deliberately before installation.
 
 ## What the poller does
 
@@ -27,11 +55,13 @@ Environment=NUDGE_CLIENTS=codex,gemini
 The poller logs its state at startup (`nudge=DISABLED` or `nudge=codex,...`), so
 the active posture is always observable in `~/.claude-peers-codex-autodrain.log`.
 
-## Install / update
+## Install or update
 
 ```sh
 cp docs/systemd/claude-peers-codex-autodrain.service \
    ~/.config/systemd/user/claude-peers-codex-autodrain.service
+chmod 600 ~/.config/systemd/user/claude-peers-codex-autodrain.service
+systemd-analyze --user verify ~/.config/systemd/user/claude-peers-codex-autodrain.service
 systemctl --user daemon-reload
 # enable only if you want systemd (not cron) to own the poller:
 # systemctl --user enable --now claude-peers-codex-autodrain.service
@@ -39,11 +69,10 @@ systemctl --user daemon-reload
 
 ## Two launchers — pick one
 
-The poller can be supervised by **either**:
+The poller can be supervised by **either**, never both:
 
-- **cron watchdog** (`~/bin/ensure-codex-autodrain`, `*/2 * * * *`) — the current
-  live launcher; self-heals a wedged poller every 2 min. Relies on the in-code
-  default for the disabled state.
+- **cron watchdog** (`bin/ensure-codex-autodrain`) — an optional external
+  launcher. Its in-code default keeps auto-nudge disabled.
 - **this systemd unit** — `disabled`/`inactive` by default. If you enable it,
   disable the cron line first to avoid a double-launch.
 

@@ -1197,12 +1197,12 @@ function handleRegister(body: RegisterRequest): RegisterResult {
   // tty is a nullable column; summary is NOT NULL DEFAULT ''. bun:sqlite throws
   // a NOT NULL constraint error when `undefined`/`null` is BOUND to summary —
   // the column DEFAULT only applies when the column is omitted, not when a
-  // nullish value is bound. A bg/daemon-hosted lane registers lazily (first
-  // tool call) BEFORE its async auto-summary lands, so body.summary is
-  // undefined and the insert threw → /register 500 → the lane never registered
-  // and was invisible to the broker (the "lane needs a manual nudge" bug).
+  // nullish value is bound. A bg/daemon-hosted lane may register lazily on its
+  // first tool call without an explicit manual summary, so body.summary can be
+  // undefined; the old insert then threw, returned /register 500, and left the
+  // lane invisible to the broker (the "lane needs a manual nudge" bug).
   // Coalesce both to their column-valid empty forms so registration can't crash
-  // on a not-yet-summarized session.
+  // when a manual summary has not been set.
   const ttyValue = body.tty ?? null;
   const summaryValue = body.summary ?? "";
   const preserveKnownSamePidMetadata = samePidRefresh && existing?.id === id;

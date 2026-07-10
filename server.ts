@@ -2275,15 +2275,9 @@ async function main() {
   if (peerName) log(`Peer name: ${peerName}`);
   if (tmuxInfo) log(`Tmux: ${tmuxInfo.session}:${tmuxInfo.window_index ?? ""}:${tmuxInfo.window_name ?? ""}`);
 
-  // 3. No auto-generated summary. A lane registers with an EMPTY summary and
-  // shows blank in list_peers until an agent/operator sets a real one via the
-  // set_summary tool. The previous auto-summary ("[tmux <session>:<window>]
-  // <project> — editing <file>") was pure redundancy — every field was already
-  // visible elsewhere (tmux coords in the pane border, client in receiver_mode,
-  // the edited file in the pane title) — and it crowded out the DELIBERATE
-  // summaries (e.g. "ux.1 — lane COMMITTED") that carry real, non-duplicated
-  // status. The broker's /set-summary uses COALESCE(NULLIF(?, ''), summary), so
-  // passing "" means "do not set", never clobbering a summary set later.
+  // 3. Summaries are deliberate agent/operator state set through set_summary,
+  // never inferred from process or tmux metadata. An empty registration leaves
+  // an existing same-ID summary intact at the broker.
   const initialSummary = "";
 
   // 4. Register with broker (and define the re-register closure so 401

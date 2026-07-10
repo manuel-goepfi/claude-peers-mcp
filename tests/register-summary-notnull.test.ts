@@ -1,12 +1,12 @@
 /**
- * Regression test — /register must not crash when a peer registers BEFORE its
- * async auto-summary lands (the "lane needs a manual nudge" bug).
+ * Regression test — /register must not crash when a peer registers without an
+ * explicit manual summary (the "lane needs a manual nudge" bug).
  *
  * Root cause (verified 2026-06-15): `peers.summary` is `TEXT NOT NULL DEFAULT
  * ''`. A column DEFAULT only applies when the column is OMITTED from the INSERT
  * — NOT when a nullish value is bound to it. bg/daemon-hosted lanes register
- * lazily on first tool call, often before the gpt-5.4-nano summary is generated,
- * so `body.summary` is `undefined`. Binding `undefined`/`null` to a NOT NULL
+ * lazily on first tool call, and a caller may omit the optional summary, so
+ * `body.summary` is `undefined`. Binding `undefined`/`null` to a NOT NULL
  * column throws `NOT NULL constraint failed: peers.summary`, which made
  * `/register` return a bare 500 and the lane silently never registered → it was
  * invisible to the broker → the operator had to manually nudge it.
@@ -79,7 +79,7 @@ describe("register: summary NOT NULL crash", () => {
     db.close();
   });
 
-  test("FIX — body.summary ?? '' lets a not-yet-summarized lane register", () => {
+  test("FIX — body.summary ?? '' lets a lane without a manual summary register", () => {
     const db = freshPeersDb();
     expect(() => runInsert(db, undefined, "/dev/pts/3", true)).not.toThrow();
     const row = db.query("SELECT summary, tty FROM peers WHERE id = 'peer1'").get() as { summary: string; tty: string | null };
