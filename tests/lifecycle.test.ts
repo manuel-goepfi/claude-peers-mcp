@@ -41,6 +41,28 @@ async function waitFor(predicate: () => boolean, timeoutMs: number, label: strin
   throw new Error(`timed out after ${timeoutMs}ms waiting for: ${label}`);
 }
 
+async function readSpawnedPid(stream: ReadableStream<Uint8Array>): Promise<number> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buffered = "";
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffered += decoder.decode(value, { stream: true });
+      const newline = buffered.indexOf("\n");
+      if (newline >= 0) {
+        const pid = Number(buffered.slice(0, newline));
+        if (Number.isInteger(pid) && pid > 1) return pid;
+        throw new Error(`wrapper emitted invalid server pid: ${buffered.slice(0, newline)}`);
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  throw new Error("wrapper exited before emitting the server pid");
+}
+
 function isLiveNonZombieProcess(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -113,17 +135,17 @@ describe("server.ts lifecycle", () => {
       // (held open by this test), so the stdin-EOF path cannot fire — only the
       // parent-death watchdog can. Heartbeat interval shrunk via env override.
       const wrapper = Bun.spawn(
-        ["bash", "-c", `bun "${SERVER_SCRIPT}" <&0 & sleep 0.3`],
+        ["bash", "-c", `bun "${SERVER_SCRIPT}" <&0 >/dev/null 2>&1 & child=$!; printf '%s\\n' "$child"; sleep 0.3`],
         {
           env: serverEnv({ CLAUDE_PEERS_HEARTBEAT_MS: "200" }),
           stdin: "pipe", // held open for the server's whole lifetime
-          stdout: "ignore",
+          stdout: "pipe",
           stderr: "ignore",
         }
       );
       try {
+        const serverPid = await readSpawnedPid(wrapper.stdout);
         await waitFor(() => peerRows().length === 1, 10000, "server registration");
-        const serverPid = peerRows()[0]!.pid;
 
         await wrapper.exited; // parent (bash) is now gone -> server reparented
 
