@@ -487,6 +487,14 @@ export function evaluateCampaign(records: FleetRunRecord[], quick = false): Camp
   for (const stage of ["baseline", "instrumented", "tmux-suppressed", "adaptive"] as BenchmarkStage[]) byStage.set(stage, new Map());
   for (const record of records) byStage.get(record.stage)!.set(pairKey(record), record);
 
+  if (!quick) {
+    checks.push({ name: "exact campaign record count", passed: records.length === 108, actual: records.length, limit: 108 });
+    for (const stage of ["baseline", "instrumented", "tmux-suppressed", "adaptive"] as BenchmarkStage[]) {
+      const count = records.filter((record) => record.stage === stage).length;
+      checks.push({ name: `${stage} stage record count`, passed: count === 27, actual: count, limit: 27 });
+    }
+  }
+
   for (const [key, baseline] of byStage.get("baseline")!) {
     const instrumented = byStage.get("instrumented")!.get(key);
     if (!instrumented) continue;
@@ -515,6 +523,18 @@ export function evaluateCampaign(records: FleetRunRecord[], quick = false): Camp
 
   for (const record of records) {
     checks.push({ name: `no request errors ${record.stage} ${pairKey(record)}`, passed: record.errors === 0 && record.rate_limited === 0, actual: `${record.errors}/${record.rate_limited}`, limit: "0/0" });
+  }
+  for (const stage of ["baseline", "instrumented", "tmux-suppressed", "adaptive"] as BenchmarkStage[]) {
+    for (const scenario of scenarios) {
+      for (let repetition = 1; repetition <= 3; repetition++) {
+        const scaling = records.filter((record) => record.stage === stage && record.scenario === scenario && record.repetition === repetition).sort((a, b) => a.fleet_size - b.fleet_size);
+        if (scaling.length < 2) continue;
+        const cpuMonotonic = scaling.every((record, index) => index === 0 || record.cpu_seconds >= scaling[index - 1]!.cpu_seconds);
+        const pssMonotonic = scaling.every((record, index) => index === 0 || record.pss_kb.average >= scaling[index - 1]!.pss_kb.average);
+        checks.push({ name: `CPU scaling ${stage} ${scenario} r${repetition}`, passed: cpuMonotonic, actual: scaling.map((record) => record.cpu_seconds).join(","), limit: "monotonic" });
+        checks.push({ name: `PSS scaling ${stage} ${scenario} r${repetition}`, passed: pssMonotonic, actual: scaling.map((record) => Math.round(record.pss_kb.average)).join(","), limit: "monotonic" });
+      }
+    }
   }
   return { summary_version: 1, quick, passed: checks.every((check) => check.passed), records: records.length, checks };
 }

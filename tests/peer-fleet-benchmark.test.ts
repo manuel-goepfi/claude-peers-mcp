@@ -32,6 +32,36 @@ function record(stage: FleetRunRecord["stage"], overrides: Partial<FleetRunRecor
   };
 }
 
+function passingCampaign(): FleetRunRecord[] {
+  const records: FleetRunRecord[] = [];
+  const scenarios = ["all-idle", "one-active", "randomized-phase"] as const;
+  for (const stage of ["baseline", "instrumented", "tmux-suppressed", "adaptive"] as const) {
+    for (const fleetSize of [1, 10, 50]) {
+      for (const scenario of scenarios) {
+        for (let repetition = 1; repetition <= 3; repetition++) {
+          const baselineCpu = fleetSize * 2;
+          const cpu = stage === "instrumented" ? baselineCpu * 1.04 : stage === "adaptive" ? baselineCpu * 0.4 : baselineCpu;
+          const baselinePss = fleetSize * 1_000;
+          const pss = stage === "instrumented" ? baselinePss * 1.04 : baselinePss;
+          records.push(record(stage, {
+            fleet_size: fleetSize,
+            scenario,
+            repetition,
+            seed: fleetSize * 100_000 + scenarios.indexOf(scenario) * 1_000 + repetition,
+            cpu_seconds: cpu,
+            cpu_seconds_by_process: { broker: cpu * 0.2, adapters: cpu * 0.8 },
+            pss_kb: { samples: [pss], average: pss, max: pss },
+            queue_to_buffer: scenario === "one-active"
+              ? { active: { count: 3, p50_ms: 500, p95_ms: 1_000, max_ms: 1_000 }, idle: { count: 0, p50_ms: null, p95_ms: null, max_ms: null } }
+              : { active: { count: 0, p50_ms: null, p95_ms: null, max_ms: null }, idle: { count: 3, p50_ms: 5_000, p95_ms: 9_000, max_ms: 10_000 } },
+          }));
+        }
+      }
+    }
+  }
+  return records;
+}
+
 describe("peer fleet evidence evaluation", () => {
   test("latency summaries retain state-specific p50/p95/max", () => {
     const samples = [
@@ -44,8 +74,9 @@ describe("peer fleet evidence evaluation", () => {
   });
 
   test("passes the paired CPU, PSS, request, herd, and idle latency gates", () => {
-    const records = [record("baseline"), record("instrumented", { cpu_seconds: 104, pss_kb: { samples: [1040], average: 1040, max: 1040 } }), record("adaptive")];
-    expect(evaluateCampaign(records).passed).toBe(true);
+    const summary = evaluateCampaign(passingCampaign());
+    expect(summary.records).toBe(108);
+    expect(summary.passed).toBe(true);
   });
 
   test("fails and names a missed adaptive gate", () => {
@@ -53,5 +84,15 @@ describe("peer fleet evidence evaluation", () => {
     const summary = evaluateCampaign(records);
     expect(summary.passed).toBe(false);
     expect(summary.checks.some((check) => check.name.startsWith("final CPU reduction") && !check.passed)).toBe(true);
+  });
+
+  test("rejects non-monotonic fleet scaling", () => {
+    const records = [
+      record("baseline", { fleet_size: 1, cpu_seconds: 10 }),
+      record("baseline", { fleet_size: 10, cpu_seconds: 9 }),
+    ];
+    const summary = evaluateCampaign(records, true);
+    expect(summary.passed).toBe(false);
+    expect(summary.checks.some((check) => check.name.startsWith("CPU scaling") && !check.passed)).toBe(true);
   });
 });
