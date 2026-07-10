@@ -111,4 +111,25 @@ describe("hook shell wrappers", () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
+
+  test("Claude register wrapper resolves the startup hook and pins the Claude client", async () => {
+    const { root, wrapper } = makeFakeInstall("claude-register-peer-session.sh");
+    try {
+      const proc = Bun.spawn(["bash", wrapper], {
+        cwd: root,
+        env: { PATH: process.env.PATH ?? "" },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const stdout = await new Response(proc.stdout).text();
+      const stderr = await new Response(proc.stderr).text();
+      expect(await proc.exited).toBe(0);
+      expect(stderr).toBe("");
+      const payload = JSON.parse(stdout) as { cwd: string; client: string | null };
+      expect(payload.cwd).toBe(root);
+      expect(payload.client).toBe("claude");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });

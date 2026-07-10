@@ -20,10 +20,14 @@ const BROKER_LOG = process.env.CLAUDE_PEERS_BROKER_LOG ?? `${process.env.HOME}/.
 const BROKER_LOG_MAX_BYTES = 10 * 1024 * 1024;
 const BROKER_SYSTEMD_UNIT_PATH = `${process.env.HOME}/.config/systemd/user/claude-peers-broker.service`;
 const SYSTEMD_START_TIMEOUT_SECONDS = "3";
-const CLIENT_TYPE: Extract<ClientType, "codex" | "gemini"> =
-  process.env.CLAUDE_PEERS_CLIENT_TYPE === "gemini" ? "gemini" : "codex";
-const RECEIVER_MODE: Extract<ReceiverMode, "codex-hook" | "gemini-hook"> =
-  CLIENT_TYPE === "gemini" ? "gemini-hook" : "codex-hook";
+type HookClientType = Extract<ClientType, "claude" | "codex" | "gemini">;
+const CLIENT_TYPE: HookClientType = process.env.CLAUDE_PEERS_CLIENT_TYPE === "claude"
+  ? "claude"
+  : process.env.CLAUDE_PEERS_CLIENT_TYPE === "gemini"
+    ? "gemini"
+    : "codex";
+const RECEIVER_MODE: Extract<ReceiverMode, "claude-channel" | "codex-hook" | "gemini-hook"> =
+  CLIENT_TYPE === "claude" ? "claude-channel" : CLIENT_TYPE === "gemini" ? "gemini-hook" : "codex-hook";
 
 interface RegisterMetadata {
   pid: number;
@@ -61,7 +65,7 @@ function processTable(): Map<number, ProcessInfo> {
 export function findClientPidFromTable(
   table: Map<number, ProcessInfo>,
   startPid = process.ppid,
-  clientType: Extract<ClientType, "codex" | "gemini"> = CLIENT_TYPE,
+  clientType: HookClientType = CLIENT_TYPE,
 ): number | null {
   let current = startPid;
   for (let i = 0; i < 30; i++) {
@@ -199,7 +203,7 @@ export function publishBrokerIdentityToTmux(identity: {
   return result;
 }
 
-function peerName(clientType: Extract<ClientType, "codex" | "gemini">, pid: number, tmux: TmuxPaneInfo | null, env: Record<string, string | undefined>): string {
+function peerName(clientType: HookClientType, pid: number, tmux: TmuxPaneInfo | null, env: Record<string, string | undefined>): string {
   const envName = env.CLAUDE_PEER_NAME?.trim();
   if (envName) return envName;
   if (tmux?.session && tmux.pane_index) return `${tmux.session}.${tmux.pane_index}`;

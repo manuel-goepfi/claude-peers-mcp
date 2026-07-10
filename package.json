@@ -11,7 +11,9 @@
     "server": "bun server.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
-    "verify": "bun run typecheck && bun test"
+    "smoke:install": "bun scripts/smoke-clean-install.ts",
+    "smoke:clients": "bun scripts/smoke-real-clients.ts",
+    "verify": "bun run typecheck && bun test && bun run smoke:install"
   },
   "devDependencies": {
     "@types/bun": "1.3.11"

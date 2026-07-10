@@ -52,6 +52,7 @@ describe("Gemini hook installer", () => {
         };
       };
       expect(doc.mcpServers["claude-peers"]).toBeDefined();
+      expect(doc.mcpServers["claude-peers"]).toEqual({ command: process.execPath, args: [join(new URL("..", import.meta.url).pathname, "server.ts")] });
       const hooks = doc.hooks.BeforeAgent.flatMap((bucket) => bucket.hooks);
       const commands = hooks.map((hook) => hook.command);
       expect(commands).toContain("/usr/bin/env bash existing-gemini-context.sh");
