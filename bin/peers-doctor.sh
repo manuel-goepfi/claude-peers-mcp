@@ -10,6 +10,8 @@ set -u
 PASS=0
 WARN=0
 FAIL=0
+BROKER_PORT="${CLAUDE_PEERS_PORT:-7899}"
+BROKER_URL="http://127.0.0.1:${BROKER_PORT}"
 
 ok()   { printf "[\e[32m✓\e[0m] %s\n" "$1"; PASS=$((PASS+1)); }
 warn() { printf "[\e[33m!\e[0m] %s\n    → %s\n" "$1" "$2"; WARN=$((WARN+1)); }
@@ -19,7 +21,7 @@ printf "claude-peers doctor — %s\n\n" "$(date -Iseconds)"
 
 # 1. broker HTTP /health — authoritative liveness check (the pgrep pattern
 # can miss brokers launched as `bun broker.ts` without a full path).
-HEALTH=$(curl -sf -m 2 http://127.0.0.1:7899/health 2>/dev/null || echo "")
+HEALTH=$(curl -sf -m 2 "${BROKER_URL}/health" 2>/dev/null || echo "")
 if [[ -n "$HEALTH" ]]; then
   CAPS_KNOWN=false
   if command -v jq >/dev/null 2>&1; then
@@ -37,15 +39,17 @@ if [[ -n "$HEALTH" ]]; then
   BROKER_PID=$(pgrep -f 'bun.*broker\.ts' 2>/dev/null | head -1)
   ok "broker /health responding (${PEER_COUNT} peers${BROKER_PID:+, pid $BROKER_PID})"
   if [[ "$CAPS_KNOWN" != "true" ]]; then
-    warn "broker capability flags not parsed" "install jq or inspect /health manually; doctor will verify /claim-by-pid directly when this pane has an MCP PID"
+    warn "broker capability flags not parsed" "install jq or inspect /health manually; doctor remains read-only and will not probe delivery endpoints"
   elif [[ "$CLAIM_CAP" == "true" && "$ACK_CAP" == "true" && "$HEARTBEAT_CAP" == "true" ]]; then
     ok "broker advertises prompt-hook drain capabilities"
   else
     fail "broker /health is alive but missing prompt-hook drain capabilities" "systemctl --user restart claude-peers-broker; stale brokers cannot autodrain Codex/Gemini peers"
   fi
 else
-  fail "broker /health not responding on 127.0.0.1:7899" "systemctl --user restart claude-peers-broker (managed unit with memory cap — do NOT spawn bun broker.ts manually)"
+  fail "broker /health not responding on 127.0.0.1:${BROKER_PORT}" "systemctl --user restart claude-peers-broker (managed unit with memory cap — do NOT spawn bun broker.ts manually)"
 fi
+
+warn "read-only safety mode: delivery endpoints are not probed" "interim doctor verifies broker reachability and advertised capabilities only; validate end-to-end drain behavior from the receiving client"
 
 # 3. DB readable
 if [[ -f "$HOME/.claude-peers.db" ]]; then
@@ -106,38 +110,7 @@ for h in drain-peer-inbox.sh claude-peers-standby-watcher.sh claude-peers-sessio
   fi
 done
 
-# 7. /poll-by-pid responds
-if [[ -n "$MY_MCP" ]]; then
-  RESP=$(curl -s -m 2 -w '\n%{http_code}' -X POST http://127.0.0.1:7899/poll-by-pid \
-    -H 'Content-Type: application/json' \
-    -d "{\"pid\":${MY_MCP},\"caller_pid\":$$}" 2>/dev/null)
-  BODY=$(printf '%s\n' "$RESP" | sed '$d')
-  STATUS=$(printf '%s\n' "$RESP" | tail -n1)
-  if [[ "$STATUS" == "200" && "$BODY" =~ \"peer_id\":\"[^\"]+\" ]]; then
-    ok "/poll-by-pid responds 200 for this session's MCP"
-  elif [[ "$STATUS" == "200" ]]; then
-    warn "/poll-by-pid endpoint reachable but this PID has no broker peer row" "relaunch this session if Claude MCP delivery should be active; Codex/Gemini prompt-drain checks below may not apply to this PID"
-  else
-    fail "/poll-by-pid returned ${STATUS:-no-response}" "check broker + rebuild (bun install) + restart"
-  fi
-
-  CLAIM_RESP=$(curl -s -m 2 -w '\n%{http_code}' -X POST http://127.0.0.1:7899/claim-by-pid \
-    -H 'Content-Type: application/json' \
-    -d "{\"pid\":${MY_MCP},\"caller_pid\":$$,\"drain_id\":\"doctor-$$\"}" 2>/dev/null)
-  CLAIM_BODY=$(printf '%s\n' "$CLAIM_RESP" | sed '$d')
-  CLAIM_STATUS=$(printf '%s\n' "$CLAIM_RESP" | tail -n1)
-  if [[ "$CLAIM_STATUS" == "200" && "$CLAIM_BODY" =~ \"peer_id\":\"[^\"]+\" ]]; then
-    ok "/claim-by-pid responds 200 for safe prompt-hook drain"
-  elif [[ "${CAPS_KNOWN:-false}" == "true" && "${CLAIM_CAP:-false}" != "true" ]]; then
-    fail "/claim-by-pid unavailable on this broker" "restart broker onto current code; /health lacks capabilities.hookDrain.claimByPid"
-  elif [[ "$CLAIM_STATUS" == "404" && "$CLAIM_BODY" =~ peer[[:space:]-]*not[[:space:]-]*found ]]; then
-    warn "/claim-by-pid endpoint reachable but this PID has no claimable prompt-hook row" "this is expected for some Claude MCP-only sessions; verify Codex/Gemini claim drain from their client PID or relaunch registration if this was a Codex/Gemini pane"
-  else
-    fail "/claim-by-pid returned ${CLAIM_STATUS:-no-response}" "restart broker so the prompt-hook endpoints are available"
-  fi
-fi
-
-# 7b. Codex/Gemini hook surfaces
+# 7. Codex/Gemini hook surfaces
 CODEX_HOOK="$HOME/claude-peers-mcp/hooks/codex-drain-peer-inbox.sh"
 if [[ -x "$CODEX_HOOK" ]]; then
   ok "Codex inbox hook executable"
@@ -152,7 +125,7 @@ else
   warn "Gemini inbox hook not executable at $GEMINI_HOOK" "chmod +x $GEMINI_HOOK or reinstall fork"
 fi
 
-# 7c. orphaned / spare-parented server.ts processes. An orphan (ppid=1) is a
+# 7b. orphaned / spare-parented server.ts processes. An orphan (ppid=1) is a
 # dead session's MCP server still heartbeating — it squats a seat, breeds #N
 # duplicate names, and blocks rehydration. Spare-parented (claude --bg-spare)
 # servers are pre-warm ghosts. Both classes should not exist after the
@@ -175,7 +148,7 @@ else
   [[ -n "$SPARES" ]] && warn "bg-spare-parented server.ts: ${SPARES}" "kill ${SPARES}— pre-warm ghosts; new code defers their registration"
 fi
 
-# 7d. Codex hook trust. Codex trust is hash-based: any hooks.json rewrite
+# 7c. Codex hook trust. Codex trust is hash-based: any hooks.json rewrite
 # (e.g. install-codex-hook.ts) marks hooks untrusted and they silently stop
 # running until re-trusted. We can't read Codex's trust store portably, so
 # flag recently-modified hooks.json files as a reminder.
