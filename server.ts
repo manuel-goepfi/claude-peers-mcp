@@ -46,6 +46,8 @@ import { findNearestVisibleCodexProcessByStart, findSingleVisibleCodexProcess } 
 import {
   brokerIdentityPaneTarget as sharedBrokerIdentityPaneTarget,
   publishBrokerIdentityToTmux as sharedPublishBrokerIdentityToTmux,
+  tmuxIdentityWriteKey,
+  TmuxIdentityWriteTracker,
   type TmuxMirrorResult,
 } from "./shared/tmux-identity.ts";
 import { frameUntrusted, renderInboundLine } from "./shared/render.ts";
@@ -54,12 +56,23 @@ import { PEERS_VERSION } from "./shared/version.ts";
 import { brokerIsReady, openOwnerOnlyAppendLog } from "./shared/broker-client.ts";
 import { brokerServiceConfig, installedBrokerServiceIsCurrent } from "./shared/broker-service.ts";
 import { parseTmuxPanes, composeTmuxFromEnv, prepareTmuxPaneText, tmuxPaneTarget, bgSessionIdFromPtyHostArgs, resolveBgAttachPane, type TmuxPaneInfo } from "./shared/tmux.ts";
+import { AdaptivePollScheduler, cadencePhaseDelay, deterministicPollPhase, type PollDecision, type PollOutcome } from "./shared/poll-scheduler.ts";
 
 // --- Configuration ---
 
 const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 const POLL_INTERVAL_MS = 1000;
+function booleanSetting(name: string, fallback: boolean): boolean {
+  const raw = process.env[name]?.trim().toLowerCase();
+  if (raw === undefined || raw === "") return fallback;
+  if (["1", "true", "yes", "on"].includes(raw)) return true;
+  if (["0", "false", "no", "off"].includes(raw)) return false;
+  return fallback;
+}
+const ADAPTIVE_POLLING_ENABLED = booleanSetting("CLAUDE_PEERS_ADAPTIVE_POLLING", true);
+const TMUX_UNCHANGED_WRITE_SUPPRESSION = booleanSetting("CLAUDE_PEERS_TMUX_UNCHANGED_WRITE_SUPPRESSION", true);
+const HEARTBEAT_PHASE_SPREAD_ENABLED = booleanSetting("CLAUDE_PEERS_HEARTBEAT_PHASE_SPREAD", true);
 // Env override exists for tests only (lifecycle tests need sub-second ticks).
 const HEARTBEAT_INTERVAL_MS = parseInt(process.env.CLAUDE_PEERS_HEARTBEAT_MS ?? "15000", 10);
 // Re-detect our tmux pane only every Nth heartbeat, NOT every tick. detectTmuxPane()
@@ -170,6 +183,7 @@ const PEER_ID_BODY_PATHS = new Set([
   "/poll-messages",
   "/ack-messages",
   "/message-status",
+  "/metrics",
 ]);
 
 export function rewriteAuthBodyForPeer(path: string, body: unknown, oldPeerId: string | null, newPeerId: string | null): unknown {
@@ -254,6 +268,7 @@ async function brokerFetch<T>(path: string, body: unknown, _retry = false): Prom
   // Only a genuine healthy call (direct success, no 401, not a /register) clears it.
   const successIsRecoveryActivity = _retry || path === "/register";
   firstReregisterChurnAt = nextChurnStreak(firstReregisterChurnAt, successIsRecoveryActivity, true, Date.now());
+  if (_retry) notePollingActivity("broker-recovery");
   return res.json() as Promise<T>;
 }
 
@@ -268,6 +283,7 @@ let reregisterPeer: () => Promise<void> = async () => {
 // the CallTool handler awaits this to register on first use. Replaced by
 // main() with the real closure; no-op resolution once registered.
 let ensureRegistered: () => Promise<void> = async () => {};
+let notePollingActivity: (reason: string) => void = () => {};
 
 export function __testSetBrokerAuthStateForTest(state: {
   id?: PeerId | null;
@@ -1008,6 +1024,8 @@ export function brokerIdentityPaneTarget(tmuxInfo: TmuxPaneInfo | null): string 
   return sharedBrokerIdentityPaneTarget(tmuxInfo);
 }
 
+const tmuxIdentityWriteTracker = new TmuxIdentityWriteTracker();
+
 export function publishBrokerIdentityToTmux(identity: {
   id: PeerId;
   name: string | null;
@@ -1015,12 +1033,19 @@ export function publishBrokerIdentityToTmux(identity: {
   client_type: ClientType;
   receiver_mode: ReceiverMode;
 }, tmuxInfo: TmuxPaneInfo | null = myTmuxInfo, options: { updateOperatorLabel?: boolean } = {}): TmuxMirrorResult {
+  const target = sharedBrokerIdentityPaneTarget(tmuxInfo);
+  const now = Date.now();
+  const key = target ? `${tmuxIdentityWriteKey(identity, target)}:${options.updateOperatorLabel === true}` : null;
+  if (TMUX_UNCHANGED_WRITE_SUPPRESSION && target && key && !tmuxIdentityWriteTracker.shouldWrite(key, now)) {
+    return tmuxIdentityWriteTracker.skippedResult(target);
+  }
   const result = sharedPublishBrokerIdentityToTmux(identity, tmuxInfo, {
     updateOperatorLabel: options.updateOperatorLabel,
     writeOperatorLabel: true,
     readPaneOption: readTmuxPaneOption,
     setPaneOption: setTmuxPaneOption,
   });
+  if (TMUX_UNCHANGED_WRITE_SUPPRESSION && result.target && key) tmuxIdentityWriteTracker.record(key, result, now);
   if (!result.target) return result;
   const displayLabel = identity.name || identity.resolved_name || identity.id;
   const ok = result.failedOptions.length === 0;
@@ -1084,6 +1109,7 @@ export function planTmuxMirrorTransition(
 
 function recordTmuxMirrorResult(context: string, result: TmuxMirrorResult): void {
   if (!result.target) return;
+  if (result.skipped) return;
   if (result.ok) {
     latestTmuxMirrorFailure = null;
     return;
@@ -1515,6 +1541,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       return { content: [{ type: "text" as const, text: `Peer registration failed: ${errMsg(e)}` }], isError: true };
     }
   }
+  notePollingActivity(`tool:${name}`);
 
   switch (name) {
     case "list_peers": {
@@ -2077,8 +2104,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
 // --- Polling loop for inbound messages ---
 
-async function pollAndPushMessages() {
-  if (!myId) return;
+async function pollAndPushMessages(): Promise<PollOutcome> {
+  if (!myId) return "empty";
 
   try {
     const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
@@ -2094,7 +2121,7 @@ async function pollAndPushMessages() {
       newMessages.push(msg);
     }
 
-    if (newMessages.length === 0) return;
+    if (newMessages.length === 0) return "empty";
 
     // Fetch peer list once for sender metadata (not per-message)
     let peerCache: Peer[] | null = null;
@@ -2141,8 +2168,10 @@ async function pollAndPushMessages() {
       // Delivery confirmed ONLY when drainPendingMessages() or check_messages
       // includes this message in a tool response that Claude actually reads.
     }
+    return "nonempty";
   } catch (e) {
     log(`Poll error: ${e instanceof Error ? e.message : String(e)}`);
+    return "error";
   }
 }
 
@@ -2344,6 +2373,7 @@ async function main() {
     myOperatorName = r.name ?? peerName;
     myResolvedName = r.resolved_name ?? r.name ?? peerName;
     applyReceiverMetadata(r.client_type ?? myClientType, r.receiver_mode ?? myReceiverMode, "re-register");
+    notePollingActivity("re-registration");
     recordTmuxMirrorResult("re-register", publishBrokerIdentityToTmux({
       id: myId,
       name: myOperatorName,
@@ -2409,23 +2439,60 @@ async function main() {
   // Manual check_messages remains available for these clients because it polls the
   // broker directly instead of relying on this local buffer.
   let pollActive = false;
+  let pollInFlight = false;
+  let pollTimer: ReturnType<typeof setTimeout> | null = null;
+  const pollScheduler = new AdaptivePollScheduler(myId ?? peerName ?? String(myRegisterPid), performance.now());
 
-  async function schedulePoll() {
+  const recordPollDecision = (decision: PollDecision) => {
+    if (decision.transition) log(`poll-state ${JSON.stringify(decision.transition)}`);
+  };
+
+  const armPoll = (delayMs: number) => {
+    if (pollTimer) clearTimeout(pollTimer);
+    pollTimer = setTimeout(runScheduledPoll, delayMs);
+  };
+
+  async function runScheduledPoll() {
+    pollTimer = null;
+    if (!pollActive || pollInFlight) return;
+    pollInFlight = true;
+    const outcome = await pollAndPushMessages();
+    pollInFlight = false;
     if (!pollActive) return;
-    await pollAndPushMessages();
-    if (pollActive) setTimeout(schedulePoll, POLL_INTERVAL_MS);
+    if (ADAPTIVE_POLLING_ENABLED) {
+      const decision = pollScheduler.afterPoll(outcome, performance.now());
+      recordPollDecision(decision);
+      armPoll(decision.delay_ms);
+    } else {
+      armPoll(POLL_INTERVAL_MS);
+    }
   }
+
+  notePollingActivity = (reason: string) => {
+    if (!ADAPTIVE_POLLING_ENABLED) return;
+    const decision = pollScheduler.activity(reason, performance.now());
+    recordPollDecision(decision);
+    if (pollActive && !pollInFlight) armPoll(decision.delay_ms);
+  };
 
   function startBackgroundPoll(reason: string) {
     if (pollActive) return;
     pollActive = true;
     log(`background channel poll enabled (${reason})`);
-    setTimeout(schedulePoll, POLL_INTERVAL_MS);
+    if (ADAPTIVE_POLLING_ENABLED) {
+      const decision = pollScheduler.activity("poll-start", performance.now());
+      recordPollDecision(decision);
+      armPoll(decision.delay_ms);
+    } else {
+      armPoll(POLL_INTERVAL_MS);
+    }
   }
 
   function stopBackgroundPoll(reason: string) {
     if (!pollActive) return;
     pollActive = false;
+    if (pollTimer) clearTimeout(pollTimer);
+    pollTimer = null;
     log(`background channel poll disabled (${reason})`);
   }
 
@@ -2469,7 +2536,10 @@ async function main() {
       client_type: myClientType,
       receiver_mode: myReceiverMode,
     }, myTmuxInfo));
-  const heartbeatTimer = setInterval(async () => {
+  const heartbeatIdentity = myId ?? peerName ?? String(myRegisterPid);
+  const heartbeatPhaseMs = deterministicPollPhase(heartbeatIdentity, HEARTBEAT_INTERVAL_MS);
+  let heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
+  const runHeartbeat = async () => {
     if (!myId || heartbeatInFlight) return;
     // Orphan self-reap, evaluated HERE on the timer (off the request path) — never
     // inside brokerFetch, so a user tool call can't die mid-request. If auth has
@@ -2574,7 +2644,19 @@ async function main() {
     } finally {
       heartbeatInFlight = false;
     }
-  }, HEARTBEAT_INTERVAL_MS);
+  };
+  const scheduleHeartbeat = () => {
+    if (shuttingDown) return;
+    const delayMs = HEARTBEAT_PHASE_SPREAD_ENABLED
+      ? cadencePhaseDelay(HEARTBEAT_INTERVAL_MS, performance.now(), heartbeatPhaseMs)
+      : HEARTBEAT_INTERVAL_MS;
+    heartbeatTimer = setTimeout(async () => {
+      heartbeatTimer = null;
+      await runHeartbeat();
+      scheduleHeartbeat();
+    }, delayMs);
+  };
+  scheduleHeartbeat();
 
   // 8. Prune confirmedDeliveredIds and localMessageBuffer periodically.
   //
@@ -2630,7 +2712,11 @@ async function main() {
     const hardExit = setTimeout(() => process.exit(0), 3000);
     if (typeof hardExit.unref === "function") hardExit.unref();
     pollActive = false;
-    clearInterval(heartbeatTimer);
+    if (pollTimer) clearTimeout(pollTimer);
+    pollTimer = null;
+    notePollingActivity = () => {};
+    if (heartbeatTimer) clearTimeout(heartbeatTimer);
+    heartbeatTimer = null;
     clearInterval(pruneTimer);
     clearInterval(parentWatchdogTimer);
     if (myId) {

@@ -55,6 +55,7 @@ import { isReapable, deadSeatMailExpired, shouldRotateLog, PEER_GHOST_AFTER_MS }
 import { PEERS_VERSION } from "./shared/version.ts";
 import { acquireBrokerOwnership, assertDatabaseIdentity, type BrokerLifecycleIdentity } from "./shared/broker-lifecycle.ts";
 import { initializeStorage, positiveMilliseconds, retentionPurgeSql, unknownReceiverPurgeSql, STORAGE_SCHEMA_VERSION, type StorageReadiness } from "./shared/storage.ts";
+import { RuntimeMetrics } from "./shared/runtime-metrics.ts";
 
 const PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const TEST_PORT_ZERO = process.env.NODE_ENV === "test" && process.env.CLAUDE_PEERS_TEST_PORT_ZERO === "1";
@@ -161,6 +162,7 @@ function booleanEnv(name: string, defaultValue: boolean): boolean {
 }
 
 const BRIDGE_ENABLED = booleanEnv("CLAUDE_PEERS_BRIDGE_ENABLED", true);
+const runtimeMetrics = new RuntimeMetrics(booleanEnv("CLAUDE_PEERS_METRICS_ENABLED", true));
 const BROKER_CAPABILITIES = {
   hookDrain: {
     pollByPid: true,
@@ -184,6 +186,9 @@ const BROKER_CAPABILITIES = {
     schemaVersion: STORAGE_SCHEMA_VERSION,
     readiness: true,
     retentionAt: true,
+  },
+  metrics: {
+    aggregateRuntimeMetrics: runtimeMetrics.enabled,
   },
 } as const;
 
@@ -1778,6 +1783,8 @@ function handleBroadcast(authedFromId: string, body: BroadcastRequest): Broadcas
 
 function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
   const messages = selectAvailableMessages(body.id);
+  const now = Date.now();
+  for (const message of messages) runtimeMetrics.recordQueueToBuffer(message.id, message.sent_at, now);
   // Read-only: caller must explicitly ack via /ack-messages
   return { messages };
 }
@@ -1796,6 +1803,7 @@ function handleAckMessages(body: AckMessagesRequest): { ok: boolean; acked: numb
       const result = markDeliveredScoped.run(nowIso, nowIso, id, body.id);
       if (result.changes > 0 && row) {
         const latencyMs = nowMs - new Date(row.sent_at).getTime();
+        runtimeMetrics.recordQueueToAck(row.sent_at, nowMs);
         console.error(`[broker] deliver id=${id} from=${row.from_id} to=${body.id} via=${via} latency_ms=${latencyMs}`);
       }
       count += result.changes;
@@ -1886,6 +1894,7 @@ function handleClaimByPid(body: ClaimByPidRequest): ClaimByPidResponse {
       if (result.changes > 0) {
         claimedMessages.push(m);
         bytes += nextBytes;
+        runtimeMetrics.recordQueueToBuffer(m.id, m.sent_at, Date.now());
       }
     }
   })();
@@ -1919,6 +1928,7 @@ function handleAckByPid(body: AckByPidRequest): AckByPidResponse {
       const result = markDeliveredClaimedScoped.run(nowIso, nowIso, id, auth.id, drainId);
       if (result.changes > 0 && row) {
         const latencyMs = nowMs - new Date(row.sent_at).getTime();
+        runtimeMetrics.recordQueueToAck(row.sent_at, nowMs);
         console.error(`[broker] deliver id=${id} from=${row.from_id} to=${auth.id} via=${via} latency_ms=${latencyMs}`);
       }
       count += result.changes;
@@ -1969,6 +1979,8 @@ function handlePollByPid(body: { pid: number; caller_pid: number }): {
       if (result.changes > 0) {
         ackedMessages.push(m);
         const latencyMs = nowMs - new Date(m.sent_at).getTime();
+        runtimeMetrics.recordQueueToBuffer(m.id, m.sent_at, nowMs);
+        runtimeMetrics.recordQueueToAck(m.sent_at, nowMs);
         console.error(`[broker] deliver id=${m.id} from=${m.from_id} to=${auth.id} via=poll-by-pid latency_ms=${latencyMs}`);
         count++;
       }
@@ -1996,6 +2008,7 @@ function handlePollByPid(body: { pid: number; caller_pid: number }): {
 requestHandler = async (req: Request) => {
     const url = new URL(req.url);
     const path = url.pathname;
+    runtimeMetrics.recordRoute(req.method, path);
 
     if (req.method !== "POST") {
       if (path === "/health") {
@@ -2173,6 +2186,8 @@ requestHandler = async (req: Request) => {
             }
             return Response.json(response);
           }
+        case "/metrics":
+          return Response.json(runtimeMetrics.snapshot());
         case "/set-summary": {
           const summary = String(body.summary ?? "");
           if (utf8Bytes(summary) > MAX_SUMMARY_BYTES) {

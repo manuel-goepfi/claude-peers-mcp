@@ -1,7 +1,56 @@
 import type { ClientType, ReceiverMode } from "./types.ts";
 import type { TmuxPaneInfo } from "./tmux.ts";
 
-export type TmuxMirrorResult = { ok: boolean; target: string | null; failedOptions: string[] };
+export type TmuxMirrorResult = { ok: boolean; target: string | null; failedOptions: string[]; skipped?: boolean };
+
+interface TmuxWriteState {
+  key: string;
+  ok: boolean;
+  attempts: number;
+  lastAttemptAt: number;
+  failedOptions: string[];
+}
+
+const RETRY_DELAYS_MS = [15_000, 30_000, 60_000] as const;
+
+export class TmuxIdentityWriteTracker {
+  private state: TmuxWriteState | null = null;
+
+  shouldWrite(key: string, now: number): boolean {
+    if (!this.state || this.state.key !== key) return true;
+    if (this.state.ok) return false;
+    const retryIndex = this.state.attempts - 1;
+    if (retryIndex >= RETRY_DELAYS_MS.length) return false;
+    return now - this.state.lastAttemptAt >= RETRY_DELAYS_MS[retryIndex]!;
+  }
+
+  record(key: string, result: TmuxMirrorResult, now: number): void {
+    const same = this.state?.key === key;
+    this.state = {
+      key,
+      ok: result.ok,
+      attempts: same ? (this.state!.attempts + 1) : 1,
+      lastAttemptAt: now,
+      failedOptions: [...result.failedOptions],
+    };
+  }
+
+  skippedResult(target: string): TmuxMirrorResult {
+    if (!this.state) return { ok: true, target, failedOptions: [], skipped: true };
+    return { ok: this.state.ok, target, failedOptions: [...this.state.failedOptions], skipped: true };
+  }
+}
+
+export function tmuxIdentityWriteKey(identity: BrokerIdentityForTmux, target: string): string {
+  return JSON.stringify([
+    target,
+    identity.id,
+    identity.name,
+    identity.resolved_name,
+    identity.client_type,
+    identity.receiver_mode,
+  ]);
+}
 
 export interface BrokerIdentityForTmux {
   id: string;

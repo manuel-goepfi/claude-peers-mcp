@@ -13,6 +13,7 @@
     "typecheck": "tsc --noEmit",
     "smoke:install": "bun scripts/smoke-clean-install.ts",
     "smoke:clients": "bun scripts/smoke-real-clients.ts",
+    "benchmark:peers": "bun bench/peer-fleet.ts",
     "verify": "bun run typecheck && bun test && bun run smoke:install"
   },
   "devDependencies": {
