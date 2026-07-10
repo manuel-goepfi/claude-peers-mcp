@@ -2,6 +2,7 @@
 export type PeerId = string;
 export type ClientType = "claude" | "codex" | "gemini" | "unknown";
 export type ReceiverMode = "claude-channel" | "codex-hook" | "gemini-hook" | "manual-drain" | "unknown";
+export type DeliveryState = "queued" | "claimed" | "acknowledged" | "unknown";
 
 export interface Peer {
   id: PeerId;
@@ -187,6 +188,9 @@ export interface PeerTarget {
 export interface SendMessageResponse {
   ok: boolean;
   id?: number;
+  // Additive state contract. Older brokers omit this field; queue insertion is
+  // the only success possible on send, so compatible clients may infer queued.
+  state?: DeliveryState;
   code?: PeerResolveErrorCode;
   error?: string;
   target?: PeerTarget;
@@ -200,6 +204,13 @@ export interface SendToPeerRequest {
 }
 
 export type SendToPeerResponse = SendMessageResponse;
+
+export interface BroadcastResponse {
+  ok: boolean;
+  sent: number;
+  state?: DeliveryState;
+  error?: string;
+}
 
 export interface TmuxPaneSnapshot {
   ok: boolean;
@@ -254,6 +265,7 @@ export interface ClaimByPidRequest {
 
 export interface ClaimByPidResponse {
   ok: boolean;
+  state?: DeliveryState;
   error?: string;
   status?: number;
   peer_id?: string;
@@ -269,6 +281,15 @@ export interface AckByPidRequest {
   drain_id: string;
   ids: number[];
   via?: string;
+}
+
+export interface AckByPidResponse {
+  ok: boolean;
+  state?: DeliveryState;
+  peer_id?: string;
+  acked?: number;
+  error?: string;
+  status?: number;
 }
 
 export interface HookHeartbeatByPidRequest {

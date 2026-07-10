@@ -10,7 +10,7 @@
  */
 
 import { Database } from "bun:sqlite";
-import { readFileSync, writeFileSync, renameSync, chmodSync, statSync, existsSync, truncateSync } from "node:fs";
+import { readFileSync, writeFileSync, renameSync, chmodSync, statSync, existsSync, truncateSync, unlinkSync } from "node:fs";
 import { timingSafeEqual } from "node:crypto";
 // L6: top-level node:fs import (was inline require() in verifyPidUid hot path).
 import type {
@@ -25,13 +25,16 @@ import type {
   SendMessageRequest,
   SendMessageResponse,
   SendToPeerRequest,
+  BroadcastResponse,
   PollMessagesRequest,
   PollMessagesResponse,
   AckMessagesRequest,
   ClaimByPidRequest,
   ClaimByPidResponse,
   AckByPidRequest,
+  AckByPidResponse,
   HookHeartbeatByPidRequest,
+  DeliveryState,
   ClientType,
   ReceiverMode,
   Peer,
@@ -47,6 +50,7 @@ import type {
 // follow-up; this narrow extraction unlocks load-bearing test mirrors
 // for the reap predicate without touching the broker's startup shape.
 import { isReapable, deadSeatMailExpired, shouldRotateLog, PEER_GHOST_AFTER_MS } from "./shared/reaper.ts";
+import { PEERS_VERSION } from "./shared/version.ts";
 
 const PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const TEST_PORT_ZERO = process.env.NODE_ENV === "test" && process.env.CLAUDE_PEERS_TEST_PORT_ZERO === "1";
@@ -80,7 +84,16 @@ const MAX_BROADCAST_TARGETS = RATE_MAX_MSGS; // hard cap = 60 — ties fanout to
 const CLAIM_TTL_MS = 30_000;
 const CLAIM_MAX_MESSAGES = 25;
 const CLAIM_MAX_BYTES = 64 * 1024;
-const BROKER_VERSION = "0.1.0";
+function booleanEnv(name: string, defaultValue: boolean): boolean {
+  const raw = process.env[name]?.trim().toLowerCase();
+  if (raw === undefined || raw === "") return defaultValue;
+  if (["1", "true", "yes", "on"].includes(raw)) return true;
+  if (["0", "false", "no", "off"].includes(raw)) return false;
+  console.error(`[broker] invalid ${name}="${process.env[name]}" (expected true/false) — using ${defaultValue}`);
+  return defaultValue;
+}
+
+const BRIDGE_ENABLED = booleanEnv("CLAUDE_PEERS_BRIDGE_ENABLED", true);
 const BROKER_CAPABILITIES = {
   hookDrain: {
     pollByPid: true,
@@ -89,10 +102,12 @@ const BROKER_CAPABILITIES = {
     hookHeartbeatByPid: true,
   },
   bridge: {
-    messagesSinceId: true,
+    ...(BRIDGE_ENABLED ? { messagesSinceId: true } : {}),
   },
   delivery: {
     sendToPeer: true,
+    states: true,
+    vocabulary: ["queued", "claimed", "acknowledged", "unknown"],
   },
 } as const;
 
@@ -605,7 +620,8 @@ const selectBroadcastTargets = db.prepare(`
 // can read a message's delivery state — otherwise a peer could enumerate
 // another peer's message history by guessing ids.
 const selectMessageStatus = db.prepare(`
-  SELECT id, delivered, delivered_at FROM messages WHERE id = ? AND from_id = ?
+  SELECT id, delivered, delivered_at, claimed_by, claimed_at
+  FROM messages WHERE id = ? AND from_id = ?
 `);
 
 // AP-063: bridge cursor read. Returns ALL messages with id > cursor, regardless
@@ -661,6 +677,17 @@ function publishBridgeTokenFile(): void {
     console.error(`[broker] bridge token written to ${BRIDGE_TOKEN_FILE}`);
   } catch (e) {
     console.error(`[broker] FATAL: cannot write bridge token to ${BRIDGE_TOKEN_FILE}:`, e);
+    process.exit(2);
+  }
+}
+
+function removeBridgeTokenFile(): void {
+  try {
+    unlinkSync(BRIDGE_TOKEN_FILE);
+    console.error(`[broker] bridge disabled; removed stale token ${BRIDGE_TOKEN_FILE}`);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    console.error(`[broker] FATAL: cannot remove disabled bridge token ${BRIDGE_TOKEN_FILE}:`, error);
     process.exit(2);
   }
 }
@@ -1574,6 +1601,7 @@ function handleSendMessage(authedFromId: string, body: SendMessageRequest): Send
   return {
     ok: true,
     id: Number(result.lastInsertRowid),
+    state: "queued",
     target: describePeerTarget(target),
   };
 }
@@ -1586,22 +1614,29 @@ function handleSendToPeer(authedFromId: string, body: SendToPeerRequest): SendMe
     return { ok: false, code: resolved.code, error: resolved.error, candidates: resolved.candidates };
   }
   const result = insertMessage.run(authedFromId, resolved.peer.id, body.text, new Date().toISOString());
-  return { ok: true, id: Number(result.lastInsertRowid), target: describePeerTarget(resolved.peer) };
+  return { ok: true, id: Number(result.lastInsertRowid), state: "queued", target: describePeerTarget(resolved.peer) };
 }
 
-// /message-status: sender-scoped lookup of delivered/delivered_at for a
-// message the sender previously inserted. Returns one entry per requested
-// id, or { delivered: false, delivered_at: null } for ids that don't
-// match an owned row (never leaks across senders).
+// /message-status: sender-scoped state lookup for messages the caller inserted.
+// Legacy delivered/delivered_at fields remain compatibility evidence; unknown
+// IDs never reveal whether another sender owns the row.
 function handleMessageStatus(authedFromId: string, body: { ids: number[] }):
-  { ok: boolean; statuses: { id: number; delivered: boolean; delivered_at: string | null }[] } {
+  { ok: boolean; statuses: { id: number; state: DeliveryState; delivered: boolean; delivered_at: string | null }[] } {
   if (!Array.isArray(body.ids)) return { ok: true, statuses: [] };
   const statuses = body.ids.map((id) => {
     const row = selectMessageStatus.get(id, authedFromId) as
-      { id: number; delivered: number; delivered_at: string | null } | null;
+      { id: number; delivered: number; delivered_at: string | null; claimed_by: string | null; claimed_at: string | null } | null;
+    const activeClaim = Boolean(row?.claimed_by && row.claimed_at && row.claimed_at >= claimCutoffIso());
     return row
-      ? { id: row.id, delivered: row.delivered === 1, delivered_at: row.delivered_at }
-      : { id, delivered: false, delivered_at: null };
+      ? {
+          id: row.id,
+          state: row.delivered === 1
+            ? (row.delivered_at ? "acknowledged" as const : "unknown" as const)
+            : (activeClaim ? "claimed" as const : "queued" as const),
+          delivered: row.delivered === 1,
+          delivered_at: row.delivered_at,
+        }
+      : { id, state: "unknown" as const, delivered: false, delivered_at: null };
   });
   return { ok: true, statuses };
 }
@@ -1610,7 +1645,7 @@ function handleMessageStatus(authedFromId: string, body: { ids: number[] }):
 // filter (tmux_session | git_root | name_like) so a compromised peer can't
 // use it for unbounded global blast. Inserts one row per target inside a
 // transaction; no at-broker ack behavior differs from single /send-message.
-function handleBroadcast(authedFromId: string, body: BroadcastRequest): { ok: boolean; sent: number; error?: string } {
+function handleBroadcast(authedFromId: string, body: BroadcastRequest): BroadcastResponse {
   if (typeof body.text !== "string") return { ok: false, sent: 0, error: "text must be string" };
   if (utf8Bytes(body.text) > MAX_MSG_BYTES) return { ok: false, sent: 0, error: `text exceeds ${MAX_MSG_BYTES} bytes` };
 
@@ -1667,7 +1702,7 @@ function handleBroadcast(authedFromId: string, body: BroadcastRequest): { ok: bo
       sent++;
     }
   })();
-  return { ok: true, sent };
+  return { ok: true, sent, state: "queued" };
 }
 
 function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
@@ -1676,7 +1711,7 @@ function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
   return { messages };
 }
 
-function handleAckMessages(body: AckMessagesRequest): { ok: boolean; acked: number } {
+function handleAckMessages(body: AckMessagesRequest): { ok: boolean; acked: number; state?: "acknowledged" } {
   const nowIso = new Date().toISOString();
   const nowMs = Date.now();
   const via = typeof body.via === "string" && body.via.length > 0 ? body.via : "unknown";
@@ -1696,7 +1731,7 @@ function handleAckMessages(body: AckMessagesRequest): { ok: boolean; acked: numb
     }
     return count;
   })();
-  return { ok: true, acked };
+  return { ok: true, acked, ...(acked > 0 ? { state: "acknowledged" as const } : {}) };
 }
 
 function handleUnregister(body: { id: string }): void {
@@ -1785,10 +1820,16 @@ function handleClaimByPid(body: ClaimByPidRequest): ClaimByPidResponse {
   })();
 
   updateReceiverHealth.run(now, clientType, receiverMode, now, null, null, auth.id);
-  return { ok: true, peer_id: auth.id, drain_id: drainId, messages: claimedMessages };
+  return {
+    ok: true,
+    peer_id: auth.id,
+    drain_id: drainId,
+    messages: claimedMessages,
+    ...(claimedMessages.length > 0 ? { state: "claimed" as const } : {}),
+  };
 }
 
-function handleAckByPid(body: AckByPidRequest): { ok: boolean; peer_id?: string; acked?: number; error?: string; status?: number } {
+function handleAckByPid(body: AckByPidRequest): AckByPidResponse {
   const auth = authPidDrain(Number(body.pid), Number(body.caller_pid));
   if (!auth.ok) {
     return { ok: false, status: auth.status, error: auth.error };
@@ -1817,7 +1858,7 @@ function handleAckByPid(body: AckByPidRequest): { ok: boolean; peer_id?: string;
     ? `ack mismatch: requested ${ids.length}, acked ${acked}`
     : null;
   updateReceiverHealth.run(nowIso, clientType, receiverMode, nowIso, acked > 0 ? nowIso : null, drainError, auth.id);
-  return { ok: true, peer_id: auth.id, acked };
+  return { ok: true, peer_id: auth.id, acked, ...(acked > 0 ? { state: "acknowledged" as const } : {}) };
 }
 
 // /poll-by-pid: unauthenticated-by-token, PID-authenticated drain path used
@@ -1827,6 +1868,7 @@ function handleAckByPid(body: AckByPidRequest): { ok: boolean; peer_id?: string;
 // delivered, and returns them. Caller proves same-UID via verifyPidUid.
 function handlePollByPid(body: { pid: number; caller_pid: number }): {
   ok: boolean;
+  state?: "acknowledged";
   error?: string;
   status?: number;
   peer_id?: string;
@@ -1869,7 +1911,13 @@ function handlePollByPid(body: { pid: number; caller_pid: number }): {
   // hook polled); last_drain_at only when mail was acked (mirrors codex ack).
   updateClaudeDrainHealth.run(nowIso, acked > 0 ? nowIso : null, auth.id);
 
-  return { ok: true, peer_id: auth.id, messages: ackedMessages, acked };
+  return {
+    ok: true,
+    peer_id: auth.id,
+    messages: ackedMessages,
+    acked,
+    ...(acked > 0 ? { state: "acknowledged" as const } : {}),
+  };
 }
 
 // --- HTTP Server ---
@@ -1886,12 +1934,13 @@ const server = Bun.serve({
         return Response.json({
           status: "ok",
           peers: (selectAllPeers.all() as Peer[]).length,
-          version: BROKER_VERSION,
+          version: PEERS_VERSION,
           capabilities: BROKER_CAPABILITIES,
         });
       }
       // AP-063: bridge cursor read. Bridge daemon polls this every 2s.
       if (path === "/messages-since-id") {
+        if (!BRIDGE_ENABLED) return Response.json({ error: "not found" }, { status: 404 });
         const auth = authBridge(req, path);
         if (!auth.ok) return Response.json({ error: auth.error }, { status: auth.status });
         const limited = rateCheck(BRIDGE_RATE_KEY, false);
@@ -1958,7 +2007,7 @@ const server = Bun.serve({
         if (!res.ok) {
           return Response.json({ error: res.error }, { status: res.status ?? 400 });
         }
-        return Response.json({ peer_id: res.peer_id, messages: res.messages, acked: res.acked });
+        return Response.json({ peer_id: res.peer_id, messages: res.messages, acked: res.acked, state: res.state });
       }
 
       if (path === "/claim-by-pid" || path === "/ack-by-pid" || path === "/hook-heartbeat-by-pid") {
@@ -1974,12 +2023,12 @@ const server = Bun.serve({
         if (path === "/claim-by-pid") {
           const res = handleClaimByPid(body as unknown as ClaimByPidRequest);
           if (!res.ok) return Response.json({ error: res.error }, { status: res.status ?? 400 });
-          return Response.json({ peer_id: res.peer_id, drain_id: res.drain_id, messages: res.messages });
+          return Response.json({ peer_id: res.peer_id, drain_id: res.drain_id, messages: res.messages, state: res.state });
         }
         if (path === "/ack-by-pid") {
           const res = handleAckByPid(body as unknown as AckByPidRequest);
           if (!res.ok) return Response.json({ error: res.error }, { status: res.status ?? 400 });
-          return Response.json({ peer_id: res.peer_id, acked: res.acked });
+          return Response.json({ peer_id: res.peer_id, acked: res.acked, state: res.state });
         }
         const res = handleHookHeartbeatByPid(body as unknown as HookHeartbeatByPidRequest);
         if (!res.ok) return Response.json({ error: res.error }, { status: res.status ?? 400 });
@@ -2107,7 +2156,8 @@ if (server.hostname !== "127.0.0.1") {
   process.exit(2);
 }
 
-publishBridgeTokenFile();
+if (BRIDGE_ENABLED) publishBridgeTokenFile();
+else removeBridgeTokenFile();
 const boundPort = server.port ?? PORT;
 if (TEST_PORT_ZERO) {
   process.stdout.write(`${JSON.stringify({ event: "claude-peers-test-ready", port: boundPort })}\n`);

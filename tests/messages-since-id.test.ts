@@ -10,7 +10,7 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { startTestBroker, type TestBroker } from "./helpers/test-broker.ts";
 
 const BROKER_SCRIPT = new URL("../broker.ts", import.meta.url).pathname;
@@ -191,6 +191,31 @@ describe("AP-063 token regeneration on restart", () => {
     } finally {
       try { proc2?.kill(); } catch { /* ignore */ }
       await first.stop();
+    }
+  });
+});
+
+describe("AP-063 bridge disable control", () => {
+  test("disabled mode publishes no token or cursor capability and returns generic 404", async () => {
+    const disabled = await startTestBroker({
+      prefix: "bridge-disabled",
+      env: { CLAUDE_PEERS_BRIDGE_ENABLED: "false" },
+      prepare: ({ tokenPath }) => writeFileSync(tokenPath, "stale-bridge-token", { mode: 0o600 }),
+    });
+    try {
+      expect(existsSync(disabled.tokenPath)).toBe(false);
+      const health = await fetch(`${disabled.url}/health`).then((response) => response.json()) as {
+        capabilities?: { bridge?: { messagesSinceId?: boolean } };
+      };
+      expect(health.capabilities?.bridge?.messagesSinceId).toBeUndefined();
+
+      const response = await fetch(`${disabled.url}/messages-since-id?since=0`, {
+        headers: { Authorization: "Bearer not-a-real-token" },
+      });
+      expect(response.status).toBe(404);
+      expect(await response.json()).toEqual({ error: "not found" });
+    } finally {
+      await disabled.stop();
     }
   });
 });

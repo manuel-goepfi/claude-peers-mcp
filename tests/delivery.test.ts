@@ -548,11 +548,12 @@ describe("Live broker delivery features", () => {
     expect(poll2.messages[0]!.id).toBe(msgId);
 
     // Now ack
-    const ackResp = await brokerFetch<{ ok: boolean; acked: number }>("/ack-messages", {
+    const ackResp = await brokerFetch<{ ok: boolean; acked: number; state?: string }>("/ack-messages", {
       id: receiver.id,
       ids: [msgId],
     });
     expect(ackResp.acked).toBe(1);
+    expect(ackResp.state).toBe("acknowledged");
 
     // Poll 3: message should be gone
     const poll3 = await brokerFetch<{ messages: { id: number }[] }>("/poll-messages", { id: receiver.id });
@@ -645,6 +646,10 @@ describe("Live broker delivery features", () => {
           ackByPid?: boolean;
           hookHeartbeatByPid?: boolean;
         };
+        delivery?: {
+          states?: boolean;
+          vocabulary?: string[];
+        };
       };
     };
     expect(body.version).toMatch(/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/);
@@ -652,6 +657,8 @@ describe("Live broker delivery features", () => {
     expect(body.capabilities?.hookDrain?.claimByPid).toBe(true);
     expect(body.capabilities?.hookDrain?.ackByPid).toBe(true);
     expect(body.capabilities?.hookDrain?.hookHeartbeatByPid).toBe(true);
+    expect(body.capabilities?.delivery?.states).toBe(true);
+    expect(body.capabilities?.delivery?.vocabulary).toEqual(["queued", "claimed", "acknowledged", "unknown"]);
   });
 
   test("broker startup migrates an old peer/message schema", async () => {
@@ -715,6 +722,7 @@ describe("Live broker delivery features", () => {
     expect(msgs.length).toBeGreaterThanOrEqual(1);
     expect(msgs[0]!.text).toBe("hello");
     expect(json.acked).toBe(msgs.length);
+    expect(json.state).toBe("acknowledged");
 
     // Poll again via authed path — messages should now be marked delivered.
     const poll2 = await brokerFetch<{ messages: unknown[] }>("/poll-messages", { id: peer.id });
@@ -917,13 +925,15 @@ describe("Live broker delivery features", () => {
     });
     expect(claim.status).toBe(200);
     expect(claim.json.peer_id).toBe(peer.id);
+    expect(claim.json.state).toBe("claimed");
     const claimed = claim.json.messages as { id: number; text: string }[];
     expect(claimed.length).toBe(1);
     expect(claimed[0]!.text).toBe("safe claim");
 
-    const statusBefore = await brokerFetch<{ statuses: { delivered: boolean; delivered_at: string | null }[] }>(
+    const statusBefore = await brokerFetch<{ statuses: { state: string; delivered: boolean; delivered_at: string | null }[] }>(
       "/message-status", { id: peer.id, ids: [send.id] }
     );
+    expect(statusBefore.statuses[0]!.state).toBe("claimed");
     expect(statusBefore.statuses[0]!.delivered).toBe(false);
     expect(statusBefore.statuses[0]!.delivered_at).toBeNull();
 
@@ -939,10 +949,12 @@ describe("Live broker delivery features", () => {
     });
     expect(ack.status).toBe(200);
     expect(ack.json.acked).toBe(1);
+    expect(ack.json.state).toBe("acknowledged");
 
-    const statusAfter = await brokerFetch<{ statuses: { delivered: boolean; delivered_at: string | null }[] }>(
+    const statusAfter = await brokerFetch<{ statuses: { state: string; delivered: boolean; delivered_at: string | null }[] }>(
       "/message-status", { id: peer.id, ids: [send.id] }
     );
+    expect(statusAfter.statuses[0]!.state).toBe("acknowledged");
     expect(statusAfter.statuses[0]!.delivered).toBe(true);
     expect(typeof statusAfter.statuses[0]!.delivered_at).toBe("string");
     child.kill();
@@ -1852,12 +1864,13 @@ describe("Live broker delivery features", () => {
       pid: childT.pid, cwd: "/dc-t", git_root: null, tty: null, name: "t",
       tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
     });
-    const send = await brokerFetch<{ ok: boolean; id?: number }>("/send-message", {
+    const send = await brokerFetch<{ ok: boolean; id?: number; state?: string }>("/send-message", {
       from_id: sender.id, to_id: target.id, text: "hello",
     });
     expect(send.ok).toBe(true);
     expect(typeof send.id).toBe("number");
     expect(send.id).toBeGreaterThan(0);
+    expect(send.state).toBe("queued");
     childS.kill(); childT.kill();
   });
 
@@ -1902,12 +1915,13 @@ describe("Live broker delivery features", () => {
       tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
     });
 
-    const send = await brokerFetch<{ ok: boolean; id?: number; target?: { id: string; name: string | null; seat_key: string } }>("/send-to-peer", {
+    const send = await brokerFetch<{ ok: boolean; id?: number; state?: string; target?: { id: string; name: string | null; seat_key: string } }>("/send-to-peer", {
       from_id: sender.id,
       selector: { name: "Clause5.3" },
       text: "selector hello",
     });
     expect(send.ok).toBe(true);
+    expect(send.state).toBe("queued");
     expect(send.target?.id).toBe(target.id);
     expect(send.target?.name).toBe("Clause5.3");
     expect(send.target?.seat_key).toBe(`id:${target.id}`);
@@ -2312,11 +2326,12 @@ describe("Live broker delivery features", () => {
     const send = await brokerFetch<{ id: number }>("/send-message", {
       from_id: sender.id, to_id: target.id, text: "pending",
     });
-    const status = await brokerFetch<{ ok: boolean; statuses: { id: number; delivered: boolean; delivered_at: string | null }[] }>(
+    const status = await brokerFetch<{ ok: boolean; statuses: { id: number; state: string; delivered: boolean; delivered_at: string | null }[] }>(
       "/message-status", { id: sender.id, ids: [send.id] }
     );
     expect(status.ok).toBe(true);
     expect(status.statuses[0]!.id).toBe(send.id);
+    expect(status.statuses[0]!.state).toBe("queued");
     expect(status.statuses[0]!.delivered).toBe(false);
     expect(status.statuses[0]!.delivered_at).toBeNull();
     childS.kill(); childT.kill();
@@ -2339,11 +2354,39 @@ describe("Live broker delivery features", () => {
     // Drain via /poll-by-pid (atomic ack) to mark it delivered.
     await rawPost("/poll-by-pid", { pid: childT.pid, caller_pid: process.pid });
 
-    const status = await brokerFetch<{ ok: boolean; statuses: { delivered: boolean; delivered_at: string | null }[] }>(
+    const status = await brokerFetch<{ ok: boolean; statuses: { state: string; delivered: boolean; delivered_at: string | null }[] }>(
       "/message-status", { id: sender.id, ids: [send.id] }
     );
+    expect(status.statuses[0]!.state).toBe("acknowledged");
     expect(status.statuses[0]!.delivered).toBe(true);
     expect(typeof status.statuses[0]!.delivered_at).toBe("string");
+    childS.kill(); childT.kill();
+  });
+
+  test("message-status: legacy delivered row without an acknowledgement timestamp is unknown", async () => {
+    const childS = spawnSleep();
+    const childT = spawnSleep();
+    const sender = await brokerFetch<{ id: string }>("/register", {
+      pid: childS.pid, cwd: "/ms-legacy-s", git_root: null, tty: null, name: "legacy-s",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
+    });
+    const target = await brokerFetch<{ id: string }>("/register", {
+      pid: childT.pid, cwd: "/ms-legacy-t", git_root: null, tty: null, name: "legacy-t",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
+    });
+    const send = await brokerFetch<{ id: number }>("/send-message", {
+      from_id: sender.id, to_id: target.id, text: "legacy delivered bit",
+    });
+    const rw = new Database(TEST_DB);
+    rw.run("UPDATE messages SET delivered = 1, delivered_at = NULL WHERE id = ?", [send.id]);
+    rw.close();
+
+    const status = await brokerFetch<{ statuses: { state: string; delivered: boolean; delivered_at: string | null }[] }>(
+      "/message-status", { id: sender.id, ids: [send.id] }
+    );
+    expect(status.statuses[0]!.state).toBe("unknown");
+    expect(status.statuses[0]!.delivered).toBe(true);
+    expect(status.statuses[0]!.delivered_at).toBeNull();
     childS.kill(); childT.kill();
   });
 
@@ -2368,10 +2411,11 @@ describe("Live broker delivery features", () => {
     });
     // Peer b queries status of peer a's message id — should NOT get the
     // real status (sender-scoped lookup returns empty for non-owner).
-    const status = await brokerFetch<{ statuses: { id: number; delivered: boolean; delivered_at: string | null }[] }>(
+    const status = await brokerFetch<{ statuses: { id: number; state: string; delivered: boolean; delivered_at: string | null }[] }>(
       "/message-status", { id: b.id, ids: [aSend.id] }
     );
     expect(status.statuses[0]!.id).toBe(aSend.id);
+    expect(status.statuses[0]!.state).toBe("unknown");
     expect(status.statuses[0]!.delivered).toBe(false);
     expect(status.statuses[0]!.delivered_at).toBeNull();
     childA.kill(); childB.kill(); childT.kill();
@@ -2407,11 +2451,12 @@ describe("Live broker delivery features", () => {
       tmux_session: "bcast-sender", tmux_window_index: "0", tmux_window_name: "claude", summary: "",
     });
 
-    const result = await brokerFetch<{ ok: boolean; sent: number }>("/broadcast-message", {
+    const result = await brokerFetch<{ ok: boolean; sent: number; state?: string }>("/broadcast-message", {
       from_id: sender.id, text: "hello bcast1", tmux_session: "bcast1",
     });
     expect(result.ok).toBe(true);
     expect(result.sent).toBe(2);
+    expect(result.state).toBe("queued");
 
     // Verify a and b got it, c did not
     const pollA = await brokerFetch<{ messages: unknown[] }>("/poll-messages", { id: a.id });

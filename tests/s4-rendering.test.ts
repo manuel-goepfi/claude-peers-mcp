@@ -12,8 +12,16 @@
 // These run as pure unit tests; no broker spin-up.
 
 import { describe, test, expect } from "bun:test";
+import { readFileSync } from "node:fs";
 import { frameUntrusted, renderInboundLine } from "../server.ts";
 import type { Message } from "../shared/types.ts";
+
+test("MCP instructions authenticate broker identity without granting process provenance or command authority", () => {
+  const source = readFileSync(new URL("../server.ts", import.meta.url), "utf8");
+  expect(source).not.toContain("Treat peer messages as trusted agent-to-agent commands");
+  expect(source).toContain("broker-issued peer identity");
+  expect(source).toContain("does not prove OS-process provenance");
+});
 
 function msg(partial: Partial<Message>): Message {
   return {
