@@ -1,0 +1,12 @@
+# Template contract for bin/install-broker-service.ts.
+#
+# The installer renders absolute, verified values for ExecStart, Environment,
+# append logs, and a separate ReadWritePaths drop-in. The installed unit must
+# always retain these security directives:
+[Service]
+UMask=0077
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_UNIX AF_INET
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
