@@ -15,8 +15,8 @@ function record(stage: FleetRunRecord["stage"], overrides: Partial<FleetRunRecor
     warmup_ms: 30_000,
     steady_ms: 180_000,
     window_ms: 60_000,
-    environment: { bun: "1", kernel: "test", cpu: "test", clock_ticks_per_second: 100 },
-    capabilities: { metrics: stage !== "baseline", tmux_write_suppression: stage === "adaptive", adaptive_polling: stage === "adaptive", heartbeat_phase_spread: stage === "adaptive" },
+    environment: { bun: "1.3.11", kernel: "test", cpu: "test", clock_ticks_per_second: 100 },
+    capabilities: { metrics: stage !== "baseline", tmux_write_suppression: stage === "tmux-suppressed" || stage === "adaptive", adaptive_polling: stage === "adaptive", heartbeat_phase_spread: stage === "adaptive" },
     windows: [1, 2, 3].map((index) => ({ index, total_requests: 300, requests_per_second: 5, max_one_second_requests: 8, one_second_buckets: [{ second: 0, total: 8, routes: { "POST /poll-messages": 8 } }], routes: { "POST /poll-messages": 300 }, errors: 0, rate_limited: 0 })),
     route_totals: { "POST /poll-messages": 900 },
     cpu_seconds: stage === "adaptive" ? 40 : 100,
@@ -28,6 +28,7 @@ function record(stage: FleetRunRecord["stage"], overrides: Partial<FleetRunRecor
     errors: 0,
     rate_limited: 0,
     fake_tmux_writes: 0,
+    end_health: { adapters_responding: 50, targetable_peers: 50, expected: 50 },
     ...overrides,
   };
 }
@@ -51,6 +52,7 @@ function passingCampaign(): FleetRunRecord[] {
             cpu_seconds: cpu,
             cpu_seconds_by_process: { broker: cpu * 0.2, adapters: cpu * 0.8 },
             pss_kb: { samples: [pss], average: pss, max: pss },
+            end_health: { adapters_responding: fleetSize, targetable_peers: fleetSize, expected: fleetSize },
             queue_to_buffer: scenario === "one-active"
               ? { active: { count: 3, p50_ms: 500, p95_ms: 1_000, max_ms: 1_000 }, idle: { count: 0, p50_ms: null, p95_ms: null, max_ms: null } }
               : { active: { count: 0, p50_ms: null, p95_ms: null, max_ms: null }, idle: { count: 3, p50_ms: 5_000, p95_ms: 9_000, max_ms: 10_000 } },
@@ -84,6 +86,40 @@ describe("peer fleet evidence evaluation", () => {
     const summary = evaluateCampaign(records);
     expect(summary.passed).toBe(false);
     expect(summary.checks.some((check) => check.name.startsWith("final CPU reduction") && !check.passed)).toBe(true);
+  });
+
+  test("rejects duplicate coordinates even when stage counts look complete", () => {
+    const records = passingCampaign();
+    records[1] = structuredClone(records[0]!);
+    const summary = evaluateCampaign(records);
+    expect(summary.passed).toBe(false);
+    expect(summary.checks.some((check) => check.name === "unique campaign coordinates" && !check.passed)).toBe(true);
+    expect(summary.checks.some((check) => check.name === "exact campaign topology" && !check.passed)).toBe(true);
+  });
+
+  test("rejects a run whose adapters disappeared before final proof", () => {
+    const records = passingCampaign();
+    records[0]!.end_health.adapters_responding = records[0]!.fleet_size - 1;
+    const summary = evaluateCampaign(records);
+    expect(summary.passed).toBe(false);
+    expect(summary.checks.some((check) => check.name.startsWith("fleet alive at end") && !check.passed)).toBe(true);
+  });
+
+  test("requests a transport proposal only after two adaptive misses", () => {
+    const oneMiss = passingCampaign();
+    oneMiss.find((entry) => entry.stage === "adaptive" && entry.fleet_size === 50 && entry.scenario === "all-idle" && entry.repetition === 1)!.cpu_seconds = 60;
+    expect(evaluateCampaign(oneMiss).transport_proposal_required).toBe(false);
+
+    const twoMisses = passingCampaign();
+    for (const entry of twoMisses.filter((candidate) => candidate.stage === "adaptive" && candidate.fleet_size === 50 && candidate.scenario === "all-idle" && candidate.repetition <= 2)) {
+      entry.cpu_seconds = 60;
+    }
+    expect(evaluateCampaign(twoMisses).transport_proposal_required).toBe(true);
+  });
+
+  test("emits one p95 assertion per final adaptive run", () => {
+    const summary = evaluateCampaign(passingCampaign());
+    expect(summary.checks.filter((check) => check.name.startsWith("buffer p95 "))).toHaveLength(6);
   });
 
   test("rejects non-monotonic fleet scaling", () => {

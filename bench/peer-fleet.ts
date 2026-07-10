@@ -3,7 +3,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { startTestBroker, type TestBroker } from "../tests/helpers/test-broker.ts";
 
 export type BenchmarkStage = "baseline" | "instrumented" | "tmux-suppressed" | "adaptive";
@@ -54,6 +54,7 @@ export interface FleetRunRecord {
   errors: number;
   rate_limited: number;
   fake_tmux_writes: number;
+  end_health: { adapters_responding: number; targetable_peers: number; expected: number };
 }
 
 interface ProxyEvent { at: number; route: string; status: number }
@@ -375,6 +376,7 @@ async function runFleet(options: {
     let tick = 0;
     let sentIndex = 0;
     let activityBusy = false;
+    let scenarioError: Error | null = null;
     let rejectScenario: (error: Error) => void = () => {};
     const scenarioFailure = new Promise<never>((_resolve, reject) => { rejectScenario = reject; });
     const tickScenario = async () => {
@@ -413,7 +415,11 @@ async function runFleet(options: {
         activityBusy = false;
       }
     };
-    activityTimer = setInterval(() => void tickScenario().catch((error) => rejectScenario(error instanceof Error ? error : new Error(String(error)))), 1_000);
+    const failScenario = (error: unknown) => {
+      scenarioError = error instanceof Error ? error : new Error(String(error));
+      rejectScenario(scenarioError);
+    };
+    activityTimer = setInterval(() => void tickScenario().catch(failScenario), 1_000);
     await tickScenario();
     await Promise.race([delay(options.warmupMs), scenarioFailure]);
 
@@ -433,6 +439,16 @@ async function runFleet(options: {
     if (activityTimer) clearInterval(activityTimer);
     activityTimer = null;
     while (activityBusy) await delay(10);
+    if (scenarioError) throw scenarioError;
+
+    const adapterProofs = await Promise.all(adapters.map((adapter) => adapter.client.callTool({ name: "whoami", arguments: {} })));
+    const adaptersResponding = adapterProofs.filter((proof) => !proof.isError).length;
+    const endPeers = await post<Array<{ id: string; name: string | null }>>(proxy, "/list-peers", { id: registration.id, scope: "machine", cwd: repoRoot, git_root: null }, registration.token);
+    const targetIds = new Set(targets.map((target) => target.id));
+    const targetablePeers = endPeers.filter((peer) => targetIds.has(peer.id)).length;
+    if (adaptersResponding !== options.fleetSize || targetablePeers !== options.fleetSize) {
+      throw new Error(`fleet lost adapters: responding=${adaptersResponding}/${options.fleetSize}, targetable=${targetablePeers}/${options.fleetSize}`);
+    }
 
     const windows = summarizeWindows(proxy.events, steadyStart, options.steadyMs, options.windowMs);
     const steadyEvents = proxy.events.filter((event) => event.at >= steadyStart && event.at < steadyStart + options.steadyMs);
@@ -464,6 +480,7 @@ async function runFleet(options: {
       errors: steadyEvents.filter((event) => event.status >= 400).length,
       rate_limited: steadyEvents.filter((event) => event.status === 429).length,
       fake_tmux_writes: fileLineCount(fakeTmux.writes),
+      end_health: { adapters_responding: adaptersResponding, targetable_peers: targetablePeers, expected: options.fleetSize },
     };
   } finally {
     if (activityTimer) clearInterval(activityTimer);
@@ -475,7 +492,14 @@ async function runFleet(options: {
 }
 
 interface CampaignCheck { name: string; passed: boolean; actual: number | string | null; limit: number | string }
-export interface CampaignSummary { summary_version: 1; quick: boolean; passed: boolean; records: number; checks: CampaignCheck[] }
+export interface CampaignSummary {
+  summary_version: 1;
+  quick: boolean;
+  passed: boolean;
+  records: number;
+  transport_proposal_required: boolean;
+  checks: CampaignCheck[];
+}
 
 function pairKey(record: FleetRunRecord): string {
   return `${record.fleet_size}|${record.scenario}|${record.repetition}|${record.seed}`;
@@ -483,9 +507,17 @@ function pairKey(record: FleetRunRecord): string {
 
 export function evaluateCampaign(records: FleetRunRecord[], quick = false): CampaignSummary {
   const checks: CampaignCheck[] = [];
+  const coordinateCounts = new Map<string, number>();
   const byStage = new Map<BenchmarkStage, Map<string, FleetRunRecord>>();
   for (const stage of ["baseline", "instrumented", "tmux-suppressed", "adaptive"] as BenchmarkStage[]) byStage.set(stage, new Map());
-  for (const record of records) byStage.get(record.stage)!.set(pairKey(record), record);
+  for (const record of records) {
+    const coordinate = `${record.stage}|${pairKey(record)}`;
+    coordinateCounts.set(coordinate, (coordinateCounts.get(coordinate) ?? 0) + 1);
+    byStage.get(record.stage)!.set(pairKey(record), record);
+  }
+
+  const duplicates = [...coordinateCounts.entries()].filter(([, count]) => count !== 1).map(([coordinate, count]) => `${coordinate}x${count}`);
+  checks.push({ name: "unique campaign coordinates", passed: duplicates.length === 0, actual: duplicates.length ? duplicates.join(",") : "unique", limit: "exactly once" });
 
   if (!quick) {
     checks.push({ name: "exact campaign record count", passed: records.length === 108, actual: records.length, limit: 108 });
@@ -493,6 +525,49 @@ export function evaluateCampaign(records: FleetRunRecord[], quick = false): Camp
       const count = records.filter((record) => record.stage === stage).length;
       checks.push({ name: `${stage} stage record count`, passed: count === 27, actual: count, limit: 27 });
     }
+    const expectedCoordinates = new Set<string>();
+    for (const stage of ["baseline", "instrumented", "tmux-suppressed", "adaptive"] as BenchmarkStage[]) {
+      for (const fleetSize of [1, 10, 50]) {
+        for (const scenario of scenarios) {
+          for (let repetition = 1; repetition <= 3; repetition++) {
+            const seed = fleetSize * 100_000 + scenarios.indexOf(scenario) * 1_000 + repetition;
+            expectedCoordinates.add(`${stage}|${fleetSize}|${scenario}|${repetition}|${seed}`);
+          }
+        }
+      }
+    }
+    const actualCoordinates = new Set(records.map((record) => `${record.stage}|${pairKey(record)}`));
+    const missing = [...expectedCoordinates].filter((coordinate) => !actualCoordinates.has(coordinate));
+    const unexpected = [...actualCoordinates].filter((coordinate) => !expectedCoordinates.has(coordinate));
+    checks.push({
+      name: "exact campaign topology",
+      passed: missing.length === 0 && unexpected.length === 0,
+      actual: missing.length === 0 && unexpected.length === 0 ? "complete" : `missing=${missing.length},unexpected=${unexpected.length}`,
+      limit: "108 expected stage/fleet/scenario/repetition/seed coordinates",
+    });
+  }
+
+  for (const record of records) {
+    const expectedCapabilities = stageCapabilities(record.stage);
+    const capabilitiesMatch = Object.entries(expectedCapabilities).every(([name, enabled]) => record.capabilities[name as keyof typeof expectedCapabilities] === enabled);
+    checks.push({ name: `stage capabilities ${record.stage} ${pairKey(record)}`, passed: capabilitiesMatch, actual: JSON.stringify(record.capabilities), limit: JSON.stringify(expectedCapabilities) });
+    const windowsValid = record.windows.length === 3 && record.steady_ms === record.window_ms * 3 && record.windows.every((window, index) => window.index === index + 1);
+    checks.push({ name: `three measurement windows ${record.stage} ${pairKey(record)}`, passed: windowsValid, actual: `${record.windows.map((window) => window.index).join(",")}/${record.steady_ms}/${record.window_ms}`, limit: "windows 1,2,3 and steady=3*window" });
+    const windowRoutes: Record<string, number> = {};
+    for (const window of record.windows) {
+      for (const [route, count] of Object.entries(window.routes)) windowRoutes[route] = (windowRoutes[route] ?? 0) + count;
+    }
+    const routeTotalsMatch = JSON.stringify(Object.entries(windowRoutes).sort()) === JSON.stringify(Object.entries(record.route_totals).sort());
+    const errorsMatch = record.windows.reduce((sum, window) => sum + window.errors, 0) === record.errors;
+    const rateLimitsMatch = record.windows.reduce((sum, window) => sum + window.rate_limited, 0) === record.rate_limited;
+    checks.push({ name: `window aggregates ${record.stage} ${pairKey(record)}`, passed: routeTotalsMatch && errorsMatch && rateLimitsMatch, actual: `${routeTotalsMatch}/${errorsMatch}/${rateLimitsMatch}`, limit: "routes/errors/rate-limits match" });
+    const metadataValid = record.record_version === 1 && record.revision.length > 0 && record.environment.kernel.length > 0 && record.environment.cpu.length > 0 && record.environment.clock_ticks_per_second > 0 && (quick || record.environment.bun === "1.3.11");
+    checks.push({ name: `record metadata ${record.stage} ${pairKey(record)}`, passed: metadataValid, actual: `${record.record_version}/${record.revision}/${record.environment.bun}`, limit: quick ? "complete" : "v1/revision/Bun 1.3.11" });
+    const resourcesValid = record.cpu_seconds >= 0 && record.pss_kb.samples.length > 0 && record.pss_kb.average > 0 && record.pss_kb.max >= record.pss_kb.average;
+    checks.push({ name: `resource samples ${record.stage} ${pairKey(record)}`, passed: resourcesValid, actual: `${record.cpu_seconds}/${record.pss_kb.samples.length}/${record.pss_kb.average}/${record.pss_kb.max}`, limit: "nonnegative CPU and nonempty positive PSS" });
+    const expectedEnd = record.fleet_size;
+    const endHealthy = record.end_health.expected === expectedEnd && record.end_health.adapters_responding === expectedEnd && record.end_health.targetable_peers === expectedEnd;
+    checks.push({ name: `fleet alive at end ${record.stage} ${pairKey(record)}`, passed: endHealthy, actual: `${record.end_health.adapters_responding}/${record.end_health.targetable_peers}/${record.end_health.expected}`, limit: `${expectedEnd}/${expectedEnd}/${expectedEnd}` });
   }
 
   for (const [key, baseline] of byStage.get("baseline")!) {
@@ -504,21 +579,32 @@ export function evaluateCampaign(records: FleetRunRecord[], quick = false): Camp
     checks.push({ name: `instrumentation PSS overhead ${key}`, passed: quick || pssRatio <= 1.05, actual: pssRatio, limit: "<=1.05" });
   }
 
+  const adaptiveMisses = new Map<"all-idle" | "one-active", number>([["all-idle", 0], ["one-active", 0]]);
   for (const [key, adaptive] of byStage.get("adaptive")!) {
     const baseline = byStage.get("baseline")!.get(key);
     if (!baseline || adaptive.fleet_size !== 50 || !["all-idle", "one-active"].includes(adaptive.scenario)) continue;
+    let adaptiveRunPassed = true;
+    const addAdaptiveCheck = (name: string, passed: boolean, actual: number | null, limit: string) => {
+      const gated = quick || passed;
+      checks.push({ name, passed: gated, actual, limit });
+      if (!gated) adaptiveRunPassed = false;
+    };
     const reduction = baseline.cpu_seconds > 0 ? 1 - adaptive.cpu_seconds / baseline.cpu_seconds : Number.NEGATIVE_INFINITY;
     const pssRatio = baseline.pss_kb.average > 0 ? adaptive.pss_kb.average / baseline.pss_kb.average : Number.POSITIVE_INFINITY;
-    checks.push({ name: `final CPU reduction ${key}`, passed: quick || reduction >= 0.5, actual: reduction, limit: ">=0.50" });
-    checks.push({ name: `final PSS ratio ${key}`, passed: quick || pssRatio <= 1.10, actual: pssRatio, limit: "<=1.10" });
+    addAdaptiveCheck(`final CPU reduction ${key}`, reduction >= 0.5, reduction, ">=0.50");
+    addAdaptiveCheck(`final PSS ratio ${key}`, pssRatio <= 1.10, pssRatio, "<=1.10");
     for (const window of adaptive.windows) {
-      checks.push({ name: `request budget ${key} window ${window.index}`, passed: quick || window.requests_per_second <= 10, actual: window.requests_per_second, limit: "<=10/s" });
-      checks.push({ name: `one-second herd ${key} window ${window.index}`, passed: quick || window.max_one_second_requests <= 20, actual: window.max_one_second_requests, limit: "<=20" });
+      addAdaptiveCheck(`request budget ${key} window ${window.index}`, window.requests_per_second <= 10, window.requests_per_second, "<=10/s");
+      addAdaptiveCheck(`one-second herd ${key} window ${window.index}`, window.max_one_second_requests <= 20, window.max_one_second_requests, "<=20");
     }
     const latency = adaptive.scenario === "one-active" ? adaptive.queue_to_buffer.active : adaptive.queue_to_buffer.idle;
     const p95Limit = adaptive.scenario === "one-active" ? 2_000 : 11_000;
-    checks.push({ name: `buffer p95 ${key}`, passed: quick || (latency.p95_ms !== null && latency.p95_ms <= p95Limit), actual: latency.p95_ms, limit: `<=${p95Limit}` });
-    if (adaptive.scenario === "all-idle") checks.push({ name: `buffer max ${key}`, passed: quick || (latency.max_ms !== null && latency.max_ms <= 12_000), actual: latency.max_ms, limit: "<=12000" });
+    addAdaptiveCheck(`buffer p95 ${key}`, latency.p95_ms !== null && latency.p95_ms <= p95Limit, latency.p95_ms, `<=${p95Limit}`);
+    if (adaptive.scenario === "all-idle") addAdaptiveCheck(`buffer max ${key}`, latency.max_ms !== null && latency.max_ms <= 12_000, latency.max_ms, "<=12000");
+    if (!adaptiveRunPassed) {
+      const scenario = adaptive.scenario as "all-idle" | "one-active";
+      adaptiveMisses.set(scenario, adaptiveMisses.get(scenario)! + 1);
+    }
   }
 
   for (const record of records) {
@@ -536,7 +622,8 @@ export function evaluateCampaign(records: FleetRunRecord[], quick = false): Camp
       }
     }
   }
-  return { summary_version: 1, quick, passed: checks.every((check) => check.passed), records: records.length, checks };
+  const transportProposalRequired = !quick && [...adaptiveMisses.values()].some((misses) => misses >= 2);
+  return { summary_version: 1, quick, passed: checks.every((check) => check.passed), records: records.length, transport_proposal_required: transportProposalRequired, checks };
 }
 
 function argValue(args: string[], name: string, fallback: string): string {
@@ -553,6 +640,12 @@ async function main(args = process.argv.slice(2)): Promise<number> {
   const warmupMs = Number(argValue(args, "--warmup-ms", quick ? "2000" : "30000"));
   const steadyMs = Number(argValue(args, "--steady-ms", quick ? "6000" : "180000"));
   const windowMs = Number(argValue(args, "--window-ms", quick ? "2000" : "60000"));
+  if (!quick && process.platform !== "linux") throw new Error("release campaign supports Linux only");
+  if (!quick && Bun.version !== "1.3.11") throw new Error(`release campaign requires Bun 1.3.11, found ${Bun.version}`);
+  if (!quick && Bun.spawnSync(["git", "diff", "--quiet", "HEAD", "--"]).exitCode !== 0) throw new Error("release campaign requires a clean tracked worktree");
+  if (!quick && JSON.stringify(fleets) !== JSON.stringify([1, 10, 50])) throw new Error("release campaign requires peer fleets 1,10,50 in canonical order");
+  if (!quick && JSON.stringify(stages) !== JSON.stringify(["baseline", "instrumented", "tmux-suppressed", "adaptive"])) throw new Error("release campaign requires all four stages in canonical order");
+  if (!quick && JSON.stringify(selectedScenarios) !== JSON.stringify(scenarios)) throw new Error("release campaign requires all three scenarios in canonical order");
   if (!quick && (warmupMs !== 30_000 || steadyMs !== 180_000 || windowMs !== 60_000 || repetitions !== 3)) throw new Error("release campaign requires 30s warmup, 180s steady, 60s windows, and 3 repetitions");
   if (steadyMs / windowMs !== 3) throw new Error("campaign must contain exactly three steady-state windows");
   if (fleets.some((value) => !Number.isInteger(value) || value < 1) || repetitions < 1) throw new Error("invalid fleet or repetition count");
@@ -561,7 +654,8 @@ async function main(args = process.argv.slice(2)): Promise<number> {
   const revision = commandText("git", ["rev-parse", "HEAD"]);
   const clockTicks = Number(commandText("getconf", ["CLK_TCK"])) || 100;
   const output = resolve(argValue(args, "--output", join(repoRoot, "bench/results", new Date().toISOString().replace(/[:.]/g, "-"))));
-  mkdirSync(output, { recursive: true, mode: 0o700 });
+  mkdirSync(dirname(output), { recursive: true, mode: 0o700 });
+  mkdirSync(output, { mode: 0o700 });
   const records: FleetRunRecord[] = [];
   for (const stage of stages) {
     for (const fleetSize of fleets) {
@@ -579,7 +673,7 @@ async function main(args = process.argv.slice(2)): Promise<number> {
   }
   const summary = evaluateCampaign(records, quick);
   writeFileSync(join(output, "summary.json"), `${JSON.stringify(summary, null, 2)}\n`, { mode: 0o600 });
-  if (!quick && !summary.passed) {
+  if (summary.transport_proposal_required) {
     const failures = summary.checks.filter((check) => !check.passed);
     writeFileSync(join(output, "transport-proposal-required.md"), `# Adaptive polling gate failed\n\nThe measured repair stops here. No long-poll or replacement transport was implemented.\n\nFailed checks:\n${failures.map((failure) => `- ${failure.name}: actual ${failure.actual}, required ${failure.limit}`).join("\n")}\n`, { mode: 0o600 });
   }
