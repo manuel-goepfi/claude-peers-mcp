@@ -24,10 +24,10 @@ function record(stage: FleetRunRecord["stage"], overrides: Partial<FleetRunRecor
     pss_kb: { samples: [1000], average: 1000, max: 1000 },
     queue_to_buffer: { active: { count: 0, p50_ms: null, p95_ms: null, max_ms: null }, idle: { count: 3, p50_ms: 5000, p95_ms: 9000, max_ms: 10_000 } },
     queue_to_ack: { active: { count: 0, p50_ms: null, p95_ms: null, max_ms: null }, idle: { count: 0, p50_ms: null, p95_ms: null, max_ms: null } },
-    poll_state_transitions: [],
+    poll_state_transitions: stage === "adaptive" ? [{ adapter: 0, observed_at: "2026-01-01T00:00:00.000Z", from: "active", to: "backoff", reason: "empty-poll", delay_ms: 2_000 }] : [],
     errors: 0,
     rate_limited: 0,
-    fake_tmux_writes: 0,
+    fake_tmux_writes: stage === "tmux-suppressed" || stage === "adaptive" ? 10 : 100,
     end_health: { adapters_responding: 50, targetable_peers: 50, expected: 50 },
     ...overrides,
   };
@@ -103,6 +103,17 @@ describe("peer fleet evidence evaluation", () => {
     const summary = evaluateCampaign(records);
     expect(summary.passed).toBe(false);
     expect(summary.checks.some((check) => check.name.startsWith("fleet alive at end") && !check.passed)).toBe(true);
+  });
+
+  test("rejects missing adaptive transitions and ineffective tmux suppression", () => {
+    const records = passingCampaign();
+    records.find((entry) => entry.stage === "adaptive")!.poll_state_transitions = [];
+    const instrumented = records.find((entry) => entry.stage === "instrumented")!;
+    records.find((entry) => entry.stage === "tmux-suppressed" && entry.fleet_size === instrumented.fleet_size && entry.scenario === instrumented.scenario && entry.repetition === instrumented.repetition)!.fake_tmux_writes = instrumented.fake_tmux_writes;
+    const summary = evaluateCampaign(records);
+    expect(summary.passed).toBe(false);
+    expect(summary.checks.some((check) => check.name.startsWith("adaptive transition evidence") && !check.passed)).toBe(true);
+    expect(summary.checks.some((check) => check.name.startsWith("tmux-suppressed tmux write suppression") && !check.passed)).toBe(true);
   });
 
   test("requests a transport proposal only after two adaptive misses", () => {

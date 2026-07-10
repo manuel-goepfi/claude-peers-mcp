@@ -1,6 +1,10 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { existsSync, realpathSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { installBrokerService } from "../bin/install-broker-service.ts";
+import { brokerServiceConfig } from "../shared/broker-service.ts";
 import { processStartIdentity } from "../shared/broker-lifecycle.ts";
 import { startTestBroker, type TestBroker } from "./helpers/test-broker.ts";
 
@@ -50,6 +54,58 @@ afterAll(async () => {
 });
 
 describe("authenticated CLI", () => {
+  test("starts a current managed service instead of bypassing it with a direct broker", async () => {
+    const root = mkdtempSync(join(tmpdir(), "claude-peers-cli-managed-"));
+    const bin = join(root, "bin");
+    const pidFile = join(root, "managed.pid");
+    const portProbe = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response() });
+    const port = portProbe.port!;
+    portProbe.stop(true);
+    const env = {
+      ...process.env,
+      HOME: root,
+      CLAUDE_PEERS_PORT: String(port),
+      CLAUDE_PEERS_DB: join(root, "managed.db"),
+      CLAUDE_PEERS_BACKUP: join(root, "managed.backup"),
+      CLAUDE_PEERS_BRIDGE_TOKEN_FILE: join(root, "managed.token"),
+      CLAUDE_PEERS_BROKER_LOG: join(root, "managed.log"),
+    };
+    let managedPid: number | null = null;
+    const previousSkip = process.env.CLAUDE_PEERS_INSTALL_SKIP_SYSTEMD;
+    try {
+      process.env.CLAUDE_PEERS_INSTALL_SKIP_SYSTEMD = "1";
+      installBrokerService(brokerServiceConfig(env));
+      mkdirSync(bin, { mode: 0o700 });
+      const fakeSystemctl = join(bin, "systemctl");
+      writeFileSync(fakeSystemctl, `#!/bin/sh
+if [ "$1" = "--user" ] && [ "$2" = "start" ]; then
+  CLAUDE_PEERS_OWNER_MODE=systemd INVOCATION_ID=cli-test ${JSON.stringify(process.execPath)} ${JSON.stringify(new URL("../broker.ts", import.meta.url).pathname)} >/dev/null 2>>${JSON.stringify(env.CLAUDE_PEERS_BROKER_LOG)} &
+  echo $! > ${JSON.stringify(pidFile)}
+  exit 0
+fi
+exit 1
+`, { mode: 0o700 });
+      chmodSync(fakeSystemctl, 0o700);
+      const result = await runCli(["--json", "status"], {
+        ...env,
+        PATH: `${bin}:${process.env.PATH ?? ""}`,
+        CLAUDE_PEERS_NO_AUTOSTART: "0",
+      });
+      expect(result.code).toBe(0);
+      expect(existsSync(pidFile)).toBe(true);
+      managedPid = Number(readFileSync(pidFile, "utf8").trim());
+      expect(Number.isInteger(managedPid)).toBe(true);
+    } finally {
+      if (previousSkip === undefined) delete process.env.CLAUDE_PEERS_INSTALL_SKIP_SYSTEMD;
+      else process.env.CLAUDE_PEERS_INSTALL_SKIP_SYSTEMD = previousSkip;
+      if (managedPid) {
+        try { process.kill(managedPid, "SIGTERM"); } catch { /* already stopped */ }
+        await Bun.sleep(200);
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("status uses a transient identity, emits no credential, and cleans up", async () => {
     const result = await runCli(["--json", "status"]);
     expect(result.code).toBe(0);

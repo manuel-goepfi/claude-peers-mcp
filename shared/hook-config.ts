@@ -81,7 +81,9 @@ function upsert(document: HookDocument, client: HookClient, spec: CanonicalHook)
   document.hooks[spec.event] ??= [];
   const buckets = document.hooks[spec.event]!;
   const matches = (hook: Hook) => matchesSpec(client, spec, hook);
-  let target = buckets.find((bucket) => Array.isArray(bucket.hooks) && bucket.hooks.some(matches));
+  let target = buckets.find((bucket) =>
+    (bucket.matcher ?? undefined) === spec.matcher && Array.isArray(bucket.hooks) && bucket.hooks.some(matches)
+  );
   if (!target) target = buckets.find((bucket) => (bucket.matcher ?? undefined) === spec.matcher && Array.isArray(bucket.hooks));
   if (!target) {
     target = { ...(spec.matcher ? { matcher: spec.matcher } : {}), hooks: [] };
@@ -122,6 +124,7 @@ export function installClientHooks(
 ): Record<string, unknown> {
   const doc = document as HookDocument;
   for (const spec of canonicalHooks(client, repoRoot)) upsert(doc, client, spec);
+  compact(doc);
   if (client === "gemini") {
     doc.mcpServers ??= {};
     doc.mcpServers["claude-peers"] = { command: process.execPath, args: [resolve(repoRoot, "server.ts")] };

@@ -45,7 +45,7 @@ export async function runHookInstaller(options: HookInstallerOptions): Promise<n
     }
 
     let alternatePathToRemove: string | null = null;
-    if ((explicitScope || check) && !uninstall) {
+    if (!uninstall) {
       const alternateRoot = scope === "user" ? resolve(process.cwd()) : home;
       const alternatePath = resolve(alternateRoot, configRelativePath);
       if (alternatePath !== configPath) {
@@ -79,7 +79,20 @@ export async function runHookInstaller(options: HookInstallerOptions): Promise<n
     }
 
     if (alternatePathToRemove) {
-      installJsonConfig(alternatePathToRemove, (document) => uninstallClientHooks(document, client, sourceRepo));
+      try {
+        installJsonConfig(alternatePathToRemove, (document) => uninstallClientHooks(document, client, sourceRepo));
+      } catch (transferError) {
+        try {
+          if (result.backupPath) {
+            restoreJsonConfig(configPath, result.backupPath, (document) => installClientHooks(document, client, sourceRepo));
+          } else if (result.changed) {
+            installJsonConfig(configPath, (document) => uninstallClientHooks(document, client, sourceRepo));
+          }
+        } catch (rollbackError) {
+          throw new Error(`scope transfer failed and target rollback also failed: ${String(transferError)}; ${String(rollbackError)}`);
+        }
+        throw transferError;
+      }
     }
     if (result.backupPath) console.log(`backup: ${result.backupPath}`);
     console.log(`${uninstall ? "uninstalled" : result.changed ? "installed" : "already current"} ${label} peer hooks: ${configPath}`);

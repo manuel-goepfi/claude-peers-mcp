@@ -64,6 +64,7 @@ describe("broker user-service installer", () => {
       expect(unit).toContain(directive);
     }
     expect(unit).toContain(`CLAUDE_PEERS_DB=${config.databasePath}`);
+    expect(unit).toContain(`CLAUDE_PEERS_PORT=${config.port}`);
     expect(unit).toContain("StandardOutput=append:");
     expect(unit).toContain("\\x20");
 
@@ -111,6 +112,22 @@ describe("broker user-service installer", () => {
     uninstallBrokerService(config);
     expect(existsSync(config.unitPath)).toBe(false);
     expect(existsSync(config.dropInPath)).toBe(false);
+  });
+
+  test("renders a custom broker port into the managed environment", () => {
+    const config = { ...fixture(), port: 7999 };
+    expect(renderBrokerService(config)).toContain('Environment="CLAUDE_PEERS_PORT=7999"');
+  });
+
+  test("uninstall refuses to overwrite post-install operator edits", () => {
+    const config = fixture();
+    mkdirSync(dirname(config.unitPath), { recursive: true });
+    writeFileSync(config.unitPath, "operator predecessor\n", { mode: 0o600 });
+    installBrokerService(config);
+    writeFileSync(config.unitPath, `${renderBrokerService(config)}# later operator edit\n`, { mode: 0o600 });
+    expect(() => uninstallBrokerService(config)).toThrow(/operator edits/);
+    expect(readFileSync(config.unitPath, "utf8")).toContain("later operator edit");
+    expect(readFileSync(config.dropInPath, "utf8")).toBe(renderBrokerServiceDropIn(config));
   });
 
   test("refuses a symlinked service target", () => {

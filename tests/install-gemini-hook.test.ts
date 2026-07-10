@@ -38,7 +38,7 @@ describe("Gemini hook installer", () => {
       }, null, 2));
 
       for (let i = 0; i < 2; i++) {
-        const proc = Bun.spawn(["bun", installer, repo], { stdout: "ignore", stderr: "pipe" });
+        const proc = Bun.spawn(["bun", installer, repo], { env: { ...process.env, HOME: repo }, stdout: "ignore", stderr: "pipe" });
         const stderr = await new Response(proc.stderr).text();
         expect(await proc.exited).toBe(0);
         expect(stderr).toBe("");
@@ -75,7 +75,7 @@ describe("Gemini hook installer", () => {
       const settingsPath = join(repo, ".gemini", "settings.json");
       mkdirSync(join(repo, ".gemini"), { recursive: true });
       writeFileSync(settingsPath, "{not-json");
-      const proc = Bun.spawn(["bun", installer, repo], { stdout: "ignore", stderr: "pipe" });
+      const proc = Bun.spawn(["bun", installer, repo], { env: { ...process.env, HOME: repo }, stdout: "ignore", stderr: "pipe" });
       await new Response(proc.stderr).text();
       expect(await proc.exited).not.toBe(0);
       expect(readFileSync(settingsPath, "utf8")).toBe("{not-json");
@@ -107,7 +107,7 @@ describe("Gemini hook installer", () => {
         },
       }, null, 2));
 
-      const proc = Bun.spawn(["bun", installer, repo], { stdout: "ignore", stderr: "pipe" });
+      const proc = Bun.spawn(["bun", installer, repo], { env: { ...process.env, HOME: repo }, stdout: "ignore", stderr: "pipe" });
       await new Response(proc.stderr).text();
       expect(await proc.exited).toBe(0);
 
@@ -148,7 +148,7 @@ describe("Gemini hook installer", () => {
         },
       }, null, 2));
 
-      const proc = Bun.spawn(["bun", installer, repo], { stdout: "ignore", stderr: "pipe" });
+      const proc = Bun.spawn(["bun", installer, repo], { env: { ...process.env, HOME: repo }, stdout: "ignore", stderr: "pipe" });
       const stderr = await new Response(proc.stderr).text();
       expect(await proc.exited).toBe(0);
       expect(stderr).toBe("");

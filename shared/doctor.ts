@@ -266,7 +266,7 @@ function decodeDatabase(db: Database, version: number, processes: Map<number, Pr
   const peer = db.query(`
     SELECT COUNT(*) AS total,
       SUM(CASE WHEN ${peerColumns.has("non_targetable") ? "non_targetable = 0" : "1"} THEN 1 ELSE 0 END) AS targetable,
-      SUM(CASE WHEN last_seen >= datetime('now', '-60 seconds') THEN 1 ELSE 0 END) AS active
+      SUM(CASE WHEN julianday(last_seen) >= julianday('now', '-60 seconds') THEN 1 ELSE 0 END) AS active
     FROM peers
   `).get() as { total: number; targetable: number; active: number };
   const queue = db.query(`

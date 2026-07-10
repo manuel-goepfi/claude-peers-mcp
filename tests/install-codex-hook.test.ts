@@ -31,7 +31,7 @@ describe("Codex hook installer", () => {
       }, null, 2));
 
       for (let i = 0; i < 2; i++) {
-        const proc = Bun.spawn(["bun", installer, repo], { stdout: "ignore", stderr: "pipe" });
+        const proc = Bun.spawn(["bun", installer, repo], { env: { ...process.env, HOME: repo }, stdout: "ignore", stderr: "pipe" });
         const stderr = await new Response(proc.stderr).text();
         expect(await proc.exited).toBe(0);
         expect(stderr).toBe("");
@@ -80,7 +80,7 @@ describe("Codex hook installer", () => {
       const hooksPath = join(repo, ".codex", "hooks.json");
       mkdirSync(join(repo, ".codex"), { recursive: true });
       writeFileSync(hooksPath, "{not-json");
-      const proc = Bun.spawn(["bun", installer, repo], { stdout: "ignore", stderr: "pipe" });
+      const proc = Bun.spawn(["bun", installer, repo], { env: { ...process.env, HOME: repo }, stdout: "ignore", stderr: "pipe" });
       await new Response(proc.stderr).text();
       expect(await proc.exited).not.toBe(0);
       expect(readFileSync(hooksPath, "utf8")).toBe("{not-json");
@@ -120,7 +120,7 @@ describe("Codex hook installer", () => {
         },
       }, null, 2));
 
-      const proc = Bun.spawn(["bun", installer, repo], { stdout: "ignore", stderr: "pipe" });
+      const proc = Bun.spawn(["bun", installer, repo], { env: { ...process.env, HOME: repo }, stdout: "ignore", stderr: "pipe" });
       const stderr = await new Response(proc.stderr).text();
       expect(await proc.exited).toBe(0);
       expect(stderr).toBe("");
@@ -170,7 +170,7 @@ describe("Codex hook installer", () => {
         },
       }, null, 2));
 
-      const proc = Bun.spawn(["bun", installer, repo], { stdout: "ignore", stderr: "pipe" });
+      const proc = Bun.spawn(["bun", installer, repo], { env: { ...process.env, HOME: repo }, stdout: "ignore", stderr: "pipe" });
       const stderr = await new Response(proc.stderr).text();
       expect(await proc.exited).toBe(0);
       expect(stderr).toBe("");
@@ -212,7 +212,7 @@ describe("Codex hook installer", () => {
         },
       }, null, 2));
 
-      const proc = Bun.spawn(["bun", installer, repo], { stdout: "ignore", stderr: "pipe" });
+      const proc = Bun.spawn(["bun", installer, repo], { env: { ...process.env, HOME: repo }, stdout: "ignore", stderr: "pipe" });
       const stderr = await new Response(proc.stderr).text();
       expect(await proc.exited).toBe(0);
       expect(stderr).toBe("");

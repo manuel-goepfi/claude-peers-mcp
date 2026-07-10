@@ -236,7 +236,7 @@ async function startAdapters(options: {
   transitions: FleetRunRecord["poll_state_transitions"];
 }): Promise<AdapterHandle[]> {
   const capabilities = stageCapabilities(options.stage);
-  return Promise.all(Array.from({ length: options.count }, async (_, index) => {
+  const results = await Promise.allSettled(Array.from({ length: options.count }, async (_, index) => {
     const client = new Client({ name: `peer-fleet-${index}`, version: "1.0.0" });
     const transport = new StdioClientTransport({
       command: process.execPath,
@@ -279,6 +279,13 @@ async function startAdapters(options: {
     await client.connect(transport);
     return { client, transport };
   }));
+  const handles = results.flatMap((result) => result.status === "fulfilled" ? [result.value] : []);
+  const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+  if (failure) {
+    await Promise.allSettled(handles.map((handle) => handle.client.close()));
+    throw failure.reason;
+  }
+  return handles;
 }
 
 function summarizeWindows(events: ProxyEvent[], steadyStart: number, steadyMs: number, windowMs: number): WindowRecord[] {
@@ -340,6 +347,7 @@ async function runFleet(options: {
   const transitions: FleetRunRecord["poll_state_transitions"] = [];
   let adapters: AdapterHandle[] = [];
   let activityTimer: ReturnType<typeof setInterval> | null = null;
+  let pssTimer: ReturnType<typeof setInterval> | null = null;
   const startedAt = new Date().toISOString();
   try {
     adapters = await startAdapters({
@@ -416,16 +424,17 @@ async function runFleet(options: {
     const pssSamples: number[] = [];
     const samplePss = () => pssSamples.push(pids.reduce((sum, pid) => sum + processPssKb(pid), 0));
     samplePss();
-    const pssTimer = setInterval(samplePss, Math.min(5_000, Math.max(1_000, options.windowMs / 2)));
+    pssTimer = setInterval(samplePss, Math.min(5_000, Math.max(1_000, options.windowMs / 2)));
     await Promise.race([Bun.sleep(options.steadyMs), scenarioFailure]);
-    clearInterval(pssTimer);
-    samplePss();
-    const brokerCpuEnd = processCpuTicks(broker.proc.pid);
-    const adapterCpuEnd = pids.slice(1).reduce((sum, pid) => sum + processCpuTicks(pid), 0);
     if (activityTimer) clearInterval(activityTimer);
     activityTimer = null;
     while (activityBusy) await Bun.sleep(10);
     if (scenarioError) throw scenarioError;
+    if (pssTimer) clearInterval(pssTimer);
+    pssTimer = null;
+    samplePss();
+    const brokerCpuEnd = processCpuTicks(broker.proc.pid);
+    const adapterCpuEnd = pids.slice(1).reduce((sum, pid) => sum + processCpuTicks(pid), 0);
 
     const adapterProofs = await Promise.all(adapters.map((adapter) => adapter.client.callTool({ name: "whoami", arguments: {} })));
     const adaptersResponding = adapterProofs.filter((proof) => !proof.isError).length;
@@ -470,6 +479,7 @@ async function runFleet(options: {
     };
   } finally {
     if (activityTimer) clearInterval(activityTimer);
+    if (pssTimer) clearInterval(pssTimer);
     await Promise.allSettled(adapters.map((adapter) => adapter.client.close()));
     proxy.stop();
     await broker.stop();
@@ -554,6 +564,9 @@ export function evaluateCampaign(records: FleetRunRecord[], quick = false): Camp
     const expectedEnd = record.fleet_size;
     const endHealthy = record.end_health.expected === expectedEnd && record.end_health.adapters_responding === expectedEnd && record.end_health.targetable_peers === expectedEnd;
     checks.push({ name: `fleet alive at end ${record.stage} ${pairKey(record)}`, passed: endHealthy, actual: `${record.end_health.adapters_responding}/${record.end_health.targetable_peers}/${record.end_health.expected}`, limit: `${expectedEnd}/${expectedEnd}/${expectedEnd}` });
+    if (record.stage === "adaptive") {
+      checks.push({ name: `adaptive transition evidence ${pairKey(record)}`, passed: quick || record.poll_state_transitions.length > 0, actual: record.poll_state_transitions.length, limit: ">0" });
+    }
   }
 
   for (const [key, baseline] of byStage.get("baseline")!) {
@@ -563,6 +576,15 @@ export function evaluateCampaign(records: FleetRunRecord[], quick = false): Camp
     const pssRatio = baseline.pss_kb.average > 0 ? instrumented.pss_kb.average / baseline.pss_kb.average : Number.POSITIVE_INFINITY;
     checks.push({ name: `instrumentation CPU overhead ${key}`, passed: quick || cpuRatio <= 1.05, actual: cpuRatio, limit: "<=1.05" });
     checks.push({ name: `instrumentation PSS overhead ${key}`, passed: quick || pssRatio <= 1.05, actual: pssRatio, limit: "<=1.05" });
+  }
+
+  for (const [key, instrumented] of byStage.get("instrumented")!) {
+    for (const stage of ["tmux-suppressed", "adaptive"] as const) {
+      const suppressed = byStage.get(stage)!.get(key);
+      if (!suppressed) continue;
+      const reduced = suppressed.fake_tmux_writes < instrumented.fake_tmux_writes;
+      checks.push({ name: `${stage} tmux write suppression ${key}`, passed: quick || reduced, actual: `${suppressed.fake_tmux_writes}/${instrumented.fake_tmux_writes}`, limit: "suppressed < instrumented" });
+    }
   }
 
   const adaptiveMisses = new Map<"all-idle" | "one-active", number>([["all-idle", 0], ["one-active", 0]]);

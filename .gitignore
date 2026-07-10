@@ -27,6 +27,9 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 .cache
 *.tsbuildinfo
 
+# Project-scope hook commands contain the local clone path; install them locally.
+.codex/hooks.json
+
 # IntelliJ based IDEs
 .idea
 

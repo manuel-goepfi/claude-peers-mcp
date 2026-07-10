@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { classifyClientHooks, installClientHooks } from "../shared/hook-config.ts";
@@ -8,7 +8,7 @@ const installer = new URL("../bin/install-claude-hook.ts", import.meta.url).path
 const repoRoot = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
 
 async function run(repo: string, ...args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
-  const proc = Bun.spawn(["bun", installer, repo, ...args], { stdout: "pipe", stderr: "pipe" });
+  const proc = Bun.spawn(["bun", installer, repo, ...args], { env: { ...process.env, HOME: repo }, stdout: "pipe", stderr: "pipe" });
   const [stdout, stderr, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
   return { code, stdout, stderr };
 }
@@ -147,6 +147,49 @@ describe("Claude hook installer", () => {
       const projectDoc = JSON.parse(readFileSync(join(project, ".claude", "settings.json"), "utf8")) as Record<string, unknown>;
       expect(classifyClientHooks(user, "claude", repoRoot).exact).toBe(0);
       expect(classifyClientHooks(projectDoc, "claude", repoRoot).exact).toBe(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("default user install rejects a project owner and failed replace rolls the target back", async () => {
+    const root = mkdtempSync(join(tmpdir(), "claude-peers-claude-default-scope-"));
+    try {
+      const home = join(root, "home");
+      const project = join(root, "project");
+      const safeClone = join(home, "clone");
+      mkdirSync(join(home, ".claude"), { recursive: true, mode: 0o700 });
+      mkdirSync(safeClone, { mode: 0o700 });
+      for (const entry of ["bin", "shared", "hooks"]) cpSync(join(repoRoot, entry), join(safeClone, entry), { recursive: true });
+      const safeInstaller = join(safeClone, "bin", "install-claude-hook.ts");
+      mkdirSync(join(project, ".claude"), { recursive: true, mode: 0o700 });
+      const projectPath = join(project, ".claude", "settings.json");
+      writeFileSync(projectPath, `${JSON.stringify(installClientHooks({}, "claude", repoRoot), null, 2)}\n`, { mode: 0o600 });
+      const invoke = async (...args: string[]) => {
+        const proc = Bun.spawn(["bun", safeInstaller, ...args], {
+          cwd: project,
+          env: { ...process.env, HOME: home },
+          stdout: "pipe",
+          stderr: "pipe",
+        });
+        const [code, stderr] = await Promise.all([proc.exited, new Response(proc.stderr).text()]);
+        return { code, stderr };
+      };
+
+      const duplicate = await invoke();
+      expect(duplicate.code).toBe(1);
+      expect(duplicate.stderr).toContain("duplicate Claude hook scope");
+      expect(() => readFileSync(join(home, ".claude", "settings.json"))).toThrow();
+
+      rmSync(projectPath);
+      const userPath = join(home, ".claude", "settings.json");
+      writeFileSync(userPath, `${JSON.stringify(installClientHooks({}, "claude", repoRoot), null, 2)}\n`, { mode: 0o600 });
+      chmodSync(join(home, ".claude"), 0o770);
+      const failedTransfer = await invoke("--scope", "project", project, "--replace");
+      expect(failedTransfer.code).toBe(1);
+      expect(classifyClientHooks(JSON.parse(readFileSync(userPath, "utf8")), "claude", repoRoot).exact).toBe(1);
+      const rolledBack = JSON.parse(readFileSync(projectPath, "utf8")) as Record<string, unknown>;
+      expect(classifyClientHooks(rolledBack, "claude", repoRoot).exact).toBe(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

@@ -73,8 +73,16 @@ function booleanSetting(name: string, fallback: boolean): boolean {
 const ADAPTIVE_POLLING_ENABLED = booleanSetting("CLAUDE_PEERS_ADAPTIVE_POLLING", true);
 const TMUX_UNCHANGED_WRITE_SUPPRESSION = booleanSetting("CLAUDE_PEERS_TMUX_UNCHANGED_WRITE_SUPPRESSION", true);
 const HEARTBEAT_PHASE_SPREAD_ENABLED = booleanSetting("CLAUDE_PEERS_HEARTBEAT_PHASE_SPREAD", true);
+export function positiveHeartbeatInterval(raw: string | undefined, fallback = 15_000): number {
+  const parsed = Number(raw ?? fallback);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
+
+export function shouldReplacePollDeadline(currentDeadline: number | null, candidateDeadline: number): boolean {
+  return currentDeadline === null || candidateDeadline < currentDeadline;
+}
 // Env override exists for tests only (lifecycle tests need sub-second ticks).
-const HEARTBEAT_INTERVAL_MS = parseInt(process.env.CLAUDE_PEERS_HEARTBEAT_MS ?? "15000", 10);
+const HEARTBEAT_INTERVAL_MS = positiveHeartbeatInterval(process.env.CLAUDE_PEERS_HEARTBEAT_MS);
 // Re-detect our tmux pane only every Nth heartbeat, NOT every tick. detectTmuxPane()
 // runs `tmux list-panes -a` — an O(all-panes) server-wide scan. With N server
 // instances each scanning every heartbeat, the single tmux server saturates
@@ -2435,6 +2443,7 @@ async function main() {
   let pollActive = false;
   let pollInFlight = false;
   let pollTimer: ReturnType<typeof setTimeout> | null = null;
+  let pollDeadline: number | null = null;
   const pollScheduler = new AdaptivePollScheduler(myId ?? peerName ?? String(myRegisterPid), performance.now());
 
   const recordPollDecision = (decision: PollDecision) => {
@@ -2442,12 +2451,16 @@ async function main() {
   };
 
   const armPoll = (delayMs: number) => {
+    const candidateDeadline = performance.now() + delayMs;
+    if (pollTimer && !shouldReplacePollDeadline(pollDeadline, candidateDeadline)) return;
     if (pollTimer) clearTimeout(pollTimer);
+    pollDeadline = candidateDeadline;
     pollTimer = setTimeout(runScheduledPoll, delayMs);
   };
 
   async function runScheduledPoll() {
     pollTimer = null;
+    pollDeadline = null;
     if (!pollActive || pollInFlight) return;
     pollInFlight = true;
     const outcome = await pollAndPushMessages();
@@ -2487,6 +2500,7 @@ async function main() {
     pollActive = false;
     if (pollTimer) clearTimeout(pollTimer);
     pollTimer = null;
+    pollDeadline = null;
     log(`background channel poll disabled (${reason})`);
   }
 

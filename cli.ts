@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 import { existsSync, realpathSync } from "node:fs";
-import { BrokerRequestError, ensureBrokerRunning, requestBroker } from "./shared/broker-client.ts";
+import { BrokerRequestError, brokerIsReady, ensureBrokerRunning, requestBroker } from "./shared/broker-client.ts";
 import {
   listenerPidsForLoopbackPort,
   isBrokerLifecycleIdentity,
@@ -149,6 +149,34 @@ async function systemctl(args: string[], timeoutMs: number): Promise<{ code: num
     throw new CliError("timeout", "systemctl --user timed out");
   }
   return { code: outcome.code, stdout: await stdoutPromise };
+}
+
+async function ensureCliBroker(baseUrl: string, timeoutMs: number): Promise<void> {
+  if (await brokerIsReady(baseUrl, Math.min(timeoutMs, 2_000))) return;
+  const unitPath = `${process.env.HOME}/.config/systemd/user/claude-peers-broker.service`;
+  if (existsSync(unitPath)) {
+    const config = brokerServiceConfig();
+    if (installedBrokerServiceIsCurrent(config)) {
+      if (process.env.CLAUDE_PEERS_NO_AUTOSTART === "1") {
+        throw new CliError("transport", "broker is not running and auto-start is disabled");
+      }
+      const started = await systemctl(["start", "claude-peers-broker.service"], timeoutMs);
+      if (started.code !== 0) throw new CliError("unsafe", "verified managed broker service failed to start");
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        if (await brokerIsReady(baseUrl, 500)) return;
+        await Bun.sleep(100);
+      }
+      throw new CliError("timeout", "managed broker did not become ready before the startup deadline");
+    }
+  }
+  await ensureBrokerRunning({
+    baseUrl,
+    brokerScript: realpathSync(new URL("./broker.ts", import.meta.url).pathname),
+    logPath: process.env.CLAUDE_PEERS_BROKER_LOG ?? `${process.env.HOME}/.claude-peers-broker.log`,
+    timeoutMs,
+    allowStart: process.env.CLAUDE_PEERS_NO_AUTOSTART !== "1",
+  });
 }
 
 async function managedMainPid(timeoutMs: number): Promise<number> {
@@ -348,15 +376,9 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   const baseUrl = `http://127.0.0.1:${port}`;
   const timeoutMs = configuredTimeout();
   try {
-    await ensureBrokerRunning({
-      baseUrl,
-      brokerScript: realpathSync(new URL("./broker.ts", import.meta.url).pathname),
-      logPath: process.env.CLAUDE_PEERS_BROKER_LOG ?? `${process.env.HOME}/.claude-peers-broker.log`,
-      timeoutMs: Math.max(timeoutMs, 1000),
-      allowStart: process.env.CLAUDE_PEERS_NO_AUTOSTART !== "1",
-    });
+    await ensureCliBroker(baseUrl, Math.max(timeoutMs, 1000));
   } catch (error) {
-    const mapped = mapRequestError(error, "broker startup");
+    const mapped = error instanceof CliError ? error : mapRequestError(error, "broker startup");
     reportError(mapped, json);
     return EXIT[mapped.kind];
   }

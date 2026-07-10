@@ -1,15 +1,22 @@
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
 import { canonicalHooks, classifyClientHooks, installClientHooks } from "../shared/hook-config.ts";
 
 const repoRoot = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
 
 describe("canonical hook configuration", () => {
-  test("tracked Codex fixture is rendered from the canonical hook definitions", () => {
-    const tracked = readFileSync(join(repoRoot, ".codex", "hooks.json"), "utf8");
-    const rendered = `${JSON.stringify(installClientHooks({}, "codex", repoRoot), null, 2)}\n`;
-    expect(tracked).toBe(rendered);
+  test("moves a stale managed hook without changing an unrelated bucket matcher", () => {
+    const document = {
+      hooks: {
+        SessionStart: [{ matcher: "other-event", hooks: [
+          { type: "command", command: "bun unrelated.ts" },
+          { name: "claude-peers-codex-register", type: "command", command: "bun /old/codex-register-peer-session.ts" },
+        ] }],
+      },
+    };
+    const installed = installClientHooks(document, "codex", repoRoot) as typeof document;
+    expect(installed.hooks.SessionStart[0]!.matcher).toBe("other-event");
+    expect(installed.hooks.SessionStart[0]!.hooks).toEqual([{ type: "command", command: "bun unrelated.ts" }]);
+    expect(classifyClientHooks(installed as Record<string, unknown>, "codex", repoRoot).exact).toBe(4);
   });
 
   test("classification requires exact matcher and does not confuse missing specs", () => {

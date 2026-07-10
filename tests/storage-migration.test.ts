@@ -1,16 +1,18 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { existsSync, lstatSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, lstatSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   explainUsesIndex,
   initializeStorage,
+  maximumSequenceHighWater,
   restoreStorageBackup,
   retentionPurgeSql,
   STORAGE_SCHEMA_VERSION,
   storageIndexes,
   storageSnapshot,
+  storageUserVersion,
   unknownReceiverPurgeSql,
   type StorageBackupManifest,
 } from "../shared/storage.ts";
@@ -72,6 +74,12 @@ function legacyDatabase(path: string): Database {
 }
 
 describe("versioned historical-message migration", () => {
+  test("sequence high-water calculation stays bounded for million-row histories", () => {
+    const ids = Array.from({ length: 1_000_000 }, (_, index) => index + 1);
+    expect(maximumSequenceHighWater(5, ids)).toBe(1_000_000);
+    expect(maximumSequenceHighWater(1_000_001, ids)).toBe(1_000_001);
+  });
+
   test("fresh database creates the final schema without a legacy backup", () => {
     const dir = root();
     const dbPath = join(dir, "fresh.db");
@@ -169,6 +177,39 @@ describe("versioned historical-message migration", () => {
     expect((db.query("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(1);
     expect(initializeStorage(db, { databasePath: dbPath, backupPath }).migrated).toBe(false);
     db.close();
+  });
+
+  test("broker automatically restores the verified backup after a post-commit failure", async () => {
+    const dir = root();
+    const dbPath = join(dir, "automatic-restore.db");
+    const backupPath = join(dir, "automatic-restore.backup");
+    const legacy = legacyDatabase(dbPath);
+    const before = storageSnapshot(legacy);
+    legacy.close();
+    const proc = Bun.spawn(["bun", brokerScript], {
+      env: {
+        ...process.env,
+        HOME: dir,
+        NODE_ENV: "test",
+        CLAUDE_PEERS_PORT: "0",
+        CLAUDE_PEERS_TEST_PORT_ZERO: "1",
+        CLAUDE_PEERS_DB: dbPath,
+        CLAUDE_PEERS_BACKUP: backupPath,
+        CLAUDE_PEERS_BRIDGE_TOKEN_FILE: join(dir, "automatic-restore.token"),
+        CLAUDE_PEERS_TEST_FAIL_AFTER_MIGRATION_COMMIT: "1",
+      },
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [code, stderr] = await Promise.all([proc.exited, new Response(proc.stderr).text()]);
+    expect(code).not.toBe(0);
+    expect(stderr).toContain("restored verified backup");
+    const restored = new Database(dbPath, { readonly: true });
+    expect(storageUserVersion(restored)).toBe(0);
+    expect(storageSnapshot(restored)).toEqual(before);
+    restored.close();
+    expect(readdirSync(dir).some((name) => name.startsWith("automatic-restore.db.pre-restore-"))).toBe(true);
   });
 
   test("large legacy table without sqlite_sequence migrates with exact gaps and future ids", () => {

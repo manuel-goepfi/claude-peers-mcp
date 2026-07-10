@@ -5,6 +5,7 @@ import { basename, dirname, join } from "node:path";
 const brokerScript = new URL("../../broker.ts", import.meta.url).pathname;
 
 export interface TestBrokerOptions {
+  brokerScriptPath?: string;
   cleanupOnStop?: boolean;
   dbPath?: string;
   env?: Record<string, string | undefined>;
@@ -84,8 +85,9 @@ export async function startTestBroker(options: TestBrokerOptions = {}): Promise<
     if (cleanupOnStop) rmSync(root, { recursive: true, force: true });
     throw error;
   }
-  const proc = Bun.spawn(["bun", brokerScript], {
-    cwd: dirname(brokerScript),
+  const selectedBrokerScript = options.brokerScriptPath ?? brokerScript;
+  const proc = Bun.spawn(["bun", selectedBrokerScript], {
+    cwd: dirname(selectedBrokerScript),
     env: {
       ...process.env,
       ...options.env,

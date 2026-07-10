@@ -40,7 +40,7 @@ Do not use broad process-name kills. A failed safe shutdown is an ownership inci
 
 ### Managed systemd ownership
 
-Install the rendered user unit and its narrow state-path drop-in:
+Install the rendered user unit and its configured-parent state-path drop-in:
 
 ```bash
 bun bin/install-broker-service.ts install
@@ -50,6 +50,8 @@ systemctl --user status claude-peers-broker.service
 ```
 
 The managed unit sets `CLAUDE_PEERS_OWNER_MODE=systemd`. In this mode, safe shutdown also verifies systemd's current `MainPID`. To remove the managed files and restore any operator-owned predecessors:
+
+The compatibility defaults place the database, token, backup, and log directly under `$HOME`; systemd must therefore grant their shared parent, the home directory, write access despite `ProtectHome=read-only`. For a genuinely narrow sandbox, set all four paths under one dedicated 0700 state directory before the first managed install. Relocating an existing database is an offline migration and must follow the ownership and WAL checks below.
 
 ```bash
 systemctl --user disable --now claude-peers-broker.service

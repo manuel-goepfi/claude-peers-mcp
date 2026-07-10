@@ -102,14 +102,16 @@ describe("schema-aware doctor", () => {
       const now = new Date().toISOString();
       db.run("INSERT INTO peers (id, pid, cwd, client_type, receiver_mode, registered_at, last_seen) VALUES ('later-match', 30, '/', 'codex', 'codex-hook', ?, ?)", [now, now]);
       db.run("INSERT INTO peers (id, pid, cwd, client_type, receiver_mode, registered_at, last_seen) VALUES ('first-unrelated', 999999, '/', 'claude', 'claude-channel', ?, ?)", [now, now]);
+      db.run("INSERT INTO peers (id, pid, cwd, client_type, receiver_mode, registered_at, last_seen) VALUES ('stale-same-day', 999998, '/', 'claude', 'claude-channel', ?, ?)", [now, new Date(Date.now() - 4 * 60 * 60 * 1_000).toISOString()]);
       db.close();
       const report = inspectDatabase(dbPath, "ready", processes, repoRoot);
       expect(report.aggregates?.correlation).toEqual({
-        registered_processes: 2,
+        registered_processes: 3,
         live_registered_processes: 1,
         adapters_with_registered_client: 1,
         adapters_without_registered_client: 3,
       });
+      expect(report.aggregates?.peers.active).toBe(2);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

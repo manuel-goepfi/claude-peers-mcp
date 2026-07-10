@@ -14,9 +14,14 @@
  * re-detect runs. `jitter` de-phases the fleet so N servers don't all scan together.
  */
 import { describe, test, expect } from "bun:test";
-import { shouldRedetectTmux } from "../server.ts";
+import { positiveHeartbeatInterval, shouldRedetectTmux } from "../server.ts";
 
 describe("shouldRedetectTmux", () => {
+  test("invalid heartbeat intervals fall back instead of creating a timer storm", () => {
+    for (const value of ["0", "-1", "not-a-number", "Infinity"]) expect(positiveHeartbeatInterval(value)).toBe(15_000);
+    expect(positiveHeartbeatInterval("200")).toBe(200);
+  });
+
   test("every=1 → true on EVERY tick (old behavior / test mode)", () => {
     for (let t = 0; t < 10; t++) expect(shouldRedetectTmux(t, 0, 1)).toBe(true);
   });

@@ -219,7 +219,7 @@ bun bin/install-broker-service.ts --check
 systemctl --user enable --now claude-peers-broker.service
 ```
 
-The installer renders absolute paths, 0600 unit/drop-in files, a narrow `ReadWritePaths` drop-in, and verifies the unit with `systemd-analyze --user verify` when available. Hardening includes `UMask=0077`, `NoNewPrivileges=yes`, loopback/Unix address-family restriction, private `/tmp`, strict system protection, and read-only home. Uninstall restores operator-owned predecessor files when present:
+The installer renders absolute paths, 0600 unit/drop-in files, a `ReadWritePaths` drop-in limited to the configured state-file parent directories, and verifies the unit with `systemd-analyze --user verify` when available. Hardening includes `UMask=0077`, `NoNewPrivileges=yes`, loopback/Unix address-family restriction, private `/tmp`, and strict system protection. The compatibility defaults store state directly under `$HOME`, so their writable parent is the whole home directory; configure every state path under one dedicated owner-only directory before the first managed install if a narrow home sandbox is required. Uninstall refuses post-install edits and restores operator-owned predecessor files only while the managed bytes are unchanged:
 
 ```bash
 bun bin/install-broker-service.ts --uninstall

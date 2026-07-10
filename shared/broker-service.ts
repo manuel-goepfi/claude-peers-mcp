@@ -3,6 +3,7 @@ import { dirname, resolve } from "node:path";
 
 export interface BrokerServiceConfig {
   home: string;
+  port: number;
   bunPath: string;
   brokerScript: string;
   databasePath: string;
@@ -19,6 +20,8 @@ function absolute(value: string, base: string): string {
 
 export function brokerServiceConfig(env: Record<string, string | undefined> = process.env): BrokerServiceConfig {
   const home = realpathSync(env.HOME ?? "");
+  const port = Number(env.CLAUDE_PEERS_PORT ?? "7899");
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("CLAUDE_PEERS_PORT must be an integer from 1 to 65535");
   const brokerScript = realpathSync(new URL("../broker.ts", import.meta.url).pathname);
   const databasePath = absolute(env.CLAUDE_PEERS_DB ?? `${home}/.claude-peers.db`, home);
   const bridgeTokenPath = absolute(env.CLAUDE_PEERS_BRIDGE_TOKEN_FILE ?? `${home}/.claude-peers-bridge.token`, home);
@@ -26,6 +29,7 @@ export function brokerServiceConfig(env: Record<string, string | undefined> = pr
   const logPath = absolute(env.CLAUDE_PEERS_BROKER_LOG ?? `${home}/.claude-peers-broker.log`, home);
   return {
     home,
+    port,
     bunPath: realpathSync(process.execPath),
     brokerScript,
     databasePath,
@@ -73,6 +77,7 @@ PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
 ${environment("HOME", config.home)}
+${environment("CLAUDE_PEERS_PORT", String(config.port))}
 ${environment("CLAUDE_PEERS_DB", config.databasePath)}
 ${environment("CLAUDE_PEERS_BRIDGE_TOKEN_FILE", config.bridgeTokenPath)}
 ${environment("CLAUDE_PEERS_BACKUP", config.backupPath)}

@@ -1,7 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import { AdaptivePollScheduler, cadencePhaseDelay, deterministicPollPhase, phaseSpreadDelay, POLL_BACKOFF_MS } from "../shared/poll-scheduler.ts";
+import { shouldReplacePollDeadline } from "../server.ts";
 
 describe("adaptive Claude polling", () => {
+  test("rapid activity can pull a poll earlier but cannot postpone its deadline", () => {
+    expect(shouldReplacePollDeadline(null, 1_000)).toBe(true);
+    expect(shouldReplacePollDeadline(1_000, 1_500)).toBe(false);
+    expect(shouldReplacePollDeadline(1_000, 900)).toBe(true);
+  });
+
   test("uses the exact 1s, 1s, 2s, 4s, 8s, 10s empty-poll sequence", () => {
     const scheduler = new AdaptivePollScheduler("peer-a", 0);
     const bases: number[] = [];

@@ -128,6 +128,27 @@ export function installBrokerService(config = brokerServiceConfig()): { changed:
   return { changed };
 }
 
+function assertRestoreSafe(path: string, expectedManagedContent: string): void {
+  const backup = `${path}${backupSuffix}`;
+  if (existsSync(path)) {
+    const stat = lstatSync(path);
+    const uid = process.getuid?.() ?? -1;
+    if (stat.isSymbolicLink() || !stat.isFile() || (uid >= 0 && stat.uid !== uid)) {
+      throw new Error(`unsafe managed service file: ${path}`);
+    }
+    if (readFileSync(path, "utf8") !== expectedManagedContent) {
+      throw new Error(`managed service file changed after installation; refusing to overwrite operator edits: ${path}`);
+    }
+  }
+  if (existsSync(backup)) {
+    const backupStat = lstatSync(backup);
+    const uid = process.getuid?.() ?? -1;
+    if (backupStat.isSymbolicLink() || !backupStat.isFile() || (uid >= 0 && backupStat.uid !== uid)) {
+      throw new Error(`unsafe service backup: ${backup}`);
+    }
+  }
+}
+
 function restoreOrRemove(path: string): boolean {
   const backup = `${path}${backupSuffix}`;
   if (existsSync(backup)) {
@@ -137,16 +158,14 @@ function restoreOrRemove(path: string): boolean {
     return true;
   }
   if (!existsSync(path)) return false;
-  const content = readFileSync(path, "utf8");
-  if (!content.startsWith("# Managed by claude-peers")) {
-    throw new Error(`refusing to remove an unowned service file: ${path}`);
-  }
   rmSync(path);
   fsyncDirectory(dirname(path));
   return true;
 }
 
 export function uninstallBrokerService(config = brokerServiceConfig()): { changed: boolean } {
+  assertRestoreSafe(config.dropInPath, renderBrokerServiceDropIn(config));
+  assertRestoreSafe(config.unitPath, renderBrokerService(config));
   const dropInChanged = restoreOrRemove(config.dropInPath);
   const unitChanged = restoreOrRemove(config.unitPath);
   const changed = dropInChanged || unitChanged;

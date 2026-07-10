@@ -113,4 +113,55 @@ describe("runtime aggregate metrics", () => {
       await broker.stop();
     }
   });
+
+  test("invalid short-lived hook callers cannot create unbounded rate buckets", async () => {
+    const broker = await startTestBroker({ prefix: "runtime-metrics-hook-buckets" });
+    const callers = Array.from({ length: 20 }, () => Bun.spawn(["sleep", "30"]));
+    try {
+      for (const caller of callers) {
+        const response = await fetch(`${broker.url}/claim-by-pid`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ pid: 999_999_999, caller_pid: caller.pid }),
+        });
+        expect(response.status).toBe(404);
+      }
+      const registration = await fetch(`${broker.url}/register-cli`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ pid: process.pid }),
+      }).then((response) => response.json()) as { id: string; token: string };
+      const metrics = await fetch(`${broker.url}/metrics`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Peer-Token": registration.token },
+        body: JSON.stringify({ id: registration.id }),
+      }).then((response) => response.json());
+      expect(metrics).toMatchObject({ rate_limit_buckets: 1 });
+    } finally {
+      for (const caller of callers) caller.kill();
+      await Promise.all(callers.map((caller) => caller.exited));
+      await broker.stop();
+    }
+  });
+
+  test("rejects oversized streamed bodies without trusting Content-Length", async () => {
+    const broker = await startTestBroker({ prefix: "runtime-metrics-stream-limit" });
+    try {
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new Uint8Array(40_000).fill(0x20));
+          controller.enqueue(new Uint8Array(40_000).fill(0x20));
+          controller.close();
+        },
+      });
+      const response = await fetch(`${broker.url}/register`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: stream,
+      });
+      expect(response.status).toBe(413);
+    } finally {
+      await broker.stop();
+    }
+  });
 });

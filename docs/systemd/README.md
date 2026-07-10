@@ -3,9 +3,15 @@
 ## Core broker service
 
 Use the installer rather than copying the tracked template. It resolves Bun,
-the clone, state paths, and the current user's home into a 0600 unit plus a
-narrow `ReadWritePaths` drop-in, verifies the rendered unit when
+the clone, state paths, current port, and the current user's home into a 0600 unit plus a
+configured-parent `ReadWritePaths` drop-in, verifies the rendered unit when
 `systemd-analyze` is available, and reloads the user manager.
+
+Legacy default state files live directly under `$HOME`, so their common writable
+parent is the whole home directory. Set the database, bridge token, backup, and
+log beneath one dedicated 0700 state directory before first install when a
+narrow home sandbox is required. Move existing state only through the offline
+procedure in the operations guide.
 
 ```sh
 bun bin/install-broker-service.ts install

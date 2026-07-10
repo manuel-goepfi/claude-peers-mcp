@@ -1,5 +1,7 @@
 #!/usr/bin/env bun
 import { cpSync, chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { inspectClientSurfaces } from "../shared/doctor.ts";
@@ -30,9 +32,30 @@ function backupFrom(output: string): string {
   return path;
 }
 
-async function protocolSmoke(root: string): Promise<void> {
-  const broker = await startTestBroker({ root: join(root, "broker"), cleanupOnStop: false, prefix: "clean-install" });
+async function protocolSmoke(root: string, clone: string): Promise<void> {
+  const broker = await startTestBroker({
+    root: join(root, "broker"),
+    cleanupOnStop: false,
+    prefix: "clean-install",
+    brokerScriptPath: join(clone, "broker.ts"),
+  });
   const children = [Bun.spawn(["sleep", "30"]), Bun.spawn(["sleep", "30"])];
+  const installedClient = new Client({ name: "clean-install-smoke", version: "1.0.0" });
+  const installedTransport = new StdioClientTransport({
+    command: process.execPath,
+    args: [join(clone, "server.ts")],
+    cwd: clone,
+    env: {
+      ...process.env,
+      HOME: root,
+      CLAUDE_PEERS_PORT: String(broker.port),
+      CLAUDE_PEERS_DB: broker.dbPath,
+      CLAUDE_PEERS_BROKER_LOG: broker.logPath,
+      CLAUDE_PEERS_CLIENT_TYPE: "claude",
+      CLAUDE_PEER_NAME: "installed-copy-smoke",
+    },
+    stderr: "pipe",
+  });
   const tokens = new Map<string, string>();
   const post = async <T>(path: string, body: Record<string, unknown>): Promise<T> => {
     const id = String(body.id ?? body.from_id ?? "");
@@ -51,6 +74,9 @@ async function protocolSmoke(root: string): Promise<void> {
   };
 
   try {
+    await installedClient.connect(installedTransport);
+    const proof = await installedClient.callTool({ name: "whoami", arguments: {} });
+    invariant(!proof.isError, "copied MCP server failed its whoami proof");
     const registered = [] as Array<{ id: string }>;
     for (const [index, child] of children.entries()) {
       registered.push(await post<{ id: string }>("/register", {
@@ -76,6 +102,7 @@ async function protocolSmoke(root: string): Promise<void> {
     const acked = await post<{ acked: number }>("/ack-messages", { id: registered[1]!.id, ids: [sent.id] });
     invariant(acked.acked === 1, "receiver did not acknowledge the queued message");
   } finally {
+    await installedClient.close().catch(() => undefined);
     for (const child of children) child.kill();
     await Promise.all(children.map((child) => child.exited));
     await broker.stop();
@@ -91,10 +118,11 @@ export async function main(): Promise<void> {
     mkdirSync(home, { mode: 0o700 });
     mkdirSync(project, { mode: 0o700 });
     mkdirSync(clone, { mode: 0o700 });
-    for (const entry of ["bin", "hooks", "shared", "server.ts", "broker.ts", "package.json"]) {
+    for (const entry of ["bin", "hooks", "shared", "server.ts", "broker.ts", "package.json", "bun.lock"]) {
       cpSync(join(sourceRoot, entry), join(clone, entry), { recursive: true });
     }
     chmodSync(clone, 0o700);
+    await run([process.execPath, "install", "--frozen-lockfile"], { cwd: clone, home });
 
     const originals = {
       claude: "{\n  \"theme\": \"smoke\"\n}\n",
@@ -148,7 +176,7 @@ export async function main(): Promise<void> {
       invariant(!surfaces[client].duplicate_scope, `${client} is installed in duplicate scopes`);
     }
 
-    await protocolSmoke(root);
+    await protocolSmoke(root, clone);
 
     for (const client of ["claude", "codex", "gemini"] as const) {
       await run([process.execPath, installers[client], "--uninstall"], { cwd: project, home });

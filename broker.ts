@@ -55,7 +55,17 @@ import type {
 import { isReapable, deadSeatMailExpired, shouldRotateLog, PEER_GHOST_AFTER_MS } from "./shared/reaper.ts";
 import { PEERS_VERSION } from "./shared/version.ts";
 import { acquireBrokerOwnership, assertDatabaseIdentity, type BrokerLifecycleIdentity } from "./shared/broker-lifecycle.ts";
-import { initializeStorage, positiveMilliseconds, retentionPurgeSql, unknownReceiverPurgeSql, STORAGE_SCHEMA_VERSION, type StorageReadiness } from "./shared/storage.ts";
+import {
+  initializeStorage,
+  positiveMilliseconds,
+  PostCommitStorageVerificationError,
+  restoreStorageAfterFailedMigration,
+  retentionPurgeSql,
+  unknownReceiverPurgeSql,
+  STORAGE_SCHEMA_VERSION,
+  type InitializeStorageResult,
+  type StorageReadiness,
+} from "./shared/storage.ts";
 import { RuntimeMetrics } from "./shared/runtime-metrics.ts";
 
 const PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
@@ -269,13 +279,36 @@ if (Number.isFinite(testMigrationPause) && testMigrationPause > 0) {
 }
 
 const db = new Database(DB_PATH);
-const storage = initializeStorage(db, {
-  databasePath: DB_PATH,
-  backupPath: process.env.CLAUDE_PEERS_BACKUP,
-  onReadiness(state) {
-    storageReadiness = state;
-  },
-});
+let storage: InitializeStorageResult;
+try {
+  storage = initializeStorage(db, {
+    databasePath: DB_PATH,
+    backupPath: process.env.CLAUDE_PEERS_BACKUP,
+    onReadiness(state) {
+      storageReadiness = state;
+    },
+    onCheckpoint: process.env.NODE_ENV === "test" && process.env.CLAUDE_PEERS_TEST_FAIL_AFTER_MIGRATION_COMMIT === "1"
+      ? (checkpoint) => { if (checkpoint === "after-commit") throw new Error("injected broker post-commit verification failure"); }
+      : undefined,
+  });
+} catch (error) {
+  if (!(error instanceof PostCommitStorageVerificationError)) throw error;
+  try {
+    db.close(false);
+  } catch (closeError) {
+    console.error(`[claude-peers broker] FATAL: post-commit verification failed and the live database could not be closed safely: ${closeError instanceof Error ? closeError.message : String(closeError)}`);
+    server.stop(true);
+    process.exit(2);
+  }
+  try {
+    const recovered = restoreStorageAfterFailedMigration({ databasePath: DB_PATH, backupPath: error.backupPath });
+    console.error(`[claude-peers broker] FATAL: post-commit verification failed; restored verified backup${recovered.displacedPath ? ` and preserved failed database at ${recovered.displacedPath}` : ""}`);
+  } catch (restoreError) {
+    console.error(`[claude-peers broker] FATAL: post-commit verification failed and automatic backup restore also failed: ${restoreError instanceof Error ? restoreError.message : String(restoreError)}`);
+  }
+  server.stop(true);
+  process.exit(2);
+}
 chmodSync(DB_PATH, 0o600);
 
 // One-time compatibility backfill for rows written before name/resolved_name
@@ -1858,6 +1891,8 @@ function handleHookHeartbeatByPid(body: HookHeartbeatByPidRequest): { ok: boolea
   if (!auth.ok) {
     return { ok: false, status: auth.status, error: auth.error };
   }
+  const limited = rateCheck(auth.id, false);
+  if (limited) return { ok: false, status: 429, error: limited };
   const now = new Date().toISOString();
   const status = body.status === "error" ? "error" : "ok";
   const { clientType, receiverMode } = hookMetadata(auth.id, body);
@@ -1878,6 +1913,8 @@ function handleClaimByPid(body: ClaimByPidRequest): ClaimByPidResponse {
   if (!auth.ok) {
     return { ok: false, status: auth.status, error: auth.error };
   }
+  const limited = rateCheck(auth.id, false);
+  if (limited) return { ok: false, status: 429, error: limited };
   const { clientType, receiverMode } = hookMetadata(auth.id, body);
 
   const limitRaw = Number(body.limit ?? CLAIM_MAX_MESSAGES);
@@ -1926,6 +1963,8 @@ function handleAckByPid(body: AckByPidRequest): AckByPidResponse {
   if (!auth.ok) {
     return { ok: false, status: auth.status, error: auth.error };
   }
+  const limited = rateCheck(auth.id, false);
+  if (limited) return { ok: false, status: 429, error: limited };
   const { clientType, receiverMode } = hookMetadata(auth.id, body);
   const drainId = typeof body.drain_id === "string" ? body.drain_id : "";
   if (!drainId) return { ok: false, status: 400, error: "missing drain_id" };
@@ -1973,6 +2012,8 @@ function handlePollByPid(body: { pid: number; caller_pid: number }): {
     if (auth.peer_id === "") return { ok: true, peer_id: "", messages: [], acked: 0 };
     return { ok: false, status: auth.status, error: auth.error };
   }
+  const limited = rateCheck(auth.id, false);
+  if (limited) return { ok: false, status: 429, error: limited };
 
   // Atomically fetch + mark delivered + log latency (matches handleAckMessages).
   // Concurrent-drain safety: the SELECT happens before the transaction begins,
@@ -2016,6 +2057,45 @@ function handlePollByPid(body: { pid: number; caller_pid: number }): {
 }
 
 // --- HTTP Server ---
+
+async function readBoundedJsonBody(request: Request): Promise<
+  | { ok: true; value: Record<string, unknown> }
+  | { ok: false; status: 400 | 413; error: string }
+> {
+  const reader = request.body?.getReader();
+  if (!reader) return { ok: false, status: 400, error: "invalid json: empty body" };
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > MAX_REQ_BYTES) {
+        await reader.cancel();
+        return { ok: false, status: 413, error: `request exceeds ${MAX_REQ_BYTES} bytes` };
+      }
+      chunks.push(value);
+    }
+  } catch (error) {
+    return { ok: false, status: 400, error: `invalid request body: ${error instanceof Error ? error.message : String(error)}` };
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  try {
+    const value = JSON.parse(new TextDecoder().decode(bytes)) as unknown;
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("root must be an object");
+    return { ok: true, value: value as Record<string, unknown> };
+  } catch (error) {
+    return { ok: false, status: 400, error: `invalid json: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
 
 requestHandler = async (req: Request) => {
     const url = new URL(req.url);
@@ -2066,12 +2146,9 @@ requestHandler = async (req: Request) => {
       return Response.json({ error: `request exceeds ${MAX_REQ_BYTES} bytes` }, { status: 413 });
     }
 
-    let body: Record<string, unknown>;
-    try {
-      body = (await req.json()) as Record<string, unknown>;
-    } catch (e) {
-      return Response.json({ error: `invalid json: ${e instanceof Error ? e.message : String(e)}` }, { status: 400 });
-    }
+    const parsedBody = await readBoundedJsonBody(req);
+    if (!parsedBody.ok) return Response.json({ error: parsedBody.error }, { status: parsedBody.status });
+    const body = parsedBody.value;
 
     try {
       // /register is the only unauthenticated route — it issues the token.
@@ -2102,14 +2179,6 @@ requestHandler = async (req: Request) => {
       if (path === "/poll-by-pid") {
         const rawPid = Number(body.pid);
         const rawCallerPid = Number(body.caller_pid);
-        const rlKey = `pid:${Number.isFinite(rawCallerPid) ? rawCallerPid : "invalid"}`;
-        const limited = rateCheck(rlKey, false);
-        if (limited) {
-          return new Response(JSON.stringify({ error: limited }), {
-            status: 429,
-            headers: { "Content-Type": "application/json", "Retry-After": String(Math.ceil(RATE_WINDOW_MS / 1000)) },
-          });
-        }
         const res = handlePollByPid({ pid: rawPid, caller_pid: rawCallerPid });
         if (!res.ok) {
           return Response.json({ error: res.error }, { status: res.status ?? 400 });
@@ -2118,15 +2187,6 @@ requestHandler = async (req: Request) => {
       }
 
       if (path === "/claim-by-pid" || path === "/ack-by-pid" || path === "/hook-heartbeat-by-pid") {
-        const rawCallerPid = Number(body.caller_pid);
-        const rlKey = `pid:${Number.isFinite(rawCallerPid) ? rawCallerPid : "invalid"}`;
-        const limited = rateCheck(rlKey, false);
-        if (limited) {
-          return new Response(JSON.stringify({ error: limited }), {
-            status: 429,
-            headers: { "Content-Type": "application/json", "Retry-After": String(Math.ceil(RATE_WINDOW_MS / 1000)) },
-          });
-        }
         if (path === "/claim-by-pid") {
           const res = handleClaimByPid(body as unknown as ClaimByPidRequest);
           if (!res.ok) return Response.json({ error: res.error }, { status: res.status ?? 400 });

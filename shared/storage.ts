@@ -69,6 +69,25 @@ export interface InitializeStorageResult {
   backupManifestPath?: string;
 }
 
+export class PostCommitStorageVerificationError extends Error {
+  constructor(
+    message: string,
+    readonly backupPath: string,
+    readonly backupManifestPath: string,
+    readonly originalError: unknown,
+  ) {
+    super(message);
+    this.name = "PostCommitStorageVerificationError";
+  }
+}
+
+class CommittedMigrationError extends Error {
+  constructor(readonly originalError: unknown) {
+    super(originalError instanceof Error ? originalError.message : String(originalError));
+    this.name = "CommittedMigrationError";
+  }
+}
+
 const peerColumns = [
   { name: "name", type: "TEXT" },
   { name: "tmux_session", type: "TEXT" },
@@ -139,6 +158,10 @@ function digest(values: unknown[]): string {
   return hash.digest("hex");
 }
 
+export function maximumSequenceHighWater(sequence: number, ids: unknown[]): number {
+  return ids.reduce<number>((maximum, id) => Math.max(maximum, Number(id) || 0), Math.max(0, sequence));
+}
+
 export function storageSnapshot(db: Database): StorageSnapshot {
   const messageCols = storageTableColumns(db, "messages");
   const peerCols = storageTableColumns(db, "peers");
@@ -187,7 +210,7 @@ export function storageSnapshot(db: Database): StorageSnapshot {
     queued_count: queued,
     claimed_count: claimed,
     delivered_count: delivered,
-    sequence_high_water: Math.max(sequenceHighWater(db), ...ids.map(Number), 0),
+    sequence_high_water: maximumSequenceHighWater(sequenceHighWater(db), ids),
     peer_count: peerCount,
     peer_digest: digest(peerRows),
     non_targetable_count: nonTargetableCount,
@@ -379,6 +402,7 @@ function migrateLegacy(
   onCheckpoint?: (checkpoint: StorageMigrationCheckpoint) => void,
 ): void {
   db.exec("BEGIN IMMEDIATE");
+  let committed = false;
   try {
     ensurePeerColumns(db);
     const oldColumns = storageTableColumns(db, "messages");
@@ -411,8 +435,10 @@ function migrateLegacy(
     onCheckpoint?.("before-version");
     db.run(`PRAGMA user_version = ${STORAGE_SCHEMA_VERSION}`);
     db.exec("COMMIT");
+    committed = true;
     onCheckpoint?.("after-commit");
   } catch (error) {
+    if (committed) throw new CommittedMigrationError(error);
     try { db.exec("ROLLBACK"); } catch { /* transaction may already be gone */ }
     throw error;
   }
@@ -475,11 +501,24 @@ export function initializeStorage(db: Database, options: InitializeStorageOption
   const backup = createOrVerifyBackup(db, backupPath, version, before);
   options.onCheckpoint?.("backup-complete");
   const migrationTimestamp = options.migrationTimestamp ?? new Date().toISOString();
-  migrateLegacy(db, migrationTimestamp, before.sequence_high_water, options.onCheckpoint);
-  validateCurrentSchema(db);
-  const after = storageSnapshot(db);
-  if (!sameSnapshot(before, after)) {
-    throw new Error("post-migration message/peer digest, partition, or sequence verification failed");
+  try {
+    migrateLegacy(db, migrationTimestamp, before.sequence_high_water, options.onCheckpoint);
+    validateCurrentSchema(db);
+    const after = storageSnapshot(db);
+    if (!sameSnapshot(before, after)) {
+      throw new Error("post-migration message/peer digest, partition, or sequence verification failed");
+    }
+  } catch (error) {
+    if (error instanceof CommittedMigrationError || storageUserVersion(db) === STORAGE_SCHEMA_VERSION) {
+      const original = error instanceof CommittedMigrationError ? error.originalError : error;
+      throw new PostCommitStorageVerificationError(
+        `post-commit storage verification failed: ${original instanceof Error ? original.message : String(original)}`,
+        backup.backupPath,
+        backup.manifestPath,
+        original,
+      );
+    }
+    throw error;
   }
   options.onReadiness?.("ready");
   return {
@@ -490,12 +529,16 @@ export function initializeStorage(db: Database, options: InitializeStorageOption
   };
 }
 
-export function restoreStorageBackup(options: { databasePath: string; backupPath: string }): { displacedPath?: string } {
+function restoreVerifiedStorageBackup(
+  options: { databasePath: string; backupPath: string },
+  preserveClosedSidecars: boolean,
+): { displacedPath?: string } {
   const databasePath = resolve(options.databasePath);
   const backupPath = resolve(options.backupPath);
   const manifestPath = `${backupPath}.manifest.json`;
   if (!existsSync(backupPath) || !existsSync(manifestPath)) throw new Error("verified backup and manifest are both required");
-  if (existsSync(`${databasePath}-wal`) || existsSync(`${databasePath}-shm`)) {
+  const sidecarSuffixes = ["-wal", "-shm"].filter((suffix) => existsSync(`${databasePath}${suffix}`));
+  if (!preserveClosedSidecars && sidecarSuffixes.length > 0) {
     throw new Error("refusing restore while SQLite WAL/SHM sidecars exist; stop and checkpoint the broker first");
   }
   const manifest = readManifest(manifestPath);
@@ -522,16 +565,32 @@ export function restoreStorageBackup(options: { databasePath: string; backupPath
     if (existsSync(databasePath)) {
       displacedPath = `${databasePath}.pre-restore-${new Date().toISOString().replace(/[:.]/g, "-")}`;
       renameSync(databasePath, displacedPath);
+      for (const suffix of sidecarSuffixes) renameSync(`${databasePath}${suffix}`, `${displacedPath}${suffix}`);
     }
     renameSync(tmp, databasePath);
     fsyncDirectory(dirname(databasePath));
   } catch (error) {
     if (existsSync(tmp)) rmSync(tmp, { force: true });
-    if (displacedPath && existsSync(displacedPath) && !existsSync(databasePath)) renameSync(displacedPath, databasePath);
+    if (displacedPath && existsSync(displacedPath) && !existsSync(databasePath)) {
+      renameSync(displacedPath, databasePath);
+      for (const suffix of sidecarSuffixes) {
+        if (existsSync(`${displacedPath}${suffix}`) && !existsSync(`${databasePath}${suffix}`)) {
+          renameSync(`${displacedPath}${suffix}`, `${databasePath}${suffix}`);
+        }
+      }
+    }
     fsyncDirectory(dirname(databasePath));
     throw error;
   }
   return displacedPath ? { displacedPath } : {};
+}
+
+export function restoreStorageBackup(options: { databasePath: string; backupPath: string }): { displacedPath?: string } {
+  return restoreVerifiedStorageBackup(options, false);
+}
+
+export function restoreStorageAfterFailedMigration(options: { databasePath: string; backupPath: string }): { displacedPath?: string } {
+  return restoreVerifiedStorageBackup(options, true);
 }
 
 export function retentionPurgeSql(): string {
