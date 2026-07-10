@@ -19,7 +19,7 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { openSync, closeSync, statSync, existsSync, readlinkSync, readFileSync } from "node:fs";
+import { closeSync, statSync, existsSync, readlinkSync, readFileSync } from "node:fs";
 
 // --- Tiny error formatting helper (avoids the e instanceof Error ternary
 //     repeated at every catch site) ---
@@ -51,6 +51,8 @@ import {
 import { frameUntrusted, renderInboundLine } from "./shared/render.ts";
 export { frameUntrusted, renderInboundLine } from "./shared/render.ts";
 import { PEERS_VERSION } from "./shared/version.ts";
+import { brokerIsReady, openOwnerOnlyAppendLog } from "./shared/broker-client.ts";
+import { brokerServiceConfig, installedBrokerServiceIsCurrent } from "./shared/broker-service.ts";
 import { parseTmuxPanes, composeTmuxFromEnv, prepareTmuxPaneText, tmuxPaneTarget, bgSessionIdFromPtyHostArgs, resolveBgAttachPane, type TmuxPaneInfo } from "./shared/tmux.ts";
 
 // --- Configuration ---
@@ -82,7 +84,7 @@ export function shouldRedetectTmux(tick: number, jitter: number, every: number):
   return (tick + jitter) % n === 0;
 }
 const BROKER_SCRIPT = new URL("./broker.ts", import.meta.url).pathname;
-const BROKER_LOG = `${process.env.HOME}/.claude-peers-broker.log`;
+const BROKER_LOG = process.env.CLAUDE_PEERS_BROKER_LOG ?? `${process.env.HOME}/.claude-peers-broker.log`;
 const BROKER_LOG_MAX_BYTES = 10 * 1024 * 1024; // 10MB
 const BROKER_SYSTEMD_UNIT_PATH = `${process.env.HOME}/.config/systemd/user/claude-peers-broker.service`;
 const SYSTEMD_START_TIMEOUT_SECONDS = "3";
@@ -286,12 +288,7 @@ export async function __testBrokerFetchForTest<T>(path: string, body: unknown): 
 }
 
 async function isBrokerAlive(): Promise<boolean> {
-  try {
-    const res = await fetch(`${BROKER_URL}/health`, { signal: AbortSignal.timeout(2000) });
-    return res.ok;
-  } catch {
-    return false;
-  }
+  return brokerIsReady(BROKER_URL, 2000);
 }
 
 function rotateBrokerLogIfLarge(): void {
@@ -311,6 +308,11 @@ function rotateBrokerLogIfLarge(): void {
 
 function startBrokerViaSystemd(): boolean {
   if (!existsSync(BROKER_SYSTEMD_UNIT_PATH)) return false;
+  const serviceConfig = brokerServiceConfig();
+  if (!installedBrokerServiceIsCurrent(serviceConfig)) {
+    log("systemd broker unit/drop-in is stale, unsafe, or configured for different paths; refusing managed start and using verified direct startup");
+    return false;
+  }
   try {
     const proc = Bun.spawnSync(["timeout", SYSTEMD_START_TIMEOUT_SECONDS, "systemctl", "--user", "start", "claude-peers-broker.service"], {
       stdout: "ignore",
@@ -349,7 +351,7 @@ async function ensureBroker(): Promise<void> {
   // NOT append — that corrupts the log on every restart and prevents file growth,
   // so the rotation guard above never fires. fs.openSync(path, 'a') is the only
   // way to get true append semantics for a child process stderr sink.
-  const logFd = openSync(BROKER_LOG, "a");
+  const logFd = openOwnerOnlyAppendLog(BROKER_LOG);
   const proc = Bun.spawn(["bun", BROKER_SCRIPT], {
     stdio: ["ignore", "ignore", logFd],
   });

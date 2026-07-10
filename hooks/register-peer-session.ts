@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { closeSync, existsSync, openSync, readFileSync, readlinkSync, statSync } from "node:fs";
+import { closeSync, existsSync, readFileSync, readlinkSync, statSync } from "node:fs";
 import { isClientProcess as sharedIsClientProcess, isCodexAppServerProcess, type ProcessInfo } from "../shared/client.ts";
 import {
   brokerIdentityPaneTarget as sharedBrokerIdentityPaneTarget,
@@ -10,11 +10,13 @@ import {
 import type { ClientType, ReceiverMode, RegisterResponse } from "../shared/types.ts";
 import { composeTmuxFromEnv, parsePsTree, parseTmuxPanes, type TmuxPaneInfo } from "../shared/tmux.ts";
 import { findSingleVisibleCodexProcess } from "../shared/visible-codex.ts";
+import { brokerIsReady, openOwnerOnlyAppendLog, requestBroker } from "../shared/broker-client.ts";
+import { brokerServiceConfig, installedBrokerServiceIsCurrent } from "../shared/broker-service.ts";
 
 const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 const BROKER_SCRIPT = new URL("../broker.ts", import.meta.url).pathname;
-const BROKER_LOG = `${process.env.HOME}/.claude-peers-broker.log`;
+const BROKER_LOG = process.env.CLAUDE_PEERS_BROKER_LOG ?? `${process.env.HOME}/.claude-peers-broker.log`;
 const BROKER_LOG_MAX_BYTES = 10 * 1024 * 1024;
 const BROKER_SYSTEMD_UNIT_PATH = `${process.env.HOME}/.config/systemd/user/claude-peers-broker.service`;
 const SYSTEMD_START_TIMEOUT_SECONDS = "3";
@@ -238,27 +240,11 @@ async function metadata(): Promise<RegisterMetadata | null> {
 }
 
 async function post<T>(path: string, body: unknown): Promise<T> {
-  const res = await fetch(`${BROKER_URL}${path}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(3000),
-  });
-  const json = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    const err = typeof json === "object" && json && "error" in json ? String((json as { error: unknown }).error) : res.statusText;
-    throw new Error(`${path} ${res.status}: ${err}`);
-  }
-  return json as T;
+  return requestBroker<T>({ baseUrl: BROKER_URL, path, body, timeoutMs: 3000 });
 }
 
 async function isBrokerAlive(): Promise<boolean> {
-  try {
-    const res = await fetch(`${BROKER_URL}/health`, { signal: AbortSignal.timeout(1000) });
-    return res.ok;
-  } catch {
-    return false;
-  }
+  return brokerIsReady(BROKER_URL, 1000);
 }
 
 function rotateBrokerLogIfLarge(): void {
@@ -273,6 +259,11 @@ function rotateBrokerLogIfLarge(): void {
 
 function startBrokerViaSystemd(): boolean {
   if (!existsSync(BROKER_SYSTEMD_UNIT_PATH)) return false;
+  const serviceConfig = brokerServiceConfig();
+  if (!installedBrokerServiceIsCurrent(serviceConfig)) {
+    log("systemd broker unit/drop-in is stale, unsafe, or configured for different paths; refusing managed start and using verified direct startup");
+    return false;
+  }
   try {
     const proc = Bun.spawnSync(["timeout", SYSTEMD_START_TIMEOUT_SECONDS, "systemctl", "--user", "start", "claude-peers-broker.service"], {
       stdout: "ignore",
@@ -297,7 +288,7 @@ async function ensureBroker(): Promise<void> {
     log("systemd broker start did not become healthy; falling back to direct spawn");
   }
   rotateBrokerLogIfLarge();
-  const logFd = openSync(BROKER_LOG, "a");
+  const logFd = openOwnerOnlyAppendLog(BROKER_LOG);
   try {
     const proc = Bun.spawn(["bun", BROKER_SCRIPT], {
       stdio: ["ignore", "ignore", logFd],
