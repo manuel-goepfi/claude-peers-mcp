@@ -16,6 +16,8 @@ import { timingSafeEqual } from "node:crypto";
 import type {
   RegisterRequest,
   RegisterResponse,
+  RegisterCliRequest,
+  RegisterCliResponse,
   HeartbeatRequest,
   HeartbeatResponse,
   SetSummaryRequest,
@@ -51,10 +53,11 @@ import type {
 // for the reap predicate without touching the broker's startup shape.
 import { isReapable, deadSeatMailExpired, shouldRotateLog, PEER_GHOST_AFTER_MS } from "./shared/reaper.ts";
 import { PEERS_VERSION } from "./shared/version.ts";
+import { acquireBrokerOwnership, assertDatabaseIdentity, type BrokerLifecycleIdentity } from "./shared/broker-lifecycle.ts";
 
 const PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const TEST_PORT_ZERO = process.env.NODE_ENV === "test" && process.env.CLAUDE_PEERS_TEST_PORT_ZERO === "1";
-const DB_PATH = process.env.CLAUDE_PEERS_DB ?? `${process.env.HOME}/.claude-peers.db`;
+const CONFIGURED_DB_PATH = process.env.CLAUDE_PEERS_DB ?? `${process.env.HOME}/.claude-peers.db`;
 // S1 + M4: bind to 127.0.0.1 literal so the post-bind assertion below can
 // compare against a fixed string. The HOST_OVERRIDE env vars are NOT honoured
 // for the actual bind — they only exist to fail-loud if someone sets them
@@ -71,6 +74,67 @@ if (PORT < 0 || PORT > 65535 || Number.isNaN(PORT) || (PORT === 0 && !TEST_PORT_
   console.error(`[claude-peers broker] FATAL: invalid port ${PORT}`);
   process.exit(2);
 }
+
+// Win the network identity before touching SQLite. While startup/migration is
+// in progress, the bound listener exposes only an explicit not-ready response;
+// the fully initialized handler is installed near the bottom of this file.
+let requestHandler: (request: Request) => Response | Promise<Response> = () =>
+  Response.json({ status: "starting", ready: false }, { status: 503 });
+const server = Bun.serve({
+  port: PORT,
+  hostname: HOSTNAME,
+  fetch(request) {
+    return requestHandler(request);
+  },
+});
+if (server.hostname !== HOSTNAME) {
+  console.error(`[claude-peers broker] FATAL: post-bind hostname is ${server.hostname}, expected ${HOSTNAME}`);
+  process.exit(2);
+}
+
+let ownership: ReturnType<typeof acquireBrokerOwnership>;
+try {
+  const configuredOwnerMode = process.env.CLAUDE_PEERS_OWNER_MODE;
+  if (configuredOwnerMode && configuredOwnerMode !== "direct" && configuredOwnerMode !== "systemd") {
+    throw new Error(`invalid CLAUDE_PEERS_OWNER_MODE=${configuredOwnerMode}`);
+  }
+  ownership = acquireBrokerOwnership({
+    databasePath: CONFIGURED_DB_PATH,
+    brokerScriptPath: new URL("./broker.ts", import.meta.url).pathname,
+    ownerMode: configuredOwnerMode as "direct" | "systemd" | undefined,
+  });
+  assertDatabaseIdentity(CONFIGURED_DB_PATH, ownership.canonicalDatabasePath);
+} catch (error) {
+  console.error(`[claude-peers broker] FATAL: database ownership failed: ${error instanceof Error ? error.message : String(error)}`);
+  server.stop(true);
+  process.exit(2);
+}
+const DB_PATH = ownership.canonicalDatabasePath;
+function lifecycleIdentity(): BrokerLifecycleIdentity {
+  return {
+    pid: ownership.metadata.pid,
+    process_start: ownership.metadata.process_start,
+    instance_nonce: ownership.metadata.instance_nonce,
+    database_path: ownership.metadata.database_path,
+    lock_path: ownership.metadata.lock_path,
+    owner_mode: ownership.metadata.owner_mode,
+    executable_path: ownership.metadata.executable_path,
+    broker_script_path: ownership.metadata.broker_script_path,
+    ready: true,
+    capabilities: {
+      procSocketIdentity: true,
+      nonceProtectedOwnership: true,
+      verifiedShutdown: true,
+    },
+  };
+}
+process.once("exit", () => {
+  if (!ownership.release()) {
+    console.error(`[claude-peers broker] WARN: ownership lock was not released (nonce or identity changed): ${ownership.lockPath}`);
+  }
+});
+process.once("SIGTERM", () => process.exit(0));
+process.once("SIGINT", () => process.exit(0));
 
 // --- S5: limits ---
 const MAX_MSG_BYTES = 32 * 1024;       // 32 KB per message body
@@ -108,6 +172,10 @@ const BROKER_CAPABILITIES = {
     sendToPeer: true,
     states: true,
     vocabulary: ["queued", "claimed", "acknowledged", "unknown"],
+  },
+  cli: {
+    registerCli: true,
+    nonTargetable: true,
   },
 } as const;
 
@@ -165,7 +233,7 @@ const UNDELIVERED_MSG_TTL_MS = positiveEnvMs("CLAUDE_PEERS_UNDELIVERED_MSG_TTL_M
 // bounds it on the periodic reaper tick too, so the log can't grow unbounded
 // during a flood with no new registrations (how it reached 24MB on 2026-06-19).
 const BROKER_LOG_MAX_BYTES = 10 * 1024 * 1024; // 10MB (mirrors the register hook)
-const BROKER_LOG_PATH = `${process.env.HOME}/.claude-peers-broker.log`;
+const BROKER_LOG_PATH = process.env.CLAUDE_PEERS_BROKER_LOG ?? `${process.env.HOME}/.claude-peers-broker.log`;
 const MY_UID = process.getuid?.() ?? -1;
 
 // M3: warn loudly if we can't enforce S3 (non-Linux dev environment).
@@ -221,6 +289,7 @@ const migrationColumns = [
   { name: "last_hook_seen_at", type: "TEXT" },
   { name: "last_drain_at", type: "TEXT" },
   { name: "last_drain_error", type: "TEXT" },
+  { name: "non_targetable", type: "INTEGER NOT NULL DEFAULT 0" },
 ];
 for (const col of migrationColumns) {
   try {
@@ -400,6 +469,20 @@ const insertPeer = db.prepare(`
   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
+const insertCliPeer = db.prepare(`
+  INSERT INTO peers (
+    id, pid, cwd, git_root, absolute_git_dir, tty, name, resolved_name,
+    tmux_session, tmux_window_index, tmux_window_name, tmux_pane_id,
+    client_type, receiver_mode, summary, registered_at, last_seen, token,
+    non_targetable
+  ) VALUES (?, ?, '', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+            'unknown', 'unknown', '', ?, ?, ?, 1)
+`);
+
+const deleteCliPeerByPid = db.prepare(`
+  DELETE FROM peers WHERE pid = ? AND non_targetable = 1
+`);
+
 const updatePeerRegistration = db.prepare(`
   UPDATE peers
   SET pid = ?,
@@ -492,12 +575,16 @@ const selectAllPeers = db.prepare(`
   SELECT * FROM peers
 `);
 
+const selectAllTargetablePeers = db.prepare(`
+  SELECT * FROM peers WHERE non_targetable = 0
+`);
+
 const selectPeersByDirectory = db.prepare(`
-  SELECT * FROM peers WHERE cwd = ?
+  SELECT * FROM peers WHERE cwd = ? AND non_targetable = 0
 `);
 
 const selectPeersByGitRoot = db.prepare(`
-  SELECT * FROM peers WHERE git_root = ?
+  SELECT * FROM peers WHERE git_root = ? AND non_targetable = 0
 `);
 
 const insertMessage = db.prepare(`
@@ -533,7 +620,7 @@ const selectMsgForLatency = db.prepare(`
 // caller_pid is verified same-UID via verifyPidUid, and loopback-only bind
 // means the attacker boundary is already "other user on this machine".
 const selectPeerIdByPid = db.prepare(`
-  SELECT id FROM peers WHERE pid = ?
+  SELECT id FROM peers WHERE pid = ? AND non_targetable = 0
 `);
 
 const claimMessage = db.prepare(`
@@ -552,7 +639,8 @@ const claimMessage = db.prepare(`
 // not rehydration.
 const selectRehydrateCandidatesByPane = db.prepare(`
   SELECT id, pid, last_seen, git_root FROM peers
-  WHERE tmux_session = ?
+  WHERE non_targetable = 0
+    AND tmux_session = ?
     AND tmux_pane_id = ?
     AND cwd = ?
     AND (git_root = ? OR git_root IS NULL)
@@ -563,7 +651,8 @@ const selectRehydrateCandidatesByPane = db.prepare(`
 
 const selectRehydrateCandidatesByWindow = db.prepare(`
   SELECT id, pid, last_seen, git_root FROM peers
-  WHERE tmux_session = ?
+  WHERE non_targetable = 0
+    AND tmux_session = ?
     AND tmux_pane_id IS NULL
     AND tmux_window_index = ?
     AND tmux_window_name = ?
@@ -585,7 +674,8 @@ const selectRehydrateCandidatesByWindow = db.prepare(`
 // checked in code (the query returns candidates; we act only on the dead ones).
 const selectSamePaneSelfDuplicates = db.prepare(`
   SELECT id, pid FROM peers
-  WHERE tmux_session = ? AND tmux_pane_id = ? AND cwd = ? AND name = ? AND pid != ?
+  WHERE non_targetable = 0
+    AND tmux_session = ? AND tmux_pane_id = ? AND cwd = ? AND name = ? AND pid != ?
   ORDER BY last_seen DESC
 `);
 
@@ -610,6 +700,7 @@ const selectSamePaneSelfDuplicates = db.prepare(`
 const selectBroadcastTargets = db.prepare(`
   SELECT id FROM peers
   WHERE id != ?
+    AND non_targetable = 0
     AND receiver_mode != 'unknown'
     AND (? IS NULL OR tmux_session = ?)
     AND (? IS NULL OR git_root = ?)
@@ -929,6 +1020,41 @@ type RegisterResult =
   | { ok: true; value: RegisterResponse }
   | { ok: false; status: number; error: string };
 
+type RegisterCliResult =
+  | { ok: true; value: RegisterCliResponse }
+  | { ok: false; status: number; error: string };
+
+function handleRegisterCli(body: Record<string, unknown>): RegisterCliResult {
+  const keys = Object.keys(body);
+  if (keys.length !== 1 || keys[0] !== "pid") {
+    return { ok: false, status: 400, error: "register-cli accepts only pid" };
+  }
+  const request = body as unknown as RegisterCliRequest;
+  const pidErr = verifyPidUid(request.pid);
+  if (pidErr) return { ok: false, status: 403, error: `CLI PID/UID rejected: ${pidErr}` };
+
+  const id = generateId();
+  const token = generateToken();
+  const now = new Date().toISOString();
+  db.transaction(() => {
+    // A previous hard-killed CLI can leave a non-targetable row until the
+    // reaper runs. PID reuse is safe to collapse because these rows can never
+    // receive mail and ordinary session rows are excluded by the flag.
+    deleteCliPeerByPid.run(request.pid);
+    insertCliPeer.run(id, request.pid, now, now, token);
+  })();
+  return {
+    ok: true,
+    value: {
+      id,
+      token,
+      client_type: "unknown",
+      receiver_mode: "unknown",
+      non_targetable: true,
+    },
+  };
+}
+
 function handleRegister(body: RegisterRequest): RegisterResult {
   // S3: PID/UID validation before issuing any token.
   const pidErr = verifyPidUid(body.pid);
@@ -1233,7 +1359,7 @@ function handleSetName(body: SetNameRequest): { name: string | null; resolved_na
 function disambiguateName(rawName: string | null, selfId: string, windowName?: string | null): string | null {
   if (!rawName) return null;
   const rows = db.query(
-    "SELECT pid, COALESCE(resolved_name, name) AS name, tmux_window_name AS win FROM peers WHERE COALESCE(resolved_name, name) IS NOT NULL AND id != ?"
+    "SELECT pid, COALESCE(resolved_name, name) AS name, tmux_window_name AS win FROM peers WHERE non_targetable = 0 AND COALESCE(resolved_name, name) IS NOT NULL AND id != ?"
   ).all(selfId) as { pid: number; name: string; win: string | null }[];
   const live = rows.filter(r => isPidAlive(r.pid));
   const liveNames = new Set(live.map(r => r.name));
@@ -1474,7 +1600,7 @@ function resolveFreshPeer(selector: PeerSelector | undefined): ResolvePeerResult
     return { ok: false, code: "INVALID_SELECTOR", error: "tmux_pane_id alone is not a unique peer selector; include tmux_session or another identity field" };
   }
 
-  const allPeers = selectAllPeers.all() as Peer[];
+  const allPeers = selectAllTargetablePeers.all() as Peer[];
   const staleById = targetSelector.id ? allPeers.find((p) => p.id === targetSelector.id) ?? null : null;
   const activePeers = activeOnly(livePeersForResolution(allPeers));
 
@@ -1539,7 +1665,7 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
 
   switch (body.scope) {
     case "machine":
-      peers = selectAllPeers.all() as Peer[];
+      peers = selectAllTargetablePeers.all() as Peer[];
       break;
     case "directory":
       peers = selectPeersByDirectory.all(body.cwd) as Peer[];
@@ -1547,7 +1673,7 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
     case "repo": {
       const callerRepoRoot = deriveRepoCommonRoot(body.absolute_git_dir ?? null);
       if (callerRepoRoot) {
-        const all = selectAllPeers.all() as Peer[];
+        const all = selectAllTargetablePeers.all() as Peer[];
         peers = all.filter((p) => {
           const peerRoot = deriveRepoCommonRoot(p.absolute_git_dir);
           if (peerRoot) return peerRoot === callerRepoRoot;
@@ -1563,7 +1689,7 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
       break;
     }
     default:
-      peers = selectAllPeers.all() as Peer[];
+      peers = selectAllTargetablePeers.all() as Peer[];
   }
 
   // Exclude the requesting peer
@@ -1680,7 +1806,7 @@ function handleBroadcast(authedFromId: string, body: BroadcastRequest): Broadcas
     nameFilter, nameFilter
   ) as { id: string }[];
 
-  const activeIds = new Set(activeOnly(liveAndFreshPeers(selectAllPeers.all() as Peer[])).map((p) => p.id));
+  const activeIds = new Set(activeOnly(liveAndFreshPeers(selectAllTargetablePeers.all() as Peer[])).map((p) => p.id));
   const activeTargets = targets.filter((t) => activeIds.has(t.id));
 
   // Enforce fanout cap — prevents /broadcast-message from inserting more
@@ -1922,10 +2048,7 @@ function handlePollByPid(body: { pid: number; caller_pid: number }): {
 
 // --- HTTP Server ---
 
-const server = Bun.serve({
-  port: PORT,
-  hostname: HOSTNAME,
-  async fetch(req) {
+requestHandler = async (req: Request) => {
     const url = new URL(req.url);
     const path = url.pathname;
 
@@ -1933,7 +2056,7 @@ const server = Bun.serve({
       if (path === "/health") {
         return Response.json({
           status: "ok",
-          peers: (selectAllPeers.all() as Peer[]).length,
+          peers: (selectAllTargetablePeers.all() as Peer[]).length,
           version: PEERS_VERSION,
           capabilities: BROKER_CAPABILITIES,
         });
@@ -1985,6 +2108,17 @@ const server = Bun.serve({
           return Response.json({ error: result.error }, { status: result.status });
         }
         // S5: count the registration request against the new peer's bucket.
+        rateCheck(result.value.id, false);
+        return Response.json(result.value);
+      }
+
+      // CLI callers receive a normal peer token but a permanently
+      // non-targetable identity. This atomic route is intentionally separate
+      // from session registration so no seat metadata, dedup, supersession, or
+      // rehydration behavior can make the transient caller discoverable.
+      if (path === "/register-cli") {
+        const result = handleRegisterCli(body);
+        if (!result.ok) return Response.json({ error: result.error }, { status: result.status });
         rateCheck(result.value.id, false);
         return Response.json(result.value);
       }
@@ -2123,6 +2257,8 @@ const server = Bun.serve({
           return Response.json(handleBroadcast(auth.id, body as unknown as BroadcastRequest));
         case "/message-status":
           return Response.json(handleMessageStatus(auth.id, { ids: (body.ids as number[]) ?? [] }));
+        case "/lifecycle-identity":
+          return Response.json(lifecycleIdentity());
         case "/poll-messages":
           return Response.json(handlePollMessages({ id: auth.id }));
         case "/ack-messages":
@@ -2146,15 +2282,7 @@ const server = Bun.serve({
       console.error(`[broker] unhandled error on ${path}:`, e);
       return Response.json({ error: "internal error" }, { status: 500 });
     }
-  },
-});
-
-// S1: final post-bind assertion. If anything (Bun version drift, future
-// refactor) ever made the listener bind off-loopback, exit immediately.
-if (server.hostname !== "127.0.0.1") {
-  console.error(`[claude-peers broker] FATAL: post-bind hostname is ${server.hostname}, expected 127.0.0.1`);
-  process.exit(2);
-}
+};
 
 if (BRIDGE_ENABLED) publishBridgeTokenFile();
 else removeBridgeTokenFile();

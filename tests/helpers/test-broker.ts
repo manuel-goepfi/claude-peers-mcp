@@ -172,9 +172,10 @@ export async function startTestBroker(options: TestBrokerOptions = {}): Promise<
   } catch (error) {
     if (proc.exitCode === null) proc.kill("SIGKILL");
     await proc.exited;
-    await stderrDone;
+    const stderr = await stderrDone;
     if (cleanupOnStop) rmSync(root, { recursive: true, force: true });
     const label = basename(root);
-    throw new Error(`${label}: ${error instanceof Error ? error.message : String(error)}`);
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`${label}: ${detail}${stderr.trim() ? `: ${stderr.trim()}` : ""}`);
   }
 }

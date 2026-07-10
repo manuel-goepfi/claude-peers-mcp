@@ -33,6 +33,9 @@ export interface Peer {
   summary: string;
   registered_at: string; // ISO timestamp
   last_seen: string; // ISO timestamp
+  // Transient authenticated callers (currently the CLI) can send and inspect
+  // but never appear in discovery or resolve as delivery targets.
+  non_targetable?: number;
 }
 
 export interface Message {
@@ -81,6 +84,18 @@ export interface RegisterResponse {
   resolved_name: string | null;
   client_type: ClientType;
   receiver_mode: ReceiverMode;
+}
+
+export interface RegisterCliRequest {
+  pid: number;
+}
+
+export interface RegisterCliResponse {
+  id: PeerId;
+  token: string;
+  client_type: "unknown";
+  receiver_mode: "unknown";
+  non_targetable: true;
 }
 
 export interface HeartbeatRequest {

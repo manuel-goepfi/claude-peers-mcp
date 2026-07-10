@@ -468,7 +468,7 @@ describe("Live broker delivery features", () => {
       body: JSON.stringify(body),
     });
     const json = (await res.json()) as Record<string, unknown>;
-    if (path === "/register" && json.id && json.token) {
+    if ((path === "/register" || path === "/register-cli") && json.id && json.token) {
       tokens.set(json.id as string, json.token as string);
     }
     return json as T;
@@ -513,6 +513,82 @@ describe("Live broker delivery features", () => {
     expect(reg.client_type).toBe("codex");
     expect(reg.receiver_mode).toBe("manual-drain");
     child.kill();
+  });
+
+  test("register-cli creates an authenticated identity that is globally non-targetable", async () => {
+    const targetProcess = spawnSleep();
+    const ordinary = await brokerFetch<{ id: string }>("/register", {
+      pid: targetProcess.pid, cwd: "/cli-target", git_root: null, tty: null, name: "cli-target",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
+    });
+    const cli = await brokerFetch<{ id: string; token: string; non_targetable: boolean }>("/register-cli", {
+      pid: process.pid,
+    });
+    expect(cli.non_targetable).toBe(true);
+    const shaped = new Database(TEST_DB);
+    shaped.run(
+      "UPDATE peers SET name = 'broadcast-cli', resolved_name = 'broadcast-cli', receiver_mode = 'claude-channel' WHERE id = ?",
+      [cli.id],
+    );
+    shaped.close();
+
+    const listed = await brokerFetch<Array<{ id: string }>>("/list-peers", {
+      id: cli.id, scope: "machine", cwd: "/", git_root: null,
+    });
+    expect(listed.some((peer) => peer.id === cli.id)).toBe(false);
+    expect(listed.some((peer) => peer.id === ordinary.id)).toBe(true);
+
+    const targetCli = await brokerFetch<{ ok: boolean; code?: string }>("/send-message", {
+      from_id: ordinary.id, to_id: cli.id, text: "must not target cli",
+    });
+    expect(targetCli.ok).toBe(false);
+    expect(targetCli.code).toBe("PEER_NOT_FOUND");
+
+    const selectedCli = await brokerFetch<{ ok: boolean; code?: string }>("/send-to-peer", {
+      from_id: ordinary.id, selector: { id: cli.id }, text: "selector must not target cli",
+    });
+    expect(selectedCli.ok).toBe(false);
+    expect(selectedCli.code).toBe("PEER_NOT_FOUND");
+
+    const broadcast = await brokerFetch<{ ok: boolean; sent: number }>("/broadcast-message", {
+      from_id: ordinary.id, text: "broadcast must skip cli", name_like: "broadcast-cli",
+    });
+    expect(broadcast.ok).toBe(true);
+    expect(broadcast.sent).toBe(0);
+
+    const sent = await brokerFetch<{ ok: boolean; state?: string }>("/send-message", {
+      from_id: cli.id, to_id: ordinary.id, text: "from transient cli",
+    });
+    expect(sent.ok).toBe(true);
+    expect(sent.state).toBe("queued");
+
+    await brokerFetch("/unregister", { id: cli.id });
+    const replay = await fetch(`${brokerUrl}/list-peers`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Peer-Token": cli.token },
+      body: JSON.stringify({ id: cli.id, scope: "machine", cwd: "/", git_root: null }),
+    });
+    expect(replay.status).toBe(401);
+    targetProcess.kill();
+  });
+
+  test("register-cli rejects all session and rehydration metadata without mutation", async () => {
+    const before = new Database(TEST_DB, { readonly: true });
+    const beforeCount = (before.query("SELECT COUNT(*) AS count FROM peers").get() as { count: number }).count;
+    before.close();
+
+    const response = await fetch(`${brokerUrl}/register-cli`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pid: process.pid, name: "spoof", tmux_session: "infra", tmux_pane_id: "%1" }),
+    });
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error: "register-cli accepts only pid" });
+
+    const after = new Database(TEST_DB, { readonly: true });
+    const afterCount = (after.query("SELECT COUNT(*) AS count FROM peers").get() as { count: number }).count;
+    after.close();
+    expect(afterCount).toBe(beforeCount);
   });
 
   test("read-only poll: messages remain undelivered after poll", async () => {
@@ -696,7 +772,7 @@ describe("Live broker delivery features", () => {
       const peerColumns = new Set((migrated.query("PRAGMA table_info(peers)").all() as { name: string }[]).map((c) => c.name));
       const messageColumns = new Set((migrated.query("PRAGMA table_info(messages)").all() as { name: string }[]).map((c) => c.name));
       migrated.close();
-      for (const col of ["client_type", "receiver_mode", "last_hook_seen_at", "last_drain_at", "last_drain_error"]) {
+      for (const col of ["client_type", "receiver_mode", "last_hook_seen_at", "last_drain_at", "last_drain_error", "non_targetable"]) {
         expect(peerColumns.has(col)).toBe(true);
       }
       for (const col of ["delivered_at", "claimed_by", "claimed_at"]) {
