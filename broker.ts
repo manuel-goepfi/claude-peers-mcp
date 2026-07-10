@@ -54,6 +54,7 @@ import type {
 import { isReapable, deadSeatMailExpired, shouldRotateLog, PEER_GHOST_AFTER_MS } from "./shared/reaper.ts";
 import { PEERS_VERSION } from "./shared/version.ts";
 import { acquireBrokerOwnership, assertDatabaseIdentity, type BrokerLifecycleIdentity } from "./shared/broker-lifecycle.ts";
+import { initializeStorage, positiveMilliseconds, retentionPurgeSql, unknownReceiverPurgeSql, STORAGE_SCHEMA_VERSION, type StorageReadiness } from "./shared/storage.ts";
 
 const PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const TEST_PORT_ZERO = process.env.NODE_ENV === "test" && process.env.CLAUDE_PEERS_TEST_PORT_ZERO === "1";
@@ -78,8 +79,9 @@ if (PORT < 0 || PORT > 65535 || Number.isNaN(PORT) || (PORT === 0 && !TEST_PORT_
 // Win the network identity before touching SQLite. While startup/migration is
 // in progress, the bound listener exposes only an explicit not-ready response;
 // the fully initialized handler is installed near the bottom of this file.
+let storageReadiness: StorageReadiness = "starting";
 let requestHandler: (request: Request) => Response | Promise<Response> = () =>
-  Response.json({ status: "starting", ready: false }, { status: 503 });
+  Response.json({ status: storageReadiness, ready: false, schema_version: STORAGE_SCHEMA_VERSION }, { status: 503 });
 const server = Bun.serve({
   port: PORT,
   hostname: HOSTNAME,
@@ -125,6 +127,7 @@ function lifecycleIdentity(): BrokerLifecycleIdentity {
       procSocketIdentity: true,
       nonceProtectedOwnership: true,
       verifiedShutdown: true,
+      storageSchema: STORAGE_SCHEMA_VERSION,
     },
   };
 }
@@ -177,6 +180,11 @@ const BROKER_CAPABILITIES = {
     registerCli: true,
     nonTargetable: true,
   },
+  storage: {
+    schemaVersion: STORAGE_SCHEMA_VERSION,
+    readiness: true,
+    retentionAt: true,
+  },
 } as const;
 
 // --- S7: ghost reaping ---
@@ -202,11 +210,14 @@ const REHYDRATE_WINDOW_MS = 3600_000;  // 1h
 // default literal (no string-vs-numeric drift hazard).
 function positiveEnvMs(name: string, def: number): number {
   const raw = process.env[name];
-  if (raw === undefined) return def;
-  const n = parseInt(raw, 10);
-  if (Number.isFinite(n) && n > 0) return n;
-  console.error(`[broker] invalid ${name}="${raw}" (must be a positive integer ms) — using default ${def}`);
-  return def;
+  const value = positiveMilliseconds(raw, def);
+  if (raw !== undefined) {
+    const parsed = Number.parseInt(raw, 10);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      console.error(`[broker] invalid ${name}="${raw}" (must be a positive integer ms) — using default ${def}`);
+    }
+  }
+  return value;
 }
 // TTL ceiling on preserving a DEAD seat that still holds undelivered mail. Past
 // this, the row + its stranded mail are reaped instead of kept forever (the
@@ -243,67 +254,23 @@ if (MY_UID < 0) {
 
 // --- Database setup ---
 
-const db = new Database(DB_PATH);
-db.run("PRAGMA journal_mode = WAL");
-db.run("PRAGMA busy_timeout = 3000");
-
-db.run(`
-  CREATE TABLE IF NOT EXISTS peers (
-    id TEXT PRIMARY KEY,
-    pid INTEGER NOT NULL,
-    cwd TEXT NOT NULL,
-    git_root TEXT,
-    tty TEXT,
-    summary TEXT NOT NULL DEFAULT '',
-    registered_at TEXT NOT NULL,
-    last_seen TEXT NOT NULL
-  )
-`);
-
-db.run(`
-  CREATE TABLE IF NOT EXISTS messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    from_id TEXT NOT NULL,
-    to_id TEXT NOT NULL,
-    text TEXT NOT NULL,
-    sent_at TEXT NOT NULL,
-    delivered INTEGER NOT NULL DEFAULT 0,
-    FOREIGN KEY (from_id) REFERENCES peers(id),
-    FOREIGN KEY (to_id) REFERENCES peers(id)
-  )
-`);
-
-// --- Idempotent schema migrations (F1+F2) ---
-const migrationColumns = [
-  { name: "name", type: "TEXT" },
-  { name: "tmux_session", type: "TEXT" },
-  { name: "tmux_window_index", type: "TEXT" },
-  { name: "tmux_window_name", type: "TEXT" },
-  { name: "tmux_pane_id", type: "TEXT" },
-  // S2: per-peer auth token issued at /register
-  { name: "token", type: "TEXT" },
-  { name: "resolved_name", type: "TEXT" },
-  { name: "absolute_git_dir", type: "TEXT" },
-  { name: "client_type", type: "TEXT NOT NULL DEFAULT 'unknown'" },
-  { name: "receiver_mode", type: "TEXT NOT NULL DEFAULT 'unknown'" },
-  { name: "last_hook_seen_at", type: "TEXT" },
-  { name: "last_drain_at", type: "TEXT" },
-  { name: "last_drain_error", type: "TEXT" },
-  { name: "non_targetable", type: "INTEGER NOT NULL DEFAULT 0" },
-];
-for (const col of migrationColumns) {
-  try {
-    db.run(`ALTER TABLE peers ADD COLUMN ${col.name} ${col.type}`);
-  } catch (e) {
-    // ONLY swallow "duplicate column name" errors (the idempotent re-run case).
-    // Disk full, permission denied, corruption, etc. should crash loudly so the
-    // broker doesn't silently start with a half-migrated schema.
-    const msg = e instanceof Error ? e.message : String(e);
-    if (!msg.includes("duplicate column name")) {
-      throw e;
-    }
-  }
+const testMigrationPause = process.env.NODE_ENV === "test"
+  ? Number(process.env.CLAUDE_PEERS_TEST_MIGRATION_PAUSE_MS ?? "0")
+  : 0;
+if (Number.isFinite(testMigrationPause) && testMigrationPause > 0) {
+  storageReadiness = "migrating";
+  await Bun.sleep(testMigrationPause);
 }
+
+const db = new Database(DB_PATH);
+const storage = initializeStorage(db, {
+  databasePath: DB_PATH,
+  backupPath: process.env.CLAUDE_PEERS_BACKUP,
+  onReadiness(state) {
+    storageReadiness = state;
+  },
+});
+chmodSync(DB_PATH, 0o600);
 
 // One-time compatibility backfill for rows written before name/resolved_name
 // split. Old brokers stored broker-deduped values like codex.2#4 directly in
@@ -319,24 +286,6 @@ for (const row of db.query("SELECT id, name, resolved_name FROM peers WHERE name
   const operatorName = operatorMatch ? operatorMatch[1]! : row.name;
   if (operatorName !== row.name || row.resolved_name === null) {
     backfillPeerIdentity.run(operatorName, resolved, row.id);
-  }
-}
-
-// Messages-table migrations: delivered_at populated by /ack-messages, used
-// to compute queue→deliver latency for the idle-peer delivery investigation.
-const messageMigrationColumns = [
-  { name: "delivered_at", type: "TEXT" },
-  { name: "claimed_by", type: "TEXT" },
-  { name: "claimed_at", type: "TEXT" },
-];
-for (const col of messageMigrationColumns) {
-  try {
-    db.run(`ALTER TABLE messages ADD COLUMN ${col.name} ${col.type}`);
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    if (!msg.includes("duplicate column name")) {
-      throw e;
-    }
   }
 }
 
@@ -382,7 +331,7 @@ function cleanStalePeers() {
     // they accumulate forever (unbounded DB growth). Purge delivered mail older than
     // DELIVERED_MSG_TTL_MS — keeps a window of history for audit/debug, then drops it.
     const cutoffIso = new Date(Date.now() - DELIVERED_MSG_TTL_MS).toISOString();
-    const purged = db.run("DELETE FROM messages WHERE delivered = 1 AND delivered_at IS NOT NULL AND delivered_at < ?", [cutoffIso]);
+    const purged = db.run(retentionPurgeSql(), [cutoffIso]);
     if (purged.changes > 0) {
       console.error(`[broker] delivered-mail TTL: purged ${purged.changes} delivered message(s) older than ${DELIVERED_MSG_TTL_MS}ms`);
     }
@@ -392,11 +341,7 @@ function cleanStalePeers() {
     // it by absolute age, scoped to receiver_mode='unknown' so a real idle peer is
     // never affected. See UNDELIVERED_MSG_TTL_MS for the full leak rationale.
     const undelivCutoff = new Date(Date.now() - UNDELIVERED_MSG_TTL_MS).toISOString();
-    const staleUndeliv = db.run(
-      `DELETE FROM messages WHERE delivered = 0 AND sent_at < ?
-         AND to_id IN (SELECT id FROM peers WHERE receiver_mode = 'unknown')`,
-      [undelivCutoff],
-    );
+    const staleUndeliv = db.run(unknownReceiverPurgeSql(), [undelivCutoff]);
     if (staleUndeliv.changes > 0) {
       console.error(`[broker] undelivered-mail TTL: dropped ${staleUndeliv.changes} message(s) older than ${UNDELIVERED_MSG_TTL_MS}ms to non-draining peer(s)`);
     }
@@ -600,11 +545,11 @@ const selectUndelivered = db.prepare(`
 `);
 
 const markDeliveredScoped = db.prepare(`
-  UPDATE messages SET delivered = 1, delivered_at = ?, claimed_by = NULL, claimed_at = NULL WHERE id = ? AND to_id = ?
+  UPDATE messages SET delivered = 1, delivered_at = ?, retention_at = ?, claimed_by = NULL, claimed_at = NULL WHERE id = ? AND to_id = ?
 `);
 
 const markDeliveredClaimedScoped = db.prepare(`
-  UPDATE messages SET delivered = 1, delivered_at = ?, claimed_by = NULL, claimed_at = NULL
+  UPDATE messages SET delivered = 1, delivered_at = ?, retention_at = ?, claimed_by = NULL, claimed_at = NULL
   WHERE id = ? AND to_id = ? AND claimed_by = ?
 `);
 
@@ -1848,7 +1793,7 @@ function handleAckMessages(body: AckMessagesRequest): { ok: boolean; acked: numb
       // Row is null if id doesn't belong to this peer — scoped UPDATE below
       // will also return changes=0 in that case, so we skip the log line.
       const row = selectMsgForLatency.get(id, body.id) as { from_id: string; sent_at: string } | null;
-      const result = markDeliveredScoped.run(nowIso, id, body.id);
+      const result = markDeliveredScoped.run(nowIso, nowIso, id, body.id);
       if (result.changes > 0 && row) {
         const latencyMs = nowMs - new Date(row.sent_at).getTime();
         console.error(`[broker] deliver id=${id} from=${row.from_id} to=${body.id} via=${via} latency_ms=${latencyMs}`);
@@ -1971,7 +1916,7 @@ function handleAckByPid(body: AckByPidRequest): AckByPidResponse {
     let count = 0;
     for (const id of ids) {
       const row = selectMsgForLatency.get(id, auth.id) as { from_id: string; sent_at: string } | null;
-      const result = markDeliveredClaimedScoped.run(nowIso, id, auth.id, drainId);
+      const result = markDeliveredClaimedScoped.run(nowIso, nowIso, id, auth.id, drainId);
       if (result.changes > 0 && row) {
         const latencyMs = nowMs - new Date(row.sent_at).getTime();
         console.error(`[broker] deliver id=${id} from=${row.from_id} to=${auth.id} via=${via} latency_ms=${latencyMs}`);
@@ -2020,7 +1965,7 @@ function handlePollByPid(body: { pid: number; caller_pid: number }): {
   const acked = db.transaction(() => {
     let count = 0;
     for (const m of fetched) {
-      const result = markDeliveredScoped.run(nowIso, m.id, auth.id);
+      const result = markDeliveredScoped.run(nowIso, nowIso, m.id, auth.id);
       if (result.changes > 0) {
         ackedMessages.push(m);
         const latencyMs = nowMs - new Date(m.sent_at).getTime();
@@ -2056,8 +2001,10 @@ requestHandler = async (req: Request) => {
       if (path === "/health") {
         return Response.json({
           status: "ok",
+          ready: true,
           peers: (selectAllTargetablePeers.all() as Peer[]).length,
           version: PEERS_VERSION,
+          schema_version: storage.version,
           capabilities: BROKER_CAPABILITIES,
         });
       }
@@ -2291,3 +2238,6 @@ if (TEST_PORT_ZERO) {
   process.stdout.write(`${JSON.stringify({ event: "claude-peers-test-ready", port: boundPort })}\n`);
 }
 console.error(`[claude-peers broker] listening on ${server.hostname}:${boundPort} (db: ${DB_PATH}, uid: ${MY_UID})`);
+if (storage.migrated) {
+  console.error(`[claude-peers broker] storage ready at schema v${storage.version}${storage.backupPath ? " (verified backup retained)" : ""}`);
+}

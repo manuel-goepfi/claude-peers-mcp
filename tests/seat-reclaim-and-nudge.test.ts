@@ -22,6 +22,7 @@
 import { describe, test, expect, beforeEach } from "bun:test";
 import { Database } from "bun:sqlite";
 import { bootstrapCapBlocks, paneAlreadyNudgedThisTick } from "../bin/codex-autodrain-poller.ts";
+import { retentionPurgeSql, storageIndexes, unknownReceiverPurgeSql } from "../shared/storage.ts";
 
 const REHYDRATE_WINDOW_MS = 3600_000; // 1h — mirror of broker.ts
 
@@ -392,25 +393,26 @@ describe("Bug 6 — delivered-message TTL purge (bounds unbounded DB growth)", (
 
   beforeEach(() => {
     db = new Database(":memory:");
-    db.run("CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, to_id TEXT, delivered INTEGER, delivered_at TEXT)");
+    db.run("CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, to_id TEXT, delivered INTEGER, delivered_at TEXT, retention_at TEXT)");
+    db.run(`CREATE INDEX ${storageIndexes.deliveredRetention} ON messages(delivered, retention_at)`);
   });
 
   // Mirror of the cleanStalePeers delivered-purge DELETE.
   function purgeDelivered(nowMs: number): number {
     const cutoffIso = new Date(nowMs - DELIVERED_MSG_TTL_MS).toISOString();
-    return db.run("DELETE FROM messages WHERE delivered = 1 AND delivered_at IS NOT NULL AND delivered_at < ?", [cutoffIso]).changes;
+    return db.run(retentionPurgeSql(), [cutoffIso]).changes;
   }
 
   test("an OLD delivered message (past TTL) is purged", () => {
     const old = new Date(Date.now() - 30 * 24 * 3600_000).toISOString(); // 30 days
-    db.run("INSERT INTO messages (to_id, delivered, delivered_at) VALUES ('a', 1, ?)", [old]);
+    db.run("INSERT INTO messages (to_id, delivered, delivered_at, retention_at) VALUES ('a', 1, ?, ?)", [old, old]);
     expect(purgeDelivered(Date.now())).toBe(1);
     expect(db.query("SELECT COUNT(*) AS n FROM messages").get()).toEqual({ n: 0 });
   });
 
   test("a RECENT delivered message (within TTL) is kept", () => {
     const recent = new Date(Date.now() - 60_000).toISOString(); // 1 min ago
-    db.run("INSERT INTO messages (to_id, delivered, delivered_at) VALUES ('a', 1, ?)", [recent]);
+    db.run("INSERT INTO messages (to_id, delivered, delivered_at, retention_at) VALUES ('a', 1, ?, ?)", [recent, recent]);
     expect(purgeDelivered(Date.now())).toBe(0);
     expect(db.query("SELECT COUNT(*) AS n FROM messages").get()).toEqual({ n: 1 });
   });
@@ -445,16 +447,13 @@ describe("Bug 7 — undelivered-mail TTL for live-but-non-draining peers (receiv
     db = new Database(":memory:");
     db.run("CREATE TABLE peers (id TEXT PRIMARY KEY, receiver_mode TEXT NOT NULL DEFAULT 'unknown')");
     db.run("CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, to_id TEXT, delivered INTEGER, sent_at TEXT)");
+    db.run(`CREATE INDEX ${storageIndexes.unknownReceiverRetention} ON messages(delivered, sent_at, to_id)`);
   });
 
   // Mirror of the cleanStalePeers undelivered-mail-TTL DELETE.
   function purgeStaleUndelivered(nowMs: number): number {
     const cutoffIso = new Date(nowMs - UNDELIVERED_MSG_TTL_MS).toISOString();
-    return db.run(
-      `DELETE FROM messages WHERE delivered = 0 AND sent_at < ?
-         AND to_id IN (SELECT id FROM peers WHERE receiver_mode = 'unknown')`,
-      [cutoffIso],
-    ).changes;
+    return db.run(unknownReceiverPurgeSql(), [cutoffIso]).changes;
   }
 
   const OLD = new Date(Date.now() - 30 * 24 * 3600_000).toISOString(); // 30d

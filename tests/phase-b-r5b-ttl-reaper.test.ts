@@ -66,6 +66,7 @@ import { Database } from "bun:sqlite";
 // hoisted into a side-effect-free shared module specifically so the
 // predicate tests below test load-bearing prod code, not a copy.
 import { isReapable, deadSeatMailExpired, shouldRotateLog, PEER_GHOST_AFTER_MS } from "../shared/reaper";
+import { positiveMilliseconds, retentionPurgeSql, unknownReceiverPurgeSql } from "../shared/storage.ts";
 
 type TestPeer = { id: string; pid: number; last_seen: string };
 
@@ -445,29 +446,23 @@ describe("shouldRotateLog", () => {
   });
 });
 
-// --- positiveEnvMs: reject non-positive TTL env overrides ---
-// Mirror of the broker.ts helper (broker.ts is not import-safe). The load-bearing
+// --- positiveMilliseconds: reject non-positive TTL env overrides ---
+// Import-safe production helper. The load-bearing
 // case: a NEGATIVE override must NOT pass through (a bare `parseInt || def` lets it,
 // and a negative TTL makes the purge cutoff land in the future → wipes all rows).
-describe("positiveEnvMs (mirror) — rejects non-positive TTL overrides", () => {
-  function positiveEnvMs(raw: string | undefined, def: number): number {
-    if (raw === undefined) return def;
-    const n = parseInt(raw, 10);
-    if (Number.isFinite(n) && n > 0) return n;
-    return def;
-  }
-  test("absent → default", () => expect(positiveEnvMs(undefined, 86_400_000)).toBe(86_400_000));
-  test("valid positive → parsed", () => expect(positiveEnvMs("3600000", 86_400_000)).toBe(3_600_000));
+describe("positiveMilliseconds — rejects non-positive TTL overrides", () => {
+  test("absent → default", () => expect(positiveMilliseconds(undefined, 86_400_000)).toBe(86_400_000));
+  test("valid positive → parsed", () => expect(positiveMilliseconds("3600000", 86_400_000)).toBe(3_600_000));
   test("NEGATIVE → default (the full-wipe footgun is closed)", () => {
-    expect(positiveEnvMs("-86400000", 604_800_000)).toBe(604_800_000);
+    expect(positiveMilliseconds("-86400000", 604_800_000)).toBe(604_800_000);
   });
   test("zero → default (not a silent 'purge everything')", () => {
-    expect(positiveEnvMs("0", 604_800_000)).toBe(604_800_000);
+    expect(positiveMilliseconds("0", 604_800_000)).toBe(604_800_000);
   });
-  test("garbage → default", () => expect(positiveEnvMs("foo", 86_400_000)).toBe(86_400_000));
+  test("garbage → default", () => expect(positiveMilliseconds("foo", 86_400_000)).toBe(86_400_000));
   test("PLANTED-WRONG guard: a negative override must never be returned verbatim", () => {
     // If the guard regresses to `parseInt(raw,10) || def`, this returns -1 and flips.
-    expect(positiveEnvMs("-1", 86_400_000)).toBeGreaterThan(0);
+    expect(positiveMilliseconds("-1", 86_400_000)).toBeGreaterThan(0);
   });
 });
 
@@ -486,7 +481,9 @@ describe("reaper controls are WIRED into the broker (source-grep sentinels)", ()
   test("cleanStalePeers CALLS the delivered-purge DELETE and rotateBrokerLogIfLarge", async () => {
     const src = await Bun.file(`${import.meta.dir}/../broker.ts`).text();
     const body = (src.split("function cleanStalePeers()")[1] ?? "").split("\nfunction ")[0];
-    expect(body).toMatch(/DELETE FROM messages WHERE delivered = 1/);
+    expect(body).toContain("retentionPurgeSql()");
+    expect(retentionPurgeSql()).toMatch(/delivered = 1.*retention_at IS NOT NULL.*retention_at < \?/);
+    expect(retentionPurgeSql()).not.toContain("delivered_at");
     expect(body).toMatch(/rotateBrokerLogIfLarge\(\)/);
   });
   test("cleanStalePeers CALLS the undelivered-mail TTL DELETE gated on receiver_mode='unknown'", async () => {
@@ -495,12 +492,13 @@ describe("reaper controls are WIRED into the broker (source-grep sentinels)", ()
     // The undelivered cap must (a) target delivered=0 by sent_at, and (b) be gated
     // on receiver_mode='unknown' so it never drops a real idle peer's mail. Dropping
     // EITHER half reopens a leak (no cap) or breaks the non-lossy guarantee.
-    expect(body).toMatch(/DELETE FROM messages WHERE delivered = 0 AND sent_at < \?/);
-    expect(body).toMatch(/SELECT id FROM peers WHERE receiver_mode = 'unknown'/);
+    expect(body).toContain("unknownReceiverPurgeSql()");
+    expect(unknownReceiverPurgeSql()).toMatch(/delivered = 0 AND sent_at < \?/);
+    expect(unknownReceiverPurgeSql()).toMatch(/SELECT id FROM peers WHERE receiver_mode = 'unknown'/);
     // Must live AFTER the delivered-purge DELETE (i.e. inside the same mail-purge
     // try-stage, not a new unguarded stage).
-    const delIdx = body.indexOf("DELETE FROM messages WHERE delivered = 1");
-    const undelIdx = body.indexOf("DELETE FROM messages WHERE delivered = 0 AND sent_at");
+    const delIdx = body.indexOf("retentionPurgeSql()");
+    const undelIdx = body.indexOf("unknownReceiverPurgeSql()");
     expect(delIdx).toBeGreaterThanOrEqual(0);
     expect(undelIdx).toBeGreaterThan(delIdx);
   });

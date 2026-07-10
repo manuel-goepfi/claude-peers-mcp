@@ -52,6 +52,7 @@ export interface BrokerLifecycleIdentity {
     procSocketIdentity: true;
     nonceProtectedOwnership: true;
     verifiedShutdown: true;
+    storageSchema: number;
   };
 }
 

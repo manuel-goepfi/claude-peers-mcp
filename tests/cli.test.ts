@@ -274,7 +274,7 @@ describe("verified broker shutdown", () => {
             executable_path: realpathSync("/proc/self/exe"),
             broker_script_path: cliScript,
             ready: true,
-            capabilities: { procSocketIdentity: true, nonceProtectedOwnership: true, verifiedShutdown: true },
+            capabilities: { procSocketIdentity: true, nonceProtectedOwnership: true, verifiedShutdown: true, storageSchema: 1 },
           });
         }
         if (path === "/unregister") return Response.json({ ok: true });

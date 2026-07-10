@@ -715,6 +715,8 @@ describe("Live broker delivery features", () => {
     expect(res.status).toBe(200);
     const body = await res.json() as {
       version?: string;
+      ready?: boolean;
+      schema_version?: number;
       capabilities?: {
         hookDrain?: {
           pollByPid?: boolean;
@@ -726,6 +728,11 @@ describe("Live broker delivery features", () => {
           states?: boolean;
           vocabulary?: string[];
         };
+        storage?: {
+          schemaVersion?: number;
+          readiness?: boolean;
+          retentionAt?: boolean;
+        };
       };
     };
     expect(body.version).toMatch(/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/);
@@ -735,6 +742,9 @@ describe("Live broker delivery features", () => {
     expect(body.capabilities?.hookDrain?.hookHeartbeatByPid).toBe(true);
     expect(body.capabilities?.delivery?.states).toBe(true);
     expect(body.capabilities?.delivery?.vocabulary).toEqual(["queued", "claimed", "acknowledged", "unknown"]);
+    expect(body.ready).toBe(true);
+    expect(body.schema_version).toBe(1);
+    expect(body.capabilities?.storage).toEqual({ schemaVersion: 1, readiness: true, retentionAt: true });
   });
 
   test("broker startup migrates an old peer/message schema", async () => {
@@ -775,7 +785,7 @@ describe("Live broker delivery features", () => {
       for (const col of ["client_type", "receiver_mode", "last_hook_seen_at", "last_drain_at", "last_drain_error", "non_targetable"]) {
         expect(peerColumns.has(col)).toBe(true);
       }
-      for (const col of ["delivered_at", "claimed_by", "claimed_at"]) {
+      for (const col of ["delivered_at", "retention_at", "claimed_by", "claimed_at"]) {
         expect(messageColumns.has(col)).toBe(true);
       }
     } finally {
@@ -808,12 +818,13 @@ describe("Live broker delivery features", () => {
     // broken by a future refactor that drops the nowIso UPDATE arg. Open a
     // read-only handle to the broker's DB — WAL mode allows concurrent reads.
     const ro = new Database(TEST_DB, { readonly: true });
-    const row = ro.query("SELECT delivered, delivered_at FROM messages WHERE id = ?").get(msgs[0]!.id) as
-      { delivered: number; delivered_at: string | null };
+    const row = ro.query("SELECT delivered, delivered_at, retention_at FROM messages WHERE id = ?").get(msgs[0]!.id) as
+      { delivered: number; delivered_at: string | null; retention_at: string | null };
     ro.close();
     expect(row.delivered).toBe(1);
     expect(row.delivered_at).not.toBeNull();
     expect(typeof row.delivered_at).toBe("string");
+    expect(row.retention_at).toBe(row.delivered_at);
     child.kill();
   });
 

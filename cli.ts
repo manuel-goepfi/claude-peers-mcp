@@ -136,7 +136,8 @@ function validateLifecycleIdentity(value: BrokerLifecycleIdentity): BrokerLifecy
     value.ready !== true ||
     value.capabilities?.procSocketIdentity !== true ||
     value.capabilities?.nonceProtectedOwnership !== true ||
-    value.capabilities?.verifiedShutdown !== true
+    value.capabilities?.verifiedShutdown !== true ||
+    value.capabilities?.storageSchema !== 1
   ) {
     throw new CliError("unsafe", "broker lifecycle identity is missing required verification fields");
   }
