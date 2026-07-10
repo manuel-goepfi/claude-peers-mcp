@@ -11,6 +11,7 @@ import { Database } from "bun:sqlite";
 import type { Peer, RegisterRequest } from "../shared/types.ts";
 import { parseTmuxPanes, parsePsTree } from "../shared/tmux.ts";
 import { generateSummary } from "../shared/summarize.ts";
+import { startTestBroker, type TestBroker } from "./helpers/test-broker.ts";
 
 // --- Broker-level tests (schema + registration + queries) ---
 
@@ -550,39 +551,16 @@ not a row
 // --- Integration test: live broker round-trip ---
 
 describe("F1+F2 live broker integration", () => {
-  const BROKER_PORT = 17899; // Use non-standard port to avoid conflicts
-  const BROKER_SCRIPT = new URL("../broker.ts", import.meta.url).pathname;
-  let brokerProc: ReturnType<typeof Bun.spawn>;
-  const brokerUrl = `http://127.0.0.1:${BROKER_PORT}`;
-  const TEST_DB = "/tmp/claude-peers-test-f1f2.db";
+  let broker: TestBroker;
+  let brokerUrl = "";
 
   beforeAll(async () => {
-    // Clean up any old test DB
-    try { await Bun.write(TEST_DB, ""); Bun.spawnSync(["rm", "-f", TEST_DB]); } catch {}
-
-    brokerProc = Bun.spawn(["bun", BROKER_SCRIPT], {
-      env: { ...process.env, CLAUDE_PEERS_PORT: String(BROKER_PORT), CLAUDE_PEERS_DB: TEST_DB },
-      stdout: "ignore",
-      stderr: "ignore",
-    });
-
-    // Wait for broker to start — fail fast with a clear message if it doesn't
-    let brokerAlive = false;
-    for (let i = 0; i < 30; i++) {
-      try {
-        const res = await fetch(`${brokerUrl}/health`, { signal: AbortSignal.timeout(500) });
-        if (res.ok) { brokerAlive = true; break; }
-      } catch {}
-      await new Promise((r) => setTimeout(r, 200));
-    }
-    if (!brokerAlive) {
-      throw new Error(`Test broker failed to start on ${brokerUrl} within 6 seconds`);
-    }
+    broker = await startTestBroker({ prefix: "f1-f2" });
+    brokerUrl = broker.url;
   });
 
-  afterAll(() => {
-    brokerProc.kill();
-    Bun.spawnSync(["rm", "-f", TEST_DB]);
+  afterAll(async () => {
+    await broker.stop();
   });
 
   // S2: token-aware test fetch (mirrors delivery.test.ts).

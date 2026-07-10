@@ -974,7 +974,7 @@ export function tmuxOnlyPeerHintFromList(
       if (wantedName && sessionMatches && operatorLabel === wantedName) return true;
       if (wantedName && sessionMatches && `${session}.${paneIndex}` === wantedName) return true;
       if (wantedName && sessionMatches && `${session}:${windowIndex}.${paneIndex}` === wantedName) return true;
-      if (wantedNameLike && sessionMatches && operatorLabel.toLowerCase().includes(wantedNameLike)) return true;
+      if (wantedNameLike && sessionMatches && operatorLabel?.toLowerCase().includes(wantedNameLike)) return true;
       if (wantedNameLike && sessionMatches && `${session}.${paneIndex}`.toLowerCase().includes(wantedNameLike)) return true;
       if (wantedNameLike && sessionMatches && `${session}:${windowIndex}.${paneIndex}`.toLowerCase().includes(wantedNameLike)) return true;
       if (wantedSession && !wantedPaneId && !wantedName && sessionMatches) return true;

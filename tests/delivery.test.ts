@@ -12,7 +12,7 @@
 
 import { describe, test, expect, beforeAll, afterAll, afterEach } from "bun:test";
 import { Database } from "bun:sqlite";
-import { createServer } from "node:net";
+import { startTestBroker, type TestBroker } from "./helpers/test-broker.ts";
 
 // --- Broker schema + ack endpoint logic ---
 
@@ -423,10 +423,9 @@ describe("C1: broker log append semantics", () => {
 
 describe("Live broker delivery features", () => {
   let BROKER_PORT = 0;
-  const BROKER_SCRIPT = new URL("../broker.ts", import.meta.url).pathname;
-  let brokerProc: ReturnType<typeof Bun.spawn>;
+  let broker: TestBroker;
   let brokerUrl = "";
-  const TEST_DB = "/tmp/claude-peers-test-delivery.db";
+  let TEST_DB = "";
   const childProcesses = new Set<ReturnType<typeof Bun.spawn>>();
 
   function spawnSleep(): ReturnType<typeof Bun.spawn> {
@@ -435,70 +434,17 @@ describe("Live broker delivery features", () => {
     return child;
   }
 
-  async function findFreeBrokerPort(): Promise<number> {
-    return await new Promise((resolve, reject) => {
-      const probe = createServer();
-      probe.unref();
-      probe.once("error", reject);
-      probe.listen(0, "127.0.0.1", () => {
-        const address = probe.address();
-        const port = typeof address === "object" && address ? address.port : 0;
-        probe.close((err) => err ? reject(err) : resolve(port));
-      });
-    });
-  }
-
-  const brokerStderrChunks: string[] = [];
   beforeAll(async () => {
-    Bun.spawnSync(["rm", "-f", TEST_DB]);
-
-    let brokerAlive = false;
-    for (let attempt = 0; attempt < 5 && !brokerAlive; attempt++) {
-      BROKER_PORT = await findFreeBrokerPort();
-      brokerUrl = `http://127.0.0.1:${BROKER_PORT}`;
-      brokerProc = Bun.spawn(["bun", BROKER_SCRIPT], {
-        env: { ...process.env, CLAUDE_PEERS_PORT: String(BROKER_PORT), CLAUDE_PEERS_DB: TEST_DB, CLAUDE_PEERS_BRIDGE_TOKEN_FILE: "/tmp/claude-peers-test-bridge.token" },
-        stdout: "ignore",
-        stderr: "pipe",
-      });
-      // Capture stderr so latency-log-format assertions can grep the log lines
-      // the broker emits on every successful ack. Non-blocking — discards if
-      // the reader can't keep up (tests only assert on the tail).
-      const proc = brokerProc;
-      (async () => {
-        const decoder = new TextDecoder();
-        if (!proc.stderr || typeof proc.stderr === "number") return;
-        const reader = (proc.stderr as ReadableStream<Uint8Array>).getReader();
-        try {
-          while (true) {
-            const { value, done } = await reader.read();
-            if (done) break;
-            if (value) brokerStderrChunks.push(decoder.decode(value));
-          }
-        } catch {}
-      })();
-
-      for (let i = 0; i < 30; i++) {
-        try {
-          const res = await fetch(`${brokerUrl}/health`, { signal: AbortSignal.timeout(500) });
-          if (res.ok) { brokerAlive = true; break; }
-        } catch {}
-        await new Promise((r) => setTimeout(r, 200));
-      }
-      if (!brokerAlive) brokerProc.kill();
-    }
-    if (!brokerAlive) {
-      const stderrTail = brokerStderrChunks.join("").slice(-4000);
-      throw new Error(`Test broker failed to start after 5 attempts; last url=${brokerUrl}; stderr tail:\n${stderrTail}`);
-    }
+    broker = await startTestBroker({ prefix: "delivery" });
+    BROKER_PORT = broker.port;
+    brokerUrl = broker.url;
+    TEST_DB = broker.dbPath;
   }, 35_000);
 
-  afterAll(() => {
-    brokerProc?.kill();
+  afterAll(async () => {
     for (const child of childProcesses) child.kill();
     childProcesses.clear();
-    Bun.spawnSync(["rm", "-f", TEST_DB]);
-    Bun.spawnSync(["rm", "-f", "/tmp/claude-peers-test-bridge.token"]);
+    await broker.stop();
   });
 
   afterEach(() => {
@@ -709,58 +655,37 @@ describe("Live broker delivery features", () => {
   });
 
   test("broker startup migrates an old peer/message schema", async () => {
-    const dbPath = "/tmp/claude-peers-old-schema-migration.db";
-    const tokenPath = "/tmp/claude-peers-old-schema-bridge.token";
-    const port = await findFreeBrokerPort();
-    Bun.spawnSync(["rm", "-f", dbPath]);
-    Bun.spawnSync(["rm", "-f", tokenPath]);
-    const old = new Database(dbPath);
-    old.run(`
-      CREATE TABLE peers (
-        id TEXT PRIMARY KEY,
-        pid INTEGER NOT NULL,
-        cwd TEXT NOT NULL,
-        git_root TEXT,
-        tty TEXT,
-        summary TEXT NOT NULL DEFAULT '',
-        registered_at TEXT NOT NULL,
-        last_seen TEXT NOT NULL
-      )
-    `);
-    old.run(`
-      CREATE TABLE messages (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        from_id TEXT NOT NULL,
-        to_id TEXT NOT NULL,
-        text TEXT NOT NULL,
-        sent_at TEXT NOT NULL,
-        delivered INTEGER NOT NULL DEFAULT 0
-      )
-    `);
-    old.close();
-
-    const proc = Bun.spawn(["bun", BROKER_SCRIPT], {
-      env: {
-        ...process.env,
-        CLAUDE_PEERS_PORT: String(port),
-        CLAUDE_PEERS_DB: dbPath,
-        CLAUDE_PEERS_BRIDGE_TOKEN_FILE: tokenPath,
+    const migrationBroker = await startTestBroker({
+      prefix: "old-schema-migration",
+      prepare({ dbPath }) {
+        const old = new Database(dbPath);
+        old.run(`
+          CREATE TABLE peers (
+            id TEXT PRIMARY KEY,
+            pid INTEGER NOT NULL,
+            cwd TEXT NOT NULL,
+            git_root TEXT,
+            tty TEXT,
+            summary TEXT NOT NULL DEFAULT '',
+            registered_at TEXT NOT NULL,
+            last_seen TEXT NOT NULL
+          )
+        `);
+        old.run(`
+          CREATE TABLE messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            from_id TEXT NOT NULL,
+            to_id TEXT NOT NULL,
+            text TEXT NOT NULL,
+            sent_at TEXT NOT NULL,
+            delivered INTEGER NOT NULL DEFAULT 0
+          )
+        `);
+        old.close();
       },
-      stdout: "ignore",
-      stderr: "ignore",
     });
     try {
-      let brokerAlive = false;
-      for (let i = 0; i < 30; i++) {
-        try {
-          const res = await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(500) });
-          if (res.ok) { brokerAlive = true; break; }
-        } catch {}
-        await new Promise((r) => setTimeout(r, 100));
-      }
-      expect(brokerAlive).toBe(true);
-
-      const migrated = new Database(dbPath, { readonly: true });
+      const migrated = new Database(migrationBroker.dbPath, { readonly: true });
       const peerColumns = new Set((migrated.query("PRAGMA table_info(peers)").all() as { name: string }[]).map((c) => c.name));
       const messageColumns = new Set((migrated.query("PRAGMA table_info(messages)").all() as { name: string }[]).map((c) => c.name));
       migrated.close();
@@ -771,9 +696,7 @@ describe("Live broker delivery features", () => {
         expect(messageColumns.has(col)).toBe(true);
       }
     } finally {
-      proc.kill();
-      Bun.spawnSync(["rm", "-f", dbPath]);
-      Bun.spawnSync(["rm", "-f", tokenPath]);
+      await migrationBroker.stop();
     }
   });
 
@@ -951,11 +874,11 @@ describe("Live broker delivery features", () => {
     await brokerFetch("/send-message", { from_id: peer.id, to_id: peer.id, text: "log-format probe" });
 
     // Drain via the hook path and capture the resulting log line.
-    const before = brokerStderrChunks.length;
+    const before = broker.stderr().length;
     await rawPost("/poll-by-pid", { pid: child.pid, caller_pid: process.pid });
     // Small wait for stderr pipe to flush the console.error line.
     await new Promise((r) => setTimeout(r, 150));
-    const newLogs = brokerStderrChunks.slice(before).join("");
+    const newLogs = broker.stderr().slice(before);
 
     // Assert the full canonical format (id, from, to, via=poll-by-pid, latency_ms).
     // Any regression dropping one of these fields will fail grep.

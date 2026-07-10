@@ -13,40 +13,15 @@
 //   (b) parent died -> watchdog notices reparenting -> unregister + exit
 import { test, expect, describe, beforeAll, afterAll } from "bun:test";
 import { Database } from "bun:sqlite";
-import { createServer } from "node:net";
+import { readFileSync } from "node:fs";
+import { startTestBroker, type TestBroker } from "./helpers/test-broker.ts";
 
-const BROKER_SCRIPT = new URL("../broker.ts", import.meta.url).pathname;
 const SERVER_SCRIPT = new URL("../server.ts", import.meta.url).pathname;
-const TEST_DB = "/tmp/claude-peers-test-lifecycle.db";
-const TEST_TOKEN_FILE = "/tmp/claude-peers-test-lifecycle-bridge.token";
+let TEST_DB = "";
+let TEST_TOKEN_FILE = "";
 
 let BROKER_PORT = 0;
-let brokerProc: ReturnType<typeof Bun.spawn> | null = null;
-
-async function findFreeBrokerPort(): Promise<number> {
-  return await new Promise((resolve, reject) => {
-    const probe = createServer();
-    probe.unref();
-    probe.once("error", reject);
-    probe.listen(0, "127.0.0.1", () => {
-      const address = probe.address();
-      const port = typeof address === "object" && address ? address.port : 0;
-      probe.close((err) => (err ? reject(err) : resolve(port)));
-    });
-  });
-}
-
-async function waitForHealth(url: string, timeoutMs = 8000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    try {
-      const res = await fetch(`${url}/health`, { signal: AbortSignal.timeout(500) });
-      if (res.ok) return;
-    } catch {}
-    await Bun.sleep(100);
-  }
-  throw new Error(`broker /health never responded within ${timeoutMs}ms`);
-}
+let broker: TestBroker | null = null;
 
 function peerRows(): { id: string; pid: number }[] {
   const db = new Database(TEST_DB, { readonly: true });
@@ -66,6 +41,18 @@ async function waitFor(predicate: () => boolean, timeoutMs: number, label: strin
   throw new Error(`timed out after ${timeoutMs}ms waiting for: ${label}`);
 }
 
+function isLiveNonZombieProcess(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const commandEnd = stat.lastIndexOf(")");
+    const state = commandEnd >= 0 ? stat.slice(commandEnd + 2).split(" ")[0] : undefined;
+    return state !== "Z";
+  } catch {
+    return false;
+  }
+}
+
 function serverEnv(extra: Record<string, string> = {}): Record<string, string | undefined> {
   // CLAUDE_PEERS_DB is passed so that, if ensureBroker ever races and spawns
   // its own broker, it still targets the test DB rather than production.
@@ -81,24 +68,14 @@ function serverEnv(extra: Record<string, string> = {}): Record<string, string | 
 }
 
 beforeAll(async () => {
-  Bun.spawnSync(["rm", "-f", TEST_DB, TEST_TOKEN_FILE]);
-  BROKER_PORT = await findFreeBrokerPort();
-  brokerProc = Bun.spawn(["bun", BROKER_SCRIPT], {
-    env: {
-      ...process.env,
-      CLAUDE_PEERS_PORT: String(BROKER_PORT),
-      CLAUDE_PEERS_DB: TEST_DB,
-      CLAUDE_PEERS_BRIDGE_TOKEN_FILE: TEST_TOKEN_FILE,
-    },
-    stdout: "ignore",
-    stderr: "ignore",
-  });
-  await waitForHealth(`http://127.0.0.1:${BROKER_PORT}`);
+  broker = await startTestBroker({ prefix: "lifecycle" });
+  BROKER_PORT = broker.port;
+  TEST_DB = broker.dbPath;
+  TEST_TOKEN_FILE = broker.tokenPath;
 });
 
-afterAll(() => {
-  brokerProc?.kill();
-  Bun.spawnSync(["rm", "-f", TEST_DB, TEST_TOKEN_FILE]);
+afterAll(async () => {
+  await broker?.stop();
 });
 
 describe("server.ts lifecycle", () => {
@@ -153,14 +130,7 @@ describe("server.ts lifecycle", () => {
         // Watchdog tick (200ms) should unregister and exit the server.
         await waitFor(() => peerRows().length === 0, 8000, "peer row unregistered after parent death");
         await waitFor(
-          () => {
-            try {
-              process.kill(serverPid, 0);
-              return false; // still alive
-            } catch {
-              return true; // ESRCH — exited
-            }
-          },
+          () => !isLiveNonZombieProcess(serverPid),
           8000,
           "server process exit after parent death"
         );
@@ -271,9 +241,8 @@ describe("server.ts lifecycle", () => {
       // /unregister — the unref'd 3s hard-exit timer is the only orphan
       // defense on this path.
       let registered = false;
-      const wedgePort = await findFreeBrokerPort();
       const wedge = Bun.serve({
-        port: wedgePort,
+        port: 0,
         hostname: "127.0.0.1",
         fetch(req) {
           const path = new URL(req.url).pathname;
@@ -286,6 +255,7 @@ describe("server.ts lifecycle", () => {
           return Response.json({ ok: true, messages: [] });
         },
       });
+      const wedgePort = wedge.port!;
       const proc = Bun.spawn(["bun", SERVER_SCRIPT], {
         env: serverEnv({ CLAUDE_PEERS_PORT: String(wedgePort) }),
         stdin: "pipe",

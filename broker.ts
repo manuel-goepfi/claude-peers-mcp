@@ -49,6 +49,7 @@ import type {
 import { isReapable, deadSeatMailExpired, shouldRotateLog, PEER_GHOST_AFTER_MS } from "./shared/reaper.ts";
 
 const PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
+const TEST_PORT_ZERO = process.env.NODE_ENV === "test" && process.env.CLAUDE_PEERS_TEST_PORT_ZERO === "1";
 const DB_PATH = process.env.CLAUDE_PEERS_DB ?? `${process.env.HOME}/.claude-peers.db`;
 // S1 + M4: bind to 127.0.0.1 literal so the post-bind assertion below can
 // compare against a fixed string. The HOST_OVERRIDE env vars are NOT honoured
@@ -62,7 +63,7 @@ if (HOST_OVERRIDE && !LOOPBACK_ALIASES.has(HOST_OVERRIDE)) {
   console.error(`[claude-peers broker] FATAL: refusing non-loopback bind (${HOST_OVERRIDE}). Phase-1 spec requires 127.0.0.1.`);
   process.exit(2);
 }
-if (PORT < 1 || PORT > 65535 || Number.isNaN(PORT)) {
+if (PORT < 0 || PORT > 65535 || Number.isNaN(PORT) || (PORT === 0 && !TEST_PORT_ZERO)) {
   console.error(`[claude-peers broker] FATAL: invalid port ${PORT}`);
   process.exit(2);
 }
@@ -2107,4 +2108,8 @@ if (server.hostname !== "127.0.0.1") {
 }
 
 publishBridgeTokenFile();
-console.error(`[claude-peers broker] listening on ${server.hostname}:${PORT} (db: ${DB_PATH}, uid: ${MY_UID})`);
+const boundPort = server.port ?? PORT;
+if (TEST_PORT_ZERO) {
+  process.stdout.write(`${JSON.stringify({ event: "claude-peers-test-ready", port: boundPort })}\n`);
+}
+console.error(`[claude-peers broker] listening on ${server.hostname}:${boundPort} (db: ${DB_PATH}, uid: ${MY_UID})`);

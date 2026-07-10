@@ -187,7 +187,8 @@ export function findHookPeerPidsFromTable(
   identityEnvReader: (pid: number) => boolean = hasPeerIdentityEnv,
   ttyReader: (pid: number) => string | null = getTty,
 ): { primary: number; fallbacks: number[] } | null {
-  const hasEnvPid = Number.isInteger(envPid) && envPid > 1;
+  const validEnvPid = envPid !== null && Number.isInteger(envPid) && envPid > 1 ? envPid : null;
+  const hasEnvPid = validEnvPid !== null;
   let clientPid = findClientAncestor(table, startPid, clientType);
   if (!clientPid && clientType === "codex") {
     const appServer = findCodexAppServerAncestor(table, startPid);
@@ -201,7 +202,7 @@ export function findHookPeerPidsFromTable(
   }
   if (!clientPid) {
     if (!hasEnvPid) log(`no ${CLIENT_TYPE} ancestor found`);
-    return hasEnvPid ? { primary: envPid!, fallbacks: [] } : null;
+    return hasEnvPid ? { primary: validEnvPid, fallbacks: [] } : null;
   }
 
   const candidates = descendants(clientPid, table)
@@ -211,15 +212,15 @@ export function findHookPeerPidsFromTable(
   const selected = cwdMatches.length > 0 ? cwdMatches : candidates;
   if (selected.length === 1) {
     const mcpPid = selected[0]!.pid;
-    const fallbacks = [mcpPid, hasEnvPid ? envPid! : null]
-      .filter((pid): pid is number => Number.isInteger(pid) && pid > 1 && pid !== clientPid)
+    const fallbacks = [mcpPid, validEnvPid]
+      .filter((pid): pid is number => pid !== null && Number.isInteger(pid) && pid > 1 && pid !== clientPid)
       .filter((pid, index, all) => all.indexOf(pid) === index);
     return { primary: clientPid, fallbacks };
   }
   if (selected.length > 1 && !hasEnvPid) {
     log(`multiple claude-peers MCP candidates: ${selected.map((p) => p.pid).join(",")}`);
   }
-  if (hasEnvPid && envPid !== clientPid) return { primary: clientPid, fallbacks: [envPid!] };
+  if (hasEnvPid && validEnvPid !== clientPid) return { primary: clientPid, fallbacks: [validEnvPid] };
   return { primary: clientPid, fallbacks: [] };
 }
 

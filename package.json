@@ -5,13 +5,16 @@
   "module": "index.ts",
   "type": "module",
   "private": true,
+  "packageManager": "bun@1.3.11",
   "scripts": {
     "broker": "bun broker.ts",
     "server": "bun server.ts",
-    "test": "bun test"
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "verify": "bun run typecheck && bun test"
   },
   "devDependencies": {
-    "@types/bun": "latest"
+    "@types/bun": "1.3.11"
   },
   "peerDependencies": {
     "typescript": "^5"

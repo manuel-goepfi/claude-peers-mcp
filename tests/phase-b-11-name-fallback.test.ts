@@ -472,7 +472,7 @@ describe("Operator-label fallback — human name first, pane_id metadata last", 
       },
     });
 
-    globalThis.fetch = (async (_url: RequestInfo | URL, init?: RequestInit) => {
+    globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
       const headers = init?.headers as Record<string, string> | undefined;
       calls.push({
         token: headers?.["X-Peer-Token"] ?? null,
