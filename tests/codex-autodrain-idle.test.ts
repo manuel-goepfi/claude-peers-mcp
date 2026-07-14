@@ -628,12 +628,12 @@ function registerResponse(name = "pr.1") {
     name,
     resolved_name: name,
     client_type: "codex",
-    receiver_mode: "codex-hook",
+    receiver_mode: "manual-drain",
   };
 }
 
 describe("reconcileVisibleCodexSeats", () => {
-  test("posts register then hook heartbeat and publishes the broker identity", async () => {
+  test("registers a visible seat without fabricating hook health", async () => {
     __resetCodexSeatReconcileStateForTest();
     const posts: Array<{ path: string; body: any }> = [];
     const publishes: Array<{ identity: any; pane: string | undefined }> = [];
@@ -658,7 +658,7 @@ describe("reconcileVisibleCodexSeats", () => {
       },
     });
 
-    expect(posts.map((p) => p.path)).toEqual(["/register", "/hook-heartbeat-by-pid"]);
+    expect(posts.map((p) => p.path)).toEqual(["/register"]);
     expect(posts[0]!.body).toMatchObject({
       pid: 200,
       cwd: "/repo",
@@ -667,19 +667,11 @@ describe("reconcileVisibleCodexSeats", () => {
       name: "pr.1",
       tmux_pane_id: "%200",
       client_type: "codex",
-      receiver_mode: "codex-hook",
+      receiver_mode: "manual-drain",
       preserve_token: true,
       summary: "",
     });
-    expect(posts[1]!.body).toMatchObject({
-      pid: 200,
-      caller_pid: process.pid,
-      client_type: "codex",
-      receiver_mode: "codex-hook",
-      status: "ok",
-      drained: 0,
-    });
-    expect(publishes.map((p) => `${p.identity.id}:${p.pane}`)).toEqual(["peer-pr.1:%200", "peer-pr.1:%200"]);
+    expect(publishes.map((p) => `${p.identity.id}:${p.identity.receiver_mode}:${p.pane}`)).toEqual(["peer-pr.1:manual-drain:%200"]);
     expect(posts.map((p) => p.path).some((path) => /claim|ack/i.test(path))).toBe(false);
   });
 

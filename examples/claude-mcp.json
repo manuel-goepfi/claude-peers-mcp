@@ -2,7 +2,7 @@
   "mcpServers": {
     "claude-peers": {
       "command": "bun",
-      "args": ["./server.ts"]
+      "args": ["/absolute/path/to/claude-peers-mcp/server.ts"]
     }
   }
 }

@@ -1,5 +1,5 @@
 import { realpathSync } from "node:fs";
-import { resolve } from "node:path";
+import { basename, resolve } from "node:path";
 import { assertSafeCloneForUserInstall, installJsonConfig, readSafeJsonConfig, restoreJsonConfig } from "./config-installer.ts";
 import { classifyClientHooks, installClientHooks, uninstallClientHooks, type HookClient } from "./hook-config.ts";
 
@@ -9,6 +9,7 @@ export interface HookInstallerOptions {
   configRelativePath: string;
   label: string;
   sourceRepo: string;
+  userConfigDirEnv?: string;
 }
 
 export async function runHookInstaller(options: HookInstallerOptions): Promise<number> {
@@ -29,9 +30,13 @@ export async function runHookInstaller(options: HookInstallerOptions): Promise<n
     );
     const scope = explicitScope ?? (positional ? "project" : "user");
     const home = realpathSync(process.env.HOME ?? "");
-    const targetRoot = scope === "user" ? home : resolve(positional ?? process.cwd());
+    const projectRoot = resolve(positional ?? process.cwd());
+    const configuredUserDir = options.userConfigDirEnv ? process.env[options.userConfigDirEnv] : undefined;
+    const userConfigPath = configuredUserDir
+      ? resolve(configuredUserDir, basename(configRelativePath))
+      : resolve(home, configRelativePath);
     if (scope === "user") assertSafeCloneForUserInstall(sourceRepo);
-    const configPath = resolve(targetRoot, configRelativePath);
+    const configPath = scope === "user" ? userConfigPath : resolve(projectRoot, configRelativePath);
     const check = args.includes("--check") || args.includes("check");
     const uninstall = args.includes("--uninstall") || args.includes("uninstall");
     const replace = args.includes("--replace");
@@ -46,8 +51,9 @@ export async function runHookInstaller(options: HookInstallerOptions): Promise<n
 
     let alternatePathToRemove: string | null = null;
     if (!uninstall) {
-      const alternateRoot = scope === "user" ? resolve(process.cwd()) : home;
-      const alternatePath = resolve(alternateRoot, configRelativePath);
+      const alternatePath = scope === "user"
+        ? resolve(process.cwd(), configRelativePath)
+        : userConfigPath;
       if (alternatePath !== configPath) {
         const alternate = readSafeJsonConfig(alternatePath);
         const classification = alternate ? classifyClientHooks(alternate, client, sourceRepo) : null;

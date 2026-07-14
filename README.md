@@ -53,9 +53,11 @@ codex mcp add claude-peers -- bun "$HOME/claude-peers-mcp/server.ts"
 gemini mcp add --scope user --transport stdio claude-peers bun "$HOME/claude-peers-mcp/server.ts"
 ```
 
-The tracked `.mcp.json` is the portable project-scope Claude fixture. Codex stores MCP servers in `.codex/config.toml`; Gemini stores them under `mcpServers` in `.gemini/settings.json`.
+User scope is the canonical configuration so the peer bus works across repositories. `examples/claude-mcp.json` is an inert project-scope Claude template; copy and adapt it to `.mcp.json` only when deliberately choosing project scope instead of the user registration above. Codex stores MCP servers in `.codex/config.toml`; Gemini stores them under `mcpServers` in `.gemini/settings.json`.
 
 ### Install receive hooks
+
+Claude receive hooks require `bash`, `curl`, `flock`, `jq`, `ps`, `awk`, `sed`, and `tail`; the installer fails closed when any are missing instead of installing an inert receiver.
 
 User scope is the default so hooks work across repositories:
 
@@ -70,7 +72,14 @@ bun bin/install-codex-hook.ts --check
 bun bin/install-gemini-hook.ts --check
 ```
 
-- Claude: `SessionStart` registration; normal receipt uses the MCP adaptive poll buffer and tool-response/check fallback.
+For an alternate Claude profile, point both install and check at its configuration directory:
+
+```bash
+CLAUDE_CONFIG_DIR="$HOME/.claude-b" bun bin/install-claude-hook.ts install
+CLAUDE_CONFIG_DIR="$HOME/.claude-b" bun bin/install-claude-hook.ts --check
+```
+
+- Claude: `SessionStart` registration, `UserPromptSubmit` drain, and a `Stop` `asyncRewake` standby watcher. The watcher polls every 10 seconds for the first hour after activity, then every 60 seconds while the Claude process remains alive; later Stop events refresh the fast window without spawning duplicate watchers.
 - Codex: `SessionStart` registration and drain, `UserPromptSubmit` drain, and `Stop` turn-end drain.
 - Gemini: `SessionStart` registration and `BeforeAgent` drain. The installer also renders its supported `mcpServers` entry.
 
@@ -136,7 +145,7 @@ Tmux capture is always explicit through `inspect_peer_pane` or `include_tmux_con
 
 | Client | Receiver mode | Receipt path |
 | --- | --- | --- |
-| Claude Code | `claude/claude-channel` | Phase-spread adaptive MCP polling, channel attempt, and tool-response/check acknowledgement. |
+| Claude Code | `claude/claude-channel` | Prompt-time hook drain plus refreshable idle `asyncRewake` watcher; adaptive MCP polling and explicit `check_messages` remain safety nets. |
 | Codex with current hooks | `codex/codex-hook` | Prompt/start/turn-end hook claim and acknowledgement. Background MCP polling stays disabled. |
 | Gemini with current hooks | `gemini/gemini-hook` | `BeforeAgent` hook claim and acknowledgement. Background MCP polling stays disabled. |
 | Codex or Gemini without a proven hook | `*/manual-drain` | `check_messages` until the hook registers and heartbeats successfully. |
@@ -180,6 +189,12 @@ History intentionally outlives ephemeral peer rows. Schema version 1 has no mess
 | `CLAUDE_PEERS_BRIDGE_TOKEN_FILE` | `$HOME/.claude-peers-bridge.token` | 0600 bearer token for privileged history reads. |
 | `CLAUDE_PEERS_METRICS_ENABLED` | `true` | Authenticated aggregate route and latency metrics; never content or IDs. |
 | `CLAUDE_PEERS_ADAPTIVE_POLLING` | `true` | Adaptive Claude receive polling. |
+| `CLAUDE_CONFIG_DIR` | `$HOME/.claude` | Claude profile directory used by the hook installer and hook logs. |
+| `CLAUDE_PEERS_STANDBY_ACTIVE_SECONDS` | `3600` | Fast standby-poll window after each Claude Stop event. |
+| `CLAUDE_PEERS_STANDBY_POLL_INTERVAL_SECONDS` | `10` | Poll cadence during the fast standby window. |
+| `CLAUDE_PEERS_STANDBY_IDLE_INTERVAL_SECONDS` | `60` | Reduced cadence after the fast window while Claude remains alive. |
+| `CLAUDE_PEERS_STANDBY_LOCK_WAIT_SECONDS` | `2` | Bounded takeover wait for a prior watcher. |
+| `CLAUDE_PEERS_STANDBY_RUNTIME_DIR` | `$XDG_RUNTIME_DIR` or `$HOME/.cache` | Owner-only watcher lock and atomic session state root. |
 | `CLAUDE_PEERS_TMUX_UNCHANGED_WRITE_SUPPRESSION` | `true` | Skip unchanged identity stamps; failed stamps receive three bounded retries. |
 | `CLAUDE_PEERS_HEARTBEAT_PHASE_SPREAD` | `true` | Deterministically de-phase fleet heartbeats. |
 | `CLAUDE_PEERS_HEARTBEAT_MS` | `15000` | Adapter heartbeat interval. |
@@ -265,7 +280,19 @@ The capacity gate is intentionally long and retains 108 records:
 bun run benchmark:peers -- --peers 1,10,50 --repetitions 3 --stages baseline,instrumented,tmux-suppressed,adaptive
 ```
 
-`bun run smoke:clients` is a separate, blocking release-host gate. It must run only on the explicitly armed A3-owned isolated Linux account with release-pinned, authenticated Claude, Codex, and Gemini clients. Missing prerequisites block release rather than being skipped.
+`bun run smoke:clients` is a separate, blocking release-host gate. It must run only on the explicitly armed A3-owned isolated Linux account with release-pinned, authenticated Claude, Codex, and Gemini clients. The clone must live inside that account's home directory:
+
+```bash
+export CLAUDE_PEERS_RELEASE_HOME="$HOME"
+export CLAUDE_PEERS_RELEASE_SMOKE=1
+export CLAUDE_PEERS_RELEASE_TIMEOUT_MS=180000
+export CLAUDE_PEERS_RELEASE_CLAUDE_VERSION=2.1.207
+export CLAUDE_PEERS_RELEASE_CODEX_VERSION=0.144.1
+export CLAUDE_PEERS_RELEASE_GEMINI_VERSION=0.47.0
+bun run smoke:clients
+```
+
+The gate records client versions, installs user-scope MCP and receive-hook configuration, proves noninteractive authentication, then runs three clients concurrently through a cyclic discovery, `send_to_peer`, `check_messages`, and acknowledgement journey. It removes the managed MCP and hook configuration in `finally`, retains no client transcript, and emits only structured phase evidence. Missing prerequisites return blocked status; a client or journey failure returns nonzero. The A3 operator must rotate or revoke temporary credentials after the run.
 
 ## License
 

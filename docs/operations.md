@@ -72,6 +72,8 @@ bun bin/install-gemini-hook.ts --check
 
 Use `--replace` for an intentional scope transfer. Correct installers are byte- and mtime-stable no-ops. A material change gets a unique 0600 sibling backup. `--restore <backup-path>` is guarded against restoring an unrelated backup or overwriting a subsequently edited install.
 
+Alternate Claude profiles are explicit: prefix both install and check with `CLAUDE_CONFIG_DIR=/path/to/profile`. Claude standby delivery uses a 10-second cadence for the first hour after Stop, then 60 seconds while the Claude process remains alive; later Stop events atomically refresh the fast deadline and current adapter PID. The `CLAUDE_PEERS_STANDBY_*` controls are documented in the README configuration table. Watcher state is owner-only under `CLAUDE_PEERS_STANDBY_RUNTIME_DIR`, `$XDG_RUNTIME_DIR`, or `$HOME/.cache` in that order.
+
 After MCP or hook changes:
 
 1. Restart the affected client session.

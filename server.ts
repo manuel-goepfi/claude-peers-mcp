@@ -1227,6 +1227,27 @@ function sendStatusHint(target: SendMessageResponse["target"] | undefined, deliv
   return " Still queued; receiver mode is unknown, so manual check_messages may be required.";
 }
 
+export function messageStatusLine(
+  row: { state?: string; delivered: boolean; delivered_at: string | null } | undefined,
+  target: SendMessageResponse["target"] | undefined,
+): string {
+  if (!row) return "";
+  switch (row.state) {
+    case "acknowledged":
+      return row.delivered_at ? ` Acknowledged at ${row.delivered_at}.` : " Acknowledged.";
+    case "claimed":
+      return " Claimed by the receiver; acknowledgement is pending.";
+    case "unknown":
+      return " Delivery state is unknown; ask the receiver to check_messages if this handoff is urgent.";
+    case "queued":
+      return sendStatusHint(target, false);
+    default:
+      if (row.delivered && row.delivered_at) return ` Acknowledged at ${row.delivered_at}.`;
+      if (!row.delivered) return sendStatusHint(target, false);
+      return "";
+  }
+}
+
 export function listPeersRoutingHint(scope: "machine" | "directory" | "repo", peerCount: number, hasTmux: boolean): string {
   if (scope !== "repo" || peerCount <= 1) return "";
   const tmuxHint = hasTmux ? "" : " Retry with has_tmux=true to hide headless/task peers.";
@@ -1662,11 +1683,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
               { id: myId, ids: [result.id] }
             );
             const row = s.statuses?.[0];
-            if (row?.delivered && row.delivered_at) {
-              statusLine = ` Acknowledged at ${row.delivered_at}.`;
-            } else if (row && !row.delivered) {
-              statusLine = sendStatusHint(result.target, false);
-            }
+            statusLine = messageStatusLine(row, result.target);
           } catch (e) {
             // Best-effort confirmation: log to stderr so ops can grep for
             // repeated failures (auth breakage, broker restart race, etc.).
@@ -1741,11 +1758,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
               { id: myId, ids: [result.id] }
             );
             const row = s.statuses?.[0];
-            if (row?.delivered && row.delivered_at) {
-              statusLine = ` Acknowledged at ${row.delivered_at}.`;
-            } else if (row && !row.delivered) {
-              statusLine = sendStatusHint(result.target, false);
-            }
+            statusLine = messageStatusLine(row, result.target);
           } catch (e) {
             statusLine = " Delivery status unavailable; ask the receiver to check_messages if this handoff is urgent.";
             log(`message-status probe failed for id=${result.id}: ${errMsg(e)}`);
@@ -2112,11 +2125,20 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
 // --- Polling loop for inbound messages ---
 
+let pollTransportFailed = false;
+
+export function successfulPollOutcome(newMessageCount: number, recovered: boolean): PollOutcome {
+  if (newMessageCount > 0) return "nonempty";
+  return recovered ? "recovered" : "empty";
+}
+
 async function pollAndPushMessages(): Promise<PollOutcome> {
   if (!myId) return "empty";
 
   try {
     const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
+    const recovered = pollTransportFailed;
+    pollTransportFailed = false;
 
     // Collect new messages that need buffering + channel push
     const newMessages: Message[] = [];
@@ -2129,7 +2151,7 @@ async function pollAndPushMessages(): Promise<PollOutcome> {
       newMessages.push(msg);
     }
 
-    if (newMessages.length === 0) return "empty";
+    if (newMessages.length === 0) return successfulPollOutcome(0, recovered);
 
     // Fetch peer list once for sender metadata (not per-message)
     let peerCache: Peer[] | null = null;
@@ -2176,8 +2198,9 @@ async function pollAndPushMessages(): Promise<PollOutcome> {
       // Delivery confirmed ONLY when drainPendingMessages() or check_messages
       // includes this message in a tool response that Claude actually reads.
     }
-    return "nonempty";
+    return successfulPollOutcome(newMessages.length, recovered);
   } catch (e) {
+    pollTransportFailed = true;
     log(`Poll error: ${e instanceof Error ? e.message : String(e)}`);
     return "error";
   }

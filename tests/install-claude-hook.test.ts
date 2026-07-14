@@ -3,6 +3,7 @@ import { chmodSync, cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, r
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { classifyClientHooks, installClientHooks } from "../shared/hook-config.ts";
+import { missingClaudeHookDependencies } from "../bin/install-claude-hook.ts";
 
 const installer = new URL("../bin/install-claude-hook.ts", import.meta.url).pathname;
 const repoRoot = new URL("..", import.meta.url).pathname.replace(/\/$/, "");
@@ -14,6 +15,12 @@ async function run(repo: string, ...args: string[]): Promise<{ code: number; std
 }
 
 describe("Claude hook installer", () => {
+  test("reports missing runtime dependencies before an inert install", () => {
+    expect(missingClaudeHookDependencies((command) => command === "bash" ? "/bin/bash" : null)).toEqual([
+      "awk", "curl", "flock", "jq", "ps", "sed", "tail",
+    ]);
+  });
+
   test("merges registration hooks, then remains byte and mtime stable", async () => {
     const repo = mkdtempSync(join(tmpdir(), "claude-peers-claude-install-"));
     try {
@@ -35,13 +42,18 @@ describe("Claude hook installer", () => {
 
       const doc = JSON.parse(readFileSync(path, "utf8")) as {
         permissions: { allow: string[] };
-        hooks: Record<string, Array<{ matcher?: string; hooks?: Array<{ command?: string }> }>>;
+        hooks: Record<string, Array<{ matcher?: string; hooks?: Array<{ command?: string; async?: boolean; asyncRewake?: boolean; timeout?: number }> }>>;
       };
       expect(doc.permissions.allow).toEqual(["Read"]);
       const sessionBuckets = doc.hooks.SessionStart!;
       const session = sessionBuckets.flatMap((bucket) => bucket.hooks ?? []);
       expect(sessionBuckets[0]?.matcher).toBe("startup|resume");
       expect(session.filter((hook) => hook.command?.includes("claude-register-peer-session.sh"))).toHaveLength(1);
+      const promptHooks = doc.hooks.UserPromptSubmit!.flatMap((bucket) => bucket.hooks ?? []);
+      expect(promptHooks.filter((hook) => hook.command?.includes("claude-drain-peer-inbox.sh"))).toHaveLength(1);
+      const stopHooks = doc.hooks.Stop!.flatMap((bucket) => bucket.hooks ?? []);
+      const standby = stopHooks.find((hook) => hook.command?.includes("claude-standby-watcher.sh"));
+      expect(standby).toMatchObject({ async: true, asyncRewake: true, timeout: 2_592_000 });
       expect(doc.hooks.PreToolUse![0]?.hooks?.[0]?.command).toBe("existing.sh");
       expect(statSync(path).mode & 0o777).toBe(0o600);
     } finally {
@@ -139,14 +151,14 @@ describe("Claude hook installer", () => {
       chmodSync(join(project, ".claude"), 0o770);
       expect((await invoke("--scope", "project", project, "--replace")).code).toBe(1);
       const preservedUser = JSON.parse(readFileSync(userPath, "utf8")) as Record<string, unknown>;
-      expect(classifyClientHooks(preservedUser, "claude", repoRoot).exact).toBe(1);
+      expect(classifyClientHooks(preservedUser, "claude", repoRoot).exact).toBe(3);
       chmodSync(join(project, ".claude"), 0o700);
 
       expect((await invoke("--scope", "project", project, "--replace")).code).toBe(0);
       const user = JSON.parse(readFileSync(userPath, "utf8")) as Record<string, unknown>;
       const projectDoc = JSON.parse(readFileSync(join(project, ".claude", "settings.json"), "utf8")) as Record<string, unknown>;
       expect(classifyClientHooks(user, "claude", repoRoot).exact).toBe(0);
-      expect(classifyClientHooks(projectDoc, "claude", repoRoot).exact).toBe(1);
+      expect(classifyClientHooks(projectDoc, "claude", repoRoot).exact).toBe(3);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -187,9 +199,64 @@ describe("Claude hook installer", () => {
       chmodSync(join(home, ".claude"), 0o770);
       const failedTransfer = await invoke("--scope", "project", project, "--replace");
       expect(failedTransfer.code).toBe(1);
-      expect(classifyClientHooks(JSON.parse(readFileSync(userPath, "utf8")), "claude", repoRoot).exact).toBe(1);
+      expect(classifyClientHooks(JSON.parse(readFileSync(userPath, "utf8")), "claude", repoRoot).exact).toBe(3);
       const rolledBack = JSON.parse(readFileSync(projectPath, "utf8")) as Record<string, unknown>;
       expect(classifyClientHooks(rolledBack, "claude", repoRoot).exact).toBe(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("replaces legacy user-level receive hooks instead of installing duplicate drains", async () => {
+    const repo = mkdtempSync(join(tmpdir(), "claude-peers-claude-legacy-"));
+    try {
+      const path = join(repo, ".claude", "settings.json");
+      mkdirSync(join(repo, ".claude"), { recursive: true });
+      writeFileSync(path, `${JSON.stringify({
+        hooks: {
+          UserPromptSubmit: [{ hooks: [{ type: "command", command: "$HOME/.claude/hooks/drain-peer-inbox.sh" }] }],
+          Stop: [{ hooks: [{ type: "command", command: "$HOME/.claude/hooks/claude-peers-standby-watcher.sh", timeout: 3600, asyncRewake: true }] }],
+          PreToolUse: [{ hooks: [{ type: "command", command: "/opt/custom/drain-peer-inbox.sh" }] }],
+        },
+      }, null, 2)}\n`, { mode: 0o600 });
+
+      expect((await run(repo)).code).toBe(0);
+      const doc = JSON.parse(readFileSync(path, "utf8")) as {
+        hooks: Record<string, Array<{ hooks?: Array<{ command?: string }> }>>;
+      };
+      const commands = Object.values(doc.hooks).flatMap((buckets) => buckets.flatMap((bucket) => bucket.hooks ?? [])).map((hook) => hook.command ?? "");
+      expect(commands.filter((command) => command.includes("claude-drain-peer-inbox.sh"))).toHaveLength(1);
+      expect(commands).toContain("/opt/custom/drain-peer-inbox.sh");
+      expect(commands.filter((command) => command.includes("standby-watcher.sh"))).toEqual([expect.stringContaining("claude-standby-watcher.sh")]);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  test("honors CLAUDE_CONFIG_DIR for alternate user profiles", async () => {
+    const root = mkdtempSync(join(tmpdir(), "claude-peers-claude-profile-"));
+    try {
+      const home = join(root, "home");
+      const safeClone = join(home, "clone");
+      const profile = join(home, ".claude-b");
+      mkdirSync(safeClone, { recursive: true, mode: 0o700 });
+      mkdirSync(profile, { mode: 0o700 });
+      for (const entry of ["bin", "shared", "hooks"]) cpSync(join(repoRoot, entry), join(safeClone, entry), { recursive: true });
+      const safeInstaller = join(safeClone, "bin", "install-claude-hook.ts");
+      const proc = Bun.spawn(["bun", safeInstaller], {
+        cwd: home,
+        env: { ...process.env, HOME: home, CLAUDE_CONFIG_DIR: profile },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [code, stderr] = await Promise.all([proc.exited, new Response(proc.stderr).text()]);
+      expect(code).toBe(0);
+      expect(stderr).toBe("");
+
+      const profilePath = join(profile, "settings.json");
+      const profileDoc = JSON.parse(readFileSync(profilePath, "utf8")) as Record<string, unknown>;
+      expect(classifyClientHooks(profileDoc, "claude", safeClone).exact).toBe(3);
+      expect(() => readFileSync(join(home, ".claude", "settings.json"))).toThrow();
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

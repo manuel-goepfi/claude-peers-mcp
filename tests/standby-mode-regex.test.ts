@@ -6,32 +6,13 @@
  * Errors here are safety-relevant — autonomous execution of peer
  * instructions without user confirmation is the dangerous failure mode.
  *
- * We extract the regex from claude-peers-standby-watcher.sh and re-run it
- * against a table of realistic summaries via a bash subprocess.
+ * Exercise the same helper the watcher invokes against realistic summaries.
  */
 import { describe, test, expect } from "bun:test";
-
-// Mirror the auto-mode pattern from the shell script EXACTLY. If the shell
-// script's pattern changes, this test must be updated in lockstep.
-const STANDBY_PHRASE = "(standby|stand[[:space:]]+by|standing[[:space:]]+by|awaiting|waiting[[:space:]]+for|ready[[:space:]]+for|holding[[:space:]]+for|listening[[:space:]]+for)";
-const AUTO_MODE_BASH = `
-  if [[ "\$1" =~ ${STANDBY_PHRASE}[[:space:]]+auto[[:space:]] ]] \\
-    || [[ "\$1" =~ (^|[[:space:]])auto[[:space:]]+${STANDBY_PHRASE} ]]; then
-    echo auto
-  else
-    echo ask
-  fi
-`;
+import { autoWakeEnabled } from "../hooks/claude-wake-mode.ts";
 
 async function modeFor(summary: string): Promise<string> {
-  // Append a trailing space so the "[[:space:]]" boundary matches at end.
-  const lc = (summary + " ").toLowerCase();
-  const proc = Bun.spawn(["bash", "-c", AUTO_MODE_BASH, "_", lc], {
-    stdout: "pipe",
-  });
-  const out = await new Response(proc.stdout).text();
-  await proc.exited;
-  return out.trim();
+  return autoWakeEnabled(summary) ? "auto" : "ask";
 }
 
 describe("standby watcher — auto-mode regex", () => {
@@ -47,7 +28,7 @@ describe("standby watcher — auto-mode regex", () => {
     expect(await modeFor("standby — waiting for handoff")).toBe("ask");
   });
 
-  test("'awaiting auto X' → auto (auto adjacent to waiting phrase)", async () => {
+  test("'awaiting auto X' → auto (standalone auto token)", async () => {
     expect(await modeFor("awaiting auto approval from executor")).toBe("auto");
   });
 
@@ -83,5 +64,9 @@ describe("standby watcher — auto-mode regex", () => {
 
   test("'Standing By Auto' → auto (case-insensitive)", async () => {
     expect(await modeFor("Standing By Auto — launch pad green")).toBe("auto");
+  });
+
+  test("'auto' alone → auto", async () => {
+    expect(await modeFor("auto")).toBe("auto");
   });
 });

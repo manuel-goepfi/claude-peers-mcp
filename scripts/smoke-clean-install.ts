@@ -113,12 +113,12 @@ export async function main(): Promise<void> {
   const root = mkdtempSync(join(tmpdir(), "claude-peers-clean-install-"));
   const home = join(root, "home");
   const clone = join(home, "claude-peers-mcp");
-  const project = join(home, "project");
   try {
     mkdirSync(home, { mode: 0o700 });
-    mkdirSync(project, { mode: 0o700 });
     mkdirSync(clone, { mode: 0o700 });
-    for (const entry of ["bin", "hooks", "shared", "server.ts", "broker.ts", "package.json", "bun.lock"]) {
+    const packageDocument = JSON.parse(readFileSync(join(sourceRoot, "package.json"), "utf8")) as { files?: unknown };
+    invariant(Array.isArray(packageDocument.files) && packageDocument.files.every((entry) => typeof entry === "string"), "package files manifest is missing or invalid");
+    for (const entry of ["package.json", ...packageDocument.files]) {
       cpSync(join(sourceRoot, entry), join(clone, entry), { recursive: true });
     }
     chmodSync(clone, 0o700);
@@ -143,7 +143,7 @@ export async function main(): Promise<void> {
     };
     const firstBackups = new Map<string, string>();
     for (const client of ["claude", "codex", "gemini"] as const) {
-      const result = await run([process.execPath, installers[client]], { cwd: project, home });
+      const result = await run([process.execPath, installers[client]], { cwd: clone, home });
       invariant(result.stderr === "", `${client} installer wrote unexpected stderr`);
       firstBackups.set(client, backupFrom(result.stdout));
     }
@@ -161,15 +161,15 @@ export async function main(): Promise<void> {
         mtime: statSync(path).mtimeMs,
         backups: readdirSync(directory).filter((name) => name.includes(".bak-")).length,
       });
-      await run([process.execPath, installers[client], "--check"], { cwd: project, home });
-      await run([process.execPath, installers[client]], { cwd: project, home });
+      await run([process.execPath, installers[client], "--check"], { cwd: clone, home });
+      await run([process.execPath, installers[client]], { cwd: clone, home });
       const before = beforeNoop.get(client)!;
       invariant(readFileSync(path).equals(before.bytes), `${client} second install changed bytes`);
       invariant(statSync(path).mtimeMs === before.mtime, `${client} second install changed mtime`);
       invariant(readdirSync(directory).filter((name) => name.includes(".bak-")).length === before.backups, `${client} second install created a backup`);
     }
 
-    const surfaces = inspectClientSurfaces(home, project, clone);
+    const surfaces = inspectClientSurfaces(home, clone, clone);
     for (const client of ["claude", "codex", "gemini"] as const) {
       invariant(surfaces[client].hooks.user.state === "current", `${client} user hook surface is not current`);
       invariant(surfaces[client].mcp.user.state === "current", `${client} user MCP surface is not current`);
@@ -179,10 +179,10 @@ export async function main(): Promise<void> {
     await protocolSmoke(root, clone);
 
     for (const client of ["claude", "codex", "gemini"] as const) {
-      await run([process.execPath, installers[client], "--uninstall"], { cwd: project, home });
-      const reinstalled = await run([process.execPath, installers[client]], { cwd: project, home });
+      await run([process.execPath, installers[client], "--uninstall"], { cwd: clone, home });
+      const reinstalled = await run([process.execPath, installers[client]], { cwd: clone, home });
       const restoreBackup = backupFrom(reinstalled.stdout);
-      await run([process.execPath, installers[client], "--restore", restoreBackup], { cwd: project, home });
+      await run([process.execPath, installers[client], "--restore", restoreBackup], { cwd: clone, home });
       const file = client === "codex" ? "hooks.json" : "settings.json";
       invariant(readFileSync(join(home, `.${client}`, file), "utf8") === originals[client], `${client} restore did not recover the original configuration`);
       invariant(firstBackups.has(client), `${client} first backup evidence was not retained`);

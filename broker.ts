@@ -54,8 +54,11 @@ import type {
 // for the reap predicate without touching the broker's startup shape.
 import { isReapable, deadSeatMailExpired, shouldRotateLog, PEER_GHOST_AFTER_MS } from "./shared/reaper.ts";
 import { PEERS_VERSION } from "./shared/version.ts";
+import { CLAIM_TTL_MS, claimCutoffIso } from "./shared/delivery-state.ts";
 import { acquireBrokerOwnership, assertDatabaseIdentity, type BrokerLifecycleIdentity } from "./shared/broker-lifecycle.ts";
 import {
+  OWNER_ONLY_UMASK,
+  hardenSqliteArtifacts,
   initializeStorage,
   positiveMilliseconds,
   PostCommitStorageVerificationError,
@@ -67,6 +70,10 @@ import {
   type StorageReadiness,
 } from "./shared/storage.ts";
 import { RuntimeMetrics } from "./shared/runtime-metrics.ts";
+
+// The broker is a dedicated process. Establish owner-only creation semantics
+// before the ownership lock, SQLite database, WAL/SHM, backup, or token exists.
+process.umask(OWNER_ONLY_UMASK);
 
 const PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const TEST_PORT_ZERO = process.env.NODE_ENV === "test" && process.env.CLAUDE_PEERS_TEST_PORT_ZERO === "1";
@@ -118,6 +125,12 @@ try {
     ownerMode: configuredOwnerMode as "direct" | "systemd" | undefined,
   });
   assertDatabaseIdentity(CONFIGURED_DB_PATH, ownership.canonicalDatabasePath);
+  try {
+    hardenSqliteArtifacts(ownership.canonicalDatabasePath);
+  } catch (error) {
+    ownership.release();
+    throw error;
+  }
 } catch (error) {
   console.error(`[claude-peers broker] FATAL: database ownership failed: ${error instanceof Error ? error.message : String(error)}`);
   server.stop(true);
@@ -160,7 +173,6 @@ const RATE_WINDOW_MS = 60_000;         // 1-minute rolling window
 const RATE_MAX_MSGS = 60;              // max messages sent per peer per window
 const RATE_MAX_REQS = 600;             // max broker requests per peer per window (10/s avg)
 const MAX_BROADCAST_TARGETS = RATE_MAX_MSGS; // hard cap = 60 — ties fanout to per-minute msg quota
-const CLAIM_TTL_MS = 30_000;
 const CLAIM_MAX_MESSAGES = 25;
 const CLAIM_MAX_BYTES = 64 * 1024;
 function booleanEnv(name: string, defaultValue: boolean): boolean {
@@ -559,8 +571,15 @@ const selectAllPeers = db.prepare(`
   SELECT * FROM peers
 `);
 
+const publicPeerColumns = `
+  id, pid, cwd, git_root, absolute_git_dir, tty, name, resolved_name,
+  tmux_session, tmux_window_index, tmux_window_name, tmux_pane_id,
+  client_type, receiver_mode, last_hook_seen_at, last_drain_at,
+  last_drain_error, summary, registered_at, last_seen
+`;
+
 const selectAllTargetablePeers = db.prepare(`
-  SELECT * FROM peers WHERE non_targetable = 0
+  SELECT ${publicPeerColumns} FROM peers WHERE non_targetable = 0
 `);
 
 const selectTargetablePeerCount = db.prepare(`
@@ -568,11 +587,11 @@ const selectTargetablePeerCount = db.prepare(`
 `);
 
 const selectPeersByDirectory = db.prepare(`
-  SELECT * FROM peers WHERE cwd = ? AND non_targetable = 0
+  SELECT ${publicPeerColumns} FROM peers WHERE cwd = ? AND non_targetable = 0
 `);
 
 const selectPeersByGitRoot = db.prepare(`
-  SELECT * FROM peers WHERE git_root = ? AND non_targetable = 0
+  SELECT ${publicPeerColumns} FROM peers WHERE git_root = ? AND non_targetable = 0
 `);
 
 const insertMessage = db.prepare(`
@@ -985,10 +1004,6 @@ function ttyCompatibleForSamePid(existingValue: string | null | undefined, incom
   const existing = normalizedTtyForIdentity(existingValue);
   const incoming = normalizedTtyForIdentity(incomingValue);
   return existing === incoming || existing === null || incoming === null;
-}
-
-function claimCutoffIso(nowMs = Date.now()): string {
-  return new Date(nowMs - CLAIM_TTL_MS).toISOString();
 }
 
 function selectAvailableMessages(peerId: string): Message[] {

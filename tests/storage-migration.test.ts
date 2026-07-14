@@ -142,6 +142,31 @@ describe("versioned historical-message migration", () => {
     db.close();
   });
 
+  test("partial v0 schema backfills only missing delivered retention anchors", () => {
+    const dir = root();
+    const dbPath = join(dir, "partial-v0.db");
+    const migrationTimestamp = "2026-07-10T12:34:56.000Z";
+    const preservedAnchor = "2026-07-01T00:00:00.000Z";
+    const db = new Database(dbPath);
+    db.run("CREATE TABLE peers (id TEXT PRIMARY KEY,pid INTEGER NOT NULL,cwd TEXT NOT NULL,git_root TEXT,tty TEXT,summary TEXT NOT NULL DEFAULT '',registered_at TEXT NOT NULL,last_seen TEXT NOT NULL)");
+    db.run("CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT,from_id TEXT NOT NULL,to_id TEXT NOT NULL,text TEXT NOT NULL,sent_at TEXT NOT NULL,delivered INTEGER NOT NULL DEFAULT 0,delivered_at TEXT,retention_at TEXT,claimed_by TEXT,claimed_at TEXT)");
+    db.run("INSERT INTO peers VALUES ('p',1,'/',NULL,NULL,'','2026','2026')");
+    db.run("INSERT INTO messages (from_id,to_id,text,sent_at,delivered,delivered_at,retention_at) VALUES ('p','p','missing','2026',1,NULL,NULL)");
+    db.run("INSERT INTO messages (from_id,to_id,text,sent_at,delivered,delivered_at,retention_at) VALUES ('p','p','preserved','2026',1,'2026',?)", [preservedAnchor]);
+    db.run("INSERT INTO messages (from_id,to_id,text,sent_at,delivered,retention_at) VALUES ('p','p','queued','2026',0,NULL)");
+
+    initializeStorage(db, { databasePath: dbPath, backupPath: join(dir, "partial-v0.backup"), migrationTimestamp });
+    const rows = db.query("SELECT text,retention_at FROM messages ORDER BY id").all() as Array<{ text: string; retention_at: string | null }>;
+    expect(rows).toEqual([
+      { text: "missing", retention_at: migrationTimestamp },
+      { text: "preserved", retention_at: preservedAnchor },
+      { text: "queued", retention_at: null },
+    ]);
+    expect(initializeStorage(db, { databasePath: dbPath }).migrated).toBe(false);
+    expect(db.query("SELECT text,retention_at FROM messages ORDER BY id").all()).toEqual(rows);
+    db.close();
+  });
+
   test("pre-commit interruption rolls back and reuses the verified backup", () => {
     const dir = root();
     const dbPath = join(dir, "rollback.db");

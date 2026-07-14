@@ -5,6 +5,7 @@ import { detectClientFromProcessChain, findBgSpareAncestor, findClientPidFromPro
 import { ownerProcessIsCurrent, readOwnerMetadata } from "./broker-lifecycle.ts";
 import { classifyClientHooks, type HookClassification, type HookClient } from "./hook-config.ts";
 import { STORAGE_SCHEMA_VERSION, storageTableColumns, storageUserVersion } from "./storage.ts";
+import { claimCutoffIso } from "./delivery-state.ts";
 
 export type SurfaceState = "current" | "stale" | "missing" | "malformed" | "unsafe";
 
@@ -36,7 +37,7 @@ export interface DatabaseAggregates {
   clients: Record<string, number>;
   receiver_modes: Record<string, number>;
   receiver_health: { observed: number; errors: number };
-  queue: { queued: number; claimed: number; acknowledged: number; total: number };
+  queue: { queued: number; claimed: number; acknowledged: number; unknown: number; total: number };
   correlation: { registered_processes: number; live_registered_processes: number; adapters_with_registered_client: number; adapters_without_registered_client: number };
 }
 
@@ -269,13 +270,16 @@ function decodeDatabase(db: Database, version: number, processes: Map<number, Pr
       SUM(CASE WHEN julianday(last_seen) >= julianday('now', '-60 seconds') THEN 1 ELSE 0 END) AS active
     FROM peers
   `).get() as { total: number; targetable: number; active: number };
+  const hasClaims = messageColumns.has("claimed_by") && messageColumns.has("claimed_at");
+  const hasDeliveredAt = messageColumns.has("delivered_at");
   const queue = db.query(`
     SELECT COUNT(*) AS total,
-      SUM(CASE WHEN delivered = 0 AND ${messageColumns.has("claimed_by") ? "claimed_by IS NULL" : "1"} THEN 1 ELSE 0 END) AS queued,
-      SUM(CASE WHEN delivered = 0 AND ${messageColumns.has("claimed_by") ? "claimed_by IS NOT NULL" : "0"} THEN 1 ELSE 0 END) AS claimed,
-      SUM(CASE WHEN delivered = 1 THEN 1 ELSE 0 END) AS acknowledged
+      SUM(CASE WHEN delivered = 0 AND ${hasClaims ? "(claimed_by IS NULL OR claimed_at IS NULL OR claimed_at < ?)" : "1"} THEN 1 ELSE 0 END) AS queued,
+      SUM(CASE WHEN delivered = 0 AND ${hasClaims ? "claimed_by IS NOT NULL AND claimed_at IS NOT NULL AND claimed_at >= ?" : "0"} THEN 1 ELSE 0 END) AS claimed,
+      SUM(CASE WHEN delivered = 1 AND ${hasDeliveredAt ? "delivered_at IS NOT NULL" : "0"} THEN 1 ELSE 0 END) AS acknowledged,
+      SUM(CASE WHEN delivered = 1 AND ${hasDeliveredAt ? "delivered_at IS NULL" : "1"} THEN 1 ELSE 0 END) AS unknown
     FROM messages
-  `).get() as { total: number; queued: number; claimed: number; acknowledged: number };
+  `).get(...(hasClaims ? [claimCutoffIso(), claimCutoffIso()] : [])) as { total: number; queued: number; claimed: number; acknowledged: number; unknown: number };
   const health = peerColumns.has("last_hook_seen_at") && peerColumns.has("last_drain_error")
     ? db.query("SELECT SUM(last_hook_seen_at IS NOT NULL) AS observed, SUM(last_drain_error IS NOT NULL) AS errors FROM peers").get() as { observed: number; errors: number }
     : { observed: 0, errors: 0 };
@@ -289,7 +293,7 @@ function decodeDatabase(db: Database, version: number, processes: Map<number, Pr
     clients: peerColumns.has("client_type") ? grouped(db, "SELECT client_type, COUNT(*) AS count FROM peers GROUP BY client_type ORDER BY client_type", "client_type") : { unknown: Number(peer.total ?? 0) },
     receiver_modes: peerColumns.has("receiver_mode") ? grouped(db, "SELECT receiver_mode, COUNT(*) AS count FROM peers GROUP BY receiver_mode ORDER BY receiver_mode", "receiver_mode") : { unknown: Number(peer.total ?? 0) },
     receiver_health: { observed: Number(health.observed ?? 0), errors: Number(health.errors ?? 0) },
-    queue: { queued: Number(queue.queued ?? 0), claimed: Number(queue.claimed ?? 0), acknowledged: Number(queue.acknowledged ?? 0), total: Number(queue.total ?? 0) },
+    queue: { queued: Number(queue.queued ?? 0), claimed: Number(queue.claimed ?? 0), acknowledged: Number(queue.acknowledged ?? 0), unknown: Number(queue.unknown ?? 0), total: Number(queue.total ?? 0) },
     correlation: {
       registered_processes: registeredPids.length,
       live_registered_processes: registeredPids.filter((pid) => processes.has(pid)).length,
@@ -403,7 +407,7 @@ export function renderDoctorHuman(report: DoctorReport): string {
   if (report.database.aggregates) {
     const a = report.database.aggregates;
     lines.push(`peers: total=${a.peers.total} active=${a.peers.active} targetable=${a.peers.targetable}`);
-    lines.push(`queue: queued=${a.queue.queued} claimed=${a.queue.claimed} acknowledged=${a.queue.acknowledged} total=${a.queue.total}`);
+    lines.push(`queue: queued=${a.queue.queued} claimed=${a.queue.claimed} acknowledged=${a.queue.acknowledged} unknown=${a.queue.unknown} total=${a.queue.total}`);
     lines.push(`receiver-health: observed=${a.receiver_health.observed} errors=${a.receiver_health.errors}`);
     lines.push(`correlation: registered=${a.correlation.registered_processes} live=${a.correlation.live_registered_processes} matched-adapters=${a.correlation.adapters_with_registered_client} unmatched-adapters=${a.correlation.adapters_without_registered_client}`);
   }

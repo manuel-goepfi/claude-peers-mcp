@@ -67,6 +67,16 @@ export function latencyStats(samples: LatencySample[], state: ReceiverState): La
   return summarizeLatency(values);
 }
 
+export function benchmarkAdapterIdentityEnv(index: number): Record<string, string> {
+  const paneId = `%${index + 1}`;
+  return {
+    CLAUDE_PEER_NAME: `bench-${index}`,
+    TMUX_PANE: paneId,
+    CLAUDE_PEER_TMUX_SESSION: "peer-fleet",
+    CLAUDE_PEER_TMUX_PANE_ID: paneId,
+  };
+}
+
 function mulberry32(seed: number): () => number {
   let value = seed >>> 0;
   return () => {
@@ -249,8 +259,7 @@ async function startAdapters(options: {
         CLAUDE_PEERS_DB: options.broker.dbPath,
         CLAUDE_PEERS_BROKER_LOG: options.broker.logPath,
         CLAUDE_PEERS_CLIENT_TYPE: "claude",
-        CLAUDE_PEER_NAME: `bench-${index}`,
-        TMUX_PANE: `%${index + 1}`,
+        ...benchmarkAdapterIdentityEnv(index),
         CLAUDE_PEERS_FAKE_TMUX_STATE: options.fakeTmuxState,
         CLAUDE_PEERS_METRICS_ENABLED: capabilities.metrics ? "true" : "false",
         CLAUDE_PEERS_TMUX_UNCHANGED_WRITE_SUPPRESSION: capabilities.tmux_write_suppression ? "true" : "false",
@@ -505,6 +514,7 @@ export function evaluateCampaign(records: FleetRunRecord[], quick = false): Camp
   const checks: CampaignCheck[] = [];
   const coordinateCounts = new Map<string, number>();
   const byStage = new Map<BenchmarkStage, Map<string, FleetRunRecord>>();
+  const reconciledWindows = new Map<WindowRecord, { requestsPerSecond: number; maxOneSecondRequests: number }>();
   for (const stage of BENCHMARK_STAGES) byStage.set(stage, new Map());
   for (const record of records) {
     const coordinate = `${record.stage}|${pairKey(record)}`;
@@ -552,6 +562,36 @@ export function evaluateCampaign(records: FleetRunRecord[], quick = false): Camp
     const windowRoutes: Record<string, number> = {};
     for (const window of record.windows) {
       for (const [route, count] of Object.entries(window.routes)) windowRoutes[route] = (windowRoutes[route] ?? 0) + count;
+      const bucketRoutes: Record<string, number> = {};
+      const bucketSeconds = new Set<number>();
+      let bucketTotal = 0;
+      let bucketsInternallyConsistent = true;
+      for (const bucket of window.one_second_buckets) {
+        const bucketRouteTotal = Object.values(bucket.routes).reduce((sum, value) => sum + value, 0);
+        bucketsInternallyConsistent &&= bucketRouteTotal === bucket.total;
+        bucketsInternallyConsistent &&= Number.isInteger(bucket.second)
+          && bucket.second >= 0
+          && bucket.second < record.window_ms / 1_000
+          && !bucketSeconds.has(bucket.second);
+        bucketSeconds.add(bucket.second);
+        bucketTotal += bucket.total;
+        for (const [route, count] of Object.entries(bucket.routes)) bucketRoutes[route] = (bucketRoutes[route] ?? 0) + count;
+      }
+      const requestsPerSecond = bucketTotal / (record.window_ms / 1_000);
+      const maxOneSecondRequests = Math.max(0, ...window.one_second_buckets.map((bucket) => bucket.total));
+      reconciledWindows.set(window, { requestsPerSecond, maxOneSecondRequests });
+      const evidenceMatches = bucketsInternallyConsistent
+        && bucketTotal === window.total_requests
+        && Object.values(window.routes).reduce((sum, value) => sum + value, 0) === window.total_requests
+        && JSON.stringify(Object.entries(bucketRoutes).sort()) === JSON.stringify(Object.entries(window.routes).sort())
+        && Math.abs(requestsPerSecond - window.requests_per_second) < 1e-9
+        && maxOneSecondRequests === window.max_one_second_requests;
+      checks.push({
+        name: `one-second evidence ${record.stage} ${pairKey(record)} window ${window.index}`,
+        passed: evidenceMatches,
+        actual: `${bucketTotal}/${window.total_requests}/${maxOneSecondRequests}/${window.max_one_second_requests}`,
+        limit: "bucket totals/routes/rate/max reconcile with window scalars",
+      });
     }
     const routeTotalsMatch = JSON.stringify(Object.entries(windowRoutes).sort()) === JSON.stringify(Object.entries(record.route_totals).sort());
     const errorsMatch = record.windows.reduce((sum, window) => sum + window.errors, 0) === record.errors;
@@ -602,8 +642,9 @@ export function evaluateCampaign(records: FleetRunRecord[], quick = false): Camp
     addAdaptiveCheck(`final CPU reduction ${key}`, reduction >= 0.5, reduction, ">=0.50");
     addAdaptiveCheck(`final PSS ratio ${key}`, pssRatio <= 1.10, pssRatio, "<=1.10");
     for (const window of adaptive.windows) {
-      addAdaptiveCheck(`request budget ${key} window ${window.index}`, window.requests_per_second <= 10, window.requests_per_second, "<=10/s");
-      addAdaptiveCheck(`one-second herd ${key} window ${window.index}`, window.max_one_second_requests <= 20, window.max_one_second_requests, "<=20");
+      const reconciled = reconciledWindows.get(window)!;
+      addAdaptiveCheck(`request budget ${key} window ${window.index}`, reconciled.requestsPerSecond <= 10, reconciled.requestsPerSecond, "<=10/s");
+      addAdaptiveCheck(`one-second herd ${key} window ${window.index}`, reconciled.maxOneSecondRequests <= 20, reconciled.maxOneSecondRequests, "<=20");
     }
     const latency = adaptive.scenario === "one-active" ? adaptive.queue_to_buffer.active : adaptive.queue_to_buffer.idle;
     const p95Limit = adaptive.scenario === "one-active" ? 2_000 : 11_000;

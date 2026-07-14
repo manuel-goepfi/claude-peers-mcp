@@ -31,6 +31,12 @@ const publicVariables = [
   "CLAUDE_PEERS_BRIDGE_TOKEN_FILE",
   "CLAUDE_PEERS_METRICS_ENABLED",
   "CLAUDE_PEERS_ADAPTIVE_POLLING",
+  "CLAUDE_CONFIG_DIR",
+  "CLAUDE_PEERS_STANDBY_ACTIVE_SECONDS",
+  "CLAUDE_PEERS_STANDBY_POLL_INTERVAL_SECONDS",
+  "CLAUDE_PEERS_STANDBY_IDLE_INTERVAL_SECONDS",
+  "CLAUDE_PEERS_STANDBY_LOCK_WAIT_SECONDS",
+  "CLAUDE_PEERS_STANDBY_RUNTIME_DIR",
   "CLAUDE_PEERS_TMUX_UNCHANGED_WRITE_SUPPRESSION",
   "CLAUDE_PEERS_HEARTBEAT_PHASE_SPREAD",
   "CLAUDE_PEERS_HEARTBEAT_MS",
@@ -60,6 +66,8 @@ describe("public distribution contract", () => {
       "broker.ts",
       "cli.ts",
       "shared/broker-service.ts",
+      "bin/install-claude-hook.ts",
+      "hooks/claude-standby-watcher.sh",
     ].map(read).join("\n");
     for (const variable of publicVariables) {
       expect(runtime).toContain(variable);
@@ -82,7 +90,7 @@ describe("public distribution contract", () => {
       engines: { bun: string };
       packageManager: string;
     };
-    const mcp = JSON.parse(read(".mcp.json")) as { mcpServers: Record<string, { command: string; args: string[] }> };
+    const mcp = JSON.parse(read("examples/claude-mcp.json")) as { mcpServers: Record<string, { command: string; args: string[] }> };
     const license = read("LICENSE");
     const readme = read("README.md");
 
@@ -92,7 +100,8 @@ describe("public distribution contract", () => {
     expect(pkg.engines.bun).toBe("1.3.11");
     expect(pkg.packageManager).toBe("bun@1.3.11");
     expect(readme).toContain(pkg.repository.url);
-    expect(mcp.mcpServers["claude-peers"]).toEqual({ command: "bun", args: ["./server.ts"] });
+    expect(mcp.mcpServers["claude-peers"]).toEqual({ command: "bun", args: ["/absolute/path/to/claude-peers-mcp/server.ts"] });
+    expect(readme).toContain("User scope is the canonical configuration");
     expect(license).toContain("MIT License");
     expect(license).toContain("Copyright (c) 2026 Louis Arge");
   });

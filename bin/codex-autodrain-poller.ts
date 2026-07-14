@@ -634,24 +634,11 @@ export async function reconcileVisibleCodexSeats(snap: TickSnapshot, deps: Recon
           tmux_window_name: seat.tmux.window_name ?? null,
           tmux_pane_id: seat.tmux.pane_id ?? null,
           client_type: "codex",
-          receiver_mode: "codex-hook",
+          receiver_mode: "manual-drain",
           preserve_token: true,
           summary: "",
         });
         publish(reg, seat.tmux);
-        await post("/hook-heartbeat-by-pid", {
-          pid: seat.pid,
-          caller_pid: process.pid,
-          client_type: "codex",
-          receiver_mode: "codex-hook",
-          status: "ok",
-          drained: 0,
-        });
-        publish({
-          ...reg,
-          client_type: "codex",
-          receiver_mode: "codex-hook",
-        }, seat.tmux);
       } catch (e) {
         log(`codex seat reconcile failed for ${seat.name} pid=${seat.pid} pane=${seat.tmux.pane_id ?? "?"}: ${e instanceof Error ? e.message : String(e)}`);
       }

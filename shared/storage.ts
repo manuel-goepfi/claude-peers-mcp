@@ -17,6 +17,18 @@ import { dirname, resolve } from "node:path";
 import { fsyncDirectory } from "./fs-durability.ts";
 
 export const STORAGE_SCHEMA_VERSION = 1;
+export const OWNER_ONLY_UMASK = 0o077;
+
+export function hardenSqliteArtifacts(databasePath: string, uid = process.getuid?.() ?? -1): void {
+  for (const path of [databasePath, `${databasePath}-wal`, `${databasePath}-shm`]) {
+    if (!existsSync(path)) continue;
+    const stat = lstatSync(path);
+    if (stat.isSymbolicLink() || !stat.isFile() || (uid >= 0 && stat.uid !== uid)) {
+      throw new Error(`unsafe SQLite artifact: ${path}`);
+    }
+    if ((stat.mode & 0o777) !== 0o600) chmodSync(path, 0o600);
+  }
+}
 
 export function positiveMilliseconds(raw: string | undefined, fallback: number): number {
   if (raw === undefined) return fallback;
@@ -412,7 +424,7 @@ function migrateLegacy(
       const claimedBy = oldColumns.has("claimed_by") ? "claimed_by" : "NULL";
       const claimedAt = oldColumns.has("claimed_at") ? "claimed_at" : "NULL";
       const retentionAt = oldColumns.has("retention_at")
-        ? "retention_at"
+        ? "CASE WHEN delivered = 1 THEN COALESCE(retention_at, ?) ELSE retention_at END"
         : "CASE WHEN delivered = 1 THEN ? ELSE NULL END";
       db.prepare(`
         INSERT INTO messages_v1 (
@@ -422,7 +434,7 @@ function migrateLegacy(
         SELECT id, from_id, to_id, text, sent_at, delivered,
                ${deliveredAt}, ${retentionAt}, ${claimedBy}, ${claimedAt}
         FROM messages ORDER BY id
-      `).run(...(oldColumns.has("retention_at") ? [] : [migrationTimestamp]));
+      `).run(migrationTimestamp);
       onCheckpoint?.("copy-complete");
       db.run("DROP TABLE messages");
       db.run("ALTER TABLE messages_v1 RENAME TO messages");

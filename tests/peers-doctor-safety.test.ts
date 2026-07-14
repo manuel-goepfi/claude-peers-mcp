@@ -119,7 +119,7 @@ describe("peers doctor safety", () => {
       const json = await runDoctor(server.port!, fixture, true);
       expect(human.exitCode).toBe(0);
       expect(json.exitCode).toBe(0);
-      expect(JSON.parse(json.output).database.aggregates.queue).toEqual({ queued: 1, claimed: 1, acknowledged: 0, total: 2 });
+      expect(JSON.parse(json.output).database.aggregates.queue).toEqual({ queued: 1, claimed: 1, acknowledged: 0, unknown: 0, total: 2 });
       expect(human.output).not.toContain("secret");
       expect(json.output).not.toContain("secret");
       expect(stateSnapshot(fixture.dbPath)).toBe(before);

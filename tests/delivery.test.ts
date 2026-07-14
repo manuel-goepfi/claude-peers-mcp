@@ -532,11 +532,12 @@ describe("Live broker delivery features", () => {
     );
     shaped.close();
 
-    const listed = await brokerFetch<Array<{ id: string }>>("/list-peers", {
+    const listed = await brokerFetch<Array<{ id: string; token?: unknown; non_targetable?: unknown }>>("/list-peers", {
       id: cli.id, scope: "machine", cwd: "/", git_root: null,
     });
     expect(listed.some((peer) => peer.id === cli.id)).toBe(false);
     expect(listed.some((peer) => peer.id === ordinary.id)).toBe(true);
+    expect(listed.every((peer) => !("token" in peer) && !("non_targetable" in peer))).toBe(true);
 
     const targetCli = await brokerFetch<{ ok: boolean; code?: string }>("/send-message", {
       from_id: ordinary.id, to_id: cli.id, text: "must not target cli",

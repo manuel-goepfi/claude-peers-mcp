@@ -56,6 +56,35 @@ describe("schema-aware doctor", () => {
     }
   });
 
+  test("uses canonical queue, claim-expiry, acknowledgement, and unknown states", () => {
+    const root = temporaryRoot("doctor-delivery-states");
+    try {
+      const dbPath = join(root, "states.db");
+      const db = new Database(dbPath);
+      initializeStorage(db, { databasePath: dbPath });
+      const now = new Date().toISOString();
+      const expired = new Date(Date.now() - 60_000).toISOString();
+      db.run("INSERT INTO peers (id,pid,cwd,summary,registered_at,last_seen) VALUES ('p',?,'/','',?,?)", [process.pid, now, now]);
+      const insert = db.prepare("INSERT INTO messages (from_id,to_id,text,sent_at,delivered,delivered_at,claimed_by,claimed_at) VALUES ('p','p',?,?,?, ?, ?, ?)");
+      insert.run("queued", now, 0, null, null, null);
+      insert.run("expired claim", now, 0, null, "old-drain", expired);
+      insert.run("active claim", now, 0, null, "live-drain", now);
+      insert.run("acknowledged", now, 1, now, null, null);
+      insert.run("legacy unknown", now, 1, null, null, null);
+      db.close();
+
+      expect(inspectDatabase(dbPath, "ready").aggregates?.queue).toEqual({
+        queued: 2,
+        claimed: 1,
+        acknowledged: 1,
+        unknown: 1,
+        total: 5,
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("unreachable health refuses schema reads while a live owner exists", () => {
     const root = temporaryRoot("doctor-owner");
     try {

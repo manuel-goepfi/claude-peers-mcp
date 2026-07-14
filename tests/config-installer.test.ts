@@ -73,7 +73,7 @@ describe("configuration installer safety", () => {
       mkdirSync(join(root, ".claude"), { mode: 0o700 });
       writeFileSync(target, "{\n  \"theme\": \"before\"\n}\n", { mode: 0o600 });
       const proc = Bun.spawn(["bun", claudeInstaller, root], {
-        env: { ...process.env, CLAUDE_PEERS_INSTALL_TEST_PAUSE_MS: "250" },
+        env: { ...process.env, HOME: root, CLAUDE_PEERS_INSTALL_TEST_PAUSE_MS: "250" },
         stdout: "pipe",
         stderr: "pipe",
       });
@@ -93,7 +93,7 @@ describe("configuration installer safety", () => {
   test("concurrent first installs converge without corrupting JSON", async () => {
     const root = mkdtempSync(join(tmpdir(), "claude-peers-config-concurrent-"));
     try {
-      const env = { ...process.env, CLAUDE_PEERS_INSTALL_TEST_PAUSE_MS: "150" };
+      const env = { ...process.env, HOME: root, CLAUDE_PEERS_INSTALL_TEST_PAUSE_MS: "150" };
       const processes = [0, 1].map(() => Bun.spawn(["bun", claudeInstaller, root], { env, stdout: "pipe", stderr: "pipe" }));
       const codes = await Promise.all(processes.map((proc) => proc.exited));
       expect(codes.every((code) => code === 0 || code === 1)).toBe(true);

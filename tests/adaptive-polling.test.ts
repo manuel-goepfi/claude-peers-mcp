@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { AdaptivePollScheduler, cadencePhaseDelay, deterministicPollPhase, phaseSpreadDelay, POLL_BACKOFF_MS } from "../shared/poll-scheduler.ts";
-import { shouldReplacePollDeadline } from "../server.ts";
+import { shouldReplacePollDeadline, successfulPollOutcome } from "../server.ts";
 
 describe("adaptive Claude polling", () => {
   test("rapid activity can pull a poll earlier but cannot postpone its deadline", () => {
@@ -52,6 +52,12 @@ describe("adaptive Claude polling", () => {
     expect(scheduler.afterPoll("recovered", 15_000).state).toBe("active");
     scheduler.afterPoll("empty", 21_000);
     expect(scheduler.afterPoll("error", 22_000).state).toBe("active");
+  });
+
+  test("the first successful empty poll after a transport error reports recovery", () => {
+    expect(successfulPollOutcome(0, true)).toBe("recovered");
+    expect(successfulPollOutcome(0, false)).toBe("empty");
+    expect(successfulPollOutcome(1, true)).toBe("nonempty");
   });
 
   test("phase spreading is deterministic and keeps active under 2s and idle under 11s", () => {

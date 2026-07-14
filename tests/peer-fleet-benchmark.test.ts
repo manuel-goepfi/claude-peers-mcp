@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { evaluateCampaign, latencyStats, type FleetRunRecord } from "../bench/peer-fleet.ts";
+import { benchmarkAdapterIdentityEnv, evaluateCampaign, latencyStats, type FleetRunRecord } from "../bench/peer-fleet.ts";
 
 function record(stage: FleetRunRecord["stage"], overrides: Partial<FleetRunRecord> = {}): FleetRunRecord {
   return {
@@ -17,7 +17,16 @@ function record(stage: FleetRunRecord["stage"], overrides: Partial<FleetRunRecor
     window_ms: 60_000,
     environment: { bun: "1.3.11", kernel: "test", cpu: "test", clock_ticks_per_second: 100 },
     capabilities: { metrics: stage !== "baseline", tmux_write_suppression: stage === "tmux-suppressed" || stage === "adaptive", adaptive_polling: stage === "adaptive", heartbeat_phase_spread: stage === "adaptive" },
-    windows: [1, 2, 3].map((index) => ({ index, total_requests: 300, requests_per_second: 5, max_one_second_requests: 8, one_second_buckets: [{ second: 0, total: 8, routes: { "POST /poll-messages": 8 } }], routes: { "POST /poll-messages": 300 }, errors: 0, rate_limited: 0 })),
+    windows: [1, 2, 3].map((index) => ({
+      index,
+      total_requests: 300,
+      requests_per_second: 5,
+      max_one_second_requests: 5,
+      one_second_buckets: Array.from({ length: 60 }, (_, second) => ({ second, total: 5, routes: { "POST /poll-messages": 5 } })),
+      routes: { "POST /poll-messages": 300 },
+      errors: 0,
+      rate_limited: 0,
+    })),
     route_totals: { "POST /poll-messages": 900 },
     cpu_seconds: stage === "adaptive" ? 40 : 100,
     cpu_seconds_by_process: { broker: 20, adapters: stage === "adaptive" ? 20 : 80 },
@@ -65,6 +74,14 @@ function passingCampaign(): FleetRunRecord[] {
 }
 
 describe("peer fleet evidence evaluation", () => {
+  test("gives every simulated adapter a canonical unique tmux seat", () => {
+    expect(benchmarkAdapterIdentityEnv(0)).toMatchObject({
+      CLAUDE_PEER_TMUX_SESSION: "peer-fleet",
+      CLAUDE_PEER_TMUX_PANE_ID: "%1",
+    });
+    expect(benchmarkAdapterIdentityEnv(9).CLAUDE_PEER_TMUX_PANE_ID).toBe("%10");
+  });
+
   test("latency summaries retain state-specific p50/p95/max", () => {
     const samples = [
       { milliseconds: 10, state: "active" as const },
@@ -114,6 +131,15 @@ describe("peer fleet evidence evaluation", () => {
     expect(summary.passed).toBe(false);
     expect(summary.checks.some((check) => check.name.startsWith("adaptive transition evidence") && !check.passed)).toBe(true);
     expect(summary.checks.some((check) => check.name.startsWith("tmux-suppressed tmux write suppression") && !check.passed)).toBe(true);
+  });
+
+  test("rejects contradictory one-second evidence even when trusted scalars look healthy", () => {
+    const records = passingCampaign();
+    const window = records[0]!.windows[0]!;
+    window.one_second_buckets = [{ second: 0, total: 1, routes: { "POST /poll-messages": 1 } }];
+    const summary = evaluateCampaign(records);
+    expect(summary.passed).toBe(false);
+    expect(summary.checks.some((check) => check.name.startsWith("one-second evidence") && !check.passed)).toBe(true);
   });
 
   test("requests a transport proposal only after two adaptive misses", () => {

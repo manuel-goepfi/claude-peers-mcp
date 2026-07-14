@@ -11,6 +11,7 @@ export interface CanonicalHook {
   matcher?: string;
   entry: Hook;
   scriptMarker: string;
+  legacyMarkers?: string[];
 }
 
 const shellQuote = (value: string): string => `'${value.replace(/'/g, "'\\''")}'`;
@@ -55,32 +56,43 @@ export function canonicalHooks(client: HookClient, repoRoot: string): CanonicalH
     ];
   }
   const register = bashCommand(resolve(hooksRoot, "claude-register-peer-session.sh"));
-  return [{
-    event: "SessionStart", matcher: "startup|resume", scriptMarker: "claude-register-peer-session.sh",
-    entry: { type: "command", command: register, timeout: 10, statusMessage: "Registering peer session" },
-  }];
+  const drain = bashCommand(resolve(hooksRoot, "claude-drain-peer-inbox.sh"));
+  const standby = bashCommand(resolve(hooksRoot, "claude-standby-watcher.sh"));
+  return [
+    {
+      event: "SessionStart", matcher: "startup|resume", scriptMarker: "claude-register-peer-session.sh",
+      entry: { name: "claude-peers-claude-register", type: "command", command: register, timeout: 10, statusMessage: "Registering peer session" },
+    },
+    {
+      event: "UserPromptSubmit", scriptMarker: "claude-drain-peer-inbox.sh", legacyMarkers: [".claude/hooks/drain-peer-inbox.sh"],
+      entry: { name: "claude-peers-claude-inbox", type: "command", command: drain, timeout: 10, statusMessage: "Checking peer inbox" },
+    },
+    {
+      event: "Stop", scriptMarker: "claude-standby-watcher.sh", legacyMarkers: ["claude-peers-standby-watcher.sh"],
+      entry: { name: "claude-peers-claude-standby", type: "command", command: standby, async: true, asyncRewake: true, timeout: 2_592_000 },
+    },
+  ];
 }
 
-function isManagedHook(client: HookClient, hook: Hook): boolean {
+function isManagedHook(client: HookClient, hook: Hook, specs: CanonicalHook[]): boolean {
   const name = typeof hook.name === "string" ? hook.name : "";
   const command = typeof hook.command === "string" ? hook.command : "";
   if (name.startsWith(`claude-peers-${client}`)) return true;
-  if (client === "claude") return command.includes("claude-register-peer-session.sh");
-  return command.includes(`${client}-register-peer-session.sh`) || command.includes(`${client}-drain-peer-inbox`);
+  return specs.some((spec) => [spec.scriptMarker, ...(spec.legacyMarkers ?? [])].some((marker) => command.includes(marker)));
 }
 
-function matchesSpec(client: HookClient, spec: CanonicalHook, hook: Hook): boolean {
-  return isManagedHook(client, hook) && (
-    hook.name === spec.entry.name ||
-    (typeof hook.command === "string" && hook.command.includes(spec.scriptMarker))
-  );
+function matchesSpec(spec: CanonicalHook, hook: Hook): boolean {
+  const name = typeof hook.name === "string" ? hook.name : "";
+  const command = typeof hook.command === "string" ? hook.command : "";
+  const markers = [spec.scriptMarker, ...(spec.legacyMarkers ?? [])];
+  return name === spec.entry.name || markers.some((marker) => command.includes(marker));
 }
 
 function upsert(document: HookDocument, client: HookClient, spec: CanonicalHook): void {
   document.hooks ??= {};
   document.hooks[spec.event] ??= [];
   const buckets = document.hooks[spec.event]!;
-  const matches = (hook: Hook) => matchesSpec(client, spec, hook);
+  const matches = (hook: Hook) => matchesSpec(spec, hook);
   let target = buckets.find((bucket) =>
     (bucket.matcher ?? undefined) === spec.matcher && Array.isArray(bucket.hooks) && bucket.hooks.some(matches)
   );
@@ -138,10 +150,11 @@ export function uninstallClientHooks(
   repoRoot: string,
 ): Record<string, unknown> {
   const doc = document as HookDocument;
+  const specs = canonicalHooks(client, repoRoot);
   if (doc.hooks) {
     for (const buckets of Object.values(doc.hooks)) {
       for (const bucket of buckets) {
-        if (Array.isArray(bucket.hooks)) bucket.hooks = bucket.hooks.filter((hook) => !isManagedHook(client, hook));
+        if (Array.isArray(bucket.hooks)) bucket.hooks = bucket.hooks.filter((hook) => !isManagedHook(client, hook, specs));
       }
     }
   }
@@ -174,7 +187,7 @@ export function classifyClientHooks(document: Record<string, unknown>, client: H
         : [],
     );
     if (exactMatches.length === 1) exact++;
-    else if (buckets.some((bucket) => (bucket.hooks ?? []).some((hook) => matchesSpec(client, spec, hook)))) stale++;
+    else if (buckets.some((bucket) => (bucket.hooks ?? []).some((hook) => matchesSpec(spec, hook)))) stale++;
   }
   return { expected: specs.length, exact, stale, missing: specs.length - exact - stale };
 }
