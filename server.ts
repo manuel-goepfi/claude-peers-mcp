@@ -892,18 +892,19 @@ export function resolvePeerName(
 ): string {
   const observerFallback = `observer-${pid}`;
   let peerName = envName ?? tmuxFallbackName ?? observerFallback;
-  // R6.1 (revised 2026-07-17 seat-audit): a task subagent NEVER squats the
-  // base seat name, regardless of how the name resolved. The original rule
-  // suffixed only the env-name/no-tmux case, on the assumption that tmux
-  // ancestry proves a real operator seat — DISPROVEN live (pane %681): an
-  // in-pane fan-out subagent's /proc walk reaches the real pane_pid, so N
-  // subagents all resolved the SAME tmux label and collided on the operator
-  // seat (same-seat supersede churn + last-writer-wins pane-stamp confusion).
-  // A real operator seat cannot trip this: its grandparent is a shell/tmux,
-  // never a claude, so isTaskSubagent stays false. The observer fallback is
-  // already pid-unique — no suffix needed there.
-  if (isTaskSubagentResult && peerName !== observerFallback) {
-    peerName = `${peerName}.task.${pid}`;
+  // R6.1: suffix ONLY the env-name/no-tmux case. A 2026-07-17 attempt to
+  // suffix tmux-resolved subagent names too was REVERTED same-day: with
+  // mcp-stdio-guard.sh wrapping every launch, the server's ancestry gained a
+  // wrapper level, so isTaskSubagent's one-step grandparent check sees the
+  // OPERATOR's own claude and false-positives on EVERY ordinary guarded
+  // session — the no-tmux condition here is what masks that false positive
+  // (an operator session always has tmux ancestry; a true Task subagent has
+  // none). The in-pane co-tenancy collision (N fan-out subagents deriving the
+  // same tmux label — pane %681) remains OPEN; fixing it needs an ancestry
+  // walk that SKIPS wrapper layers and detects claude-under-claude beyond
+  // the immediate grandparent, not a broader suffix rule here.
+  if (envName && !tmuxFallbackName && isTaskSubagentResult) {
+    peerName = `${envName}.task.${pid}`;
   }
   return peerName;
 }
@@ -2330,7 +2331,7 @@ async function main() {
       : null);
   const isSubagent = isTaskSubagent();
   let peerName: string = resolvePeerName(envName, tmuxFallbackName, isSubagent, myRegisterPid);
-  if (isSubagent && peerName.includes(".task.")) {
+  if (envName && !tmuxFallbackName && isSubagent) {
     log(`Task subagent detected — peer name suffixed: ${peerName}`);
   }
 
