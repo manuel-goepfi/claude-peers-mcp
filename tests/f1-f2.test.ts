@@ -675,16 +675,30 @@ describe("F1+F2 live broker integration", () => {
       expect(first.name).toBe("codex.2");
       expect(first.resolved_name).toBe("codex.2");
       expect(second.name).toBe("codex.2");
-      // Lane-ordinal allocation: a colliding "<lane>.<ordinal>" name takes the
-      // next free ordinal (codex.2 -> codex.3), a real routable seat, not the
-      // opaque "codex.2#2" that re-collides with find_peer(name='codex.2').
-      expect(second.resolved_name).toBe("codex.3");
+      // SAME-SEAT duplicate = seat relaunch: the predecessor is flagged
+      // superseded at registration, so it is NOT collision material and the
+      // successor KEEPS the seat name (no launch.5→launch.6 name-creep).
+      expect(second.resolved_name).toBe("codex.2");
 
       const active = await brokerFetch<Peer[]>("/list-peers", { id: second.id, scope: "machine", cwd: "/", git_root: null });
       const diagnostic = await brokerFetch<Peer[]>("/list-peers", { id: second.id, scope: "machine", cwd: "/", git_root: null, include_inactive: true });
       expect(active.filter((p) => p.name === "codex.2")).toHaveLength(1);
       expect(diagnostic.filter((p) => p.name === "codex.2")).toHaveLength(2);
-      expect(diagnostic.map((p) => p.resolved_name).sort()).toContain("codex.3");
+
+      // DISTINCT-SEAT duplicate (a genuinely different live seat): supersede
+      // does not fire, so lane-ordinal allocation still disambiguates
+      // (codex.2 -> codex.3, a real routable seat, not an opaque "#2").
+      const childC = Bun.spawn(["sleep", "60"]);
+      try {
+        const third = await brokerFetch<{ id: string; name: string | null; resolved_name: string | null }>("/register", {
+          pid: childC.pid, cwd: "/dup-other", git_root: null, tty: "pts/dup2", name: "codex.2",
+          tmux_session: "codex", tmux_window_index: "2", tmux_window_name: "node", tmux_pane_id: "%201", summary: "",
+        });
+        expect(third.name).toBe("codex.2");
+        expect(third.resolved_name).toBe("codex.3");
+      } finally {
+        childC.kill();
+      }
     } finally {
       childA.kill();
       childB.kill();

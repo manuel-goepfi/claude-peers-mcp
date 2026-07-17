@@ -23,12 +23,17 @@ function disambiguateName(
   selfId: string,
   livePidCheck: (pid: number) => boolean,
   windowName?: string | null,
+  supersededIds: Set<string> = new Set(),
 ): string | null {
   if (!rawName) return null;
   const rows = db
-    .query("SELECT pid, name, tmux_window_name AS win FROM peers WHERE name IS NOT NULL AND id != ?")
-    .all(selfId) as { pid: number; name: string; win: string | null }[];
-  const live = rows.filter((r) => livePidCheck(r.pid));
+    .query("SELECT id, pid, name, tmux_window_name AS win FROM peers WHERE name IS NOT NULL AND id != ?")
+    .all(selfId) as { id: string; pid: number; name: string; win: string | null }[];
+  // Mirrors broker.ts: a just-superseded predecessor is still PID-alive until
+  // its next heartbeat consumes the step-down signal — it must not count as a
+  // live collision (else the successor's name bumps permanently on every seat
+  // relaunch: the launch.5 → launch.6 name-creep).
+  const live = rows.filter((r) => livePidCheck(r.pid) && !supersededIds.has(r.id));
   const liveNames = new Set(live.map((r) => r.name));
   if (!liveNames.has(rawName)) return rawName;
   // Window-name disambiguator preferred over "#N" (see broker.ts for rationale):
@@ -194,6 +199,39 @@ describe("broker name de-duplication", () => {
     );
     expect(disambiguateName(db, "different'name", "self", isAlive)).toBe(
       "different'name",
+    );
+  });
+
+  // --- seat-supersede exclusion (the launch.5 → launch.6 name-creep regression) ---
+
+  test("superseded-but-alive predecessor on the same seat does NOT bump the successor's name", () => {
+    // The live-repro shape: a seat relaunch registers a new process with the
+    // same operator name while the predecessor's MCP server is still PID-alive
+    // (it exits only on its NEXT heartbeat, after registration flagged it).
+    // Before the fix this resolved launch.5 → launch.6 on EVERY relaunch.
+    db.run("INSERT INTO peers (id, pid, name) VALUES ('old', 100, 'launch.5')");
+    alive.add(100); // predecessor still alive at name-resolution time
+    const superseded = new Set(["old"]); // registration flagged it before disambiguateName ran
+    expect(disambiguateName(db, "launch.5", "self", isAlive, null, superseded)).toBe(
+      "launch.5",
+    );
+  });
+
+  test("a live UNflagged collision still bumps — supersede exclusion is surgical", () => {
+    // Two genuinely-live distinct seats sharing a name must still disambiguate;
+    // only rows flagged superseded are exempt from collision.
+    db.run("INSERT INTO peers (id, pid, name) VALUES ('old', 100, 'launch.5')");
+    db.run("INSERT INTO peers (id, pid, name) VALUES ('other', 101, 'launch.6')");
+    alive.add(100); alive.add(101);
+    const superseded = new Set(["old"]);
+    // 'old' is exempt but 'other' (launch.6) is a real live seat: requesting
+    // launch.6 must still bump past it.
+    expect(disambiguateName(db, "launch.6", "self", isAlive, null, superseded)).toBe(
+      "launch.7",
+    );
+    // And requesting launch.5 lands cleanly because only 'old' held it.
+    expect(disambiguateName(db, "launch.5", "self", isAlive, null, superseded)).toBe(
+      "launch.5",
     );
   });
 

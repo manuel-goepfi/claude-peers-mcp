@@ -1376,9 +1376,15 @@ function handleSetName(body: SetNameRequest): { name: string | null; resolved_na
 function disambiguateName(rawName: string | null, selfId: string, windowName?: string | null): string | null {
   if (!rawName) return null;
   const rows = db.query(
-    "SELECT pid, COALESCE(resolved_name, name) AS name, tmux_window_name AS win FROM peers WHERE non_targetable = 0 AND COALESCE(resolved_name, name) IS NOT NULL AND id != ?"
-  ).all(selfId) as { pid: number; name: string; win: string | null }[];
-  const live = rows.filter(r => isPidAlive(r.pid));
+    "SELECT id, pid, COALESCE(resolved_name, name) AS name, tmux_window_name AS win FROM peers WHERE non_targetable = 0 AND COALESCE(resolved_name, name) IS NOT NULL AND id != ?"
+  ).all(selfId) as { id: string; pid: number; name: string; win: string | null }[];
+  // A just-superseded predecessor is still PID-alive until its next heartbeat
+  // consumes the step-down signal — registration flags it (supersededPeerIds)
+  // BEFORE this name resolution runs. Counting it as a live collision bumps
+  // the successor's name permanently on every seat relaunch (the launch.5 →
+  // launch.6 / c5.6 → c5.7 name-creep). Superseded rows are exiting by
+  // contract — never collision material.
+  const live = rows.filter(r => isPidAlive(r.pid) && !supersededPeerIds.has(r.id));
   const liveNames = new Set(live.map(r => r.name));
   if (!liveNames.has(rawName)) return rawName;
   // Self-documenting disambiguator: when two LIVE seats share an operator name,
