@@ -145,6 +145,11 @@ let shuttingDown = false;
 // reaches. We record the START of an unrecoverable-401 streak; any successful
 // broker call clears it. Env-overridable for tests.
 let firstUnrecoverable401At: number | null = null;
+// Explicit broker-declared step-down (409 "superseded" from any brokerFetch path):
+// set here, acted on by the heartbeat timer — same off-request-path exit rule as
+// the 401 streaks. No grace window: the broker's signal is as authoritative as
+// heartbeat.superseded (it is the same one-shot flag, delivered at auth time).
+let brokerDeclaredSuperseded = false;
 const ORPHAN_EXIT_GRACE_MS = Math.max(60_000, parseInt(process.env.CLAUDE_PEERS_ORPHAN_EXIT_GRACE_MS ?? "300000", 10) || 300_000);
 
 // Pure orphan-exit decision (exported for unit testing). Given the epoch-ms when
@@ -257,6 +262,15 @@ async function brokerFetch<T>(path: string, body: unknown, _retry = false): Prom
   // off the request path on the next heartbeat tick.
   if (res.status === 401 && !shuttingDown) {
     if (firstUnrecoverable401At === null) firstUnrecoverable401At = Date.now();
+  }
+  // Explicit step-down: broker answers 409 "superseded" when our id was seat-
+  // superseded AND our token already rotated (the authenticated
+  // heartbeat.superseded signal is unreachable for us). Record only — the
+  // heartbeat timer performs the exit off the request path.
+  if (res.status === 409 && !shuttingDown) {
+    const bodyText = await res.text();
+    if (bodyText.includes("superseded")) brokerDeclaredSuperseded = true;
+    throw new Error(`Broker error (${path}): 409 ${bodyText}`);
   }
   if (!res.ok) {
     const err = await res.text();
@@ -2588,10 +2602,11 @@ async function main() {
     const reapNow = Date.now();
     const unrecExpired = shouldOrphanExit(firstUnrecoverable401At, reapNow, ORPHAN_EXIT_GRACE_MS);
     const churnExpired = shouldOrphanExit(firstReregisterChurnAt, reapNow, ORPHAN_EXIT_GRACE_MS);
-    if (!shuttingDown && (unrecExpired || churnExpired)) {
+    if (!shuttingDown && (brokerDeclaredSuperseded || unrecExpired || churnExpired)) {
       // Name the streak(s) that actually crossed the grace window, not merely the
       // one whose timer is set — both can be live at once and the diagnoses differ.
       const causes = [];
+      if (brokerDeclaredSuperseded) causes.push("broker declared superseded (seat reclaimed, token rotated)");
       if (unrecExpired) causes.push("auth continuously rejected");
       if (churnExpired) causes.push("auth churning (re-register loop; seat reclaimed)");
       log(`orphaned: ${causes.join(" + ")} for >=${ORPHAN_EXIT_GRACE_MS}ms (another MCP server owns this session) — exiting`);

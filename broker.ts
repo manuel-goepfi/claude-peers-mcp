@@ -863,6 +863,17 @@ function authPeer(req: Request, claimedId: string | undefined, path: string): { 
   }
   const row = selectPeerByToken.get(claimedId, token) as { id: string; pid: number; token: string } | null;
   if (!row) {
+    // Seat-supersede for the token-rotated loser: a flagged id whose token no
+    // longer matches can NEVER consume the one-shot superseded signal on the
+    // authenticated /heartbeat path (auth fails before the flag is checked), so
+    // it 401-churns for the whole ORPHAN_EXIT_GRACE_MS window (observed: 10k+
+    // auth-fail heartbeats). Answer 409 "superseded" — with NO reregister hint —
+    // so the loser's brokerFetch sees an explicit step-down and exits within one
+    // heartbeat tick instead of grinding out the grace window.
+    if (supersededPeerIds.delete(claimedId)) {
+      console.error(`[broker] seat-supersede: told ${claimedId} to step down at auth (token already rotated)`);
+      return { ok: false, status: 409, error: "superseded" };
+    }
     console.error(`[broker] auth fail on ${path}: invalid token for ${claimedId}`);
     return { ok: false, status: 401, error: "invalid token for peer" };
   }
@@ -2225,7 +2236,8 @@ requestHandler = async (req: Request) => {
       // as the target).
       const claimedId = reqStrict(body.id) || reqStrict(body.from_id);
       const auth = authPeer(req, claimedId, path);
-      if (!auth.ok) return Response.json({ error: auth.error, reregister: true }, { status: auth.status });
+      // reregister hint only on 401 — a 409 "superseded" means step DOWN, not retry.
+      if (!auth.ok) return Response.json({ error: auth.error, reregister: auth.status === 401 }, { status: auth.status });
 
       // S5 + M5: rate limit. /heartbeat is exempt — already bounded by the
       // client-side HEARTBEAT_INTERVAL_MS, and 429-ing it would cascade into
