@@ -770,35 +770,97 @@ const confirmedDeliveredIds = new Set<number>();
 //
 // Returns false on any platform/ps failure — better to over-register under
 // the operator's name than to false-positive on a bare shell launch.
+// One frame of /proc ancestry: executable comm + full argv as a space-joined
+// string. frames[0] = the MCP server process's PARENT, walking upward.
+export type AncestryFrame = { comm: string; args: string };
+
+function frameIsClaudeBinary(f: AncestryFrame): boolean {
+  const c = f.comm.trim();
+  if (c === "claude" || c.endsWith("/claude")) return true;
+  // The version-store binary titles its comm as the bare version string
+  // (`~/.local/share/claude/versions/2.1.212` -> comm "2.1.212"); accept it
+  // only when argv confirms a claude binary (fail-closed).
+  if (/^\d+\.\d+\.\d+$/.test(c)) {
+    return f.args.includes("/claude/") || /(^|\/)claude(\s|$)/.test(f.args);
+  }
+  return false;
+}
+
+// PURE classifier (exported for unit tests) — 2026-07-17 seat-fix v2.
+// Decides "is this MCP server owned by a nested/fan-out subagent claude?"
+// from the ancestry chain alone. Design forced by two prior failures:
+//   (a) pane %681: N in-pane fan-out subagents all derived the operator's
+//       seat name (they DO have tmux ancestry — tmux presence proves nothing);
+//   (b) the one-step grandparent check false-positived on EVERY ordinary
+//       session once mcp-stdio-guard.sh started wrapping launches (the guard
+//       shifted the chain one level, making the session claude look like a
+//       spawning parent).
+// Rules, walking frames[0] upward:
+//   - Wrapper/intermediate frames (the guard's bash, sh -c, npm/node chains)
+//     are TRANSPARENT — skipped, never classified on.
+//   - The FIRST claude-binary frame = the session that owns this server.
+//   - A SECOND claude-binary frame above it = nesting => subagent, EXCEPT the
+//     persistent daemon (`daemon run` without `--origin transient`) — that is
+//     legacy bg-lane infrastructure, and a bg lane is a first-class seat.
+//     The TRANSIENT daemon (`daemon run --origin transient`) is exactly how
+//     Task-tool fan-out spawns => subagent.
+//   - Hard boundaries: tmux/sshd/systemd/init/login shells (args "-bash" /
+//     "-zsh") above the session claude mean we reached the operator's world
+//     with no nesting => NOT a subagent.
+export function classifySubagentAncestry(frames: AncestryFrame[]): boolean {
+  let seenSessionClaude = false;
+  for (const f of frames) {
+    if (frameIsClaudeBinary(f)) {
+      if (!seenSessionClaude) {
+        seenSessionClaude = true;
+        continue;
+      }
+      if (f.args.includes("daemon run") && !f.args.includes("--origin transient")) return false;
+      return true;
+    }
+    if (seenSessionClaude) {
+      const c = f.comm.trim();
+      const a = f.args.trim();
+      if (c.startsWith("tmux") || c === "sshd" || c === "systemd" || c === "init" || a === "-bash" || a === "-zsh") {
+        return false;
+      }
+      // plain bash/sh/node/npm frames are transparent intermediates — keep walking.
+    }
+  }
+  return false;
+}
+
+function readAncestryFrames(startPid: number, maxDepth = 12): AncestryFrame[] {
+  const frames: AncestryFrame[] = [];
+  let pid = startPid;
+  for (let i = 0; i < maxDepth && pid > 1; i++) {
+    let comm = "";
+    let args = "";
+    let ppid = 0;
+    try {
+      comm = require("fs").readFileSync(`/proc/${pid}/comm`, "utf8").trim();
+      args = require("fs").readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0").join(" ").trim();
+      const stat = require("fs").readFileSync(`/proc/${pid}/stat`, "utf8");
+      // field after the last ')' then: state ppid — comm may contain spaces/parens.
+      const rest = stat.slice(stat.lastIndexOf(")") + 2);
+      ppid = parseInt(rest.split(" ")[1], 10);
+    } catch {
+      break;
+    }
+    frames.push({ comm, args });
+    if (!ppid || ppid <= 1) break;
+    pid = ppid;
+  }
+  return frames;
+}
+
 function isTaskSubagent(): boolean {
   try {
-    const myParent = process.ppid; // = the claude process that spawned us
+    const myParent = process.ppid;
     if (!myParent || myParent <= 1) return false;
-    // Walk one step up to claude's own parent.
-    const ppidProc = Bun.spawnSync(["ps", "-o", "ppid=", "-p", String(myParent)]);
-    if (ppidProc.exitCode !== 0) return false;
-    const grandparentPid = parseInt(new TextDecoder().decode(ppidProc.stdout).trim(), 10);
-    if (!grandparentPid || grandparentPid <= 1) return false;
-    const commProc = Bun.spawnSync(["ps", "-o", "comm=", "-p", String(grandparentPid)]);
-    if (commProc.exitCode !== 0) return false;
-    const comm = new TextDecoder().decode(commProc.stdout).trim();
-    // `comm` is the basename of the executable. Match both `claude` and an
-    // absolute-path comm like `/usr/local/bin/claude` (older ps versions).
-    if (comm === "claude" || comm.endsWith("/claude")) return true;
-    // 2026-07-17 seat-audit: the version-store claude binary titles its comm
-    // as the bare version string (`~/.local/share/claude/versions/2.1.212`
-    // -> comm "2.1.212"), which defeated the exact-name match and let every
-    // in-pane fan-out subagent collide on the operator seat (verified live:
-    // 3 lanes all named C5_finishall.1 on pane %681). Accept a version-shaped
-    // comm ONLY when the grandparent's argv confirms a claude binary
-    // (fail-closed: ambiguous -> not a subagent, same posture as before).
-    if (/^\d+\.\d+\.\d+$/.test(comm)) {
-      const argsProc = Bun.spawnSync(["ps", "-o", "args=", "-p", String(grandparentPid)]);
-      if (argsProc.exitCode !== 0) return false;
-      const args = new TextDecoder().decode(argsProc.stdout);
-      return args.includes("/claude/") || /(^|\/)claude(\s|$)/.test(args);
-    }
-    return false;
+    const frames = readAncestryFrames(myParent);
+    if (frames.length === 0) return false;
+    return classifySubagentAncestry(frames);
   } catch {
     return false;
   }
@@ -892,19 +954,18 @@ export function resolvePeerName(
 ): string {
   const observerFallback = `observer-${pid}`;
   let peerName = envName ?? tmuxFallbackName ?? observerFallback;
-  // R6.1: suffix ONLY the env-name/no-tmux case. A 2026-07-17 attempt to
-  // suffix tmux-resolved subagent names too was REVERTED same-day: with
-  // mcp-stdio-guard.sh wrapping every launch, the server's ancestry gained a
-  // wrapper level, so isTaskSubagent's one-step grandparent check sees the
-  // OPERATOR's own claude and false-positives on EVERY ordinary guarded
-  // session — the no-tmux condition here is what masks that false positive
-  // (an operator session always has tmux ancestry; a true Task subagent has
-  // none). The in-pane co-tenancy collision (N fan-out subagents deriving the
-  // same tmux label — pane %681) remains OPEN; fixing it needs an ancestry
-  // walk that SKIPS wrapper layers and detects claude-under-claude beyond
-  // the immediate grandparent, not a broader suffix rule here.
-  if (envName && !tmuxFallbackName && isTaskSubagentResult) {
-    peerName = `${envName}.task.${pid}`;
+  // R6.1 v2 (2026-07-17): a task subagent never squats the base seat name,
+  // however the name resolved (env OR tmux label). Safe now because
+  // isTaskSubagent uses the wrapper-aware full-ancestry classifier
+  // (classifySubagentAncestry): an ordinary guard-wrapped operator session
+  // classifies as NOT-subagent (the guard frame is transparent and no second
+  // claude sits above the session), so the v1 false-positive class — which
+  // suffixed real operator seats and forced a same-day revert — cannot
+  // recur. In-pane fan-out subagents (pane %681 class) DO classify as
+  // subagents and stop colliding on the operator's seat. Observer fallback
+  // is already pid-unique.
+  if (isTaskSubagentResult && peerName !== observerFallback) {
+    peerName = `${peerName}.task.${pid}`;
   }
   return peerName;
 }
@@ -2331,7 +2392,7 @@ async function main() {
       : null);
   const isSubagent = isTaskSubagent();
   let peerName: string = resolvePeerName(envName, tmuxFallbackName, isSubagent, myRegisterPid);
-  if (envName && !tmuxFallbackName && isSubagent) {
+  if (isSubagent && peerName.includes(".task.")) {
     log(`Task subagent detected — peer name suffixed: ${peerName}`);
   }
 

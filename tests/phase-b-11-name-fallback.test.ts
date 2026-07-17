@@ -30,6 +30,7 @@ import {
   chooseOperatorLabel,
   isHumanOperatorLabel,
   resolvePeerName,
+  classifySubagentAncestry,
   stripResolvedNameSuffix,
 } from "../server";
 import { findClientPidFromProcessChain, isClientProcess, isCodexAppServerProcess, type ProcessInfo } from "../shared/client";
@@ -198,15 +199,13 @@ describe("#11 — R6.1 Task-subagent suffix overlay (preserved from R6.1)", () =
     expect(resolvePeerName("rag.2", null, true, PID)).toBe("rag.2.task.67890");
   });
 
-  test("env + tmux + isTaskSubagent=true → NOT suffixed (R6.1 requires no-tmux)", () => {
-    // Tmux presence wins. NOTE (2026-07-17): this is not because tmux proves
-    // a "real operator seat" (in-pane fan-out subagents DO have tmux
-    // ancestry — pane %681) but because mcp-stdio-guard.sh wrapping shifts
-    // ancestry one level, making isTaskSubagent false-positive on every
-    // ordinary guarded operator session; the no-tmux condition masks that.
-    // A same-day attempt to drop this condition suffixed real operator
-    // seats (launch.3.task.<pid>) and was reverted.
-    expect(resolvePeerName("rag.2", "tmux.1", true, PID)).toBe("rag.2");
+  test("env + tmux + isTaskSubagent=true → suffixed (R6.1 v2: subagents never squat the seat)", () => {
+    // v2: the boolean now comes from the wrapper-aware full-ancestry
+    // classifier, so true MEANS subagent (the v1 guard-shift false positive
+    // that suffixed real operator seats cannot produce true here). In-pane
+    // fan-out subagents have tmux ancestry (pane %681) and must not collide
+    // on the operator's seat.
+    expect(resolvePeerName("rag.2", "tmux.1", true, PID)).toBe("rag.2.task.67890");
   });
 
   test("no env + no tmux + isTaskSubagent=true → observer-${pid} (no R6.1, no env to suffix)", () => {
@@ -215,8 +214,48 @@ describe("#11 — R6.1 Task-subagent suffix overlay (preserved from R6.1)", () =
     expect(resolvePeerName(null, null, true, PID)).toBe("observer-67890");
   });
 
-  test("no env + tmux + isTaskSubagent=true → tmux name (R6.1 requires env)", () => {
-    expect(resolvePeerName(null, "tmux.3", true, PID)).toBe("tmux.3");
+  test("no env + tmux + isTaskSubagent=true → tmux name suffixed (R6.1 v2)", () => {
+    expect(resolvePeerName(null, "tmux.3", true, PID)).toBe("tmux.3.task.67890");
+  });
+});
+
+describe("#11 — classifySubagentAncestry (seat-fix v2 pure classifier)", () => {
+  const F = (comm: string, args: string) => ({ comm, args });
+  const GUARD = F("bash", "/bin/bash /home/manzo/ManzoOps/scripts/infrastructure/monitoring/mcp-stdio-guard.sh bun /home/manzo/claude-peers-mcp/server.ts");
+  const SESSION = F("claude", "claude --model claude-fable-5");
+  const VERSION_SESSION = F("2.1.212", "/home/manzo/.local/share/claude/versions/2.1.212 --session-id abc");
+  const LOGIN = F("bash", "-bash");
+  const TMUX = F("tmux: server", "tmux attach -t esab");
+  const SHC = F("sh", "sh -c something");
+  const TRANSIENT_DAEMON = F("claude", '/home/manzo/.local/bin/claude daemon run --origin transient --spawned-by {"label":"claude"}');
+  const PERSISTENT_DAEMON = F("claude", "/home/manzo/.local/bin/claude daemon run --json-path /home/manzo/.claude/daemon.json");
+
+  test("guarded operator session → NOT subagent (the v1 regression case)", () => {
+    expect(classifySubagentAncestry([GUARD, SESSION, LOGIN, TMUX])).toBe(false);
+  });
+
+  test("unguarded operator session → NOT subagent", () => {
+    expect(classifySubagentAncestry([SESSION, LOGIN, TMUX])).toBe(false);
+  });
+
+  test("in-pane fan-out via transient daemon → subagent (pane %681 class)", () => {
+    expect(classifySubagentAncestry([GUARD, VERSION_SESSION, TRANSIENT_DAEMON, SESSION, LOGIN, TMUX])).toBe(true);
+  });
+
+  test("nested claude directly under a session claude → subagent", () => {
+    expect(classifySubagentAncestry([GUARD, SESSION, SHC, SESSION, LOGIN, TMUX])).toBe(true);
+  });
+
+  test("legacy bg lane under the persistent daemon → NOT subagent (first-class seat)", () => {
+    expect(classifySubagentAncestry([GUARD, VERSION_SESSION, PERSISTENT_DAEMON])).toBe(false);
+  });
+
+  test("version-string comm with claude argv counts as the session claude", () => {
+    expect(classifySubagentAncestry([GUARD, VERSION_SESSION, LOGIN, TMUX])).toBe(false);
+  });
+
+  test("empty chain → NOT subagent (fail-closed)", () => {
+    expect(classifySubagentAncestry([])).toBe(false);
   });
 });
 
