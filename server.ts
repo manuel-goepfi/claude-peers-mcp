@@ -784,7 +784,21 @@ function isTaskSubagent(): boolean {
     const comm = new TextDecoder().decode(commProc.stdout).trim();
     // `comm` is the basename of the executable. Match both `claude` and an
     // absolute-path comm like `/usr/local/bin/claude` (older ps versions).
-    return comm === "claude" || comm.endsWith("/claude");
+    if (comm === "claude" || comm.endsWith("/claude")) return true;
+    // 2026-07-17 seat-audit: the version-store claude binary titles its comm
+    // as the bare version string (`~/.local/share/claude/versions/2.1.212`
+    // -> comm "2.1.212"), which defeated the exact-name match and let every
+    // in-pane fan-out subagent collide on the operator seat (verified live:
+    // 3 lanes all named C5_finishall.1 on pane %681). Accept a version-shaped
+    // comm ONLY when the grandparent's argv confirms a claude binary
+    // (fail-closed: ambiguous -> not a subagent, same posture as before).
+    if (/^\d+\.\d+\.\d+$/.test(comm)) {
+      const argsProc = Bun.spawnSync(["ps", "-o", "args=", "-p", String(grandparentPid)]);
+      if (argsProc.exitCode !== 0) return false;
+      const args = new TextDecoder().decode(argsProc.stdout);
+      return args.includes("/claude/") || /(^|\/)claude(\s|$)/.test(args);
+    }
+    return false;
   } catch {
     return false;
   }
@@ -878,8 +892,18 @@ export function resolvePeerName(
 ): string {
   const observerFallback = `observer-${pid}`;
   let peerName = envName ?? tmuxFallbackName ?? observerFallback;
-  if (envName && !tmuxFallbackName && isTaskSubagentResult) {
-    peerName = `${envName}.task.${pid}`;
+  // R6.1 (revised 2026-07-17 seat-audit): a task subagent NEVER squats the
+  // base seat name, regardless of how the name resolved. The original rule
+  // suffixed only the env-name/no-tmux case, on the assumption that tmux
+  // ancestry proves a real operator seat — DISPROVEN live (pane %681): an
+  // in-pane fan-out subagent's /proc walk reaches the real pane_pid, so N
+  // subagents all resolved the SAME tmux label and collided on the operator
+  // seat (same-seat supersede churn + last-writer-wins pane-stamp confusion).
+  // A real operator seat cannot trip this: its grandparent is a shell/tmux,
+  // never a claude, so isTaskSubagent stays false. The observer fallback is
+  // already pid-unique — no suffix needed there.
+  if (isTaskSubagentResult && peerName !== observerFallback) {
+    peerName = `${peerName}.task.${pid}`;
   }
   return peerName;
 }
@@ -2306,7 +2330,7 @@ async function main() {
       : null);
   const isSubagent = isTaskSubagent();
   let peerName: string = resolvePeerName(envName, tmuxFallbackName, isSubagent, myRegisterPid);
-  if (envName && !tmuxFallbackName && isSubagent) {
+  if (isSubagent && peerName.includes(".task.")) {
     log(`Task subagent detected — peer name suffixed: ${peerName}`);
   }
 

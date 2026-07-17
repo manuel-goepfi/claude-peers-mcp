@@ -198,11 +198,14 @@ describe("#11 — R6.1 Task-subagent suffix overlay (preserved from R6.1)", () =
     expect(resolvePeerName("rag.2", null, true, PID)).toBe("rag.2.task.67890");
   });
 
-  test("env + tmux + isTaskSubagent=true → NOT suffixed (R6.1 requires no-tmux)", () => {
-    // Tmux ancestry indicates this is a real operator seat in tmux, not a
-    // Task subagent. Despite isTaskSubagent returning true (false positive
-    // from grandparent heuristic), tmux presence wins.
-    expect(resolvePeerName("rag.2", "tmux.1", true, PID)).toBe("rag.2");
+  test("env + tmux + isTaskSubagent=true → suffixed (R6.1 rev. 2026-07-17: subagents never squat the seat)", () => {
+    // ORIGINAL rule: tmux presence wins ("tmux ancestry indicates a real
+    // operator seat"). DISPROVEN by the 2026-07-17 seat-audit: in-pane
+    // fan-out subagents DO walk to a real pane_pid, so three lanes all
+    // registered the operator's seat name and churned it (pane %681).
+    // A real operator seat cannot false-positive here — its grandparent is
+    // a shell/tmux, never a claude process.
+    expect(resolvePeerName("rag.2", "tmux.1", true, PID)).toBe("rag.2.task.67890");
   });
 
   test("no env + no tmux + isTaskSubagent=true → observer-${pid} (no R6.1, no env to suffix)", () => {
@@ -211,8 +214,10 @@ describe("#11 — R6.1 Task-subagent suffix overlay (preserved from R6.1)", () =
     expect(resolvePeerName(null, null, true, PID)).toBe("observer-67890");
   });
 
-  test("no env + tmux + isTaskSubagent=true → tmux name (R6.1 requires env)", () => {
-    expect(resolvePeerName(null, "tmux.3", true, PID)).toBe("tmux.3");
+  test("no env + tmux + isTaskSubagent=true → tmux name suffixed (R6.1 rev. 2026-07-17)", () => {
+    // The tmux-resolved label is the OPERATOR's seat; a subagent that
+    // inherited it via in-pane ancestry must not collide on it.
+    expect(resolvePeerName(null, "tmux.3", true, PID)).toBe("tmux.3.task.67890");
   });
 });
 
