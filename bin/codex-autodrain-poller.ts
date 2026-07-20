@@ -77,7 +77,21 @@ const RECONCILE_CODEX_SEATS = process.env.RECONCILE_CODEX_SEATS !== "0";
 // longer TICKING (the 'silent for 16h' zombie) passes a bare pgrep check but
 // fails the freshness check. mtime is the signal; the body is human-readable.
 const HEARTBEAT_PATH = process.env.CLAUDE_PEERS_AUTODRAIN_HEARTBEAT ?? `${homedir()}/.claude-peers-autodrain.heartbeat`;
-const NUDGE_TEXT = "check your peer inbox and handle any pending messages";
+// The nudge is typed into the pane as a REAL user turn, so its wording decides
+// how the lane treats it. The original text ("check your peer inbox and handle
+// any pending messages") was phrased as an INSTRUCTION and was indistinguishable
+// from something the operator typed -- so lanes obeyed it as a task. Observed
+// 2026-07-20: a lane nudged with ZERO mail wrote a 4-step plan and started
+// grepping MEMORY.md for peer-routing conventions before the operator had to
+// interrupt it. Phrase it as a notification carrying count + provenance, and say
+// outright that it is not an assignment.
+export function nudgeText(lane: Lane): string {
+  const n = lane.unread;
+  const noun = n === 1 ? "message" : "messages";
+  return `[peer-mail] ${n} unread ${noun} in your claude-peers inbox. `
+    + `This is an automated notification, not a task: read with check_messages if `
+    + `relevant, otherwise carry on with what you were doing.`;
+}
 // Give up nudging a lane after this many consecutive attempts with mail still
 // unread — a lane whose drain hook is broken must NOT be keystroke-bombed
 // forever. The counter resets to 0 the moment the lane has no unread mail.
@@ -134,6 +148,13 @@ const bootstrapNudged = new Set<string>();       // peer id -> already got its o
 // lane carrying real mail (unread > 0) is never blocked by this — the bootstrap cap
 // applies only to the zero-mail bootstrap path. tick() calls this with the lane's
 // live unread count and `bootstrapNudged.has(lane.id)`.
+// A lane with no unread mail has nothing to receive, so a nudge could only ever
+// cost it a turn. Exported as a predicate (like bootstrapCapBlocks) so the rule
+// is assertable rather than buried in the tick loop.
+export function hasNothingToDeliver(unread: number): boolean {
+  return unread <= 0;
+}
+
 export function bootstrapCapBlocks(unread: number, alreadyBootstrapNudged: boolean): boolean {
   return unread === 0 && alreadyBootstrapNudged;
 }
@@ -742,7 +763,7 @@ function nudge(lane: Lane, paneId: string): void {
   // submission: after submit the TUI echoes the prompt into its transcript, so a
   // capture can't distinguish "still in input" from "submitted + shown in
   // scrollback" — and a stuck row is already bounded by MAX_NUDGE_ATTEMPTS.
-  const sent = sh(["tmux", "send-keys", "-l", "-t", paneId, NUDGE_TEXT]);
+  const sent = sh(["tmux", "send-keys", "-l", "-t", paneId, nudgeText(lane)]);
   if (!sent.ok) { log(`nudge send-keys failed for ${tag} — pane gone? skipping`); return; }
   Bun.spawnSync(["sleep", "0.3"]); // let the TUI commit the typed text before Enter
   const submitted = sh(["tmux", "send-keys", "-t", paneId, "C-m"]);
@@ -832,6 +853,14 @@ function tick(db: Database, snapOverride?: TickSnapshot): void {
       // deliver). A lane that is still here after its bootstrap nudge has a hook
       // that did not bind; re-nudging it just bombs the pane. (A lane that later
       // gets real mail has unread > 0 and bypasses this guard entirely.)
+      // NEVER nudge a lane with nothing to deliver. This supersedes the old A1
+      // zero-mail bootstrap path (e0c515b), which nudged a NULL-hook seat once to
+      // make its drain hook bind. That cost is not payable: the nudge consumes a
+      // real turn, and on a fresh lane it consumes the FIRST turn -- the one that
+      // frames the whole session (observed 2026-07-20 on infra.3277756, 0 unread).
+      // An unbound hook binds on the lane's next natural turn anyway, so the
+      // bootstrap only ever bought latency, never correctness.
+      if (hasNothingToDeliver(lane.unread)) continue;
       if (bootstrapCapBlocks(lane.unread, bootstrapNudged.has(lane.id))) continue;
       const since = Date.now() - (lastNudge.get(lane.id) ?? 0);
       if (since < NUDGE_COOLDOWN_MS) continue;                   // recently nudged — give it time to drain

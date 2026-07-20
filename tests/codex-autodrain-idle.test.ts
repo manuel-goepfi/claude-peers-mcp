@@ -784,3 +784,51 @@ describe("reconcileVisibleCodexSeats", () => {
     expect(visibleCalls).toBe(1);
   });
 });
+
+/**
+ * Regression tests for the 2026-07-20 turn-hijack incident.
+ *
+ * A nudge is typed into the pane as a REAL user turn. Two properties must hold
+ * or the poller steals work from the lane:
+ *   1. It must never fire at a lane with nothing to deliver.
+ *   2. Its wording must read as a notification, not an operator instruction.
+ *
+ * Live failure that motivated both: infra.3277756 was nudged with ZERO unread
+ * with the text "check your peer inbox and handle any pending messages". The
+ * lane could not distinguish that from operator input, so it planned and began
+ * executing a phantom task until the operator interrupted it.
+ */
+import { nudgeText, hasNothingToDeliver } from "../bin/codex-autodrain-poller.ts";
+
+const laneWith = (unread: number) => ({
+  id: "x", name: "infra.1", pid: 1, client_type: "codex",
+  tmux_pane_id: "%1", unread, last_hook_seen_at: null,
+});
+
+describe("nudge suppression when there is nothing to deliver", () => {
+  test("zero unread is never nudged (the infra.3277756 case)", () => {
+    expect(hasNothingToDeliver(0)).toBe(true);
+  });
+  test("negative/garbage unread is treated as nothing", () => {
+    expect(hasNothingToDeliver(-1)).toBe(true);
+  });
+  test("real mail is still nudgeable", () => {
+    expect(hasNothingToDeliver(1)).toBe(false);
+    expect(hasNothingToDeliver(7)).toBe(false);
+  });
+});
+
+describe("nudge wording is a notification, not a task", () => {
+  test("states the count and pluralises", () => {
+    expect(nudgeText(laneWith(1) as never)).toContain("1 unread message");
+    expect(nudgeText(laneWith(3) as never)).toContain("3 unread messages");
+  });
+  test("declares itself non-actionable so a lane does not adopt it as work", () => {
+    expect(nudgeText(laneWith(2) as never)).toContain("not a task");
+  });
+  test("does not reuse the imperative phrasing that caused the hijack", () => {
+    const t = nudgeText(laneWith(2) as never).toLowerCase();
+    expect(t).not.toContain("check your peer inbox and handle");
+    expect(t.startsWith("check ")).toBe(false);
+  });
+});
