@@ -14,20 +14,37 @@ ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
 SERVER_PATH="$ROOT/server.ts"
 
 child_server_pid() {
-  ps -eo pid=,ppid=,args= 2>/dev/null | awk -v parent="$1" -v server="$SERVER_PATH" \
+  ps -ewwo pid=,ppid=,args= 2>/dev/null | awk -v parent="$1" -v server="$SERVER_PATH" \
     '$2 == parent && index($0, server) > 0 { print $1; exit }'
+}
+
+# The server may run behind a stdio-guard wrapper (claude → mcp-stdio-guard.sh
+# → bun server.ts). pgrep -f matches the WRAPPER too (its argv contains the
+# server path), but the broker row carries the bun process's own pid — so any
+# match must be descended to the actual `bun` process before use.
+resolve_bun_pid() {
+  local cand="$1" depth child
+  for depth in 1 2 3; do
+    [[ -z "$cand" ]] && return 1
+    if [[ "$(ps -p "$cand" -o comm= 2>/dev/null)" == "bun" ]]; then
+      echo "$cand"; return 0
+    fi
+    child=$(pgrep -P "$cand" -f 'claude-peers-mcp/server\.ts' 2>/dev/null | head -1)
+    cand="$child"
+  done
+  return 1
 }
 
 find_mcp_pid() {
   local try walk comm
   try=$(child_server_pid "$PPID")
-  if [[ -n "$try" ]]; then printf '%s\n' "$try"; return 0; fi
+  if [[ -n "$try" ]] && try=$(resolve_bun_pid "$try"); then printf '%s\n' "$try"; return 0; fi
   walk="$PPID"
   for _ in 1 2 3 4 5; do
     comm=$(ps -p "$walk" -o comm= 2>/dev/null)
     if [[ "$comm" == "claude" ]]; then
       try=$(child_server_pid "$walk")
-      if [[ -n "$try" ]]; then printf '%s\n' "$try"; return 0; fi
+      if [[ -n "$try" ]] && try=$(resolve_bun_pid "$try"); then printf '%s\n' "$try"; return 0; fi
     fi
     walk=$(ps -p "$walk" -o ppid= 2>/dev/null | tr -d ' ')
     [[ -z "$walk" || "$walk" == "1" || "$walk" == "0" ]] && return 1

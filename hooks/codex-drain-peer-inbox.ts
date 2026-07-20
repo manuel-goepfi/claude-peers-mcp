@@ -51,7 +51,7 @@ function log(msg: string): void {
 
 function processTable(): Map<number, ProcRow> {
   const table = new Map<number, ProcRow>();
-  const proc = Bun.spawnSync(["ps", "-eo", "pid=,ppid=,comm=,args="]);
+  const proc = Bun.spawnSync(["ps", "-ewwo", "pid=,ppid=,comm=,args="]);
   if (proc.exitCode !== 0) return table;
   const text = new TextDecoder().decode(proc.stdout);
   for (const line of text.split("\n")) {
@@ -77,6 +77,29 @@ function isCodexAppServerProcess(row: ProcRow): boolean {
 
 function isPeersServer(row: ProcRow): boolean {
   return /claude-peers-mcp\/server\.ts/.test(row.args) || (/\/server\.ts/.test(row.args) && /claude-peers/.test(row.args));
+}
+
+// A stdio-guard wrapper and the `bun` server it spawns BOTH satisfy isPeersServer:
+// the wrapper's argv contains the server path too. The broker registers the RUNTIME
+// process, so an ambiguous match must resolve to the deepest one. Previously this
+// only worked by accident -- a narrow pane (COLUMNS < ~145) truncated the wrapper's
+// argv so it failed isPeersServer; at full width both matched, `selected.length === 1`
+// failed, and the hook silently drained nothing.
+function preferLeafCandidates(rows: ProcRow[], table: Map<number, ProcRow>): ProcRow[] {
+  if (rows.length <= 1) return rows;
+  const isAncestorOfAnother = (row: ProcRow): boolean => {
+    for (const other of rows) {
+      if (other.pid === row.pid) continue;
+      let cur: ProcRow | undefined = table.get(other.pid);
+      for (let guard = 0; cur && guard < 20; guard++) {
+        if (cur.ppid === row.pid) return true;
+        cur = table.get(cur.ppid);
+      }
+    }
+    return false;
+  };
+  const leaves = rows.filter((r) => !isAncestorOfAnother(r));
+  return leaves.length > 0 ? leaves : rows;
 }
 
 function descendants(rootPid: number, table: Map<number, ProcRow>): ProcRow[] {
@@ -164,7 +187,7 @@ export function findMcpPidFromTable(
     .filter(isPeersServer)
     .filter((row) => row.pid !== process.pid);
   const cwdMatches = candidates.filter((row) => cwdResolver(row.pid) === hookCwd);
-  const selected = cwdMatches.length > 0 ? cwdMatches : candidates;
+  const selected = preferLeafCandidates(cwdMatches.length > 0 ? cwdMatches : candidates, table);
   if (selected.length === 1) return selected[0]!.pid;
   return null;
 }
@@ -209,7 +232,7 @@ export function findHookPeerPidsFromTable(
     .filter(isPeersServer)
     .filter((row) => row.pid !== process.pid);
   const cwdMatches = candidates.filter((row) => cwdReader(row.pid) === hookCwd);
-  const selected = cwdMatches.length > 0 ? cwdMatches : candidates;
+  const selected = preferLeafCandidates(cwdMatches.length > 0 ? cwdMatches : candidates, table);
   if (selected.length === 1) {
     const mcpPid = selected[0]!.pid;
     const fallbacks = [mcpPid, validEnvPid]
