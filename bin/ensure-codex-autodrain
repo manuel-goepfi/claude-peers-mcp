@@ -1,13 +1,14 @@
 #!/bin/bash
 # ensure-codex-autodrain — idempotently start the claude-peers Codex auto-drain
-# poller in a dedicated tmux window, IF it is not already running.
+# poller as a background tmux server child, IF it is not already running.
 #
-# Why a tmux window (not systemd): the poller drives tmux (capture-pane +
+# Why tmux run-shell (not systemd): the poller drives tmux (capture-pane +
 # send-keys), and a tmux client spawned by bun inside a systemd-user scope
 # cannot complete the tmux client-server handshake ("server exited
-# unexpectedly", verified 2026-06-15). Running it INSIDE tmux gives native
-# server access. This script is called from .tmux.conf via run-shell so the
-# window is recreated whenever tmux (re)starts.
+# unexpectedly", verified again 2026-07-14). Running it as a tmux server child
+# gives native server access without dedicating a visible window to daemon logs.
+# This script is called from .tmux.conf via run-shell so the process is recreated
+# whenever tmux (re)starts.
 #
 # Idempotent + WATCHDOG: if a poller is alive AND ticking (fresh heartbeat), do
 # nothing. If a poller is alive but WEDGED (heartbeat stale → alive but no longer
@@ -37,8 +38,19 @@ export _AUTODRAIN_LOCKED
 
 POLLER=/home/manzo/claude-peers-mcp/bin/codex-autodrain-poller.ts
 LOG=/home/manzo/.claude-peers-codex-autodrain.log
-WINDOW=codex-autodrain
 HEARTBEAT=/home/manzo/.claude-peers-autodrain.heartbeat
+
+# Auto-nudge is disabled by default. Do not start the poller at all unless an
+# operator explicitly opts in for that launch with NUDGE_CLIENTS=codex (or
+# another allowlisted client); this prevents any background tmux keystrokes.
+NUDGE_CLIENTS=${NUDGE_CLIENTS-}
+if [ -z "$NUDGE_CLIENTS" ]; then
+  exit 0
+fi
+if ! printf '%s' "$NUDGE_CLIENTS" | grep -Eq '^(|codex|gemini|claude)(,(codex|gemini|claude))*$'; then
+  echo "$(date -Iseconds) watchdog: invalid NUDGE_CLIENTS=$NUDGE_CLIENTS — refusing to start" >> "$LOG"
+  exit 1
+fi
 
 # tmux reachability when this script runs OUTSIDE an interactive shell (cron, a
 # systemd timer). Two stripped-env traps, both of which produce the generic
@@ -92,7 +104,7 @@ elif [ "$POLLER_COUNT" -eq 1 ]; then
     fi
     echo "$(date -Iseconds) watchdog: poller alive but heartbeat stale (${age}s > ${STALE_AFTER_S}s) — restarting wedged poller" >> "$LOG"
     pkill -9 -f "$POLLER_MATCH" 2>/dev/null
-    sleep 1   # let the process exit + release its tmux window
+    sleep 1   # let the process exit cleanly
     # fall through to (re)spawn below
   else
     # No heartbeat file yet but a process exists. This is either a freshly-started
@@ -125,31 +137,29 @@ fi
 # window (scoped poller etime above) covers the gap until the first heartbeat.
 rm -f "$HEARTBEAT" 2>/dev/null
 
-# Need a tmux server with at least one session to host the window.
+# Need a live tmux server because the poller captures panes and sends keys through
+# that server. The background child itself does not need a pane or visible window.
 if ! tmux list-sessions >/dev/null 2>&1; then
   exit 0  # no tmux yet — nothing to attach to; a later reload will catch it
 fi
 
-# Pick the first session as host (the poller only needs tmux server access; the
-# host session is irrelevant to its function).
-HOST_SESSION="$(tmux list-sessions -F '#{session_name}' 2>/dev/null | head -1)"
-[ -z "$HOST_SESSION" ] && exit 0
+# Remove legacy visible daemon windows left by the old launcher. Target by
+# session:index so numeric session names are never misparsed as window indexes.
+tmux list-windows -a -F '#{session_name}:#{window_index}\t#{window_name}' 2>/dev/null \
+  | awk -F '\t' '$2 == "codex-autodrain" { print $1 }' \
+  | while IFS= read -r target; do
+      [ -n "$target" ] && tmux kill-window -t "$target" 2>/dev/null
+    done
 
-# Remove any stale (process-dead) window of the same name first, then create one.
-# Target the session with a TRAILING COLON ("name:") so tmux treats the target
-# as a SESSION, not a window index — critical when the session is named "1",
-# where a bare "-t 1" is parsed as window-index 1 ("create window failed: index
-# 1 in use") instead of session 1.
-tmux list-windows -t "${HOST_SESSION}:" -F '#{window_name}' 2>/dev/null \
-  | grep -qx "$WINDOW" && tmux kill-window -t "${HOST_SESSION}:${WINDOW}" 2>/dev/null
-
-# Pin the ABSOLUTE path to bun: the new window's shell inherits this script's
-# PATH, which under cron (/usr/bin:/bin) does NOT include the nvm/.bun bin dir,
-# so a bare `bun` would not be found and the window would die instantly (same
-# class as the TOOL-08 node-symlink trap). Auto-detect, preferring ~/.bun/bin.
+# Pin the ABSOLUTE path to bun: cron's PATH does not include ~/.bun/bin, so a
+# bare `bun` would not be found. Auto-detect, preferring ~/.bun/bin.
 BUN_BIN=/home/manzo/.bun/bin/bun
 [ -x "$BUN_BIN" ] || BUN_BIN="$(command -v bun 2>/dev/null)"
-tmux new-window -d -t "${HOST_SESSION}:" -n "$WINDOW" \
-  "cd /home/manzo && exec '$BUN_BIN' '$POLLER' 2>&1 | tee -a '$LOG'" 2>/dev/null
+
+# tmux run-shell -b inherits the live server/socket context but creates no pane.
+# Pass the opt-in explicitly: NUDGE_CLIENTS is not part of tmux's default
+# update-environment list, so merely exporting it in this watchdog is insufficient.
+tmux run-shell -b \
+  "cd /home/manzo && exec env NUDGE_CLIENTS='$NUDGE_CLIENTS' '$BUN_BIN' '$POLLER' >> '$LOG' 2>&1" 2>/dev/null
 
 exit 0
