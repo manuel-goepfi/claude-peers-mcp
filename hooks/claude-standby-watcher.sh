@@ -26,19 +26,6 @@ child_server_pid() {
     '$2 == parent && index($0, server) > 0 { print $1; exit }'
 }
 
-resolve_bun_pid() {
-  local cand="$1" depth child
-  for depth in 1 2 3; do
-    [[ -z "$cand" ]] && return 1
-    if [[ "$(ps -p "$cand" -o comm= 2>/dev/null)" == "bun" ]]; then
-      echo "$cand"; return 0
-    fi
-    child=$(pgrep -P "$cand" -f 'claude-peers-mcp/server\.ts' 2>/dev/null | head -1)
-    cand="$child"
-  done
-  return 1
-}
-
 # The server may run behind a stdio-guard wrapper (claude → mcp-stdio-guard.sh
 # → bun server.ts). pgrep -f matches the WRAPPER too (its argv contains the
 # server path), but the broker row carries the bun process's own pid — so any
