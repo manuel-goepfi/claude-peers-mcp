@@ -41,9 +41,17 @@ LOG=/home/manzo/.claude-peers-codex-autodrain.log
 HEARTBEAT=/home/manzo/.claude-peers-autodrain.heartbeat
 
 # Auto-nudge is disabled by default. Do not start the poller at all unless an
-# operator explicitly opts in for that launch with NUDGE_CLIENTS=codex (or
-# another allowlisted client); this prevents any background tmux keystrokes.
+# operator explicitly opts in — either per launch via the NUDGE_CLIENTS env var
+# (takes precedence) or persistently via the single-source config file below.
+# The file exists so the opt-in lives in ONE place instead of being duplicated
+# across every caller (crontab line + .tmux.conf run-shell), which drifted.
+# Absent or empty file = no opt-in = poller never starts (no background tmux
+# keystrokes); the allowlist validation below applies to file content too.
+NUDGE_CLIENTS_FILE="${NUDGE_CLIENTS_FILE:-$HOME/.config/claude-peers/nudge-clients}"
 NUDGE_CLIENTS=${NUDGE_CLIENTS-}
+if [ -z "$NUDGE_CLIENTS" ] && [ -f "$NUDGE_CLIENTS_FILE" ]; then
+  NUDGE_CLIENTS=$(tr -d '[:space:]' < "$NUDGE_CLIENTS_FILE")
+fi
 if [ -z "$NUDGE_CLIENTS" ]; then
   exit 0
 fi
