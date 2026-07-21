@@ -832,3 +832,16 @@ describe("nudge wording is a notification, not a task", () => {
     expect(t.startsWith("check ")).toBe(false);
   });
 });
+
+describe("nudge wording is client-aware (claude mail rides in with the nudge)", () => {
+  const claudeLane = (unread: number) => ({ ...laneWith(unread), client_type: "claude" });
+  test("claude lane is NOT told to fetch — its drain hook already delivered the mail with this prompt", () => {
+    const t = nudgeText(claudeLane(2) as never);
+    expect(t).not.toContain("check_messages");
+    expect(t).toContain("delivered with this notification");
+    expect(t).toContain("not a task");
+  });
+  test("codex lane keeps the fetch instruction (manual-drain path)", () => {
+    expect(nudgeText(laneWith(2) as never)).toContain("check_messages");
+  });
+});

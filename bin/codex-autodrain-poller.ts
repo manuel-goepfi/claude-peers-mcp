@@ -88,6 +88,16 @@ const HEARTBEAT_PATH = process.env.CLAUDE_PEERS_AUTODRAIN_HEARTBEAT ?? `${homedi
 export function nudgeText(lane: Lane): string {
   const n = lane.unread;
   const noun = n === 1 ? "message" : "messages";
+  // Claude lanes: submitting this nudge fires the UserPromptSubmit drain hook,
+  // which delivers the mail WITH this prompt — telling Claude to call
+  // check_messages sends it after mail that was already drained (the call
+  // returns empty and burns a pointless tool call). Codex/Gemini lanes drain
+  // via their own hook/manual path, so the fetch instruction stays.
+  if (lane.client_type === "claude") {
+    return `[peer-mail] ${n} unread ${noun} were just delivered with this notification `
+      + `(see the drained peer message block above). This is automated, not a task: `
+      + `act on it only if relevant, otherwise carry on with what you were doing.`;
+  }
   return `[peer-mail] ${n} unread ${noun} in your claude-peers inbox. `
     + `This is an automated notification, not a task: read with check_messages if `
     + `relevant, otherwise carry on with what you were doing.`;
