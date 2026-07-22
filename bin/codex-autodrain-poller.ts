@@ -790,6 +790,12 @@ export function resolveLanePane(
 function nudge(lane: Lane, paneId: string): void {
   const tag = `${lane.name ?? "?"}/${lane.id} pane=${paneId}`;
   if (DRY_RUN) { log(`DRY_RUN would nudge ${tag} (${lane.unread} unread)`); return; }
+  // A pane sitting in copy-mode (operator wheel-scrolled to read) treats every
+  // nudge character as a copy-mode COMMAND, not typed input — the 'g' in
+  // "check msgs" opens the "(goto line)" prompt over the operator's status bar
+  // (recurring 2026-07-22). Skip; the next tick retries after they scroll out.
+  const mode = sh(["tmux", "display-message", "-p", "-t", paneId, "#{pane_in_mode}"]);
+  if (mode.ok && mode.out.trim() === "1") { log(`skip nudge ${tag} — pane in copy-mode (operator scrolled)`); return; }
   // Type the literal prompt text then submit, with a short settle BETWEEN the
   // two so the Codex TUI commits the typed input before the Enter arrives — a
   // C-m that races ahead of the not-yet-committed text is dropped (verified
