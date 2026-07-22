@@ -142,11 +142,14 @@ const PROFILES: Record<string, IdleProfile> = {
   codex:  { prompt: /(^|\n)\s*›\s/, promptLine: /^\s*›/, strip: /^.*?›\s?/, busy: CODEX_BUSY },
   gemini: { prompt: /(^|\n)\s*›\s/, promptLine: /^\s*›/, strip: /^.*?›\s?/, busy: CODEX_BUSY },
   claude: { prompt: /(^|\n)\s*❯\s/, promptLine: /^\s*❯/, strip: /^.*?❯\s?/, busy: CLAUDE_BUSY },
-  // Cursor CLI ("agent"): input box glyph is → (U+2192), idle input shows the
-  // dim ghost placeholder "Plan, search, build anything" with the terminal
-  // cursor reverse-blocked on its first char — hence placeholderText.
+  // Cursor CLI ("agent"): input box glyph is → (U+2192). Idle placeholders are
+  // "Plan, search, build anything" (fresh session) and "Add a follow-up"
+  // (mid-conversation). placeholderText carries both because the SGR shapes
+  // defeat the generic all-dim check twice over: focused panes reverse-block
+  // the placeholder's first char (reset clears dim), and unfocused panes open
+  // the dim span BEFORE the glyph so the strip regex swallows it.
   cursor: { prompt: /(^|\n)\s*→\s/, promptLine: /^\s*→/, strip: /^.*?→\s?/, busy: CURSOR_BUSY,
-            placeholderText: /^Plan, search, build anything/ },
+            placeholderText: /^(Plan, search, build anything|Add a follow-up)/ },
 };
 export function profileFor(clientType: string): IdleProfile {
   return PROFILES[clientType] ?? PROFILES.codex!;

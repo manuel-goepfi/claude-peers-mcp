@@ -64,6 +64,18 @@ describe("paneTextIsIdle", () => {
     expect(paneTextIsIdle(cursorIdle, profileFor("cursor"))).toBe(true);
   });
 
+  test("NUDGE (cursor): mid-conversation 'Add a follow-up' placeholder, unfocused pane (dim span opens BEFORE the glyph)", () => {
+    // Live shape from infra:1.2 — one dim span covers glyph + placeholder, so
+    // the strip regex swallows the SGR and the after-glyph dim check sees
+    // "bright" text. placeholderText rescues it.
+    const cursorFollowUp = [
+      "  some prior output",
+      ` ${ESC}[48;2;47;48;58m ${ESC}[2m→ Add a follow-up${ESC}[0m${ESC}[48;2;47;48;58m   ${ESC}[49m`,
+      "  Cursor Grok 4.5 High",
+    ].join("\n");
+    expect(paneTextIsIdle(cursorFollowUp, profileFor("cursor"))).toBe(true);
+  });
+
   test("SKIP (cursor): real typed operator text after the → glyph", () => {
     const cursorTyped = [
       ` ${ESC}[2m→ ${ESC}[0mdeploy to production now`,
