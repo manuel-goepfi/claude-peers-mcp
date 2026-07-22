@@ -27,7 +27,14 @@ function argTokens(value: string): string[] {
 }
 
 function hasGeminiCliLauncher(args: string): boolean {
-  return argTokens(args).some((token) => {
+  const tokens = argTokens(args);
+  // nvm/npm bin-shim shape: node executes a script literally named `gemini`
+  // (e.g. `node ~/.nvm/versions/node/v22.22.2/bin/gemini`). Only the SCRIPT
+  // position (token 1) counts, and it must be a path — a bare `gemini` word
+  // appearing as a later argument is not a launcher.
+  const script = tokens[1]?.replace(/^['"]|['"]$/g, "").toLowerCase() ?? "";
+  if (script.includes("/") && script.replace(/^.*\//, "") === "gemini") return true;
+  return tokens.some((token) => {
     const normalized = token.replace(/^['"]|['"]$/g, "").toLowerCase();
     const base = normalized.replace(/^.*\//, "");
     return normalized.includes("@google/gemini-cli/") || base === "gemini.js" || base === "gemini-cli.js";

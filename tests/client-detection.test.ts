@@ -42,6 +42,23 @@ describe("client detection", () => {
     expect(detectClientFromProcessChain(20, processes, {})).toBe("claude");
   });
 
+  test("detects Gemini launched via the nvm bin shim (node .../bin/gemini)", () => {
+    const processes = table([
+      { pid: 30, ppid: 20, comm: "bun", args: "bun /home/manzo/claude-peers-mcp/server.ts" },
+      { pid: 20, ppid: 10, comm: "node", args: "node /home/manzo/.nvm/versions/node/v22.22.2/bin/gemini" },
+      { pid: 10, ppid: 1, comm: "bash", args: "-bash" },
+    ]);
+    expect(detectClientFromProcessChain(30, processes, {})).toBe("gemini");
+  });
+
+  test("a bare 'gemini' word as a later argument is NOT a launcher", () => {
+    const processes = table([
+      { pid: 20, ppid: 10, comm: "node", args: "node build.js --theme gemini" },
+      { pid: 10, ppid: 1, comm: "bash", args: "-bash" },
+    ]);
+    expect(detectClientFromProcessChain(20, processes, {})).toBe("unknown");
+  });
+
   test("detects Cursor ancestor by its install path, not the generic 'agent' name", () => {
     const processes = table([
       { pid: 30, ppid: 20, comm: "bun", args: "bun /home/manzo/claude-peers-mcp/server.ts" },
