@@ -1457,7 +1457,16 @@ function isHookBackedClientPeer(peer: Pick<Peer, "client_type" | "receiver_mode"
   if (!hasVisibleSeat) return false;
   return (
     (peer.client_type === "codex" && peer.receiver_mode === "codex-hook") ||
-    (peer.client_type === "gemini" && peer.receiver_mode === "gemini-hook")
+    (peer.client_type === "gemini" && peer.receiver_mode === "gemini-hook") ||
+    // Cursor rows register the visible agent TUI pid, and Cursor cycles its MCP
+    // servers on its own schedule — heartbeats stop for minutes between
+    // generations while the seat is fully alive. Without this exemption the
+    // stale row hits shouldPermanentlyReapPeer's alive-pid branch, which
+    // deletes row + queued mail IMMEDIATELY (no recoverable-inbox preserve —
+    // that branch is dead-pid only). With it, the row stays routable by pid
+    // liveness; the next server generation re-registers with the SAME pid and
+    // samePidRefresh keeps the id, so queued mail survives the cycle.
+    peer.client_type === "cursor"
   );
 }
 
@@ -1893,6 +1902,18 @@ function handleAckMessages(body: AckMessagesRequest): { ok: boolean; acked: numb
 }
 
 function handleUnregister(body: { id: string }): void {
+  // Graceful shutdown with queued mail: KEEP the row. Deleting it here made
+  // the undelivered mail orphaned (swept within one 30s tick) and forced the
+  // successor to mint a fresh id — any MCP-server restart with mail in flight
+  // silently destroyed that mail. Cursor hits this constantly (it cycles its
+  // MCP servers, each cycle SIGTERMs the old server → unregister), but the
+  // hole is client-agnostic. A preserved row simply stops heartbeating: it
+  // ghosts out of rosters at PEER_GHOST_AFTER_MS, the reaper's pending-mail
+  // branch retains it as a recoverable inbox, and the successor reclaims it —
+  // same-pid re-register via samePidRefresh (cursor cycles) or dead-pid
+  // rehydration (relaunches) — inheriting the id AND the queued mail.
+  const pending = (countUndelivered.get(body.id) as { n: number } | null)?.n ?? 0;
+  if (pending > 0) return;
   deletePeer.run(body.id);
 }
 

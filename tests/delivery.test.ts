@@ -1355,6 +1355,129 @@ describe("Live broker delivery features", () => {
     childT.kill();
   });
 
+  test("stale-but-alive Cursor seat survives a reap pass with its queued mail and keeps its id on re-register", async () => {
+    // Cursor cycles its MCP servers: heartbeats stop for minutes while the
+    // visible agent (the registered pid) stays alive. Regression under test:
+    // the stale row used to hit shouldPermanentlyReapPeer's alive-pid branch,
+    // which deleted row + queued mail immediately — no recoverable-inbox
+    // preserve, no rehydration (that path is dead-pid-only), so mail queued
+    // across a server cycle was silently destroyed and the respawn minted a
+    // fresh id.
+    const childS = spawnSleep();
+    const childT = spawnSleep();
+    const sender = await brokerFetch<{ id: string }>("/register", {
+      pid: childS.pid, cwd: "/cursor-cycle-s", git_root: null, tty: null, name: "cursor-cycle-s",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
+    });
+    const target = await brokerFetch<{ id: string }>("/register", {
+      pid: childT.pid, cwd: "/cursor-cycle-t", git_root: null, tty: null, name: "cursor-cycle-target",
+      tmux_session: "cur", tmux_window_index: "1", tmux_window_name: "agent", tmux_pane_id: "%333",
+      client_type: "cursor", receiver_mode: "manual-drain", summary: "",
+    });
+    const send = await brokerFetch<{ ok: boolean; id?: number }>("/send-to-peer", {
+      from_id: sender.id,
+      selector: { name: "cursor-cycle-target" },
+      text: "queued across a cursor server cycle",
+    });
+    expect(send.ok).toBe(true);
+
+    // Simulate the inter-generation gap: stale well past PEER_GHOST_AFTER_MS.
+    const staleIso = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+    const rw = new Database(TEST_DB);
+    rw.run("UPDATE peers SET last_seen = ? WHERE id = ?", [staleIso, target.id]);
+    rw.close();
+
+    // A list_peers call runs the liveAndFreshPeers reap pass. With the
+    // visible-seat exemption a stale-but-alive Cursor row is NOT reapable at
+    // all — it stays LISTED and routable through the inter-generation gap
+    // (mail delivers on the next nudge), exactly like stale hook-backed
+    // codex/gemini seats.
+    const listed = await brokerFetch<Array<{ id: string }>>("/list-peers", {
+      id: sender.id, scope: "machine", cwd: "/", git_root: null,
+    });
+    expect(Array.isArray(listed)).toBe(true); // guard: an auth error here would skip the reap pass
+    expect(listed.some((p) => p.id === target.id)).toBe(true);
+
+    const ro = new Database(TEST_DB, { readonly: true });
+    const row = ro.query("SELECT id FROM peers WHERE id = ?").get(target.id);
+    const mail = ro.query("SELECT COUNT(*) AS n FROM messages WHERE to_id = ? AND delivered = 0").get(target.id) as { n: number };
+    ro.close();
+    expect(row).not.toBeNull();      // row survived the reap pass (alive visible seat)
+    expect(mail.n).toBe(1);          // queued mail survived with it
+
+    // The next server generation registers with the SAME visible pid →
+    // samePidRefresh keeps the id, so the queued mail still addresses this seat.
+    const reReg = await brokerFetch<{ id: string }>("/register", {
+      pid: childT.pid, cwd: "/cursor-cycle-t", git_root: null, tty: null, name: "cursor-cycle-target",
+      tmux_session: "cur", tmux_window_index: "1", tmux_window_name: "agent", tmux_pane_id: "%333",
+      client_type: "cursor", receiver_mode: "manual-drain", summary: "",
+    });
+    expect(reReg.id).toBe(target.id);
+    childS.kill();
+    childT.kill();
+  });
+
+  test("unregister with queued mail preserves the row; successor re-register inherits id + mail", async () => {
+    // The MCP server calls /unregister on graceful shutdown (SIGTERM, stdin
+    // EOF). Regression under test: unregister used to delete the row
+    // unconditionally, orphaning any undelivered mail (swept on the next
+    // tick) and forcing the successor to mint a fresh id — reproduced live
+    // with Cursor's server cycling: queue mail, kill server, respawn → new
+    // id, mail destroyed.
+    const childS = spawnSleep();
+    const childT = spawnSleep();
+    const sender = await brokerFetch<{ id: string }>("/register", {
+      pid: childS.pid, cwd: "/unreg-mail-s", git_root: null, tty: null, name: "unreg-mail-s",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
+    });
+    const target = await brokerFetch<{ id: string }>("/register", {
+      pid: childT.pid, cwd: "/unreg-mail-t", git_root: null, tty: "pts/9", name: "unreg-mail-target",
+      tmux_session: "unr", tmux_window_index: "1", tmux_window_name: "w", tmux_pane_id: "%444",
+      client_type: "cursor", receiver_mode: "manual-drain", summary: "",
+    });
+    const send = await brokerFetch<{ ok: boolean }>("/send-to-peer", {
+      from_id: sender.id,
+      selector: { name: "unreg-mail-target" },
+      text: "queued across an unregister",
+    });
+    expect(send.ok).toBe(true);
+
+    const unreg = await brokerFetch<{ ok: boolean }>("/unregister", { id: target.id });
+    expect(unreg.ok).toBe(true);
+
+    const ro = new Database(TEST_DB, { readonly: true });
+    const row = ro.query("SELECT id FROM peers WHERE id = ?").get(target.id);
+    const mail = ro.query("SELECT COUNT(*) AS n FROM messages WHERE to_id = ? AND delivered = 0").get(target.id) as { n: number };
+    ro.close();
+    expect(row).not.toBeNull();  // row preserved as a recoverable inbox
+    expect(mail.n).toBe(1);      // mail survived the unregister
+
+    // Successor (same pid — the cursor-cycle shape) reclaims the id + mail.
+    const reReg = await brokerFetch<{ id: string }>("/register", {
+      pid: childT.pid, cwd: "/unreg-mail-t", git_root: null, tty: "pts/9", name: "unreg-mail-target",
+      tmux_session: "unr", tmux_window_index: "1", tmux_window_name: "w", tmux_pane_id: "%444",
+      client_type: "cursor", receiver_mode: "manual-drain", summary: "",
+    });
+    expect(reReg.id).toBe(target.id);
+    childS.kill();
+    childT.kill();
+  });
+
+  test("unregister with an empty inbox still deletes the row (no tombstone growth)", async () => {
+    const child = spawnSleep();
+    const peer = await brokerFetch<{ id: string }>("/register", {
+      pid: child.pid, cwd: "/unreg-clean", git_root: null, tty: null, name: "unreg-clean",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
+    });
+    const unreg = await brokerFetch<{ ok: boolean }>("/unregister", { id: peer.id });
+    expect(unreg.ok).toBe(true);
+    const ro = new Database(TEST_DB, { readonly: true });
+    const row = ro.query("SELECT id FROM peers WHERE id = ?").get(peer.id);
+    ro.close();
+    expect(row).toBeNull();
+    child.kill();
+  });
+
   test("send_to_peer rejects stale hook-backed Gemini rows without a visible seat", async () => {
     const childS = spawnSleep();
     const childT = spawnSleep();
