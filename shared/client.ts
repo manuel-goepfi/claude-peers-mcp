@@ -14,6 +14,7 @@ function normalizedClient(value: string | undefined): ClientType | null {
   if (v === "codex") return "codex";
   if (v === "gemini" || v === "gemini-cli") return "gemini";
   if (v === "cursor" || v === "cursor-agent") return "cursor";
+  if (v === "agy") return "agy";
   if (v === "unknown") return "unknown";
   return null;
 }
@@ -130,6 +131,7 @@ export function detectClientFromProcessChain(
     if (isClientProcess(p, "codex")) return "codex";
     if (isClientProcess(p, "gemini")) return "gemini";
     if (isClientProcess(p, "cursor")) return "cursor";
+    if (isClientProcess(p, "agy")) return "agy";
     if (isClientProcess(p, "claude")) return "claude";
     if (p.ppid <= 1 || p.ppid === current) break;
     current = p.ppid;
@@ -142,5 +144,6 @@ export function initialReceiverMode(clientType: ClientType): ReceiverMode {
   if (clientType === "codex") return "manual-drain";
   if (clientType === "gemini") return "manual-drain";
   if (clientType === "cursor") return "manual-drain";
+  if (clientType === "agy") return "manual-drain";
   return "unknown";
 }

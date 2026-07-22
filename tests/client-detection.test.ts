@@ -70,6 +70,16 @@ describe("client detection", () => {
     expect(initialReceiverMode("cursor")).toBe("manual-drain");
   });
 
+  test("detects agy (Google agent CLI) by binary name", () => {
+    const processes = table([
+      { pid: 30, ppid: 20, comm: "bun", args: "bun /home/manzo/claude-peers-mcp/server.ts" },
+      { pid: 20, ppid: 10, comm: "agy", args: "agy" },
+      { pid: 10, ppid: 1, comm: "bash", args: "-bash" },
+    ]);
+    expect(detectClientFromProcessChain(30, processes, {})).toBe("agy");
+    expect(initialReceiverMode("agy")).toBe("manual-drain");
+  });
+
   test("a bare 'agent' binary without the cursor-agent path is NOT Cursor", () => {
     const processes = table([
       { pid: 20, ppid: 10, comm: "agent", args: "/usr/local/bin/agent --serve" },
@@ -112,7 +122,7 @@ describe("client detection", () => {
 
   test("hook-based clients disable the Claude background poll buffer", () => {
     const src = readFileSync(new URL("../server.ts", import.meta.url), "utf8");
-    expect(src).toContain('if (myClientType === "codex" || myClientType === "gemini" || myClientType === "cursor")');
+    expect(src).toContain('if (myClientType === "codex" || myClientType === "gemini" || myClientType === "cursor" || myClientType === "agy")');
     expect(src).toContain("background channel poll disabled");
   });
 

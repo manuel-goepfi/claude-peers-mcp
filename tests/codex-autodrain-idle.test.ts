@@ -84,6 +84,31 @@ describe("paneTextIsIdle", () => {
     expect(paneTextIsIdle(cursorTyped, profileFor("cursor"))).toBe(false);
   });
 
+  test("NUDGE (agy): empty column-0 '>' prompt with indented output above", () => {
+    const agyIdle = [
+      "  ● [09:51:27] find /home/manzo running",
+      "> ",
+      "  ? for shortcuts           Gemini 3.6 Flash",
+    ].join("\n");
+    expect(paneTextIsIdle(agyIdle, profileFor("agy"))).toBe(true);
+  });
+
+  test("SKIP (agy): an INDENTED '>' line (blockquote in output) is not a prompt", () => {
+    const agyQuote = [
+      "  > quoted output line",
+      "  ? for shortcuts",
+    ].join("\n");
+    expect(paneTextIsIdle(agyQuote, profileFor("agy"))).toBe(false);
+  });
+
+  test("SKIP (agy): typed operator text after the prompt", () => {
+    const agyTyped = [
+      "> deploy everything now",
+      "  ? for shortcuts",
+    ].join("\n");
+    expect(paneTextIsIdle(agyTyped, profileFor("agy"))).toBe(false);
+  });
+
   test("SKIP (cursor): busy marker present", () => {
     const cursorBusy = [
       "  Generating (esc to interrupt)",

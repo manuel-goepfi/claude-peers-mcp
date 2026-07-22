@@ -94,7 +94,7 @@ export function nudgeText(lane: Lane): string {
   // returns empty and burns a pointless tool call). Codex/Gemini lanes drain
   // via their own hook/manual path, so the fetch instruction stays.
   if (lane.client_type === "claude") {
-    return `[peer-mail] ${n} unread ${noun} were just delivered with this notification `
+    return `[peer-mail] ${n} unread ${noun} ${n === 1 ? "was" : "were"} just delivered with this notification `
       + `(see the drained peer message block above). This is automated, not a task: `
       + `act on it only if relevant, otherwise carry on with what you were doing.`;
   }
@@ -150,6 +150,12 @@ const PROFILES: Record<string, IdleProfile> = {
   // the dim span BEFORE the glyph so the strip regex swallows it.
   cursor: { prompt: /(^|\n)\s*→\s/, promptLine: /^\s*→/, strip: /^.*?→\s?/, busy: CURSOR_BUSY,
             placeholderText: /^(Plan, search, build anything|Add a follow-up)/ },
+  // agy (Google's agent CLI): bare ASCII `>` input prompt, but COLUMN-0
+  // anchored — all agy transcript/output lines are indented ≥1 space, so the
+  // usual ASCII-'>' ambiguity (blockquotes, diff context) does not apply as
+  // long as the regexes forbid leading whitespace. Do NOT add \s* here.
+  agy: { prompt: /(^|\n)>(\s|$)/, promptLine: /^>(\s|$)/, strip: /^>\s?/,
+         busy: [/esc to (cancel|interrupt)/i, /\bGenerating\b/i, /\bThinking\b/i] },
 };
 export function profileFor(clientType: string): IdleProfile {
   return PROFILES[clientType] ?? PROFILES.codex!;
@@ -284,7 +290,7 @@ interface Lane {
 // dedup, case/space normalization) are unit-testable without mutating process.env.
 export function parseNudgeClients(raw: string | undefined = process.env.NUDGE_CLIENTS): string[] {
   if (!raw) return []; // DEFAULT: nudge nobody
-  const allowed = new Set(["codex", "gemini", "claude", "cursor"]);
+  const allowed = new Set(["codex", "gemini", "claude", "cursor", "agy"]);
   const picked = raw.split(",").map((s) => s.trim().toLowerCase()).filter((s) => allowed.has(s));
   return [...new Set(picked)];
 }
@@ -837,6 +843,12 @@ function tick(db: Database, snapOverride?: TickSnapshot): void {
   // to current lanes so they cannot grow unbounded over a multi-day run.
   const active = new Set(lanes.map((l) => l.id));
   for (const id of nudgeAttempts.keys()) if (!active.has(id)) nudgeAttempts.delete(id);
+  // A NULL-hook lane stays in the set even at 0 unread (the bootstrap clause),
+  // so leaving-the-set is NOT a reliable "mail cleared" signal for it: without
+  // this reset such a lane kept its attempt count forever and, once it hit
+  // MAX_NUDGE_ATTEMPTS, was never nudged again for FUTURE mail until a poller
+  // restart (observed on launch.4: "giving up ... still 0 unread").
+  for (const lane of lanes) if (lane.unread <= 0) nudgeAttempts.delete(lane.id);
   for (const id of lastNudge.keys()) if (!active.has(id)) lastNudge.delete(id);
   for (const id of paneCache.keys()) if (!active.has(id)) paneCache.delete(id);
   // bootstrapNudged is pruned ONLY when the lane leaves the set entirely (session

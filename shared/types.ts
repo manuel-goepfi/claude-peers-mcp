@@ -1,6 +1,6 @@
 // Unique ID for each Claude Code instance (generated on registration)
 export type PeerId = string;
-export type ClientType = "claude" | "codex" | "gemini" | "cursor" | "unknown";
+export type ClientType = "claude" | "codex" | "gemini" | "cursor" | "agy" | "unknown";
 export type ReceiverMode = "claude-channel" | "codex-hook" | "gemini-hook" | "manual-drain" | "unknown";
 export const DELIVERY_STATES = ["queued", "claimed", "acknowledged", "unknown"] as const;
 export type DeliveryState = typeof DELIVERY_STATES[number];

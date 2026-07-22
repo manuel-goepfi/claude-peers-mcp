@@ -953,8 +953,8 @@ function reqStrict(s: unknown): string {
 }
 
 function validClientType(value: unknown): ClientType {
-  return value === "claude" || value === "codex" || value === "gemini" || value === "cursor" || value === "unknown"
-    ? value : "unknown";
+  return value === "claude" || value === "codex" || value === "gemini" || value === "cursor" || value === "agy"
+    || value === "unknown" ? value : "unknown";
 }
 
 function validReceiverMode(value: unknown, clientType: ClientType): ReceiverMode {
@@ -966,6 +966,7 @@ function validReceiverMode(value: unknown, clientType: ClientType): ReceiverMode
     return value === "gemini-hook" || value === "manual-drain" ? value : "manual-drain";
   }
   if (clientType === "cursor") return "manual-drain";
+  if (clientType === "agy") return "manual-drain";
   return "unknown";
 }
 
@@ -1466,7 +1467,10 @@ function isHookBackedClientPeer(peer: Pick<Peer, "client_type" | "receiver_mode"
     // that branch is dead-pid only). With it, the row stays routable by pid
     // liveness; the next server generation re-registers with the SAME pid and
     // samePidRefresh keeps the id, so queued mail survives the cycle.
-    peer.client_type === "cursor"
+    peer.client_type === "cursor" ||
+    // agy (Google's agent CLI) registers the visible TUI pid too — same
+    // pid-liveness routability reasoning as cursor.
+    peer.client_type === "agy"
   );
 }
 
