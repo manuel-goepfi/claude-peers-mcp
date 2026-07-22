@@ -953,7 +953,8 @@ function reqStrict(s: unknown): string {
 }
 
 function validClientType(value: unknown): ClientType {
-  return value === "claude" || value === "codex" || value === "gemini" || value === "unknown" ? value : "unknown";
+  return value === "claude" || value === "codex" || value === "gemini" || value === "cursor" || value === "unknown"
+    ? value : "unknown";
 }
 
 function validReceiverMode(value: unknown, clientType: ClientType): ReceiverMode {
@@ -964,6 +965,7 @@ function validReceiverMode(value: unknown, clientType: ClientType): ReceiverMode
   if (clientType === "gemini") {
     return value === "gemini-hook" || value === "manual-drain" ? value : "manual-drain";
   }
+  if (clientType === "cursor") return "manual-drain";
   return "unknown";
 }
 

@@ -93,6 +93,11 @@ describe("opt-in resolution: env unset → file is the single source", () => {
     expect(r.code).toBe(0); // stops at the unreachable-tmux check, after the gate
     expect(r.gatePassed).toBe(true);
   });
+  test("cursor is an allowlisted client in the file", async () => {
+    const r = await runWatchdog({ file: "codex,claude,cursor\n" });
+    expect(r.code).toBe(0);
+    expect(r.gatePassed).toBe(true);
+  });
   test("injection attempt in the file refuses to start", async () => {
     const r = await runWatchdog({ file: "codex; rm -rf /\n" });
     expect(r.code).toBe(1);

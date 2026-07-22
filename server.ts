@@ -215,7 +215,8 @@ export function rewriteAuthBodyForPeer(path: string, body: unknown, oldPeerId: s
 }
 
 export function shouldDisableBackgroundPolling(clientType: ClientType, receiverMode: ReceiverMode): boolean {
-  return clientType === "codex" || clientType === "gemini" || receiverMode === "codex-hook" || receiverMode === "gemini-hook";
+  return clientType === "codex" || clientType === "gemini" || clientType === "cursor"
+    || receiverMode === "codex-hook" || receiverMode === "gemini-hook";
 }
 
 async function brokerFetch<T>(path: string, body: unknown, _retry = false): Promise<T> {
@@ -575,7 +576,7 @@ export function registrationCwdResult(
   clientType: ClientType,
   cwdReader: (pid: number) => string | null = cwdOf,
 ): RegistrationCwdResult {
-  if (clientType === "codex" || clientType === "gemini") {
+  if (clientType === "codex" || clientType === "gemini" || clientType === "cursor") {
     const clientCwd = cwdReader(registerPid);
     if (clientCwd) return { cwd: clientCwd, source: "client", missingClientCwd: false };
     return { cwd: processCwd, source: "process-fallback", missingClientCwd: true };
@@ -593,7 +594,7 @@ export function registrationCwd(
 }
 
 export function registrationTtyPid(registerPid: number, clientType: ClientType, parentPid = process.ppid): number {
-  return clientType === "codex" || clientType === "gemini" ? registerPid : parentPid;
+  return clientType === "codex" || clientType === "gemini" || clientType === "cursor" ? registerPid : parentPid;
 }
 
 function processTable(): Map<number, ProcessInfo> {
@@ -2328,7 +2329,7 @@ async function main() {
   if (spareAncestor) {
     log(`bg-spare pre-warm detected (ancestor pid ${spareAncestor.pid}) — ignoring inherited env identity, deferring registration until promotion or first tool call`);
   }
-  if (myClientType === "codex" || myClientType === "gemini") {
+  if (myClientType === "codex" || myClientType === "gemini" || myClientType === "cursor") {
     const chainPid = findClientPidFromProcessChain(process.ppid, startupProcesses, myClientType);
     if (chainPid) {
       myRegisterPid = chainPid;

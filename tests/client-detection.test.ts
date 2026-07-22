@@ -42,6 +42,25 @@ describe("client detection", () => {
     expect(detectClientFromProcessChain(20, processes, {})).toBe("claude");
   });
 
+  test("detects Cursor ancestor by its install path, not the generic 'agent' name", () => {
+    const processes = table([
+      { pid: 30, ppid: 20, comm: "bun", args: "bun /home/manzo/claude-peers-mcp/server.ts" },
+      { pid: 20, ppid: 10, comm: "MainThread", args: "/home/manzo/.local/bin/agent --use-system-ca /home/manzo/.local/share/cursor-agent/versions/2026.07.20-8cc9c0b/index.js" },
+      { pid: 10, ppid: 1, comm: "bash", args: "-bash" },
+    ]);
+    expect(detectClientFromProcessChain(30, processes, {})).toBe("cursor");
+    expect(detectClientFromProcessChain(30, processes, { CLAUDE_PEERS_CLIENT_TYPE: "cursor" })).toBe("cursor");
+    expect(initialReceiverMode("cursor")).toBe("manual-drain");
+  });
+
+  test("a bare 'agent' binary without the cursor-agent path is NOT Cursor", () => {
+    const processes = table([
+      { pid: 20, ppid: 10, comm: "agent", args: "/usr/local/bin/agent --serve" },
+      { pid: 10, ppid: 1, comm: "bash", args: "-bash" },
+    ]);
+    expect(detectClientFromProcessChain(20, processes, {})).toBe("unknown");
+  });
+
   test("detects Gemini ancestor through wrappers", () => {
     const processes = table([
       { pid: 30, ppid: 20, comm: "bun", args: "bun /home/manzo/claude-peers-mcp/server.ts" },
@@ -76,7 +95,7 @@ describe("client detection", () => {
 
   test("hook-based clients disable the Claude background poll buffer", () => {
     const src = readFileSync(new URL("../server.ts", import.meta.url), "utf8");
-    expect(src).toContain('if (myClientType === "codex" || myClientType === "gemini")');
+    expect(src).toContain('if (myClientType === "codex" || myClientType === "gemini" || myClientType === "cursor")');
     expect(src).toContain("background channel poll disabled");
   });
 

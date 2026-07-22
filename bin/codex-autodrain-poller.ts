@@ -121,6 +121,13 @@ export interface IdleProfile {
   promptLine: RegExp;    // matches a single captured line that IS the prompt line
   strip: RegExp;         // strips up to & incl the glyph (+1 optional space); keeps SGR
   busy: RegExp[];        // any match => mid-turn => never nudge
+  // Optional literal-placeholder escape hatch: some TUIs (Cursor) render the
+  // terminal cursor as a reverse-video block ON the placeholder's first char,
+  // which breaks the all-dim placeholder detection below (reverse resets dim).
+  // When the stripped prompt text matches this, treat as empty input. Safe
+  // direction: if the vendor changes the placeholder wording, nudges stop
+  // (observable, benign) rather than ever submitting real operator input.
+  placeholderText?: RegExp;
 }
 const CODEX_BUSY = [/esc to interrupt/i, /\bWorking\b/, /\bRunning\b/, /Reviewing approval/i, /tokens used/i];
 // Claude busy markers: the animated spinner verbs Claude cycles through mid-turn
@@ -128,10 +135,18 @@ const CODEX_BUSY = [/esc to interrupt/i, /\bWorking\b/, /\bRunning\b/, /Reviewin
 // shared shape: a spinner verb immediately followed by the "(Ns ·" timer), the
 // universal "esc to interrupt" hint, and the "· N tokens" in-flight status row.
 const CLAUDE_BUSY = [/esc to interrupt/i, /\(\d+s\s*·/, /·\s*[\d.]+k?\s*tokens/i, /\b(Esc to interrupt|Running…|Working…)/i];
+// Cursor busy markers are provisional (vocabulary not yet observed mid-turn on
+// this host): false-busy only delays a nudge, never misfires one.
+const CURSOR_BUSY = [/esc to interrupt/i, /esc to cancel/i, /\bGenerating\b/, /\bWorking\b/, /tokens used/i];
 const PROFILES: Record<string, IdleProfile> = {
   codex:  { prompt: /(^|\n)\s*›\s/, promptLine: /^\s*›/, strip: /^.*?›\s?/, busy: CODEX_BUSY },
   gemini: { prompt: /(^|\n)\s*›\s/, promptLine: /^\s*›/, strip: /^.*?›\s?/, busy: CODEX_BUSY },
   claude: { prompt: /(^|\n)\s*❯\s/, promptLine: /^\s*❯/, strip: /^.*?❯\s?/, busy: CLAUDE_BUSY },
+  // Cursor CLI ("agent"): input box glyph is → (U+2192), idle input shows the
+  // dim ghost placeholder "Plan, search, build anything" with the terminal
+  // cursor reverse-blocked on its first char — hence placeholderText.
+  cursor: { prompt: /(^|\n)\s*→\s/, promptLine: /^\s*→/, strip: /^.*?→\s?/, busy: CURSOR_BUSY,
+            placeholderText: /^Plan, search, build anything/ },
 };
 export function profileFor(clientType: string): IdleProfile {
   return PROFILES[clientType] ?? PROFILES.codex!;
@@ -259,14 +274,14 @@ interface Lane {
 // the operator re-engages the lane. Auto-nudge is now opt-in, not automatic.
 //
 // To opt a client back in for a session, set NUDGE_CLIENTS, e.g.
-//   NUDGE_CLIENTS=codex,gemini   (comma-separated; only codex/gemini/claude honored)
+//   NUDGE_CLIENTS=codex,gemini   (comma-separated; only codex/gemini/claude/cursor honored)
 // The whole resolution + idle-detection machinery below is kept intact so opting
 // a client back in is a one-env-var change, not a code revert.
 // Exported + raw-injectable so the parse rules (empty default, allowlist filter,
 // dedup, case/space normalization) are unit-testable without mutating process.env.
 export function parseNudgeClients(raw: string | undefined = process.env.NUDGE_CLIENTS): string[] {
   if (!raw) return []; // DEFAULT: nudge nobody
-  const allowed = new Set(["codex", "gemini", "claude"]);
+  const allowed = new Set(["codex", "gemini", "claude", "cursor"]);
   const picked = raw.split(",").map((s) => s.trim().toLowerCase()).filter((s) => allowed.has(s));
   return [...new Set(picked)];
 }
@@ -408,6 +423,8 @@ export function paneTextIsIdle(captureWithAnsi: string, profile: IdleProfile = P
   const afterGlyph = promptLine.replace(profile.strip, "");  // keep SGR codes
   const afterPlain = stripAnsi(afterGlyph).trim();
   if (afterPlain === "") return true;                          // empty input — nudge
+  // Known literal placeholder (see IdleProfile.placeholderText) — empty input.
+  if (profile.placeholderText?.test(afterPlain)) return true;
   // Non-empty: it is a placeholder (safe to nudge) ONLY if the ENTIRE visible
   // text is rendered dim. Merely CONTAINING a dim span is not enough — real
   // bright operator input with a dim ghost-autocomplete suffix or a dim inline

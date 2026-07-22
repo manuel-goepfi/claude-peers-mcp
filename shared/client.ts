@@ -13,6 +13,7 @@ function normalizedClient(value: string | undefined): ClientType | null {
   if (v === "claude" || v === "claude-code") return "claude";
   if (v === "codex") return "codex";
   if (v === "gemini" || v === "gemini-cli") return "gemini";
+  if (v === "cursor" || v === "cursor-agent") return "cursor";
   if (v === "unknown") return "unknown";
   return null;
 }
@@ -33,10 +34,23 @@ function hasGeminiCliLauncher(args: string): boolean {
   });
 }
 
+// Cursor's CLI installs as `~/.local/bin/agent` running
+// `agent --use-system-ca ~/.local/share/cursor-agent/versions/<v>/index.js`
+// (comm is often "MainThread", not "agent"). A bare `agent` binary name is far
+// too generic to classify on its own — require the cursor-agent install path
+// in the argv before calling it Cursor.
+function hasCursorAgentLauncher(args: string): boolean {
+  return argTokens(args).some((token) => {
+    const normalized = token.replace(/^['"]|['"]$/g, "").toLowerCase();
+    return normalized.includes("cursor-agent/") || normalized.replace(/^.*\//, "") === "cursor-agent";
+  });
+}
+
 export function isClientProcess(row: ProcessInfo, clientType: Exclude<ClientType, "unknown">): boolean {
   const comm = commandName(row.comm);
   const firstArg = commandName(row.args);
   if (clientType === "claude") return comm === "claude" || firstArg === "claude";
+  if (clientType === "cursor") return hasCursorAgentLauncher(row.args);
   if (comm === clientType || comm.startsWith(`${clientType}-`)) return true;
   if (firstArg === clientType || firstArg.startsWith(`${clientType}-`)) return true;
   return clientType === "gemini" && (comm === "node" || comm === "bun" || comm === "npx") && hasGeminiCliLauncher(row.args);
@@ -108,6 +122,7 @@ export function detectClientFromProcessChain(
     if (!p) break;
     if (isClientProcess(p, "codex")) return "codex";
     if (isClientProcess(p, "gemini")) return "gemini";
+    if (isClientProcess(p, "cursor")) return "cursor";
     if (isClientProcess(p, "claude")) return "claude";
     if (p.ppid <= 1 || p.ppid === current) break;
     current = p.ppid;
@@ -119,5 +134,6 @@ export function initialReceiverMode(clientType: ClientType): ReceiverMode {
   if (clientType === "claude") return "claude-channel";
   if (clientType === "codex") return "manual-drain";
   if (clientType === "gemini") return "manual-drain";
+  if (clientType === "cursor") return "manual-drain";
   return "unknown";
 }

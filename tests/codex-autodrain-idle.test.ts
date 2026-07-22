@@ -11,7 +11,7 @@
  * i.e. a dim placeholder = empty input = nudgeable.
  */
 import { describe, test, expect } from "bun:test";
-import { paneTextIsIdle, everyVisibleCharIsDim } from "../bin/codex-autodrain-poller.ts";
+import { paneTextIsIdle, everyVisibleCharIsDim, profileFor } from "../bin/codex-autodrain-poller.ts";
 
 const ESC = "\x1b";
 const dim = (s: string) => `${ESC}[2m${s}${ESC}[0m`;
@@ -49,6 +49,35 @@ describe("paneTextIsIdle", () => {
 
   test("SKIP: bold/bright queued text (explicit SGR) is not a placeholder", () => {
     expect(paneTextIsIdle(idleCapture(bold("rm -rf build")))).toBe(false);
+  });
+
+  test("NUDGE (cursor): placeholder with terminal cursor reverse-blocked on its first char", () => {
+    // Live shape from infra:1.2 — glyph → is dim, the block cursor renders the
+    // placeholder's 'P' as [0;7m (reset+reverse), rest returns to dim. The
+    // all-dim rule alone would misread this as real input; placeholderText
+    // rescues it.
+    const cursorIdle = [
+      "  Tip: Use /config to customize Cursor settings and behavior.",
+      ` ${ESC}[2m→ ${ESC}[0;7mP${ESC}[0;2mlan, search, build anything${ESC}[0m`,
+      "  Cursor Grok 4.5 High",
+    ].join("\n");
+    expect(paneTextIsIdle(cursorIdle, profileFor("cursor"))).toBe(true);
+  });
+
+  test("SKIP (cursor): real typed operator text after the → glyph", () => {
+    const cursorTyped = [
+      ` ${ESC}[2m→ ${ESC}[0mdeploy to production now`,
+      "  Cursor Grok 4.5 High",
+    ].join("\n");
+    expect(paneTextIsIdle(cursorTyped, profileFor("cursor"))).toBe(false);
+  });
+
+  test("SKIP (cursor): busy marker present", () => {
+    const cursorBusy = [
+      "  Generating (esc to interrupt)",
+      ` ${ESC}[2m→ ${ESC}[0;7mP${ESC}[0;2mlan, search, build anything${ESC}[0m`,
+    ].join("\n");
+    expect(paneTextIsIdle(cursorBusy, profileFor("cursor"))).toBe(false);
   });
 
   test("SKIP: lane is mid-turn (busy marker present)", () => {
@@ -408,6 +437,10 @@ import { parseNudgeClients } from "../bin/codex-autodrain-poller.ts";
 describe("parseNudgeClients (auto-nudge default OFF)", () => {
   test("undefined env → empty set (nudge NOBODY by default)", () => {
     expect(parseNudgeClients(undefined)).toEqual([]);
+  });
+
+  test("cursor is an allowlisted client", () => {
+    expect(parseNudgeClients("codex,claude,cursor")).toEqual(["codex", "claude", "cursor"]);
   });
 
   test("empty string → empty set", () => {
