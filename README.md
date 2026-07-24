@@ -168,7 +168,7 @@ History intentionally outlives ephemeral peer rows. Schema version 1 has no mess
 
 | Stored state | Retention behavior |
 | --- | --- |
-| `queued` to a live draining receiver | Retained until claimed/acknowledged; no age-only purge applies. |
+| `queued` to a live draining receiver | Retained until claimed/acknowledged, or until the universal `CLAUDE_PEERS_STALE_UNDELIVERED_TTL_MS` age cap (default 48h) — coordination mail unread that long is dead context; rows inside an active claim lease are never purged. |
 | `claimed` | Lease returns to claimable after 30 seconds if it is not acknowledged. |
 | Undelivered to an `unknown` receiver | Purged after `CLAUDE_PEERS_UNDELIVERED_MSG_TTL_MS`. |
 | Undelivered to a dead recoverable seat | Row and inbox remain inheritable until `CLAUDE_PEERS_DEAD_MAIL_TTL_MS`, never less than one hour, then both are reaped. |
@@ -203,6 +203,7 @@ History intentionally outlives ephemeral peer rows. Schema version 1 has no mess
 | `CLAUDE_PEERS_DEAD_MAIL_TTL_MS` | `86400000` | Recoverable dead-seat mail lifetime; floored at one hour. |
 | `CLAUDE_PEERS_DELIVERED_MSG_TTL_MS` | `604800000` | Acknowledged-history retention. |
 | `CLAUDE_PEERS_UNDELIVERED_MSG_TTL_MS` | `604800000` | Undelivered retention for unknown receivers. |
+| `CLAUDE_PEERS_STALE_UNDELIVERED_TTL_MS` | `172800000` | Universal undelivered age cap, any receiver; active claim leases excluded. |
 | `CLAUDE_PEERS_CLI_TIMEOUT_MS` | `3000` | CLI operation timeout. |
 | `CLAUDE_PEERS_NO_AUTOSTART` | unset | Set `1` to make the CLI refuse broker auto-start. |
 | `CLAUDE_PEER_NAME` | unset | Optional operator-facing seat label captured at session registration. It is not required to be unique. |

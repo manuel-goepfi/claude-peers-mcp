@@ -63,17 +63,44 @@ find_claude_pid() {
   printf '%s\n' "$$"
 }
 
-MCP_PID="${CLAUDE_PEERS_DRAIN_MCP_PID:-$(find_mcp_pid)}"
-[[ "$MCP_PID" =~ ^[0-9]+$ ]] || exit 0
+# Claim identity fallback chain. Peer rows carry different registered pids by
+# origin: the MCP server registers its own resolved pid, the SessionStart
+# register hook registers the claude TUI pid. When the session's MCP server is
+# dead (Claude Code kills it at compact/resume and never respawns mid-session)
+# find_mcp_pid fails — but a hook-registered row keyed on the claude pid may
+# still exist and MUST stay drainable, or the seat receives nudges it can never
+# clear. Try the server pid first (normal case), then the claude pid.
 CLAUDE_PID="${CLAUDE_PEERS_DRAIN_CLAUDE_PID:-$(find_claude_pid)}"
 [[ "$CLAUDE_PID" =~ ^[0-9]+$ ]] || exit 0
+MCP_PID="${CLAUDE_PEERS_DRAIN_MCP_PID:-$(find_mcp_pid)}"
+
+CLAIM_PIDS=()
+[[ "$MCP_PID" =~ ^[0-9]+$ ]] && CLAIM_PIDS+=("$MCP_PID")
+[[ "$CLAUDE_PID" != "$MCP_PID" ]] && CLAIM_PIDS+=("$CLAUDE_PID")
+[[ "${#CLAIM_PIDS[@]}" -gt 0 ]] || exit 0
 
 BROKER_PORT="${CLAUDE_PEERS_PORT:-7899}"
-RAW=$(curl -s -m 2 -w $'\n%{http_code}' -X POST "http://127.0.0.1:${BROKER_PORT}/claim-by-pid" \
-  -H 'Content-Type: application/json' \
-  -d "{\"pid\":${MCP_PID},\"caller_pid\":${CLAUDE_PID},\"client_type\":\"claude\",\"receiver_mode\":\"claude-channel\"}" 2>/dev/null)
-STATUS=$(printf '%s\n' "$RAW" | tail -n1)
-RESP=$(printf '%s' "$RAW" | sed '$d')
+STATUS=""; RESP=""
+for CLAIM_PID in "${CLAIM_PIDS[@]}"; do
+  RAW=$(curl -s -m 2 -w $'\n%{http_code}' -X POST "http://127.0.0.1:${BROKER_PORT}/claim-by-pid" \
+    -H 'Content-Type: application/json' \
+    -d "{\"pid\":${CLAIM_PID},\"caller_pid\":${CLAUDE_PID},\"client_type\":\"claude\",\"receiver_mode\":\"claude-channel\"}" 2>/dev/null)
+  STATUS=$(printf '%s\n' "$RAW" | tail -n1)
+  RESP=$(printf '%s' "$RAW" | sed '$d')
+  # 404 → no row keyed on this pid, try the next identity. 200 with an EMPTY
+  # claim also falls through: with dual rows (server-pid row + hook-registered
+  # claude-pid row) the mail can sit on the later identity while the first
+  # returns an empty 200. An empty claim holds no lease, so moving on is safe.
+  # First 200 that carries messages wins; other statuses → log path below.
+  [[ "$STATUS" == "404" ]] && continue
+  if [[ "$STATUS" == "200" ]]; then
+    N=$(printf '%s' "$RESP" | jq -r '.messages | length // 0' 2>/dev/null)
+    [[ "$N" =~ ^[1-9][0-9]*$ ]] && break
+    continue
+  fi
+  break
+done
+MCP_PID="$CLAIM_PID"
 
 if [[ -n "$STATUS" && "$STATUS" != "200" ]]; then
   LOG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/logs"

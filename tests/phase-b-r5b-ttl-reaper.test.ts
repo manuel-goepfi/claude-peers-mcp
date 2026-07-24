@@ -511,7 +511,7 @@ describe("reaper controls are WIRED into the broker (source-grep sentinels)", ()
     // ungated by receiver_mode — the age bound alone (default 48h, far beyond any
     // real drain latency) is the safety property.
     expect(body).toContain("staleUndeliveredPurgeSql()");
-    expect(staleUndeliveredPurgeSql()).toMatch(/delivered = 0 AND sent_at < \?/);
+    expect(staleUndeliveredPurgeSql()).toMatch(/delivered = 0 AND \(claimed_at IS NULL OR claimed_at < \?2\) AND sent_at < \?1/);
     expect(staleUndeliveredPurgeSql()).not.toContain("receiver_mode");
     // Runs inside the same guarded mail-purge stage, after the scoped purge.
     const scopedIdx = body.indexOf("unknownReceiverPurgeSql()");
@@ -525,14 +525,23 @@ describe("reaper controls are WIRED into the broker (source-grep sentinels)", ()
     db.run(`CREATE INDEX idx_messages_unknown_retention ON messages(delivered, sent_at, to_id)`);
     const old = new Date(Date.now() - 60 * 60 * 60 * 1000).toISOString(); // 60h
     const fresh = new Date(Date.now() - 1 * 60 * 60 * 1000).toISOString(); // 1h
+    const activeClaim = new Date(Date.now() - 5_000).toISOString(); // inside lease
+    const lapsedClaim = new Date(Date.now() - 10 * 60 * 1000).toISOString(); // lease long gone
     db.run("INSERT INTO messages (from_id, to_id, text, sent_at, delivered) VALUES ('a','b','stale seat-change',?,0)", [old]);
     db.run("INSERT INTO messages (from_id, to_id, text, sent_at, delivered) VALUES ('a','b','fresh mail',?,0)", [fresh]);
     db.run("INSERT INTO messages (from_id, to_id, text, sent_at, delivered) VALUES ('a','b','old but delivered',?,1)", [old]);
+    // Mid-claim row: over-age but inside an ACTIVE lease — a drain hook is
+    // rendering it right now; purging here would lose the ack (review P1 #3).
+    db.run("INSERT INTO messages (from_id, to_id, text, sent_at, delivered, claimed_by, claimed_at) VALUES ('a','b','old mid-claim',?,0,'drain:x',?)", [old, activeClaim]);
+    // Abandoned claim: over-age with a LAPSED lease — must still purge, or
+    // claimed-once-then-orphaned rows leak forever (leases are never cleared).
+    db.run("INSERT INTO messages (from_id, to_id, text, sent_at, delivered, claimed_by, claimed_at) VALUES ('a','b','old abandoned claim',?,0,'drain:y',?)", [old, lapsedClaim]);
     const cutoff = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+    const claimCutoff = new Date(Date.now() - 30_000).toISOString();
     const sql = staleUndeliveredPurgeSql().replace(/INDEXED BY \S+ /, "");
-    db.run(sql, [cutoff]);
+    db.run(sql, [cutoff, claimCutoff]);
     const rows = db.query("SELECT text FROM messages ORDER BY id").all() as Array<{ text: string }>;
-    expect(rows.map((r) => r.text)).toEqual(["fresh mail", "old but delivered"]);
+    expect(rows.map((r) => r.text)).toEqual(["fresh mail", "old but delivered", "old mid-claim"]);
     db.close();
   });
   test("selectBroadcastTargets EXCLUDES receiver_mode='unknown' peers (B1 leak fix wired)", async () => {

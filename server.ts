@@ -2334,6 +2334,9 @@ async function main() {
   if (spareAncestor) {
     log(`bg-spare pre-warm detected (ancestor pid ${spareAncestor.pid}) — ignoring inherited env identity, deferring registration until promotion or first tool call`);
   }
+  // Set when app-server-hosted identity resolution exhausts every path and
+  // falls back to the MCP server's own pid — the observer-${pid} signature.
+  let appServerIdentityUnresolved = false;
   if (myClientType === "codex" || myClientType === "gemini" || myClientType === "cursor" || myClientType === "agy") {
     const chainPid = findClientPidFromProcessChain(process.ppid, startupProcesses, myClientType);
     if (chainPid) {
@@ -2348,6 +2351,7 @@ async function main() {
       } else {
         log(`Codex app-server identity unresolved for cwd=${visibleCwdHint}; falling back to MCP server pid to avoid misrouting same-cwd panes`);
         myRegisterPid = process.pid;
+        appServerIdentityUnresolved = true;
       }
     } else {
       myRegisterPid = process.pid;
@@ -2542,10 +2546,12 @@ async function main() {
   // registration to the first real tool call (ensureRegistered in the CallTool
   // handler), exactly like bg-spare. A leaked thread never calls a tool, so it
   // never registers, never heartbeats, and holds no broker connection.
+  // Gate: the app-server ancestry makes detectClientFromProcessChain return
+  // "codex" (never "unknown"), so the observer signature is the register-pid
+  // fallback flag — identity resolution found no visible codex TUI and keyed
+  // the row on the MCP server's own pid.
   const appServerUnresolved =
-    myClientType === "unknown" &&
-    !identityEnv.CLAUDE_PEER_NAME &&
-    findCodexAppServerAncestor(process.ppid, startupProcesses) !== null;
+    appServerIdentityUnresolved && !identityEnv.CLAUDE_PEER_NAME;
   if (appServerUnresolved) {
     log("app-server-hosted spawn with unresolved identity — deferring registration until first tool call");
   }

@@ -408,8 +408,10 @@ function cleanStalePeers() {
     }
     // Universal undelivered cap (see STALE_UNDELIVERED_TTL_MS): any-receiver
     // backstop against 2-day-old coordination mail fueling phantom nudges.
+    // Second param: claim-lease cutoff — rows inside an active lease are
+    // mid-render in a drain hook and must survive to their ack.
     const anyUndelivCutoff = new Date(Date.now() - STALE_UNDELIVERED_TTL_MS).toISOString();
-    const expiredUndeliv = db.run(staleUndeliveredPurgeSql(), [anyUndelivCutoff]);
+    const expiredUndeliv = db.run(staleUndeliveredPurgeSql(), [anyUndelivCutoff, claimCutoffIso()]);
     if (expiredUndeliv.changes > 0) {
       console.error(`[broker] stale-undelivered TTL: dropped ${expiredUndeliv.changes} undelivered message(s) older than ${STALE_UNDELIVERED_TTL_MS}ms`);
     }
@@ -1492,10 +1494,11 @@ function isHookBackedClientPeer(peer: Pick<Peer, "client_type" | "receiver_mode"
     // claude TUI process, but last_seen freshness rides on the session's MCP
     // server, which the client kills at every compact/resume and does not
     // respawn after a mid-session death. Keep the seat routable by pid
-    // liveness: the UserPromptSubmit drain hook delivers by pid without MCP,
-    // so a live claude pid can always still receive queued mail. Rows whose
-    // registered pid was a transient spawn helper die with that pid and reap
-    // normally.
+    // liveness: the UserPromptSubmit drain hook claims by pid over HTTP with a
+    // claude-pid fallback identity (claude-drain-peer-inbox.sh claim chain),
+    // so a live claude pid can still receive queued mail with no MCP server.
+    // Rows whose registered pid was a transient spawn helper die with that pid
+    // and reap normally.
     (peer.client_type === "claude" && peer.receiver_mode === "claude-channel")
   );
 }

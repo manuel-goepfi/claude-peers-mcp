@@ -614,7 +614,12 @@ export function unknownReceiverPurgeSql(): string {
 }
 
 export function staleUndeliveredPurgeSql(): string {
-  return `DELETE FROM messages INDEXED BY ${storageIndexes.unknownReceiverRetention} WHERE delivered = 0 AND sent_at < ?`;
+  // Params: [sent_at cutoff, claim-lease cutoff]. A row inside an ACTIVE claim
+  // lease is mid-render in a drain hook — deleting it there loses the ack and
+  // breaks lease-expiry redelivery. Leases are never cleared, only compared
+  // (claimCutoffIso), so the guard is lease-expiry, not claimed_at IS NULL —
+  // an abandoned claim becomes purgeable once its lease lapses.
+  return `DELETE FROM messages INDEXED BY ${storageIndexes.unknownReceiverRetention} WHERE delivered = 0 AND (claimed_at IS NULL OR claimed_at < ?2) AND sent_at < ?1`;
 }
 
 export function explainUsesIndex(db: Database, sql: string, params: Array<string | number | null>, indexName: string): boolean {
