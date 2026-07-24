@@ -64,6 +64,7 @@ import {
   PostCommitStorageVerificationError,
   restoreStorageAfterFailedMigration,
   retentionPurgeSql,
+  staleUndeliveredPurgeSql,
   unknownReceiverPurgeSql,
   STORAGE_SCHEMA_VERSION,
   type InitializeStorageResult,
@@ -268,6 +269,15 @@ const DELIVERED_MSG_TTL_MS = positiveEnvMs("CLAUDE_PEERS_DELIVERED_MSG_TTL_MS", 
 // Claude/Codex/Gemini peer NEVER loses mail — real clients resolve receiver_mode
 // within seconds of their first hook/drain, far inside this window. Default 7d.
 const UNDELIVERED_MSG_TTL_MS = positiveEnvMs("CLAUDE_PEERS_UNDELIVERED_MSG_TTL_MS", 604_800_000);
+// Universal cap on UNDELIVERED message age, ANY receiver. Coordination mail
+// (seat changes, GO signals, review pings) that has sat unread for 2 days is
+// dead context: acting on it is worse than losing it, and until purged it keeps
+// the autodrain poller nudging the target's pane about mail the live session
+// will never usefully consume (observed: 36h-old seat-change broadcasts parked
+// on idle codex lanes driving phantom "1 unread" wakes). Deliberately much
+// longer than any real drain latency (hooks drain in seconds, manual-drain
+// lanes within hours); env-tunable for fleets with slower cadence.
+const STALE_UNDELIVERED_TTL_MS = positiveEnvMs("CLAUDE_PEERS_STALE_UNDELIVERED_TTL_MS", 172_800_000);
 // Cap the broker's OWN log file. The register hook rotates on register; this
 // bounds it on the periodic reaper tick too, so the log can't grow unbounded
 // during a flood with no new registrations (how it reached 24MB on 2026-06-19).
@@ -395,6 +405,13 @@ function cleanStalePeers() {
     const staleUndeliv = db.run(unknownReceiverPurgeSql(), [undelivCutoff]);
     if (staleUndeliv.changes > 0) {
       console.error(`[broker] undelivered-mail TTL: dropped ${staleUndeliv.changes} message(s) older than ${UNDELIVERED_MSG_TTL_MS}ms to non-draining peer(s)`);
+    }
+    // Universal undelivered cap (see STALE_UNDELIVERED_TTL_MS): any-receiver
+    // backstop against 2-day-old coordination mail fueling phantom nudges.
+    const anyUndelivCutoff = new Date(Date.now() - STALE_UNDELIVERED_TTL_MS).toISOString();
+    const expiredUndeliv = db.run(staleUndeliveredPurgeSql(), [anyUndelivCutoff]);
+    if (expiredUndeliv.changes > 0) {
+      console.error(`[broker] stale-undelivered TTL: dropped ${expiredUndeliv.changes} undelivered message(s) older than ${STALE_UNDELIVERED_TTL_MS}ms`);
     }
   } catch (e) {
     if (!mailPurgeStageWarned) {
@@ -1470,7 +1487,16 @@ function isHookBackedClientPeer(peer: Pick<Peer, "client_type" | "receiver_mode"
     peer.client_type === "cursor" ||
     // agy (Google's agent CLI) registers the visible TUI pid too — same
     // pid-liveness routability reasoning as cursor.
-    peer.client_type === "agy"
+    peer.client_type === "agy" ||
+    // Claude rows: the SessionStart register hook binds pid to the visible
+    // claude TUI process, but last_seen freshness rides on the session's MCP
+    // server, which the client kills at every compact/resume and does not
+    // respawn after a mid-session death. Keep the seat routable by pid
+    // liveness: the UserPromptSubmit drain hook delivers by pid without MCP,
+    // so a live claude pid can always still receive queued mail. Rows whose
+    // registered pid was a transient spawn helper die with that pid and reap
+    // normally.
+    (peer.client_type === "claude" && peer.receiver_mode === "claude-channel")
   );
 }
 

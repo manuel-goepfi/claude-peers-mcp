@@ -215,7 +215,11 @@ export function rewriteAuthBodyForPeer(path: string, body: unknown, oldPeerId: s
 }
 
 export function shouldDisableBackgroundPolling(clientType: ClientType, receiverMode: ReceiverMode): boolean {
+  // "unknown" clients have no channel receive path (send-only bridges, observer
+  // rows): a background poll can never deliver to them, it only holds a broker
+  // connection open per process. check_messages still polls the broker directly.
   return clientType === "codex" || clientType === "gemini" || clientType === "cursor" || clientType === "agy"
+    || clientType === "unknown"
     || receiverMode === "codex-hook" || receiverMode === "gemini-hook";
 }
 
@@ -2527,9 +2531,27 @@ async function main() {
     }
     return registerInFlight;
   };
-  if (!spareAncestor) {
+  // App-server-hosted unresolved identity: the Codex app-server spawns an MCP
+  // set per hosted thread and leaks the processes when the thread ends (the
+  // stdio-guard can't fire — its liveness anchor, the app-server, never dies).
+  // An eagerly-registered observer-${pid} row from such a spawn then heartbeats
+  // a dead thread's seat forever: roster litter plus a permanent broker
+  // connection per leaked process (observed: 90 leaked servers / 28 observer
+  // rows). Identity here is unresolvable anyway (no client ancestor, no
+  // operator-pinned name), so nothing routable is lost by waiting: defer
+  // registration to the first real tool call (ensureRegistered in the CallTool
+  // handler), exactly like bg-spare. A leaked thread never calls a tool, so it
+  // never registers, never heartbeats, and holds no broker connection.
+  const appServerUnresolved =
+    myClientType === "unknown" &&
+    !identityEnv.CLAUDE_PEER_NAME &&
+    findCodexAppServerAncestor(process.ppid, startupProcesses) !== null;
+  if (appServerUnresolved) {
+    log("app-server-hosted spawn with unresolved identity — deferring registration until first tool call");
+  }
+  if (!spareAncestor && !appServerUnresolved) {
     await ensureRegistered();
-  } else {
+  } else if (spareAncestor) {
     const promotionTimer = setInterval(() => {
       if (myId || shuttingDown) {
         clearInterval(promotionTimer);

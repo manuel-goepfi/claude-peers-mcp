@@ -66,7 +66,7 @@ import { Database } from "bun:sqlite";
 // hoisted into a side-effect-free shared module specifically so the
 // predicate tests below test load-bearing prod code, not a copy.
 import { isReapable, deadSeatMailExpired, shouldRotateLog, PEER_GHOST_AFTER_MS } from "../shared/reaper";
-import { positiveMilliseconds, retentionPurgeSql, unknownReceiverPurgeSql } from "../shared/storage.ts";
+import { positiveMilliseconds, retentionPurgeSql, staleUndeliveredPurgeSql, unknownReceiverPurgeSql } from "../shared/storage.ts";
 
 type TestPeer = { id: string; pid: number; last_seen: string };
 
@@ -501,6 +501,39 @@ describe("reaper controls are WIRED into the broker (source-grep sentinels)", ()
     const undelIdx = body.indexOf("unknownReceiverPurgeSql()");
     expect(delIdx).toBeGreaterThanOrEqual(0);
     expect(undelIdx).toBeGreaterThan(delIdx);
+  });
+  test("cleanStalePeers CALLS the universal stale-undelivered TTL DELETE (any receiver)", async () => {
+    const src = await Bun.file(`${import.meta.dir}/../broker.ts`).text();
+    const body = (src.split("function cleanStalePeers()")[1] ?? "").split("\nfunction ")[0] ?? "";
+    // Backstop for 2-day-old coordination mail to ANY receiver: undelivered mail
+    // that old fuels phantom autodrain nudges (poller sees unread the live session
+    // will never consume). Unlike unknownReceiverPurgeSql this is deliberately
+    // ungated by receiver_mode — the age bound alone (default 48h, far beyond any
+    // real drain latency) is the safety property.
+    expect(body).toContain("staleUndeliveredPurgeSql()");
+    expect(staleUndeliveredPurgeSql()).toMatch(/delivered = 0 AND sent_at < \?/);
+    expect(staleUndeliveredPurgeSql()).not.toContain("receiver_mode");
+    // Runs inside the same guarded mail-purge stage, after the scoped purge.
+    const scopedIdx = body.indexOf("unknownReceiverPurgeSql()");
+    const universalIdx = body.indexOf("staleUndeliveredPurgeSql()");
+    expect(scopedIdx).toBeGreaterThanOrEqual(0);
+    expect(universalIdx).toBeGreaterThan(scopedIdx);
+  });
+  test("stale-undelivered TTL actually deletes old mail and keeps fresh mail", () => {
+    const db = new Database(":memory:");
+    db.run(`CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, from_id TEXT NOT NULL, to_id TEXT NOT NULL, text TEXT NOT NULL, sent_at TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0, delivered_at TEXT, retention_at TEXT, claimed_by TEXT, claimed_at TEXT)`);
+    db.run(`CREATE INDEX idx_messages_unknown_retention ON messages(delivered, sent_at, to_id)`);
+    const old = new Date(Date.now() - 60 * 60 * 60 * 1000).toISOString(); // 60h
+    const fresh = new Date(Date.now() - 1 * 60 * 60 * 1000).toISOString(); // 1h
+    db.run("INSERT INTO messages (from_id, to_id, text, sent_at, delivered) VALUES ('a','b','stale seat-change',?,0)", [old]);
+    db.run("INSERT INTO messages (from_id, to_id, text, sent_at, delivered) VALUES ('a','b','fresh mail',?,0)", [fresh]);
+    db.run("INSERT INTO messages (from_id, to_id, text, sent_at, delivered) VALUES ('a','b','old but delivered',?,1)", [old]);
+    const cutoff = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+    const sql = staleUndeliveredPurgeSql().replace(/INDEXED BY \S+ /, "");
+    db.run(sql, [cutoff]);
+    const rows = db.query("SELECT text FROM messages ORDER BY id").all() as Array<{ text: string }>;
+    expect(rows.map((r) => r.text)).toEqual(["fresh mail", "old but delivered"]);
+    db.close();
   });
   test("selectBroadcastTargets EXCLUDES receiver_mode='unknown' peers (B1 leak fix wired)", async () => {
     const src = await Bun.file(`${import.meta.dir}/../broker.ts`).text();

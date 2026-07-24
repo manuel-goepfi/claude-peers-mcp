@@ -1280,6 +1280,52 @@ describe("Live broker delivery features", () => {
     childT.kill();
   });
 
+  test("send_to_peer keeps stale but alive Claude rows routable after MCP-connection death", async () => {
+    // Claude Code kills the session's MCP server at every compact/resume and
+    // never respawns it after a mid-session death, so last_seen freezes while
+    // the claude TUI pid (registered by the SessionStart hook) stays alive.
+    // The seat must remain routable: the UserPromptSubmit drain hook delivers
+    // by pid without any MCP involvement. Regression guard for the launch.11
+    // "unreachable orchestrator" incident (2026-07-24).
+    const childS = spawnSleep();
+    const childT = spawnSleep();
+    const sender = await brokerFetch<{ id: string }>("/register", {
+      pid: childS.pid, cwd: "/claude-idle-s", git_root: null, tty: null, name: "claude-idle-s",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
+    });
+    const target = await brokerFetch<{ id: string }>("/register", {
+      pid: childT.pid, cwd: "/claude-idle-t", git_root: null, tty: null, name: "claude-idle-target",
+      tmux_session: "launch", tmux_window_index: "2", tmux_window_name: "orch", tmux_pane_id: "%897",
+      client_type: "claude", receiver_mode: "claude-channel", summary: "",
+    });
+    const staleIso = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+    const rw = new Database(TEST_DB);
+    rw.run("UPDATE peers SET last_seen = ? WHERE id = ?", [staleIso, target.id]);
+    rw.close();
+
+    const send = await brokerFetch<{ ok: boolean; target?: { id: string; seat_key: string } }>("/send-to-peer", {
+      from_id: sender.id,
+      selector: { name: "claude-idle-target" },
+      text: "stale claude seat with live pid should still route",
+    });
+
+    expect(send.ok).toBe(true);
+    expect(send.target?.id).toBe(target.id);
+    expect(send.target?.seat_key).toBe("pane:launch:%897");
+
+    // Dead pid + stale row (a transient spawn-helper registration) must NOT
+    // stay routable — the exemption is pid-liveness-scoped.
+    childT.kill();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const deadSend = await brokerFetch<{ ok: boolean; code?: string }>("/send-to-peer", {
+      from_id: sender.id,
+      selector: { name: "claude-idle-target" },
+      text: "dead claude pid must not route",
+    });
+    expect(deadSend.ok).toBe(false);
+    childS.kill();
+  });
+
   test("send_to_peer rejects stale hook-backed Codex rows without a visible seat", async () => {
     const childS = spawnSleep();
     const childT = spawnSleep();

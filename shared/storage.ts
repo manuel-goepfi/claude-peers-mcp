@@ -613,6 +613,10 @@ export function unknownReceiverPurgeSql(): string {
   return `DELETE FROM messages INDEXED BY ${storageIndexes.unknownReceiverRetention} WHERE delivered = 0 AND sent_at < ? AND to_id IN (SELECT id FROM peers WHERE receiver_mode = 'unknown')`;
 }
 
+export function staleUndeliveredPurgeSql(): string {
+  return `DELETE FROM messages INDEXED BY ${storageIndexes.unknownReceiverRetention} WHERE delivered = 0 AND sent_at < ?`;
+}
+
 export function explainUsesIndex(db: Database, sql: string, params: Array<string | number | null>, indexName: string): boolean {
   const rows = db.query(`EXPLAIN QUERY PLAN ${sql}`).all(...params) as Array<{ detail: string }>;
   return rows.some((row) => row.detail.includes(indexName));

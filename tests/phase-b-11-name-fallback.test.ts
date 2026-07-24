@@ -563,7 +563,9 @@ describe("Operator-label fallback — human name first, pane_id metadata last", 
     expect(shouldDisableBackgroundPolling("gemini", "manual-drain")).toBe(true);
     expect(shouldDisableBackgroundPolling("unknown", "codex-hook")).toBe(true);
     expect(shouldDisableBackgroundPolling("claude", "claude-channel")).toBe(false);
-    expect(shouldDisableBackgroundPolling("unknown", "manual-drain")).toBe(false);
+    // "unknown" clients (send-only bridges, observer rows) have no channel
+    // receive path — polling can never deliver to them, so it stays off.
+    expect(shouldDisableBackgroundPolling("unknown", "manual-drain")).toBe(true);
   });
 
   test("repo-scope peer lists warn against first-row routing", () => {
