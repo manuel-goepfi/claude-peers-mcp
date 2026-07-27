@@ -156,6 +156,44 @@ describe("seat-anchored registration", () => {
     expect(migrated.n).toBe(1);
   });
 
+  test("a LIVE row's id survives ahead of a newer dead one", async () => {
+    // The shape left behind by every seat that duplicated before this fix, and
+    // the shape sitting in the production database right now: one row whose
+    // process is gone but whose last_seen is newest, beside one still occupied.
+    // Senders can still reach the live id; adopting the dead one would strand
+    // exactly them. Seeded directly because registration can no longer produce
+    // two rows on a seat, and a dead pid cannot register at all (S3).
+    const livePid = spawnHolder();
+    const deadHolder = Bun.spawn(["sleep", "60"], { stdout: "ignore", stderr: "ignore" });
+    const deadPid = deadHolder.pid;
+    deadHolder.kill();
+    await Bun.sleep(120);
+
+    const db = new Database(broker.dbPath);
+    const insert = (id: string, pid: number, lastSeen: string) => db.run(
+      `INSERT INTO peers (id, pid, cwd, git_root, tty, name, resolved_name, tmux_session,
+        tmux_window_index, tmux_window_name, tmux_pane_id, client_type, receiver_mode,
+        summary, registered_at, last_seen, token, non_targetable, seat_key, seat_pids)
+       VALUES (?,?,'/seat/legacy','/seat/legacy','pts/71',?,?, 'seatsess','1','lane','%708',
+        'claude','claude-channel','', ?, ?, 'tok-' || ?, 0, 'pane:seatsess:%708', '[]')`,
+      [id, pid, "legacy.1", id, lastSeen, lastSeen, id],
+    );
+    insert("legacyalive", livePid, "2026-07-27T07:00:00.000Z");
+    insert("legacydead", deadPid, "2026-07-27T07:05:00.000Z"); // newer, but gone
+    db.close();
+
+    const newcomer = spawnHolder();
+    const adopted = await register(newcomer, {
+      tmux_pane_id: "%708", cwd: "/seat/legacy", git_root: "/seat/legacy", tty: "pts/71", name: "legacy.1",
+    });
+    expect(adopted.id).toBe("legacyalive");
+
+    const after = new Database(broker.dbPath, { readonly: true });
+    const remaining = after.query("SELECT id FROM peers WHERE tmux_pane_id = '%708'").all() as Array<{ id: string }>;
+    after.close();
+    expect(remaining).toHaveLength(1);
+  });
+
   test("headless lanes never merge — two anonymous lanes stay two seats", async () => {
     const one = spawnHolder();
     const two = spawnHolder();

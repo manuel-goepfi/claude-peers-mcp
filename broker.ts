@@ -1249,11 +1249,16 @@ function handleRegister(body: RegisterRequest): RegisterResult {
       return occupantType === "unknown" || requestedClientType === "unknown" || occupantType === requestedClientType;
     });
     if (compatible.length > 0) {
-      // Newest row's id survives: it is the identity most recently advertised to
-      // the fleet, so the fewest senders hold a stale reference to it.
-      const survivor = compatible[0]!;
+      // An OCCUPIED row's id survives ahead of a merely newer one. Both rows are
+      // this seat, but senders can still reach one whose process is alive, so
+      // adopting it keeps every outstanding reference working — adopting a dead
+      // row's id instead would strand exactly those senders. Within each group
+      // the SQL order stands: exact repo match first, then most recently seen,
+      // which is the identity most recently advertised to the fleet.
+      const occupied = compatible.filter((o) => seatPidsAlive(parseSeatPids(o.seat_pids), o.pid, isPidAlive));
+      const survivor = (occupied[0] ?? compatible[0])!;
       inheritedId = survivor.id;
-      seatMerge.fromIds = compatible.slice(1).map((o) => o.id);
+      seatMerge.fromIds = compatible.filter((o) => o.id !== survivor.id).map((o) => o.id);
       seatMerge.pids = compatible.flatMap((o) => [o.pid, ...parseSeatPids(o.seat_pids)]);
       // Keep the seat's existing token. Rotating it would 401 the co-registrant
       // still serving this same seat (the MCP server, when the hook registers
