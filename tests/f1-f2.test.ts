@@ -675,15 +675,22 @@ describe("F1+F2 live broker integration", () => {
       expect(first.name).toBe("codex.2");
       expect(first.resolved_name).toBe("codex.2");
       expect(second.name).toBe("codex.2");
-      // SAME-SEAT duplicate = seat relaunch: the predecessor is flagged
-      // superseded at registration, so it is NOT collision material and the
-      // successor KEEPS the seat name (no launch.5→launch.6 name-creep).
+      // SAME-SEAT duplicate = seat relaunch: the successor KEEPS the seat name
+      // (no launch.5→launch.6 name-creep).
       expect(second.resolved_name).toBe("codex.2");
+      // Durable seat identity: the second registrant ADOPTS the seat rather
+      // than minting a second identity for one pane, so senders holding either
+      // reference reach the same seat.
+      expect(second.id).toBe(first.id);
 
       const active = await brokerFetch<Peer[]>("/list-peers", { id: second.id, scope: "machine", cwd: "/", git_root: null });
       const diagnostic = await brokerFetch<Peer[]>("/list-peers", { id: second.id, scope: "machine", cwd: "/", git_root: null, include_inactive: true });
       expect(active.filter((p) => p.name === "codex.2")).toHaveLength(1);
-      expect(diagnostic.filter((p) => p.name === "codex.2")).toHaveLength(2);
+      // One seat is one ROW now, not one active row shadowing a superseded
+      // twin: the merge folds the predecessor in, so even the diagnostic view
+      // that deliberately includes inactive rows sees a single seat. A second
+      // row here is what used to hold undrainable mail.
+      expect(diagnostic.filter((p) => p.name === "codex.2")).toHaveLength(1);
 
       // DISTINCT-SEAT duplicate (a genuinely different live seat): supersede
       // does not fire, so lane-ordinal allocation still disambiguates

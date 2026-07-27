@@ -28,6 +28,12 @@ Claude / Codex / Gemini session
 
 The broker owns both the configured loopback listener and a lifetime lock for the canonical database. Operational routes remain unavailable while storage is starting or migrating. The first adapter can start the broker directly; a hardened systemd user service is available for managed ownership.
 
+### Seat identity
+
+A peer row is anchored to a **seat** — the operator-visible place an agent lives — not to the process that registered it. The seat key is `pane:<session>:<pane_id>` when the client is in tmux, `tty:<tty>` otherwise; a headless lane has no seat key and keeps per-process identity, since two anonymous background lanes are genuinely different seats.
+
+One seat is one row with one id. Several processes legitimately register for the same seat — a Claude session registers its MCP server pid *and*, from the SessionStart hook, its TUI pid — so registration **merges** onto the existing seat instead of minting a second identity: the newest row's id survives, the duplicate's undelivered mail migrates to it, and every registering pid is recorded in `seat_pids`. The seat counts as alive while any of those pids is alive, so an MCP server killed at compact/resume does not make an occupied pane look dead. Merging replaces superseding for co-registrants: nothing is told to step down and no mail is dropped.
+
 ## Clean installation
 
 ```bash
@@ -142,6 +148,16 @@ Tmux capture is always explicit through `inspect_peer_pane` or `include_tmux_con
 | `unknown` | The sender cannot prove a current row/state, including legacy delivered rows without an acknowledgement timestamp. |
 
 `expired` is retention telemetry only; the broker does not keep message tombstones. A missing row is never guessed to be queued or expired.
+
+Queue insertion is not receipt, so every send also returns the recipient's live delivery health in `recipient` (and a human `warning` when there is something to say). This is read from the recipient's actual queue at send time, not inferred from its configuration:
+
+| `recipient.state` | Meaning |
+| --- | --- |
+| `healthy` | Draining normally, or the queue is too young to judge. |
+| `undrained` | Has a drain path but has not used it while mail waits — older than `UNDRAINED_WARN_MS` (10 minutes). The sender is told to treat the message as undelivered. |
+| `no_drain_path` | No tmux pane for the autodrain poller to nudge and no client hook. Delivery depends entirely on the recipient calling `check_messages`. |
+
+`recipient` also carries `pending` (queue depth including the message just sent), `oldest_pending_ms`, `last_drain_at`, and `nudgeable`.
 
 | Client | Receiver mode | Receipt path |
 | --- | --- | --- |

@@ -54,7 +54,13 @@ import type {
 // for the reap predicate without touching the broker's startup shape.
 import { isReapable, deadSeatMailExpired, shouldRotateLog, PEER_GHOST_AFTER_MS } from "./shared/reaper.ts";
 import { PEERS_VERSION } from "./shared/version.ts";
-import { CLAIM_TTL_MS, claimCutoffIso } from "./shared/delivery-state.ts";
+import {
+  CLAIM_TTL_MS,
+  claimCutoffIso,
+  recipientDeliveryHealth,
+  type RecipientDeliveryHealth,
+} from "./shared/delivery-state.ts";
+import { durableSeatKey, mergeSeatPids, parseSeatPids, seatPidsAlive, serializeSeatPids } from "./shared/seat.ts";
 import { acquireBrokerOwnership, assertDatabaseIdentity, type BrokerLifecycleIdentity } from "./shared/broker-lifecycle.ts";
 import {
   OWNER_ONLY_UMASK,
@@ -645,8 +651,16 @@ const selectMsgForLatency = db.prepare(`
 // token (which lives in the MCP server's memory only). Security model:
 // caller_pid is verified same-UID via verifyPidUid, and loopback-only bind
 // means the attacker boundary is already "other user on this machine".
+// Matches the row's own pid OR any pid recorded as serving its seat, so a
+// Claude session whose MCP server was killed at compact can still drain via
+// the TUI pid its SessionStart hook registered (and vice versa). The row's own
+// pid sorts first so an exact-pid row always wins over a seat-set match.
 const selectPeerIdByPid = db.prepare(`
-  SELECT id FROM peers WHERE pid = ? AND non_targetable = 0
+  SELECT id FROM peers
+  WHERE non_targetable = 0
+    AND (pid = ?1 OR (json_valid(peers.seat_pids) AND EXISTS (SELECT 1 FROM json_each(peers.seat_pids) WHERE value = ?1)))
+  ORDER BY CASE WHEN pid = ?1 THEN 0 ELSE 1 END, last_seen DESC
+  LIMIT 1
 `);
 
 const claimMessage = db.prepare(`
@@ -674,6 +688,33 @@ const selectRehydrateCandidatesByPane = db.prepare(`
     AND pid != ?
   ORDER BY CASE WHEN (? IS NOT NULL AND git_root = ?) THEN 0 ELSE 1 END, last_seen DESC LIMIT 3
 `);
+
+// Seat occupants: every row already anchored to this durable seat.
+//
+// The identity guards are deliberately the SAME ones rehydration applies, because
+// this is rehydration extended to live co-registrants — a seat is only "the same
+// seat" when the work happening there is the same work. cwd keeps a pane reused
+// by a different project from inheriting the previous occupant's mail; the
+// git_root clause lets a stored null upgrade to a known repo but never lets an
+// incoming null steal a concrete one; the window clause rejects a pane whose
+// window metadata contradicts the registrant. Dropping any of them would deliver
+// one project's mail into another's session.
+//
+// Ordered exact-repo-first, then newest: the surviving id is the one most
+// recently advertised to the fleet, so the fewest senders hold a stale reference.
+const selectSeatOccupants = db.prepare(`
+  SELECT id, pid, seat_pids, token, client_type, last_seen FROM peers
+  WHERE non_targetable = 0
+    AND seat_key = ?1
+    AND cwd = ?2
+    AND (git_root = ?3 OR git_root IS NULL)
+    AND ((?4 IS NULL OR ?5 IS NULL) OR tmux_window_index IS NULL OR tmux_window_name IS NULL
+         OR (tmux_window_index = ?4 AND tmux_window_name = ?5))
+  ORDER BY CASE WHEN (?3 IS NOT NULL AND git_root = ?3) THEN 0 ELSE 1 END, last_seen DESC
+  LIMIT 8
+`);
+
+const updateSeatIdentity = db.prepare(`UPDATE peers SET seat_key = ?, seat_pids = ? WHERE id = ?`);
 
 const selectRehydrateCandidatesByWindow = db.prepare(`
   SELECT id, pid, last_seen, git_root FROM peers
@@ -1161,11 +1202,77 @@ function handleRegister(body: RegisterRequest): RegisterResult {
     }
   }
 
+  let inheritedId: string | null = null;
+
+  // Seat merge — the durable-identity anchor. One seat is one row, however many
+  // processes register for it.
+  //
+  // A Claude session registers TWICE: server.ts registers the MCP server's pid,
+  // and the SessionStart hook registers the TUI pid. Both are correct, neither
+  // is a duplicate session, and their pids differ — so the pid-keyed paths mint
+  // two rows for one pane. The older one is flagged superseded, but a superseded
+  // row only steps down when it heartbeats again, and an MCP server killed at
+  // compact never heartbeats again. The row lingers holding mail its seat can
+  // never drain: the poller counts it unread and nudges the pane forever with
+  // nothing to show. Merging here is what ends that class.
+  //
+  // Merge, never supersede: the loser's undelivered mail migrates to the
+  // surviving id rather than being dropped, so mail arriving on either identity
+  // reaches the one seat that is actually there.
+  //
+  // Runs BEFORE rehydration because it is the stronger anchor. Rehydration
+  // inherits only from CONFIRMED-DEAD rows, so on a pane holding both a dead
+  // server row and a live TUI row it would adopt the dead one and leave the live
+  // one standing — re-creating the very duplicate this exists to collapse.
+  const requestedClientType = validClientType(body.client_type);
+  const seatKey = durableSeatKey(body);
+  const seatMerge: { fromIds: string[]; pids: number[]; token: string | null } = { fromIds: [], pids: [], token: null };
+  if (seatKey) {
+    const occupants = (selectSeatOccupants.all(
+      seatKey,
+      body.cwd,
+      body.git_root,
+      body.tmux_window_index ?? null,
+      body.tmux_window_name ?? null,
+    ) as Array<{
+      id: string; pid: number; seat_pids: string | null; token: string | null; client_type: ClientType | null; last_seen: string;
+    }>)
+      // A row whose last_seen is unparseable is untrustworthy state, not a seat
+      // to adopt — the same judgement rehydration makes.
+      .filter((o) => Number.isFinite(new Date(o.last_seen).getTime()));
+    // A seat hosts one agent at a time, but which software occupies it can
+    // change (a pane that ran codex yesterday runs claude today). Only merge
+    // rows whose client is compatible — an unknown-typed row is compatible with
+    // anything, since that is what a not-yet-identified registrar looks like.
+    const compatible = occupants.filter((o) => {
+      const occupantType = validClientType(o.client_type);
+      return occupantType === "unknown" || requestedClientType === "unknown" || occupantType === requestedClientType;
+    });
+    if (compatible.length > 0) {
+      // Newest row's id survives: it is the identity most recently advertised to
+      // the fleet, so the fewest senders hold a stale reference to it.
+      const survivor = compatible[0]!;
+      inheritedId = survivor.id;
+      seatMerge.fromIds = compatible.slice(1).map((o) => o.id);
+      seatMerge.pids = compatible.flatMap((o) => [o.pid, ...parseSeatPids(o.seat_pids)]);
+      // Keep the seat's existing token. Rotating it would 401 the co-registrant
+      // still serving this same seat (the MCP server, when the hook registers
+      // second), forcing a re-register storm to settle what is not a conflict.
+      // Both registrars are the same seat, same uid, on a loopback-only broker.
+      seatMerge.token = survivor.token;
+      console.error(
+        `[broker] seat-merge: pid=${body.pid} adopts id=${survivor.id} on ${seatKey}` +
+        (seatMerge.fromIds.length > 0 ? ` (folding ${seatMerge.fromIds.length} duplicate row(s): ${seatMerge.fromIds.join(",")})` : ""),
+      );
+    }
+  }
+
   // Rehydration: if a recently-dead peer occupied the same tmux seat, inherit
   // its ID so mail addressed to it surfaces to this new session. Pane id is the
   // strongest seat key; window metadata is a compatibility guard when present.
-  let inheritedId: string | null = null;
-  if (body.tmux_session && (body.tmux_pane_id || (body.tmux_window_index !== null && body.tmux_window_index !== undefined && body.tmux_window_name))) {
+  // Only reached when the seat merge above found nothing — chiefly legacy rows
+  // that carry window metadata but no pane id.
+  if (inheritedId === null && body.tmux_session && (body.tmux_pane_id || (body.tmux_window_index !== null && body.tmux_window_index !== undefined && body.tmux_window_name))) {
     const candidates = (body.tmux_pane_id
       ? selectRehydrateCandidatesByPane.all(
         body.tmux_session,
@@ -1223,7 +1330,6 @@ function handleRegister(body: RegisterRequest): RegisterResult {
     }
   }
 
-  const requestedClientType = validClientType(body.client_type);
   const existing = db.query(`
     SELECT id, token, cwd, git_root, absolute_git_dir, tty, tmux_session,
            tmux_window_index, tmux_window_name, tmux_pane_id, client_type,
@@ -1268,6 +1374,16 @@ function handleRegister(body: RegisterRequest): RegisterResult {
     (requestedClientType === "unknown" || existingClientType === "unknown" || existingClientType === clientType));
   const id = inheritedId ?? (samePidRefresh ? existing!.id : null) ?? generateId();
 
+  // The same-pane supersede pass above may have flagged the very row this
+  // registration just adopted. Under merge semantics that flag is now wrong in
+  // both directions: at auth it would tell a live seat to step down, and in the
+  // name walk it would treat an occupied seat as absent — handing its name to a
+  // different seat and re-creating the ambiguity the merge exists to remove.
+  // Folded ids are cleared too: those rows are gone, and their still-running
+  // co-registrants are meant to re-register into this seat, not exit.
+  supersededPeerIds.delete(id);
+  for (const foldId of seatMerge.fromIds) supersededPeerIds.delete(foldId);
+
   // Runtime-name de-dupe: keep the operator-facing name unchanged, but assign
   // a broker-unique resolved_name for diagnostics and exact process identity.
   const requestedName = body.name ?? null;
@@ -1282,7 +1398,9 @@ function handleRegister(body: RegisterRequest): RegisterResult {
   if (requestedName && finalName !== requestedName) {
     console.error(`[broker] name dedup: pid=${body.pid} requested="${requestedName}" resolved="${finalName}" (collision)`);
   }
-  const issuedToken = existing?.id === id && body.preserve_token ? existing.token : token;
+  const issuedToken = existing?.id === id && body.preserve_token
+    ? existing.token
+    : (seatMerge.token ?? token);
   // tty is a nullable column; summary is NOT NULL DEFAULT ''. bun:sqlite throws
   // a NOT NULL constraint error when `undefined`/`null` is BOUND to summary —
   // the column DEFAULT only applies when the column is omitted, not when a
@@ -1311,6 +1429,19 @@ function handleRegister(body: RegisterRequest): RegisterResult {
     // peer). db.transaction() makes the delete + write all-or-nothing; the
     // buckets.delete (in-memory) runs only after the transaction commits.
     db.transaction(() => {
+      // Fold duplicate rows on this seat into the survivor BEFORE anything else,
+      // migrating their undelivered mail instead of dropping it. Mail is keyed
+      // on to_id (no foreign key), so re-pointing it is all that "delivering to
+      // the seat rather than to a process" requires. Delivered rows are left
+      // alone — they are the sender's audit trail against the id it used.
+      for (const foldId of seatMerge.fromIds) {
+        const moved = db.run("UPDATE messages SET to_id = ? WHERE to_id = ? AND delivered = 0", [id, foldId]);
+        deletePeer.run(foldId);
+        buckets.delete(foldId);
+        if (moved.changes > 0) {
+          console.error(`[broker] seat-merge: migrated ${moved.changes} undelivered message(s) from ${foldId} to ${id}`);
+        }
+      }
       // Existing PID-dedup: a live peer re-registering must replace its own row.
       // Guarded against clobbering the inherited row we re-created above.
       if (existing && existing.id !== id) {
@@ -1323,11 +1454,21 @@ function handleRegister(body: RegisterRequest): RegisterResult {
         // peer row will ever drain (unbounded messages-table growth otherwise).
         db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [existing.id]);
       }
-      if (existing?.id === id) {
+      // Update when a row for this id is present, insert when it is not. The
+      // condition is row existence, not `existing?.id === id`: a seat-merge
+      // adopts a LIVE row registered by a different pid, and re-inserting over
+      // it would either violate the primary key or (if deleted first) discard
+      // the seat's accumulated drain state — last_drain_at is exactly what the
+      // delivery-health warnings read.
+      const rowExists = Boolean(db.query("SELECT 1 FROM peers WHERE id = ?").get(id));
+      if (rowExists) {
         updatePeerRegistration.run(body.pid, body.cwd, gitRootValue, absoluteGitDirValue, ttyWriteValue, requestedName, finalName, body.tmux_session ?? null, body.tmux_window_index ?? null, body.tmux_window_name ?? null, body.tmux_pane_id ?? null, clientType, receiverMode, summaryValue, now, issuedToken, id);
       } else {
         insertPeer.run(id, body.pid, body.cwd, gitRootValue, absoluteGitDirValue, ttyWriteValue, requestedName, finalName, body.tmux_session ?? null, body.tmux_window_index ?? null, body.tmux_window_name ?? null, body.tmux_pane_id ?? null, clientType, receiverMode, summaryValue, now, now, issuedToken);
       }
+      // Seat identity is written last so it lands on both the insert and update
+      // paths without threading two more binds through each statement.
+      updateSeatIdentity.run(seatKey, serializeSeatPids(mergeSeatPids(seatMerge.pids, body.pid, isPidAlive)), id);
     })();
     if (existing && existing.id !== id) {
       buckets.delete(existing.id);
@@ -1466,6 +1607,22 @@ function isPidAlive(pid: number): boolean {
   }
 }
 
+/**
+ * Is the SEAT behind this row still occupied?
+ *
+ * A seat is served by more than one process — a Claude session's MCP server and
+ * its TUI, for instance. The server is killed at every compact/resume and never
+ * respawns, so judging the seat by that one pid declares an occupied pane dead
+ * and reaps its mail out from under a session that is sitting right there. The
+ * seat is alive while any of its known processes is.
+ *
+ * Rows written before seat_pids existed carry an empty set and fall back to the
+ * single registered pid — exactly the old behaviour.
+ */
+function peerSeatAlive(peer: Pick<Peer, "pid"> & { seat_pids?: string | null }): boolean {
+  return seatPidsAlive(parseSeatPids(peer.seat_pids), peer.pid, isPidAlive);
+}
+
 function activePeerKey(peer: Peer): string {
   if (peer.tmux_session && peer.tmux_pane_id) return `pane:${peer.tmux_session}:${peer.tmux_pane_id}`;
   if (peer.tty) return `tty:${peer.tty}`;
@@ -1509,8 +1666,11 @@ function peerIsReapable(peer: Peer, now: number): boolean {
   // prompt hook, but if the client PID is still alive it can receive queued mail
   // on the next hook/autodrain nudge. Keep visible rows routable by PID
   // liveness, but still reap headless/app-server-shaped rows on stale last_seen.
-  if (isHookBackedClientPeer(peer) && isPidAlive(peer.pid)) return false;
-  return isReapable(peer, isPidAlive, now, PEER_GHOST_AFTER_MS);
+  // The liveness probe handed to isReapable is seat-scoped: any process serving
+  // the seat keeps it alive, not only the pid this row happens to carry.
+  const seatAlive = () => peerSeatAlive(peer);
+  if (isHookBackedClientPeer(peer) && seatAlive()) return false;
+  return isReapable(peer, seatAlive, now, PEER_GHOST_AFTER_MS);
 }
 
 // Single source of truth for "is this peer reapable, and if so, what cleanup
@@ -1528,7 +1688,7 @@ function peerIsReapable(peer: Peer, now: number): boolean {
 // are rare; cost is microseconds.
 function shouldPermanentlyReapPeer(peer: Peer, now: number): boolean {
   if (!peerIsReapable(peer, now)) return false;
-  const dead = !isPidAlive(peer.pid);
+  const dead = !peerSeatAlive(peer);
   const lastSeenMs = new Date(peer.last_seen).getTime();
   const ageMs = Number.isNaN(lastSeenMs) ? Infinity : now - lastSeenMs;
   return !dead || ageMs > REHYDRATE_WINDOW_MS;
@@ -1538,6 +1698,36 @@ function shouldPermanentlyReapPeer(peer: Peer, now: number): boolean {
 const countUndelivered = db.prepare(
   "SELECT COUNT(*) AS n FROM messages WHERE to_id = ? AND delivered = 0",
 );
+
+// Queue depth + age of the oldest waiting message, for sender-facing delivery
+// health. Same index as countUndelivered.
+const selectQueueFacts = db.prepare(
+  "SELECT COUNT(*) AS n, MIN(sent_at) AS oldest FROM messages WHERE to_id = ? AND delivered = 0",
+);
+
+/**
+ * Sender-facing delivery health for a recipient, read at send time.
+ *
+ * "Queued" alone told senders nothing: a seat that drains in seconds and a seat
+ * that has been idle since last night both returned success. This reads the
+ * recipient's actual queue and drain history so the sender learns which one it
+ * is while it can still do something about it.
+ */
+function recipientHealthFor(peer: Peer): RecipientDeliveryHealth {
+  const facts = selectQueueFacts.get(peer.id) as { n: number; oldest: string | null };
+  const oldestMs = facts.oldest ? new Date(facts.oldest).getTime() : NaN;
+  const receiverMode = validReceiverMode(peer.receiver_mode, validClientType(peer.client_type));
+  return recipientDeliveryHealth({
+    pending: facts.n,
+    oldestPendingMs: Number.isFinite(oldestMs) ? Math.max(0, Date.now() - oldestMs) : null,
+    lastDrainAt: peer.last_drain_at ?? null,
+    // The autodrain poller nudges by tmux pane; without one, nothing external
+    // can prompt this seat.
+    hasPane: Boolean(peer.tmux_session && peer.tmux_pane_id),
+    // These modes drain on the client's own prompt/tool cycle.
+    hookDriven: receiverMode === "claude-channel" || receiverMode === "codex-hook" || receiverMode === "gemini-hook",
+  });
+}
 
 function liveAndFreshPeers(peers: Peer[]): Peer[] {
   const now = Date.now();
@@ -1791,11 +1981,16 @@ function handleSendMessage(authedFromId: string, body: SendMessageRequest): Send
   }
   const target = resolved.peer;
   const result = insertMessage.run(authedFromId, target.id, body.text, new Date().toISOString());
+  // Health is read AFTER the insert so `pending` counts this message too — the
+  // sender is asking "did this land", not "what was there before I sent".
+  const recipient = recipientHealthFor(target);
   return {
     ok: true,
     id: Number(result.lastInsertRowid),
     state: "queued",
     target: describePeerTarget(target),
+    recipient,
+    warning: recipient.warning ?? undefined,
   };
 }
 
@@ -1807,7 +2002,15 @@ function handleSendToPeer(authedFromId: string, body: SendToPeerRequest): SendMe
     return { ok: false, code: resolved.code, error: resolved.error, candidates: resolved.candidates };
   }
   const result = insertMessage.run(authedFromId, resolved.peer.id, body.text, new Date().toISOString());
-  return { ok: true, id: Number(result.lastInsertRowid), state: "queued", target: describePeerTarget(resolved.peer) };
+  const recipient = recipientHealthFor(resolved.peer);
+  return {
+    ok: true,
+    id: Number(result.lastInsertRowid),
+    state: "queued",
+    target: describePeerTarget(resolved.peer),
+    recipient,
+    warning: recipient.warning ?? undefined,
+  };
 }
 
 // /message-status: sender-scoped state lookup for messages the caller inserted.

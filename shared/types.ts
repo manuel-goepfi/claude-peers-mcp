@@ -1,3 +1,5 @@
+import type { RecipientDeliveryHealth } from "./delivery-state.ts";
+
 // Unique ID for each Claude Code instance (generated on registration)
 export type PeerId = string;
 export type ClientType = "claude" | "codex" | "gemini" | "cursor" | "agy" | "unknown";
@@ -211,6 +213,12 @@ export interface SendMessageResponse {
   error?: string;
   target?: PeerTarget;
   candidates?: PeerTarget[];
+  // Delivery honesty: queue insertion is not receipt. These say whether the
+  // recipient is actually draining, so a sender waiting on a reply can tell
+  // "queued and will be read" from "queued behind a night of unread mail".
+  // Additive — older brokers omit them.
+  recipient?: RecipientDeliveryHealth;
+  warning?: string;
 }
 
 export interface SendToPeerRequest {

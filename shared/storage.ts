@@ -15,6 +15,7 @@ import {
 import { createHash } from "node:crypto";
 import { dirname, resolve } from "node:path";
 import { fsyncDirectory } from "./fs-durability.ts";
+import { seatKeyBackfillSql } from "./seat.ts";
 
 export const STORAGE_SCHEMA_VERSION = 1;
 export const OWNER_ONLY_UMASK = 0o077;
@@ -115,6 +116,11 @@ const peerColumns = [
   { name: "last_drain_at", type: "TEXT" },
   { name: "last_drain_error", type: "TEXT" },
   { name: "non_targetable", type: "INTEGER NOT NULL DEFAULT 0" },
+  // Durable seat identity (shared/seat.ts). seat_key anchors the row to the
+  // operator-visible seat (tmux pane / tty) instead of to whichever process
+  // registered it; seat_pids is the JSON set of pids known to serve that seat.
+  { name: "seat_key", type: "TEXT" },
+  { name: "seat_pids", type: "TEXT NOT NULL DEFAULT '[]'" },
 ] as const;
 
 const requiredMessageColumns = [
@@ -136,6 +142,7 @@ export const storageIndexes = {
   deliveredRetention: "idx_messages_delivered_retention",
   unknownReceiverRetention: "idx_messages_unknown_retention",
   peerReceiverMode: "idx_peers_receiver_mode",
+  peerSeatKey: "idx_peers_seat_key",
 } as const;
 
 function tableExists(db: Database, table: string): boolean {
@@ -253,7 +260,9 @@ function createPeersTable(db: Database): void {
       registered_at TEXT NOT NULL,
       last_seen TEXT NOT NULL,
       token TEXT,
-      non_targetable INTEGER NOT NULL DEFAULT 0
+      non_targetable INTEGER NOT NULL DEFAULT 0,
+      seat_key TEXT,
+      seat_pids TEXT NOT NULL DEFAULT '[]'
     )
   `);
 }
@@ -264,6 +273,21 @@ function ensurePeerColumns(db: Database): void {
   for (const column of peerColumns) {
     if (!existing.has(column.name)) db.run(`ALTER TABLE peers ADD COLUMN ${column.name} ${column.type}`);
   }
+}
+
+/**
+ * Additive peer-schema convergence, safe to run on every startup.
+ *
+ * Columns added to `peerColumns` after a database was created would otherwise
+ * only land via migrateLegacy — which an already-current database never runs,
+ * so it would fail validateCurrentSchema on the next boot instead of gaining
+ * the column. Additive changes need no version bump and no backup dance; they
+ * need to be idempotent, which each statement here is.
+ */
+export function ensureAdditivePeerSchema(db: Database): void {
+  ensurePeerColumns(db);
+  db.run(`CREATE INDEX IF NOT EXISTS ${storageIndexes.peerSeatKey} ON peers(seat_key)`);
+  db.run(seatKeyBackfillSql());
 }
 
 function createMessagesTable(db: Database, name = "messages"): void {
@@ -289,6 +313,7 @@ function createIndexes(db: Database): void {
   db.run(`CREATE INDEX ${storageIndexes.deliveredRetention} ON messages(delivered, retention_at)`);
   db.run(`CREATE INDEX ${storageIndexes.unknownReceiverRetention} ON messages(delivered, sent_at, to_id)`);
   db.run(`CREATE INDEX ${storageIndexes.peerReceiverMode} ON peers(receiver_mode, id)`);
+  db.run(`CREATE INDEX ${storageIndexes.peerSeatKey} ON peers(seat_key)`);
 }
 
 function schemaObjectsExist(db: Database): boolean {
@@ -416,6 +441,8 @@ function migrateLegacy(
   db.exec("BEGIN IMMEDIATE");
   let committed = false;
   try {
+    // Columns only here: this path builds the indexes itself further down, and
+    // creating the seat index twice in one transaction aborts the migration.
     ensurePeerColumns(db);
     const oldColumns = storageTableColumns(db, "messages");
     if (oldColumns.size > 0) {
@@ -444,6 +471,7 @@ function migrateLegacy(
     db.run("DELETE FROM sqlite_sequence WHERE name='messages'");
     db.run("INSERT INTO sqlite_sequence(name, seq) VALUES('messages', ?)", [highWater]);
     createIndexes(db);
+    db.run(seatKeyBackfillSql());
     onCheckpoint?.("before-version");
     db.run(`PRAGMA user_version = ${STORAGE_SCHEMA_VERSION}`);
     db.exec("COMMIT");
@@ -493,6 +521,7 @@ export function initializeStorage(db: Database, options: InitializeStorageOption
   const version = storageUserVersion(db);
   if (version > STORAGE_SCHEMA_VERSION) throw new Error(`database user_version ${version} is newer than supported ${STORAGE_SCHEMA_VERSION}`);
   if (version === STORAGE_SCHEMA_VERSION) {
+    ensureAdditivePeerSchema(db);
     validateCurrentSchema(db);
     options.onReadiness?.("ready");
     return { version, migrated: false };

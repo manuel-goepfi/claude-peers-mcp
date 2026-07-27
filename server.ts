@@ -1333,6 +1333,22 @@ function sendStatusHint(target: SendMessageResponse["target"] | undefined, deliv
   return " Still queued; receiver mode is unknown, so manual check_messages may be required.";
 }
 
+/**
+ * Render the broker's evidence-based delivery health for the sender.
+ *
+ * The mode hints above are inferences from the receiver's configuration ("hook
+ * is stale, so the receiver MAY need check_messages"). This is what the queue
+ * actually looks like: how many messages are waiting, how long the oldest has
+ * waited, and whether anything can prompt the recipient at all. Rendered on its
+ * own line because a sender that reads nothing else must still read this.
+ */
+export function deliveryWarningLine(
+  recipient: SendMessageResponse["recipient"] | undefined,
+): string {
+  if (!recipient?.warning) return "";
+  return `\n\n⚠ ${recipient.warning}`;
+}
+
 export function messageStatusLine(
   row: { state?: string; delivered: boolean; delivered_at: string | null } | undefined,
   target: SendMessageResponse["target"] | undefined,
@@ -1802,7 +1818,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const tmuxSnapshot = include_tmux_context === true && result.target ? await inspectPeerPane(result.target.id) : null;
         const tmuxText = tmuxSnapshot ? `\n\n${formatTmuxSnapshot(tmuxSnapshot)}` : "";
         return {
-          content: [{ type: "text" as const, text: `Message queued to ${formatPeerTarget(result.target)}.${statusLine}${tmuxText}${pending ?? ""}` }],
+          content: [{ type: "text" as const, text: `Message queued to ${formatPeerTarget(result.target)}.${statusLine}${deliveryWarningLine(result.recipient)}${tmuxText}${pending ?? ""}` }],
         };
       } catch (e) {
         return {
@@ -1875,7 +1891,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const tmuxSnapshot = include_tmux_context === true && result.target ? await inspectPeerPane(result.target.id) : null;
         const tmuxText = tmuxSnapshot ? `\n\n${formatTmuxSnapshot(tmuxSnapshot)}` : "";
         return {
-          content: [{ type: "text" as const, text: `Message queued to ${formatPeerTarget(result.target)}.${statusLine}${tmuxText}${pending ?? ""}` }],
+          content: [{ type: "text" as const, text: `Message queued to ${formatPeerTarget(result.target)}.${statusLine}${deliveryWarningLine(result.recipient)}${tmuxText}${pending ?? ""}` }],
         };
       } catch (e) {
         return {
