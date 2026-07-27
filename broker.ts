@@ -596,11 +596,15 @@ const selectAllPeers = db.prepare(`
   SELECT * FROM peers
 `);
 
+// seat_pids is load-bearing, not decoration: peerSeatAlive falls back to the
+// row's single pid when it is absent, so omitting it here would silently
+// downgrade every liveness and reap decision to pid-only — the exact behaviour
+// seat identity exists to replace, and a downgrade no test would notice.
 const publicPeerColumns = `
   id, pid, cwd, git_root, absolute_git_dir, tty, name, resolved_name,
   tmux_session, tmux_window_index, tmux_window_name, tmux_pane_id,
   client_type, receiver_mode, last_hook_seen_at, last_drain_at,
-  last_drain_error, summary, registered_at, last_seen
+  last_drain_error, summary, registered_at, last_seen, seat_key, seat_pids
 `;
 
 const selectAllTargetablePeers = db.prepare(`

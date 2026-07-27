@@ -217,23 +217,31 @@ describe("seat-anchored registration", () => {
   });
 
   test("a seat stays alive while ANY of its processes lives", async () => {
+    // Kills the pid the ROW carries and keeps a different seat pid alive, so
+    // this can only pass through seat_pids. Killing the other one would leave
+    // row.pid alive and the test would pass without seat identity at all.
     const serverPid = spawnHolder();
     const tuiPid = spawnHolder();
     const seat = await register(serverPid, { tmux_pane_id: "%705" });
     await register(tuiPid, { tmux_pane_id: "%705" });
 
-    // Kill the MCP server, exactly as Claude Code does at compact/resume.
-    for (const child of children) if (child.pid === serverPid) child.kill();
-    await Bun.sleep(120);
+    const db = new Database(broker.dbPath, { readonly: true });
+    const row = db.query("SELECT pid, seat_pids FROM peers WHERE id = ?").get(seat.id) as { pid: number; seat_pids: string };
+    db.close();
+    expect(row.pid).toBe(tuiPid); // last registrant owns the row's pid column
+    expect(JSON.parse(row.seat_pids)).toContain(serverPid);
+
+    // Kill the process the row is keyed on; the co-registrant keeps serving.
+    for (const child of children) if (child.pid === row.pid) child.kill();
+    await Bun.sleep(150);
 
     const probePid = spawnHolder();
     const probe = await call<{ id: string }>("/register", {
       pid: probePid, cwd: "/seat/probe", git_root: "/seat/probe", name: "probe.1", client_type: "claude",
     });
-    const sent = await call<{ ok: boolean; code?: string; recipient?: { nudgeable: boolean } }>("/send-message", {
+    const sent = await call<{ ok: boolean; code?: string }>("/send-message", {
       id: probe.id, from_id: probe.id, to_id: seat.id, text: "still reachable?",
     });
-    // The TUI is still sitting there; the seat must remain routable.
     expect(sent.ok).toBe(true);
   });
 });

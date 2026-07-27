@@ -28,6 +28,12 @@ export interface Peer {
   tmux_window_index: string | null;
   tmux_window_name: string | null;
   tmux_pane_id: string | null;
+  // Durable seat identity (shared/seat.ts). seat_key is the seat this row is
+  // anchored to; seat_pids is the JSON set of processes serving that seat, and
+  // the seat counts as alive while any of them is. Optional because rows read
+  // through pre-seat query shapes omit them.
+  seat_key?: string | null;
+  seat_pids?: string | null;
   client_type?: ClientType;
   receiver_mode?: ReceiverMode;
   last_hook_seen_at: string | null;

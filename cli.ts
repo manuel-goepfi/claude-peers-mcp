@@ -337,8 +337,18 @@ async function runCommand(command: string, args: string[], context: CliContext, 
     }
     const state: DeliveryState = result.state ?? "queued";
     if (state !== "queued") throw new CliError("malformed", `send returned unexpected state ${state}`);
-    if (context.json) console.log(JSON.stringify({ ok: true, command: "send", target: toId, message_id: result.id, state }));
-    else console.log(`Message queued to ${toId} (id ${result.id}).`);
+    // The recipient's queue state travels with the send: "queued" alone cannot
+    // tell an operator whether this lands in seconds or joins a backlog nobody
+    // is reading.
+    if (context.json) {
+      console.log(JSON.stringify({
+        ok: true, command: "send", target: toId, message_id: result.id, state,
+        recipient: result.recipient, warning: result.warning,
+      }));
+    } else {
+      console.log(`Message queued to ${toId} (id ${result.id}).`);
+      if (result.warning) console.log(`WARNING: ${result.warning}`);
+    }
     return;
   }
 
