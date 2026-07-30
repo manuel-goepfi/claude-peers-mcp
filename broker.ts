@@ -1754,9 +1754,14 @@ function recipientHealthFor(peer: Peer): RecipientDeliveryHealth {
     pending: facts.n,
     oldestPendingMs: Number.isFinite(oldestMs) ? Math.max(0, Date.now() - oldestMs) : null,
     lastDrainAt: peer.last_drain_at ?? null,
-    // The autodrain poller nudges by tmux pane; without one, nothing external
-    // can prompt this seat.
-    hasPane: Boolean(peer.tmux_session && peer.tmux_pane_id),
+    // The autodrain poller nudges by tmux pane — but ONLY for a client it has an
+    // idle profile for. Idle detection keys on per-client prompt glyphs and busy
+    // markers; for an unrecognised client it cannot tell an idle prompt from work
+    // in flight, so it never types into that pane. A pane alone is therefore NOT a
+    // delivery path, and reporting one as nudgeable is the same silent-success this
+    // whole field exists to prevent: live kimi-code lanes sat in real panes with
+    // queued mail while sends to them returned "healthy".
+    hasPane: Boolean(peer.tmux_session && peer.tmux_pane_id) && validClientType(peer.client_type) !== "unknown",
     // These modes drain on the client's own prompt/tool cycle.
     hookDriven: receiverMode === "claude-channel" || receiverMode === "codex-hook" || receiverMode === "gemini-hook",
   });

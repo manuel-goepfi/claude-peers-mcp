@@ -75,6 +75,37 @@ describe("sender reply-route honesty", () => {
     expect(sent.warning).toBeUndefined();
   });
 
+  test("a pane alone is not a drain path when the client has no nudge profile", async () => {
+    // Live case: kimi-code lanes registered as client_type=unknown sat in real tmux
+    // panes with queued mail, and sends to them reported "healthy". Nothing could
+    // ever deliver: background polling is disabled for unknown clients, and the
+    // poller has no idle profile for an unrecognised TUI so it never types into
+    // that pane. Reporting a pane as nudgeable is the silent success this field
+    // exists to prevent.
+    const sender = await registerTarget("rr-sender-u", "%903");
+    const unknownSeat = await call<{ id: string }>("/register", {
+      pid: spawnHolder(), cwd: "/rr/unknownclient", git_root: "/rr/unknownclient",
+      name: "mystery.1", client_type: "totally-unrecognised",
+      tmux_session: "rr", tmux_window_index: "0", tmux_window_name: "w", tmux_pane_id: "%904",
+    });
+    const sent = await call<Send>("/send-message", {
+      id: sender.id, from_id: sender.id, to_id: unknownSeat.id, text: "can this ever land?",
+    });
+    expect(sent.ok).toBe(true);
+    expect(sent.recipient?.state).toBe("no_drain_path");
+    expect(sent.warning).toContain("no automatic drain path");
+  });
+
+  test("a recognised client WITH a pane is still nudgeable", async () => {
+    const sender = await registerTarget("rr-sender-k", "%905");
+    const target = await registerTarget("rr-known", "%906");   // claude/claude-channel
+    const sent = await call<Send>("/send-message", {
+      id: sender.id, from_id: sender.id, to_id: target.id, text: "normal path",
+    });
+    expect(sent.recipient?.state).toBe("healthy");
+    expect(sent.warning).toBeUndefined();
+  });
+
   test("the reply-route warning composes with a recipient-health warning", async () => {
     const cli = await call<{ id: string }>("/register-cli", { pid: spawnHolder() });
     // No pane and manual drain: unreachable recipient AND unreplyable sender.
