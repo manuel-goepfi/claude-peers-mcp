@@ -2260,6 +2260,69 @@ function pidWithAncestors(pid: number, max = 12): number[] {
 }
 
 /**
+ * The single live seat the caller sits inside, derived from process ancestry.
+ *
+ * A peer row qualifies when the caller IS that seat's registered process or a
+ * descendant of it (matching the row pid or any seat_pids entry). Never asserted
+ * by the caller: a process inside no seat is refused rather than being allowed to
+ * name one, and ancestry matching two seats is refused rather than guessed.
+ *
+ * Shared by every "act as my own seat" route, so they cannot drift apart in what
+ * they consider proof.
+ */
+function seatFromCallerAncestry(
+  callerPid: number,
+  action: string,
+): { ok: true; seat: Peer } | { ok: false; status: number; error: string; candidates?: PeerTarget[] } {
+  const chain = new Set(pidWithAncestors(callerPid));
+  const seats = livePeersForResolution(selectAllTargetablePeers.all() as Peer[]).filter((peer) => {
+    if (chain.has(peer.pid)) return true;
+    return parseSeatPids(peer.seat_pids).some((pid) => chain.has(pid));
+  });
+  if (seats.length === 0) {
+    return { ok: false, status: 404, error: "caller is not inside any registered peer seat" };
+  }
+  if (seats.length > 1) {
+    return {
+      ok: false,
+      status: 409,
+      error: `caller ancestry matches ${seats.length} live seats; cannot ${action}`,
+      candidates: seats.map(describePeerTarget),
+    };
+  }
+  return { ok: true, seat: seats[0]! };
+}
+
+/**
+ * /set-name-by-pid: rename the seat the caller sits inside.
+ *
+ * Same ancestry proof as /send-by-pid. Exists so an operator can give a lane a
+ * name they will actually recognise, instead of living with `infra.2`, a
+ * collision-suffixed `C5_lanes.1#WALL-SUPABASE`, or the anonymous `observer-<pid>`
+ * a lane gets when it starts without CLAUDE_PEER_NAME. The peer name is what
+ * send_to_peer matches AND what the tmux pane border renders, so naming a lane
+ * makes the label on screen the label that routes.
+ */
+function handleSetNameByPid(body: Record<string, unknown>): { ok: boolean; status?: number; error?: string; id?: string; name?: string | null; resolved_name?: string | null; previous_name?: string | null } {
+  const callerPid = Number(body.caller_pid);
+  if (!Number.isInteger(callerPid) || callerPid <= 1) return { ok: false, status: 400, error: "invalid caller_pid" };
+  const callerErr = verifyPidUid(callerPid);
+  if (callerErr) return { ok: false, status: 403, error: `caller rejected: ${callerErr}` };
+  if (typeof body.name !== "string") return { ok: false, status: 400, error: "name must be a string" };
+  const desired = body.name.trim();
+  if (utf8Bytes(desired) > MAX_NAME_BYTES) return { ok: false, status: 413, error: `name exceeds ${MAX_NAME_BYTES} bytes` };
+
+  const resolved = seatFromCallerAncestry(callerPid, "choose which seat to rename");
+  if (!resolved.ok) return { ok: false, status: resolved.status, error: resolved.error };
+  const seat = resolved.seat;
+
+  const previous = seat.name;
+  const result = handleSetName({ id: seat.id, name: desired });
+  console.error(`[broker] set-name-by-pid: ${seat.id} "${previous ?? ""}" -> "${result.name ?? ""}" (resolved ${result.resolved_name ?? ""})`);
+  return { ok: true, id: seat.id, name: result.name, resolved_name: result.resolved_name, previous_name: previous };
+}
+
+/**
  * /send-by-pid: send AS the seat the caller belongs to.
  *
  * The CLI has no token for the seat it runs inside, so it used to register a
@@ -2288,25 +2351,9 @@ function handleSendByPid(body: Record<string, unknown>): SendMessageResponse & {
   const callerErr = verifyPidUid(callerPid);
   if (callerErr) return { ok: false, status: 403, error: `caller rejected: ${callerErr}` };
 
-  const chain = new Set(pidWithAncestors(callerPid));
-  const seats = livePeersForResolution(selectAllTargetablePeers.all() as Peer[]).filter((peer) => {
-    if (chain.has(peer.pid)) return true;
-    return parseSeatPids(peer.seat_pids).some((pid) => chain.has(pid));
-  });
-  if (seats.length === 0) {
-    return { ok: false, status: 404, error: "caller is not inside any registered peer seat" };
-  }
-  if (seats.length > 1) {
-    // Nested seats (a session launched from inside another) or an uncollapsed
-    // duplicate. Attributing to either would be a guess.
-    return {
-      ok: false,
-      status: 409,
-      error: `caller ancestry matches ${seats.length} live seats; cannot attribute the sender`,
-      candidates: seats.map(describePeerTarget),
-    };
-  }
-  const sender = seats[0]!;
+  const resolvedSeat = seatFromCallerAncestry(callerPid, "attribute the sender");
+  if (!resolvedSeat.ok) return resolvedSeat;
+  const sender = resolvedSeat.seat;
 
   const limited = rateCheck(sender.id, true);
   if (limited) return { ok: false, status: 429, error: limited };
@@ -2630,6 +2677,12 @@ requestHandler = async (req: Request) => {
           return Response.json({ error: res.error }, { status: res.status ?? 400 });
         }
         return Response.json({ peer_id: res.peer_id, messages: res.messages, acked: res.acked, state: res.state });
+      }
+
+      if (path === "/set-name-by-pid") {
+        const res = handleSetNameByPid(body as Record<string, unknown>);
+        if (!res.ok) return Response.json({ error: res.error }, { status: res.status ?? 400 });
+        return Response.json(res);
       }
 
       if (path === "/send-by-pid") {
