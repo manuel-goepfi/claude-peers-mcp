@@ -1770,7 +1770,14 @@ function recipientHealthFor(peer: Peer): RecipientDeliveryHealth {
     // delivery path, and reporting one as nudgeable is the same silent-success this
     // whole field exists to prevent: live kimi-code lanes sat in real panes with
     // queued mail while sends to them returned "healthy".
-    hasPane: Boolean(peer.tmux_session && peer.tmux_pane_id) && validClientType(peer.client_type) !== "unknown",
+    // Pane id ALONE, not session+pane. Pane ids are unique per tmux server, which
+    // is exactly why the poller nudges by pane id and never needs the session.
+    // Requiring both made this report no_drain_path for lanes that demonstrably
+    // drain: a cursor lane registers with tmux_pane_id set and tmux_session empty
+    // (Cursor strips the env, so the pane is recovered from the client process
+    // while the session name is not), and it was nudged and delivered in 70s while
+    // this field told the sender nothing could reach it.
+    hasPane: Boolean(peer.tmux_pane_id) && validClientType(peer.client_type) !== "unknown",
     // These modes drain on the client's own prompt/tool cycle.
     hookDriven: receiverMode === "claude-channel" || receiverMode === "codex-hook" || receiverMode === "gemini-hook",
   });

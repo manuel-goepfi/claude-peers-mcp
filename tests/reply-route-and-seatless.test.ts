@@ -106,6 +106,38 @@ describe("sender reply-route honesty", () => {
     expect(sent.warning).toBeUndefined();
   });
 
+  // Cursor registers tmux_pane_id but not tmux_session (its env is stripped, so the
+  // pane is recovered from the client process and the session name is not). The
+  // poller nudges by pane id alone, so such a lane IS reachable — and a health
+  // check demanding session+pane told senders the opposite while mail was landing.
+  test("a pane id with no session still counts as a drain path", async () => {
+    const sender = await registerTarget("rr-sender-p", "%907");
+    const paneOnly = await call<{ id: string }>("/register", {
+      pid: spawnHolder(), cwd: "/rr/paneonly", git_root: "/rr/paneonly", name: "rr-paneonly",
+      client_type: "cursor", receiver_mode: "manual-drain",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null, tmux_pane_id: "%908",
+    });
+    const sent = await call<Send>("/send-message", {
+      id: sender.id, from_id: sender.id, to_id: paneOnly.id, text: "reachable via pane id",
+    });
+    expect(sent.ok).toBe(true);
+    expect(sent.recipient?.nudgeable).toBe(true);
+    expect(sent.recipient?.state).toBe("healthy");
+    expect(sent.warning).toBeUndefined();
+  });
+
+  test("no pane at all is still no drain path", async () => {
+    const sender = await registerTarget("rr-sender-n", "%909");
+    const noPane = await call<{ id: string }>("/register", {
+      pid: spawnHolder(), cwd: "/rr/nopane", git_root: "/rr/nopane", name: "rr-nopane",
+      client_type: "cursor", receiver_mode: "manual-drain",
+    });
+    const sent = await call<Send>("/send-message", {
+      id: sender.id, from_id: sender.id, to_id: noPane.id, text: "truly unreachable",
+    });
+    expect(sent.recipient?.state).toBe("no_drain_path");
+  });
+
   test("the reply-route warning composes with a recipient-health warning", async () => {
     const cli = await call<{ id: string }>("/register-cli", { pid: spawnHolder() });
     // No pane and manual drain: unreachable recipient AND unreplyable sender.

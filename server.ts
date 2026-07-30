@@ -1157,6 +1157,25 @@ export function brokerIdentityPaneTarget(tmuxInfo: TmuxPaneInfo | null): string 
 
 const tmuxIdentityWriteTracker = new TmuxIdentityWriteTracker();
 
+/**
+ * Another process's environment, or {} when unreadable.
+ *
+ * Used to recover launch identity (CLAUDE_PEER_NAME / TMUX_PANE) from the client
+ * process when the client strips it from the MCP server's own environment.
+ */
+function environOfPid(pid: number): Record<string, string> {
+  try {
+    const out: Record<string, string> = {};
+    for (const kv of readFileSync(`/proc/${pid}/environ`, "utf8").split("\0")) {
+      const eq = kv.indexOf("=");
+      if (eq > 0) out[kv.slice(0, eq)] = kv.slice(eq + 1);
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
 export function publishBrokerIdentityToTmux(identity: {
   id: PeerId;
   name: string | null;
@@ -2375,6 +2394,24 @@ async function main() {
     const chainPid = findClientPidFromProcessChain(process.ppid, startupProcesses, myClientType);
     if (chainPid) {
       myRegisterPid = chainPid;
+      // Some clients SANITISE the environment they hand their MCP servers, so the
+      // identity the operator set at launch never reaches us. Cursor does exactly
+      // this — measured: the cursor process carries CLAUDE_PEER_NAME=curtest.1 and
+      // TMUX_PANE=%1073, while its MCP server has neither. The lane then registers
+      // as `observer-<pid>` with a tty seat instead of a name and a pane, which is
+      // unaddressable by anything the operator can read on screen.
+      //
+      // We already resolved the client's pid, and THAT process has the values. Read
+      // them from it when our own environment is missing them. Reading an ancestor's
+      // /proc/<pid>/environ is permitted under kernel.yama.ptrace_scope=1 (we are its
+      // descendant); on failure the reader returns {} and nothing changes.
+      if (!identityEnv.CLAUDE_PEER_NAME || !identityEnv.TMUX_PANE) {
+        const clientEnv = environOfPid(chainPid);
+        if (clientEnv.CLAUDE_PEER_NAME || clientEnv.TMUX_PANE) {
+          identityEnv = { ...identityEnv, ...clientEnv };
+          log(`identity recovered from client pid=${chainPid}: name=${clientEnv.CLAUDE_PEER_NAME ?? "-"} pane=${clientEnv.TMUX_PANE ?? "-"} (our own env lacked it)`);
+        }
+      }
     } else if (myClientType === "codex" && codexAppServerAncestor) {
       const visibleCwdHint = cwdOf(codexAppServerAncestor.pid) ?? serverCwd;
       const visible = findVisibleCodexSession(startupProcesses, visibleCwdHint);
