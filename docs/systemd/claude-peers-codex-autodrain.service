@@ -30,7 +30,13 @@ StandardError=append:%h/.claude-peers-codex-autodrain.log
 # send-keys), so it MUST reach the user's tmux socket in /tmp — hence NO
 # PrivateTmp below, and TMUX_TMPDIR points at the real socket dir.
 Environment=HOME=%h
-Environment=PATH=%h/.bun/bin:/usr/bin:/bin
+# /usr/local/bin is REQUIRED, not cosmetic: tmux lives there on this host, and the
+# poller's entire job is tmux capture-pane + send-keys. Omitting it does not fail
+# loudly — the poller starts, logs "nudge=<clients>", heartbeats, and silently
+# never nudges anything, because every tmux spawn fails. That is what happened on
+# 2026-07-30 when this unit replaced the long-running process: it reported healthy
+# with nudging enabled while delivery was dead fleet-wide for ~35 minutes.
+Environment=PATH=%h/.bun/bin:/usr/local/bin:/usr/bin:/bin
 Environment=BUN_INSTALL=%h/.bun
 # tmux forms its socket dir as $TMUX_TMPDIR/tmux-<uid>/, so TMUX_TMPDIR is /tmp
 # (NOT /tmp/tmux-1000 — that doubles to /tmp/tmux-1000/tmux-1000 and fails to
