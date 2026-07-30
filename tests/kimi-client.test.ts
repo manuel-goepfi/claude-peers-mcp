@@ -10,7 +10,7 @@
 
 import { describe, expect, test } from "bun:test";
 import { isClientProcess, detectClientFromProcessChain, initialReceiverMode, type ProcessInfo } from "../shared/client.ts";
-import { profileFor, parseNudgeClients, paneQuiescent } from "../bin/codex-autodrain-poller.ts";
+import { profileFor, parseNudgeClients, paneQuiescent, paneFromPidAncestry } from "../bin/codex-autodrain-poller.ts";
 import { shouldDisableBackgroundPolling } from "../server.ts";
 
 const row = (comm: string, args: string, pid = 10, ppid = 1): ProcessInfo => ({ pid, ppid, comm, args });
@@ -112,5 +112,36 @@ describe("quiescence gate (real tmux)", () => {
     } finally {
       Bun.spawnSync(["tmux", "kill-session", "-t", session], { stdout: "ignore", stderr: "ignore" });
     }
+  });
+});
+
+describe("pane resolution for lanes whose row has no pane id", () => {
+  // Cursor registers with tty set and tmux fields empty, so its row says "no pane"
+  // while the process sits in one. The poller nudges by pane, and for a
+  // manual-drain client the nudge is the ONLY delivery path — a live cursor lane
+  // (GROK-JUDGMENT) accumulated 4 unread messages exactly this way.
+  const procs = [
+    { pid: 100, ppid: 1, comm: "bash", args: "-bash" },          // pane process
+    { pid: 200, ppid: 100, comm: "MainThread", args: "cursor-agent --use-system-ca" },
+    { pid: 300, ppid: 200, comm: "bun", args: "bun server.ts" },
+  ];
+  const snap = {
+    procs,
+    paneByPid: new Map<string, number>(),
+    paneMap: new Map<number, { pane_id: string }>([[100, { pane_id: "%187" }]]),
+  } as never;
+
+  test("finds the pane by walking the lane's ancestry", () => {
+    expect(paneFromPidAncestry(300, snap)).toBe("%187");   // from the MCP server
+    expect(paneFromPidAncestry(200, snap)).toBe("%187");   // from the agent itself
+    expect(paneFromPidAncestry(100, snap)).toBe("%187");   // the pane process itself
+  });
+
+  test("returns null for a process genuinely outside tmux", () => {
+    expect(paneFromPidAncestry(999, snap)).toBeNull();
+  });
+
+  test("cursor requires quiescence too — its busy vocabulary is provisional", () => {
+    expect(profileFor("cursor").requiresQuiescence).toBe(true);
   });
 });

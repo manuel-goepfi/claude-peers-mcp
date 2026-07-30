@@ -161,8 +161,13 @@ const PROFILES: Record<string, IdleProfile> = {
   // defeat the generic all-dim check twice over: focused panes reverse-block
   // the placeholder's first char (reset clears dim), and unfocused panes open
   // the dim span BEFORE the glyph so the strip regex swallows it.
+  // requiresQuiescence for the same reason kimi has it: CURSOR_BUSY is provisional
+  // — those strings were never observed mid-turn on this host. A busy marker that
+  // fails to match is the dangerous direction (it nudges INTO a working agent),
+  // and no amount of guessing fixes that. Quiescence needs no vocabulary at all.
   cursor: { prompt: /(^|\n)\s*→\s/, promptLine: /^\s*→/, strip: /^.*?→\s?/, busy: CURSOR_BUSY,
-            placeholderText: /^(Plan, search, build anything|Add a follow-up)/ },
+            placeholderText: /^(Plan, search, build anything|Add a follow-up)/,
+            requiresQuiescence: true },
   // agy (Google's agent CLI): bare ASCII `>` input prompt, but COLUMN-0
   // anchored — all agy transcript/output lines are indented ≥1 space, so the
   // usual ASCII-'>' ambiguity (blockquotes, diff context) does not apply as
@@ -382,6 +387,26 @@ function paneOwnedByPid(paneId: string, pid: number, snap: TickSnapshot): boolea
   if (!tree) return false;
   return tree.panePid === pid || tree.text.includes(`(${pid})`);
 }
+/**
+ * The tmux pane containing `pid`, found by walking its process ancestry until a
+ * pane's pane_pid is hit. Returns null when the process is genuinely outside tmux.
+ *
+ * This is the inverse of paneOwnedByPid: that asks "is this pid under this pane",
+ * this asks "which pane is this pid under". Used only as a fallback for lanes whose
+ * registration row carries no tmux_pane_id.
+ */
+export function paneFromPidAncestry(pid: number, snap: TickSnapshot): string | null {
+  const ppidMap = new Map<number, number>();
+  for (const proc of snap.procs) ppidMap.set(proc.pid, proc.ppid);
+  let walk: number | undefined = pid;
+  for (let i = 0; i < 20 && walk !== undefined && walk > 1; i++) {
+    const pane = snap.paneMap.get(walk);
+    if (pane?.pane_id) return pane.pane_id;
+    walk = ppidMap.get(walk);
+  }
+  return null;
+}
+
 function paneOwnedByAttachId(paneId: string, sessionId: string, snap: TickSnapshot): boolean {
   const tree = paneSubtree(paneId, snap);
   if (!tree) return false;
@@ -826,7 +851,23 @@ export function resolveLanePane(
       walk = parent;
     }
   }
-  if (!bgId) return { paneId: "", attachId: null };
+  if (!bgId) {
+    // No bg session id — but the lane may still BE in a pane whose id simply never
+    // reached its registration row. Cursor does this: its MCP server registers with
+    // tty set and tmux fields empty (seat_key falls back to tty:pts/N), so the row
+    // says "no pane" while the process sits in one. Without a pane the poller can
+    // never nudge, and for a manual-drain client the nudge is the only delivery
+    // path — a live cursor lane accumulated 4 unread messages that way.
+    //
+    // Derive it the same way ownership is checked, just in reverse: walk the lane's
+    // ancestry and take the pane whose pane_pid is on that chain.
+    const derived = paneFromPidAncestry(lane.pid, snap);
+    if (derived) {
+      paneCache.set(lane.id, derived);
+      return { paneId: derived, attachId: null };
+    }
+    return { paneId: "", attachId: null };
+  }
   if (cached) return { paneId: cached, attachId: bgId };
   const pane = resolveBgAttachPane(bgId, snap.paneMap, snap.procs);
   if (pane?.pane_id) { paneCache.set(lane.id, pane.pane_id); return { paneId: pane.pane_id, attachId: bgId }; }
