@@ -122,7 +122,9 @@ describe("client detection", () => {
 
   test("hook-based clients disable the Claude background poll buffer", () => {
     const src = readFileSync(new URL("../server.ts", import.meta.url), "utf8");
-    expect(src).toContain('if (myClientType === "codex" || myClientType === "gemini" || myClientType === "cursor" || myClientType === "agy")');
+    // kimi joins the list: it has no drain hook either, so it must take the same
+    // client-pid registration path and keep the Claude poll buffer disabled.
+    expect(src).toContain('if (myClientType === "codex" || myClientType === "gemini" || myClientType === "cursor" || myClientType === "agy" || myClientType === "kimi")');
     expect(src).toContain("background channel poll disabled");
   });
 

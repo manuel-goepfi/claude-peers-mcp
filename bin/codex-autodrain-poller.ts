@@ -135,6 +135,12 @@ export interface IdleProfile {
   // direction: if the vendor changes the placeholder wording, nudges stop
   // (observable, benign) rather than ever submitting real operator input.
   placeholderText?: RegExp;
+  // Set when this client's BUSY vocabulary has never been observed on this host.
+  // Idle detection then cannot distinguish "at the prompt" from "mid-turn", so the
+  // caller must additionally require the pane to be QUIESCENT (byte-identical
+  // across two consecutive ticks) before typing into it. Strictly safer than
+  // guessing busy strings: an unknown-but-changing pane is simply never nudged.
+  requiresQuiescence?: boolean;
 }
 const CODEX_BUSY = [/esc to interrupt/i, /\bWorking\b/, /\bRunning\b/, /Reviewing approval/i, /tokens used/i];
 // Claude busy markers: the animated spinner verbs Claude cycles through mid-turn
@@ -163,9 +169,42 @@ const PROFILES: Record<string, IdleProfile> = {
   // long as the regexes forbid leading whitespace. Do NOT add \s* here.
   agy: { prompt: /(^|\n)>(\s|$)/, promptLine: /^>(\s|$)/, strip: /^>\s?/,
          busy: [/esc to (cancel|interrupt)/i, /\bGenerating\b/i, /\bThinking\b/i] },
+  // kimi (Moonshot's CLI): input is drawn in a rounded box, prompt line is
+  // U+2502 + ">" ("│ >"). The busy vocabulary has NOT been observed mid-turn on
+  // this host and could not be recovered from the binary, so this profile carries
+  // no busy markers and instead demands quiescence. That is why lanes running kimi
+  // registered as client_type=unknown had no delivery path at all: polling is
+  // disabled for unknown clients and there was no profile to nudge them with, so
+  // their mail sat unread in real, live panes.
+  kimi: { prompt: /(^|\n)\s*│\s*>/, promptLine: /^\s*│\s*>/, strip: /^.*?│\s*>\s?/,
+          busy: [], requiresQuiescence: true },
 };
 export function profileFor(clientType: string): IdleProfile {
   return PROFILES[clientType] ?? PROFILES.codex!;
+}
+
+// Pane content from the previous tick, for the quiescence gate. Keyed by pane id.
+const paneQuiescenceCache = new Map<string, string>();
+
+/**
+ * True when this pane looks the same as it did last tick.
+ *
+ * Used for clients whose busy vocabulary is unknown (IdleProfile.requiresQuiescence).
+ * A pane that is mid-turn is repainting — a spinner, a token counter, streaming
+ * output — so identical consecutive captures are strong evidence nothing is in
+ * flight. The first observation is never quiescent (no prior sample to compare),
+ * which costs one extra tick of latency and cannot produce a false nudge.
+ *
+ * Client-agnostic on purpose. Reverse-engineering each TUI's busy strings is what
+ * left kimi lanes undeliverable in the first place, and it fails again for every
+ * new client; this needs nothing but the pane.
+ */
+export function paneQuiescent(paneId: string): boolean {
+  const { ok, out } = sh(["tmux", "capture-pane", "-p", "-t", paneId, "-S", "-15"]);
+  if (!ok) return false;
+  const previous = paneQuiescenceCache.get(paneId);
+  paneQuiescenceCache.set(paneId, out);
+  return previous !== undefined && previous === out;
 }
 
 const lastNudge = new Map<string, number>();  // peer id -> epoch ms of last nudge
@@ -297,7 +336,7 @@ interface Lane {
 // dedup, case/space normalization) are unit-testable without mutating process.env.
 export function parseNudgeClients(raw: string | undefined = process.env.NUDGE_CLIENTS): string[] {
   if (!raw) return []; // DEFAULT: nudge nobody
-  const allowed = new Set(["codex", "gemini", "claude", "cursor", "agy"]);
+  const allowed = new Set(["codex", "gemini", "claude", "cursor", "agy", "kimi"]);
   const picked = raw.split(",").map((s) => s.trim().toLowerCase()).filter((s) => allowed.has(s));
   return [...new Set(picked)];
 }
@@ -930,7 +969,11 @@ function tick(db: Database, snapOverride?: TickSnapshot): void {
       // MCP server is daemon-hosted, not under the pane). Else → lane pid in subtree.
       const owned = attachId ? paneOwnedByAttachId(paneId, attachId, snap) : paneOwnedByPid(paneId, lane.pid, snap);
       if (!owned) { paneCache.delete(lane.id); continue; }       // pane gone/reused → drop cache
-      if (!paneIsIdle(paneId, profileFor(lane.client_type))) continue; // busy or has queued input — never disturb
+      const laneProfile = profileFor(lane.client_type);
+      if (!paneIsIdle(paneId, laneProfile)) continue; // busy or has queued input — never disturb
+      // Busy vocabulary unknown for this client → require the pane to be unchanged
+      // since last tick before typing into it.
+      if (laneProfile.requiresQuiescence && !paneQuiescent(paneId)) continue;
       nudge(lane, paneId);
       nudgedPanesThisTick.add(paneId);                           // A2: claim the pane for the rest of this tick
     } catch (e) {

@@ -1016,9 +1016,15 @@ function reqStrict(s: unknown): string {
   return typeof s === "string" ? s : "";
 }
 
+// Hardcoded allowlist, so a new client type must be added HERE as well as in the
+// ClientType union — otherwise the broker silently downgrades it to "unknown",
+// which costs that client every delivery path it has (background polling is off
+// for unknown clients and the poller has no idle profile for them). That is
+// exactly what happened to kimi: the server detected it correctly and registered
+// the right pid, and the row still read unknown/unknown.
 function validClientType(value: unknown): ClientType {
   return value === "claude" || value === "codex" || value === "gemini" || value === "cursor" || value === "agy"
-    || value === "unknown" ? value : "unknown";
+    || value === "kimi" || value === "unknown" ? value : "unknown";
 }
 
 function validReceiverMode(value: unknown, clientType: ClientType): ReceiverMode {
@@ -1031,6 +1037,9 @@ function validReceiverMode(value: unknown, clientType: ClientType): ReceiverMode
   }
   if (clientType === "cursor") return "manual-drain";
   if (clientType === "agy") return "manual-drain";
+  // kimi has no drain hook — it reads its inbox by calling check_messages after a
+  // nudge. Leaving it "unknown" would make every send to it report no_drain_path.
+  if (clientType === "kimi") return "manual-drain";
   return "unknown";
 }
 

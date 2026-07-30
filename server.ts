@@ -235,6 +235,7 @@ export function shouldDisableBackgroundPolling(clientType: ClientType, receiverM
   // rows): a background poll can never deliver to them, it only holds a broker
   // connection open per process. check_messages still polls the broker directly.
   return clientType === "codex" || clientType === "gemini" || clientType === "cursor" || clientType === "agy"
+    || clientType === "kimi"
     || clientType === "unknown"
     || receiverMode === "codex-hook" || receiverMode === "gemini-hook";
 }
@@ -2370,7 +2371,7 @@ async function main() {
   // Set when app-server-hosted identity resolution exhausts every path and
   // falls back to the MCP server's own pid — the observer-${pid} signature.
   let appServerIdentityUnresolved = false;
-  if (myClientType === "codex" || myClientType === "gemini" || myClientType === "cursor" || myClientType === "agy") {
+  if (myClientType === "codex" || myClientType === "gemini" || myClientType === "cursor" || myClientType === "agy" || myClientType === "kimi") {
     const chainPid = findClientPidFromProcessChain(process.ppid, startupProcesses, myClientType);
     if (chainPid) {
       myRegisterPid = chainPid;

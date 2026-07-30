@@ -15,6 +15,7 @@ function normalizedClient(value: string | undefined): ClientType | null {
   if (v === "gemini" || v === "gemini-cli") return "gemini";
   if (v === "cursor" || v === "cursor-agent") return "cursor";
   if (v === "agy") return "agy";
+  if (v === "kimi" || v === "kimi-code") return "kimi";
   if (v === "unknown") return "unknown";
   return null;
 }
@@ -58,6 +59,12 @@ export function isClientProcess(row: ProcessInfo, clientType: Exclude<ClientType
   const comm = commandName(row.comm);
   const firstArg = commandName(row.args);
   if (clientType === "claude") return comm === "claude" || firstArg === "claude";
+  // kimi ships as `kimi` (installed at ~/.kimi-code/bin/kimi) but its process is
+  // commonly seen as `kimi-code`. Match both; the generic prefix rule below would
+  // catch "kimi-code" only, and lanes registered as client_type=unknown get NO
+  // delivery path at all — background polling is disabled for unknown clients and
+  // the poller has no idle profile for them, so their mail simply sits.
+  if (clientType === "kimi") return comm === "kimi" || comm === "kimi-code" || firstArg === "kimi" || firstArg === "kimi-code";
   if (clientType === "cursor") return hasCursorAgentLauncher(row.args);
   if (comm === clientType || comm.startsWith(`${clientType}-`)) return true;
   if (firstArg === clientType || firstArg.startsWith(`${clientType}-`)) return true;
@@ -132,6 +139,7 @@ export function detectClientFromProcessChain(
     if (isClientProcess(p, "gemini")) return "gemini";
     if (isClientProcess(p, "cursor")) return "cursor";
     if (isClientProcess(p, "agy")) return "agy";
+    if (isClientProcess(p, "kimi")) return "kimi";
     if (isClientProcess(p, "claude")) return "claude";
     if (p.ppid <= 1 || p.ppid === current) break;
     current = p.ppid;
@@ -145,5 +153,8 @@ export function initialReceiverMode(clientType: ClientType): ReceiverMode {
   if (clientType === "gemini") return "manual-drain";
   if (clientType === "cursor") return "manual-drain";
   if (clientType === "agy") return "manual-drain";
+  // kimi has no drain hook: it receives by calling check_messages after a nudge,
+  // the same path codex uses and which was proven end-to-end on 2026-07-30.
+  if (clientType === "kimi") return "manual-drain";
   return "unknown";
 }
