@@ -1548,15 +1548,15 @@ function handleSetName(body: SetNameRequest): { name: string | null; resolved_na
 function disambiguateName(rawName: string | null, selfId: string, windowName?: string | null): string | null {
   if (!rawName) return null;
   const rows = db.query(
-    "SELECT id, pid, COALESCE(resolved_name, name) AS name, tmux_window_name AS win FROM peers WHERE non_targetable = 0 AND COALESCE(resolved_name, name) IS NOT NULL AND id != ?"
-  ).all(selfId) as { id: string; pid: number; name: string; win: string | null }[];
+    "SELECT id, pid, seat_pids, COALESCE(resolved_name, name) AS name, tmux_window_name AS win FROM peers WHERE non_targetable = 0 AND COALESCE(resolved_name, name) IS NOT NULL AND id != ?"
+  ).all(selfId) as { id: string; pid: number; seat_pids: string | null; name: string; win: string | null }[];
   // A just-superseded predecessor is still PID-alive until its next heartbeat
   // consumes the step-down signal — registration flags it (supersededPeerIds)
   // BEFORE this name resolution runs. Counting it as a live collision bumps
   // the successor's name permanently on every seat relaunch (the launch.5 →
   // launch.6 / c5.6 → c5.7 name-creep). Superseded rows are exiting by
   // contract — never collision material.
-  const live = rows.filter(r => isPidAlive(r.pid) && !supersededPeerIds.has(r.id));
+  const live = rows.filter(r => peerSeatAlive(r) && !supersededPeerIds.has(r.id));
   const liveNames = new Set(live.map(r => r.name));
   if (!liveNames.has(rawName)) return rawName;
   // Self-documenting disambiguator: when two LIVE seats share an operator name,
@@ -1722,6 +1722,30 @@ const selectQueueFacts = db.prepare(
  * recipient's actual queue and drain history so the sender learns which one it
  * is while it can still do something about it.
  */
+// Is the sending identity one a recipient could ever reply to?
+//
+// /register-cli issues a deliberately constrained, non_targetable identity: it
+// can send but never receive. That is the intended security model, but nothing
+// ever said so out loud — the CLI printed "Message queued" and the recipient,
+// trying to answer, got a bare "Peer <id> not found". Two codex lanes burned
+// tool calls on exactly that, and it is indistinguishable from the phantom-peer
+// bug reported from the fleet. Say it at send time instead.
+const selectSenderReplyable = db.prepare(
+  "SELECT non_targetable FROM peers WHERE id = ?",
+);
+
+function senderIsReplyable(fromId: string): boolean {
+  const row = selectSenderReplyable.get(fromId) as { non_targetable: number } | null;
+  return row !== null && row.non_targetable === 0;
+}
+
+function withSenderReplyWarning(fromId: string, health: RecipientDeliveryHealth): RecipientDeliveryHealth {
+  if (senderIsReplyable(fromId)) return health;
+  const note = "Your sending identity is send-only (non-targetable), so the recipient CANNOT reply to it — "
+    + "a reply attempt fails with \"peer not found\". Name a reachable seat in the message body if you need an answer.";
+  return { ...health, warning: health.warning ? `${health.warning} ${note}` : note };
+}
+
 function recipientHealthFor(peer: Peer): RecipientDeliveryHealth {
   const facts = selectQueueFacts.get(peer.id) as { n: number; oldest: string | null };
   const oldestMs = facts.oldest ? new Date(facts.oldest).getTime() : NaN;
@@ -1992,7 +2016,7 @@ function handleSendMessage(authedFromId: string, body: SendMessageRequest): Send
   const result = insertMessage.run(authedFromId, target.id, body.text, new Date().toISOString());
   // Health is read AFTER the insert so `pending` counts this message too — the
   // sender is asking "did this land", not "what was there before I sent".
-  const recipient = recipientHealthFor(target);
+  const recipient = withSenderReplyWarning(authedFromId, recipientHealthFor(target));
   return {
     ok: true,
     id: Number(result.lastInsertRowid),
@@ -2011,7 +2035,7 @@ function handleSendToPeer(authedFromId: string, body: SendToPeerRequest): SendMe
     return { ok: false, code: resolved.code, error: resolved.error, candidates: resolved.candidates };
   }
   const result = insertMessage.run(authedFromId, resolved.peer.id, body.text, new Date().toISOString());
-  const recipient = recipientHealthFor(resolved.peer);
+  const recipient = withSenderReplyWarning(authedFromId, recipientHealthFor(resolved.peer));
   return {
     ok: true,
     id: Number(result.lastInsertRowid),

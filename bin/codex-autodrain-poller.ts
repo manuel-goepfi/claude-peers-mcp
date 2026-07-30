@@ -98,9 +98,16 @@ export function nudgeText(lane: Lane): string {
       + `(see the drained peer message block above). This is automated, not a task: `
       + `act on it only if relevant, otherwise carry on with what you were doing.`;
   }
+  // "read with check_messages IF RELEVANT" cannot be acted on: relevance is only
+  // knowable after reading, so the lane has to guess — and a codex lane did
+  // exactly that, answering "no action needed" without ever fetching, leaving the
+  // mail unread until the poller gave up. The fetch is unconditional and cheap;
+  // only what to DO with the contents is conditional.
   return `[peer-mail] ${n} unread ${noun} in your claude-peers inbox. `
-    + `This is an automated notification, not a task: read with check_messages if `
-    + `relevant, otherwise carry on with what you were doing.`;
+    + `Call check_messages now to read ${n === 1 ? "it" : "them"} — you cannot tell whether `
+    + `${n === 1 ? "it matters" : "they matter"} without looking, and unread mail keeps re-nudging this pane. `
+    + `This is an automated notification, not a task: once read, act only if relevant, `
+    + `otherwise carry on with what you were doing.`;
 }
 // Give up nudging a lane after this many consecutive attempts with mail still
 // unread — a lane whose drain hook is broken must NOT be keystroke-bombed

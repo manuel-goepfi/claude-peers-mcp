@@ -161,6 +161,30 @@ function findClientAncestor(table: Map<number, ProcRow>, startPid = process.ppid
   return null;
 }
 
+/**
+ * True when this hook is running under a codex app-server host and has no seat
+ * of its own — no controlling tty anywhere up the chain to the app-server.
+ *
+ * Distinguishes "seatless by construction" (expected, silent) from "should have
+ * had a seat and lost it" (a real fault worth logging).
+ */
+export function isHostedWithoutSeat(
+  table: Map<number, ProcRow>,
+  startPid = process.ppid,
+  ttyReader: (pid: number) => string | null = getTty,
+): boolean {
+  const appServer = findCodexAppServerAncestor(table, startPid);
+  if (!appServer) return false;
+  let current: number | undefined = startPid;
+  for (let i = 0; i < 30 && current !== undefined; i++) {
+    if (ttyReader(current)) return false; // a tty means a real seat exists
+    if (current === appServer.pid) break;
+    current = table.get(current)?.ppid;
+    if (current !== undefined && current <= 1) break;
+  }
+  return true;
+}
+
 function findCodexAppServerAncestor(table: Map<number, ProcRow>, startPid = process.ppid): ProcRow | null {
   let current = startPid;
   for (let i = 0; i < 30; i++) {
@@ -224,7 +248,16 @@ export function findHookPeerPidsFromTable(
     clientPid = visible?.pid ?? null;
   }
   if (!clientPid) {
-    if (!hasEnvPid) log(`no ${CLIENT_TYPE} ancestor found`);
+    // An app-server-hosted thread has no seat: no tty, no tmux pane, no
+    // CLAUDE_PEER_NAME. There is nothing to disambiguate it with and no mailbox
+    // it owns, so having no seat is its NORMAL state, not a fault — the visible
+    // lanes it hosts drain on their own hooks. Logging it as a failure on every
+    // prompt buried the real failures under ~13 lines per 10 minutes and made a
+    // healthy fleet look broken. Stay quiet for that case; keep the log for a
+    // hook that genuinely should have resolved a seat and did not.
+    if (!hasEnvPid && !isHostedWithoutSeat(table, startPid, ttyReader)) {
+      log(`no ${CLIENT_TYPE} ancestor found`);
+    }
     return hasEnvPid ? { primary: validEnvPid, fallbacks: [] } : null;
   }
 
