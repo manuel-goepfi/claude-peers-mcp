@@ -37,6 +37,7 @@ afterEach(() => {
 
 interface PeerRow {
   id: string; name?: string; tmux_session?: string; summary?: string;
+  resolved_name?: string; tmux_pane_id?: string;
   pid?: number; staleSeconds?: number;
 }
 
@@ -44,14 +45,15 @@ function seedDb(root: string, peers: PeerRow[]) {
   const db = new Database(join(root, ".claude-peers.db"));
   db.run(`CREATE TABLE peers (
     id TEXT PRIMARY KEY, pid INTEGER NOT NULL DEFAULT 1, name TEXT,
-    tmux_session TEXT, tmux_window_index TEXT, tmux_window_name TEXT,
+    resolved_name TEXT, tmux_session TEXT, tmux_window_index TEXT,
+    tmux_window_name TEXT, tmux_pane_id TEXT,
     summary TEXT NOT NULL DEFAULT '', last_seen TEXT NOT NULL)`);
   const insert = db.prepare(
-    "INSERT INTO peers (id, pid, name, tmux_session, tmux_window_index, tmux_window_name, summary, last_seen) VALUES (?, ?, ?, ?, '1', 'w', ?, ?)",
+    "INSERT INTO peers (id, pid, name, resolved_name, tmux_session, tmux_window_index, tmux_window_name, tmux_pane_id, summary, last_seen) VALUES (?, ?, ?, ?, ?, '1', 'w', ?, ?, ?)",
   );
   for (const p of peers) {
     const lastSeen = new Date(Date.now() - (p.staleSeconds ?? 0) * 1000).toISOString();
-    insert.run(p.id, p.pid ?? 1, p.name ?? p.id, p.tmux_session ?? "s", p.summary ?? "", lastSeen);
+    insert.run(p.id, p.pid ?? 1, p.name ?? p.id, p.resolved_name ?? null, p.tmux_session ?? "s", p.tmux_pane_id ?? null, p.summary ?? "", lastSeen);
   }
   db.close();
 }
@@ -139,6 +141,38 @@ describe("roster rendering", () => {
     expect(ctx).toContain('<peer name="beta"');
     expect(ctx).not.toContain("ghost");           // stale excluded (90s window)
     expect(ctx).not.toContain('<peer name="me.1"'); // self excluded from roster
+  });
+
+  test("same-named seats render distinguishably, and an empty column cannot shift a later one", async () => {
+    // The misroute this fixes: an orchestrator reading the roster saw several
+    // identical lines, because `name` is not unique and tmux_session is shared by
+    // every pane in a session. resolved_name and pane id are what tell them apart.
+    //
+    // Second half is the trap found while fixing the first: with a TAB separator
+    // `read` collapses empty columns, so a peer with no pane id shifted every later
+    // field and its summary landed in an ATTRIBUTE. The pane-less row below holds
+    // that closed.
+    const root = mkdtempSync(join(tmpdir(), "greeting-twins-"));
+    roots.push(root);
+    const anchor = Bun.spawn(["sleep", "20"]);
+    children.push(anchor);
+    seedDb(root, [
+      { id: "selfrow", name: "me.1", pid: anchor.pid },
+      { id: "twinA", name: "lane.1", resolved_name: "lane.1#ALPHA", tmux_session: "s", tmux_pane_id: "%11", summary: "" },
+      { id: "twinB", name: "lane.1", resolved_name: "lane.1#BETA", tmux_session: "s", tmux_pane_id: "%22", summary: "" },
+      { id: "nopane", name: "bg.1", summary: "headless lane" },
+    ]);
+    const requests: HookRun["requests"] = [];
+    const broker = mockBroker(requests, emptyClaim);
+    const r = await runHook(root, broker.port, anchor.pid!, anchor.pid!);
+    const ctx = r.output!.hookSpecificOutput.additionalContext;
+    expect(ctx).toContain('pane="%11"');
+    expect(ctx).toContain('pane="%22"');
+    expect(ctx).toContain('resolved="lane.1#ALPHA"');
+    expect(ctx).toContain('resolved="lane.1#BETA"');
+    // The pane-less row keeps its summary in the BODY, never in an attribute.
+    expect(ctx).toContain(">headless lane</peer>");
+    expect(ctx).not.toContain('tmux="headless lane"');
   });
 
   test("peer-controlled summary is data: tags stripped, newline cannot forge an extra roster line", async () => {

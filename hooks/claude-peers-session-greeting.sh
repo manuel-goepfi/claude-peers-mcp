@@ -137,10 +137,32 @@ TOTAL_LIVE=$(sqlite3 -readonly "$HOME/.claude-peers.db" \
 # un-flattened newline would split one row into two loop iterations and let a
 # peer forge an extra roster line (the sanitizers run per-field, AFTER the
 # split, and cannot undo it).
-ROWS=$(sqlite3 -readonly -separator $'\t' "$HOME/.claude-peers.db" \
-  "SELECT COALESCE(name,''),
+# resolved_name and tmux_pane_id are newer columns. On a database predating them
+# the SELECT would fail and this hook's `|| exit 0` would silently drop BOTH the
+# roster AND the mail drain — so probe for each and substitute an empty literal
+# when absent. The projection stays 5 columns either way, so the read loop below
+# keeps exactly one parse path.
+has_column() {
+  local n
+  n=$(sqlite3 -readonly "$HOME/.claude-peers.db" \
+    "SELECT COUNT(*) FROM pragma_table_info('peers') WHERE name='$1'" 2>/dev/null) || n=0
+  [[ "$n" == "1" ]]
+}
+if has_column resolved_name; then RESOLVED_EXPR="COALESCE(resolved_name,'')"; else RESOLVED_EXPR="''"; fi
+if has_column tmux_pane_id; then PANE_EXPR="COALESCE(tmux_pane_id,'')"; else PANE_EXPR="''"; fi
+
+# Separator is US (0x1F), NOT tab. Tab is IFS whitespace, so `read` collapses runs
+# of it and drops empty fields: an empty resolved_name or pane id would shift every
+# later column and land peer-controlled summary text in an ATTRIBUTE position —
+# a forging vector, and it fires for any peer without a pane (every no-tmux lane).
+# US is not whitespace, so empty columns survive; US is stripped from
+# peer-controlled text below so it cannot be injected either.
+ROWS=$(sqlite3 -readonly -separator $'\x1f' "$HOME/.claude-peers.db" \
+  "SELECT replace(COALESCE(name,''), char(31), ' '),
+          ${RESOLVED_EXPR},
           COALESCE(tmux_session,'no-tmux'),
-          replace(replace(substr(COALESCE(summary,''),1,70), char(10), ' '), char(13), ' ')
+          ${PANE_EXPR},
+          replace(replace(replace(substr(COALESCE(summary,''),1,70), char(10), ' '), char(13), ' '), char(31), ' ')
    FROM peers
    WHERE ${LIVENESS_WHERE} ${QUERY_EXCLUDE}
    ORDER BY last_seen DESC LIMIT ${ROSTER_CAP}" 2>/dev/null) || exit 0
@@ -152,12 +174,23 @@ ROWS=$(sqlite3 -readonly -separator $'\t' "$HOME/.claude-peers.db" \
 PEER_LINES=""
 COUNT=0
 SKIPPED=0
-while IFS=$'\t' read -r name tmux summary; do
+# summary stays LAST so any trailing separator is absorbed harmlessly.
+while IFS=$'\x1f' read -r name resolved tmux pane summary; do
   [[ -z "$name" && -z "$summary" ]] && { SKIPPED=$((SKIPPED+1)); continue; }
   name_safe=$(sanitize_attr "$name")
   tmux_safe=$(sanitize_attr "$tmux")
   summary_safe=$(sanitize_body "$summary")
-  PEER_LINES+="  <peer name=\"${name_safe:-(unnamed)}\" tmux=\"${tmux_safe}\">${summary_safe}</peer>"$'\n'
+  # Publish what actually distinguishes one seat from another. `name` is NOT
+  # unique — six live lanes shared "C5_lanes.1" during the incident that prompted
+  # this — and tmux_session is shared by every pane in a session, so a roster
+  # carrying only those two renders same-named seats as identical lines. With
+  # empty summaries they become indistinguishable, and an orchestrator routing off
+  # this roster has nothing to pick by: it guesses, and misroutes. resolved_name is
+  # broker-unique; pane id is the seat's physical address.
+  extra=""
+  [[ -n "$resolved" && "$resolved" != "$name" ]] && extra+=" resolved=\"$(sanitize_attr "$resolved")\""
+  [[ -n "$pane" ]] && extra+=" pane=\"$(sanitize_attr "$pane")\""
+  PEER_LINES+="  <peer name=\"${name_safe:-(unnamed)}\"${extra} tmux=\"${tmux_safe}\">${summary_safe}</peer>"$'\n'
   COUNT=$((COUNT+1))
 done <<< "$ROWS"
 

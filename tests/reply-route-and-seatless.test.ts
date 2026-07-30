@@ -146,6 +146,14 @@ describe("seatless app-server detection", () => {
     expect(isHostedWithoutSeat(plain, 700, () => null)).toBe(false);
   });
 
+  // NOTE: the exit-code half of this fix (seatless → exit 0, so the wrapper logs
+  // no `drain-failed rc=1`) is NOT unit-tested. A spawned harness cannot build a
+  // faithful app-server tree: the shim inherits a controlling tty, and `setsid`
+  // forks and reparents, so the ancestor walk sees a different chain than in
+  // production. It was verified by hand (EXIT=0) and is confirmed in production by
+  // the absence of new `drain-failed` lines while app-server hooks keep firing.
+  // The classifier those exits depend on IS covered by the cases above.
+
   test("terminates on a broken chain instead of looping", () => {
     const orphan = new Map(table);
     orphan.set(800, { pid: 800, ppid: 999999, comm: "bash", args: "bash" });

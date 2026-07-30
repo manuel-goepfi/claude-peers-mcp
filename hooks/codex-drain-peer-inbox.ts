@@ -280,16 +280,28 @@ export function findHookPeerPidsFromTable(
   return { primary: clientPid, fallbacks: [] };
 }
 
-function findHookPeerPids(): { primary: number; fallbacks: number[] } | null {
+/**
+ * Resolve this hook's seat, distinguishing "no seat by construction" from
+ * "should have had a seat and did not".
+ *
+ * The caller needs the difference for its EXIT CODE, not just its log level: an
+ * app-server-hosted thread has no seat and no mailbox, so exiting non-zero makes
+ * the wrapper record `drain-failed rc=1` on every prompt for something that is
+ * working as intended. Silencing only the message left that half in place.
+ */
+function findHookPeerPids(): { primary: number; fallbacks: number[] } | { seatless: true } | null {
   const envPid = Number(process.env.CLAUDE_PEERS_MCP_PID ?? "");
-  return findHookPeerPidsFromTable(
-    processTable(),
+  const table = processTable();
+  const resolved = findHookPeerPidsFromTable(
+    table,
     process.ppid,
     process.cwd(),
     cwdOf,
     CLIENT_TYPE,
     Number.isInteger(envPid) && envPid > 1 ? envPid : null,
   );
+  if (resolved) return resolved;
+  return isHostedWithoutSeat(table, process.ppid) ? { seatless: true } : null;
 }
 
 async function post<T>(path: string, body: unknown): Promise<T> {
@@ -486,11 +498,15 @@ async function main(): Promise<void> {
     }
   }
 
-  const pids = findHookPeerPids();
-  if (!pids) {
+  const resolvedPids = findHookPeerPids();
+  if (!resolvedPids) {
     process.exitCode = 1;
     return;
   }
+  // Seatless by construction: nothing to drain and nothing wrong. Exit 0 so the
+  // wrapper does not log a failure for the expected case.
+  if ("seatless" in resolvedPids) return;
+  const pids = resolvedPids;
 
   const drainId = `${RECEIVER_MODE}:${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
   let claimed: { peer_id?: string; drain_id?: string; messages?: Message[] } | null = null;

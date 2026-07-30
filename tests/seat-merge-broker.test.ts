@@ -244,6 +244,44 @@ describe("seat-anchored registration", () => {
     });
     expect(sent.ok).toBe(true);
   });
+
+  test("name collision sees a seat that is alive only via seat_pids", async () => {
+    // Regression for disambiguateName: it selected `pid` only and filtered on
+    // isPidAlive(row.pid), so a seat whose row pid had died — which is the NORMAL
+    // lifecycle, Claude Code kills the MCP server at every compact/resume — read
+    // as a FREE name. A second live seat then took the same name with no suffix
+    // and send_to_peer could route to the wrong agent. Same bug class f73c1c2
+    // fixed for publicPeerColumns; this call site was missed.
+    // Mirrors the seat-liveness test: kill the pid the ROW carries and keep a
+    // co-registrant alive, so this can only pass through seat_pids.
+    const serverPid = spawnHolder();
+    const tuiPid = spawnHolder();
+    const seat = await register(serverPid, { tmux_pane_id: "%706", name: "collide.1" });
+    await register(tuiPid, { tmux_pane_id: "%706", name: "collide.1" });
+
+    const db = new Database(broker.dbPath, { readonly: true });
+    const row = db.query("SELECT pid, seat_pids FROM peers WHERE id = ?").get(seat.id) as { pid: number; seat_pids: string };
+    db.close();
+    expect(JSON.parse(row.seat_pids)).toContain(serverPid);
+
+    for (const child of children) if (child.pid === row.pid) child.kill();
+    await Bun.sleep(150);
+
+    // A different seat (different project, so it cannot merge) asks for the same
+    // operator name while the original is still alive through its co-registrant.
+    const rivalPid = spawnHolder();
+    const rival = await call<{ id: string }>("/register", {
+      pid: rivalPid, cwd: "/seat/rival", git_root: "/seat/rival", tty: "pts/71",
+      name: "collide.1", client_type: "claude", receiver_mode: "claude-channel",
+      tmux_session: "rivalsess", tmux_window_index: "9", tmux_window_name: "rival",
+      tmux_pane_id: "%799",
+    });
+
+    const after = new Database(broker.dbPath, { readonly: true });
+    const rivalRow = after.query("SELECT COALESCE(resolved_name, name) AS name FROM peers WHERE id = ?").get(rival.id) as { name: string };
+    after.close();
+    expect(rivalRow.name).not.toBe("collide.1");
+  });
 });
 
 describe("delivery honesty over the wire", () => {
