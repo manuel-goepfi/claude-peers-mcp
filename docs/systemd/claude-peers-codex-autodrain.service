@@ -36,14 +36,22 @@ Environment=BUN_INSTALL=%h/.bun
 # (NOT /tmp/tmux-1000 — that doubles to /tmp/tmux-1000/tmux-1000 and fails to
 # connect). tmux appends its own current-UID socket directory.
 Environment=TMUX_TMPDIR=/tmp
-# Auto-nudge is OFF by default (operator decision 2026-06-18): the poller does NOT
-# type "check your peer inbox..." into idle lanes. Claude lanes piggyback-drain
-# pending mail on their next turn for free; idle Codex/Gemini wakes burned quota to
-# drain low-value chatter. Mail still flows on each lane's next natural turn. This
-# line pins the disabled state explicitly so it survives a reboot / unit-enable and
-# does not rely solely on the in-code default. To re-enable a client, set the
-# comma-separated list (codex/gemini/claude honored), e.g. NUDGE_CLIENTS=codex,gemini
-Environment=NUDGE_CLIENTS=
+# Auto-nudge state. The 2026-06-18 decision pinned this EMPTY (poller does not type
+# into idle lanes; Claude lanes piggyback-drain on their next turn for free, and
+# waking idle Codex/Gemini burned quota on low-value chatter).
+#
+# Re-enabled 2026-07-30, deliberately, because the premise changed: the nudge is
+# now the ONLY working receive path for Codex lanes whose UserPromptSubmit drain
+# hook never fires (codex.1/codex.2 sit at receiver_mode=manual-drain with an empty
+# last_hook_seen_at, and reach zero-pending only via nudge + check_messages). The
+# long-running process this unit replaces had been running with these clients
+# enabled, so an empty value here would have SILENTLY turned off delivery for them
+# on install — the regression this comment exists to prevent.
+#
+# Revisit when the Codex hook-trust issue is resolved: if every lane drains via its
+# own hook, this can go back to empty. Only the env var is read — the file at
+# ~/.config/claude-peers/nudge-clients looks like config but is NOT consulted.
+Environment=NUDGE_CLIENTS=codex,claude,cursor,agy
 # Tunables (defaults shown; override here if needed):
 # Environment=POLL_INTERVAL_MS=15000
 # Environment=NUDGE_COOLDOWN_MS=60000
