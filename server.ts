@@ -72,6 +72,22 @@ function booleanSetting(name: string, fallback: boolean): boolean {
 }
 const ADAPTIVE_POLLING_ENABLED = booleanSetting("CLAUDE_PEERS_ADAPTIVE_POLLING", true);
 const TMUX_UNCHANGED_WRITE_SUPPRESSION = booleanSetting("CLAUDE_PEERS_TMUX_UNCHANGED_WRITE_SUPPRESSION", true);
+// Opt out of writing peer identity onto a tmux pane. The server finds its pane by
+// walking the PROCESS TREE, not by reading TMUX_PANE, so a server spawned from
+// inside someone's session resolves THEIR pane no matter how its environment is
+// scrubbed — a test server cannot be kept off a live pane by unsetting env alone.
+// It happened: a lifecycle fixture ({id:"wedge-peer", name:"wedge"}) wrote itself
+// onto the operator's pane, whose border renders @peer_resolved_name, so a seat
+// really named infra.2 displayed "wedge" and could not be addressed by the label
+// the operator reads. Ten suite runs re-stamped it.
+// Also the right switch for CI and for anyone who does not want their panes
+// written to.
+// Read per call, not once at import: tests that DO exercise the mirror need to opt
+// back in after the suite-wide preload disables it, and a module-level const would
+// freeze the value before they could.
+function tmuxIdentityMirrorEnabled(): boolean {
+  return booleanSetting("CLAUDE_PEERS_TMUX_IDENTITY_MIRROR", true);
+}
 const HEARTBEAT_PHASE_SPREAD_ENABLED = booleanSetting("CLAUDE_PEERS_HEARTBEAT_PHASE_SPREAD", true);
 export function positiveHeartbeatInterval(raw: string | undefined, fallback = 15_000): number {
   const parsed = Number(raw ?? fallback);
@@ -1147,6 +1163,7 @@ export function publishBrokerIdentityToTmux(identity: {
   client_type: ClientType;
   receiver_mode: ReceiverMode;
 }, tmuxInfo: TmuxPaneInfo | null = myTmuxInfo, options: { updateOperatorLabel?: boolean } = {}): TmuxMirrorResult {
+  if (!tmuxIdentityMirrorEnabled()) return { ok: true, target: null, failedOptions: [], skipped: true };
   const target = sharedBrokerIdentityPaneTarget(tmuxInfo);
   const now = Date.now();
   const key = target ? `${tmuxIdentityWriteKey(identity, target)}:${options.updateOperatorLabel === true}` : null;

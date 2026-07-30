@@ -81,6 +81,16 @@ function serverEnv(extra: Record<string, string> = {}): Record<string, string | 
   // CLAUDE_PEER_NAME pins the name so no tmux/ps detection ambiguity matters.
   return {
     ...process.env,
+    // A spawned server mirrors its identity onto ITS OWN tmux pane, which it takes
+    // from TMUX_PANE. Inheriting the operator's TMUX_PANE therefore makes a test
+    // server stamp @peer_id/@peer_label/@peer_resolved_name onto the operator's
+    // LIVE pane. That happened: this file's "wedge" fixture (id wedge-peer) landed
+    // on a real pane whose border format renders @peer_resolved_name, so the seat
+    // displayed "wedge" for hours and the operator could not address it — the
+    // border is where they read a lane's routable name. Unset it (and TMUX, so no
+    // tmux client is resolvable at all) to keep test servers off real panes.
+    TMUX_PANE: undefined,
+    TMUX: undefined,
     CLAUDE_PEERS_PORT: String(BROKER_PORT),
     CLAUDE_PEERS_DB: TEST_DB,
     CLAUDE_PEERS_BRIDGE_TOKEN_FILE: TEST_TOKEN_FILE,

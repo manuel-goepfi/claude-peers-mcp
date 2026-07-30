@@ -16,7 +16,7 @@
  * mirror copy needed.
  */
 
-import { describe, test, expect } from "bun:test";
+import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import {
   __testBrokerFetchForTest,
   __testSetBrokerAuthStateForTest,
@@ -281,6 +281,19 @@ describe("#11 — return type invariants", () => {
 // match the tmux top bar (`session.N`). `pane_id` remains stable metadata and
 // the last fallback, but must not displace the human label used by find_peer().
 describe("Operator-label fallback — human name first, pane_id metadata last", () => {
+  // These tests DO exercise the tmux identity mirror, so they opt back in after the
+  // suite-wide preload (tests/setup-no-live-tmux.ts) turns it off. The preload
+  // exists because the server locates its pane by walking the PROCESS TREE, so a
+  // test server spawned inside a live session stamps peer identity onto the
+  // operator's real pane no matter how its env is scrubbed. These tests create and
+  // destroy their own tmux session, so enabling the mirror here touches nothing live.
+  const priorMirrorSetting = process.env.CLAUDE_PEERS_TMUX_IDENTITY_MIRROR;
+  beforeAll(() => { process.env.CLAUDE_PEERS_TMUX_IDENTITY_MIRROR = "1"; });
+  afterAll(() => {
+    if (priorMirrorSetting === undefined) delete process.env.CLAUDE_PEERS_TMUX_IDENTITY_MIRROR;
+    else process.env.CLAUDE_PEERS_TMUX_IDENTITY_MIRROR = priorMirrorSetting;
+  });
+
   test("server.ts resolves a human tmux operator label before pane_id fallback", async () => {
     const source = await Bun.file(`${import.meta.dir}/../server.ts`).text();
 

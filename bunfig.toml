@@ -1,0 +1,5 @@
+[test]
+# Runs before any test file. See tests/setup-no-live-tmux.ts — without it, spawned
+# servers inherit the operator's TMUX_PANE and write peer identity options onto
+# their live panes.
+preload = ["./tests/setup-no-live-tmux.ts"]
