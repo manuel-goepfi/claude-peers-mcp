@@ -326,11 +326,35 @@ async function runCommand(command: string, args: string[], context: CliContext, 
     const [toId, ...messageParts] = args;
     const message = messageParts.join(" ").trim();
     if (!toId || !message) throw new CliError("usage", "usage: claude-peers send <peer-id> <message>");
-    const result = await authedRequest<SendMessageResponse>(context, "/send-message", {
-      from_id: context.identity.id,
-      to_id: toId,
-      text: message,
-    });
+    // Prefer sending AS this pane's seat so the recipient can reply. The CLI's own
+    // identity is non-targetable by design, so a message sent under it leaves the
+    // recipient with a from_id that stops resolving the moment this process exits —
+    // measured end-to-end: a codex lane received a message, tried to answer twice,
+    // and both replies died with "peer not found". /send-by-pid attributes the
+    // message to the seat this command was typed in, proven via TMUX_PANE.
+    //
+    // Falls back to the CLI identity whenever the seat cannot be established
+    // (no tmux, no registered peer for the pane, or two unmerged rows on it). The
+    // fallback still sends — it just carries the reply-route warning.
+    let result: SendMessageResponse | undefined;
+    try {
+      result = await requestBroker<SendMessageResponse>({
+        baseUrl: context.baseUrl,
+        path: "/send-by-pid",
+        body: { caller_pid: process.pid, to_id: toId, text: message },
+        timeoutMs: context.timeoutMs,
+      });
+      if (result && result.ok !== true) result = undefined;
+    } catch {
+      result = undefined; // no seat in our ancestry → fall through to the CLI identity
+    }
+    if (!result) {
+      result = await authedRequest<SendMessageResponse>(context, "/send-message", {
+        from_id: context.identity.id,
+        to_id: toId,
+        text: message,
+      });
+    }
     if (!result || result.ok !== true || typeof result.id !== "number") {
       if (result?.ok === false) throw new CliError("target", "broker refused the message target");
       throw new CliError("malformed", "send response is invalid");
@@ -343,10 +367,11 @@ async function runCommand(command: string, args: string[], context: CliContext, 
     if (context.json) {
       console.log(JSON.stringify({
         ok: true, command: "send", target: toId, message_id: result.id, state,
-        recipient: result.recipient, warning: result.warning,
+        sender: result.sender, recipient: result.recipient, warning: result.warning,
       }));
     } else {
-      console.log(`Message queued to ${toId} (id ${result.id}).`);
+      const asSeat = result.sender ? ` as ${result.sender.name ?? result.sender.id}` : "";
+      console.log(`Message queued to ${toId}${asSeat} (id ${result.id}).`);
       if (result.warning) console.log(`WARNING: ${result.warning}`);
     }
     return;

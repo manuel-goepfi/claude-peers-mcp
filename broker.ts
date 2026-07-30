@@ -2215,6 +2215,114 @@ function authPidDrain(pid: number, callerPid: number): { ok: true; id: string } 
   return { ok: true, id: resolved.id };
 }
 
+/**
+ * Parent pid from /proc/<pid>/stat, or null.
+ *
+ * Deliberately NOT /proc/<pid>/environ: that file is ptrace-gated, so under
+ * kernel.yama.ptrace_scope=1 (the Ubuntu default here) a process may only read the
+ * environment of its own DESCENDANTS. The broker is nobody's ancestor, so an
+ * env-based occupancy proof fails closed for every real caller — measured, after I
+ * built exactly that and got 403 for my own shell. `stat` is world-readable, so
+ * ancestry is provable where environment is not.
+ *
+ * The comm field can contain spaces and parentheses, so fields are read after the
+ * LAST ')' rather than by splitting on whitespace.
+ */
+function ppidOfPid(pid: number): number | null {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const tail = stat.slice(stat.lastIndexOf(")") + 1).trim().split(/\s+/);
+    const ppid = Number(tail[1]); // state, ppid, ...
+    return Number.isInteger(ppid) && ppid > 0 ? ppid : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The caller's pid plus its ancestors, nearest first. */
+function pidWithAncestors(pid: number, max = 12): number[] {
+  const chain: number[] = [];
+  let current: number | null = pid;
+  for (let i = 0; i < max && current !== null && current > 1; i++) {
+    chain.push(current);
+    current = ppidOfPid(current);
+  }
+  return chain;
+}
+
+/**
+ * /send-by-pid: send AS the seat the caller belongs to.
+ *
+ * The CLI has no token for the seat it runs inside, so it used to register a
+ * throwaway non_targetable identity, send, and exit — leaving the recipient with a
+ * from_id that stopped resolving. A codex lane demonstrated the cost end-to-end: it
+ * received a message, tried to answer twice, and both replies died with "peer not
+ * found". Queued mail with an unreachable sender is a conversation that cannot
+ * happen.
+ *
+ * The seat is DERIVED from the caller's process ancestry, never asserted by the
+ * caller: a peer row qualifies when the caller is that seat's registered process or
+ * one of its descendants. So `claude-peers send` typed inside a session attributes
+ * to that session, and a process outside any seat gets no attribution at all rather
+ * than a seat of its choosing.
+ *
+ * This is not a wider trust boundary than the sibling pid routes — claim-by-pid
+ * accepts any same-uid caller for ANY pid, which is strictly more permissive (it
+ * can read that seat's mail). Here the caller must additionally be inside the seat.
+ */
+function handleSendByPid(body: Record<string, unknown>): SendMessageResponse & { status?: number } {
+  if (typeof body.text !== "string") return { ok: false, status: 400, error: "text must be string" };
+  if (utf8Bytes(body.text) > MAX_MSG_BYTES) return { ok: false, status: 413, error: `text exceeds ${MAX_MSG_BYTES} bytes` };
+
+  const callerPid = Number(body.caller_pid);
+  if (!Number.isInteger(callerPid) || callerPid <= 1) return { ok: false, status: 400, error: "invalid caller_pid" };
+  const callerErr = verifyPidUid(callerPid);
+  if (callerErr) return { ok: false, status: 403, error: `caller rejected: ${callerErr}` };
+
+  const chain = new Set(pidWithAncestors(callerPid));
+  const seats = livePeersForResolution(selectAllTargetablePeers.all() as Peer[]).filter((peer) => {
+    if (chain.has(peer.pid)) return true;
+    return parseSeatPids(peer.seat_pids).some((pid) => chain.has(pid));
+  });
+  if (seats.length === 0) {
+    return { ok: false, status: 404, error: "caller is not inside any registered peer seat" };
+  }
+  if (seats.length > 1) {
+    // Nested seats (a session launched from inside another) or an uncollapsed
+    // duplicate. Attributing to either would be a guess.
+    return {
+      ok: false,
+      status: 409,
+      error: `caller ancestry matches ${seats.length} live seats; cannot attribute the sender`,
+      candidates: seats.map(describePeerTarget),
+    };
+  }
+  const sender = seats[0]!;
+
+  const limited = rateCheck(sender.id, true);
+  if (limited) return { ok: false, status: 429, error: limited };
+
+  const selector: PeerSelector = typeof body.to_id === "string" && body.to_id
+    ? { id: body.to_id }
+    : (body.selector as PeerSelector | undefined) ?? {};
+  const resolved = resolveFreshPeer(selector);
+  if (!resolved.ok) {
+    return { ok: false, status: 404, code: resolved.code, error: resolved.error, candidates: resolved.candidates };
+  }
+
+  const result = insertMessage.run(sender.id, resolved.peer.id, body.text, new Date().toISOString());
+  const recipient = withSenderReplyWarning(sender.id, recipientHealthFor(resolved.peer));
+  return {
+    ok: true,
+    id: Number(result.lastInsertRowid),
+    state: "queued",
+    target: describePeerTarget(resolved.peer),
+    recipient,
+    warning: recipient.warning ?? undefined,
+    sender: describePeerTarget(sender),
+  };
+}
+
 function handleHookHeartbeatByPid(body: HookHeartbeatByPidRequest): { ok: boolean; peer_id?: string; error?: string; status?: number } {
   const auth = authPidDrain(Number(body.pid), Number(body.caller_pid));
   if (!auth.ok) {
@@ -2513,6 +2621,12 @@ requestHandler = async (req: Request) => {
           return Response.json({ error: res.error }, { status: res.status ?? 400 });
         }
         return Response.json({ peer_id: res.peer_id, messages: res.messages, acked: res.acked, state: res.state });
+      }
+
+      if (path === "/send-by-pid") {
+        const res = handleSendByPid(body as Record<string, unknown>);
+        if (!res.ok) return Response.json({ error: res.error, code: res.code, candidates: res.candidates }, { status: res.status ?? 400 });
+        return Response.json(res);
       }
 
       if (path === "/claim-by-pid" || path === "/ack-by-pid" || path === "/hook-heartbeat-by-pid") {

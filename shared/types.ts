@@ -225,6 +225,10 @@ export interface SendMessageResponse {
   // Additive — older brokers omit them.
   recipient?: RecipientDeliveryHealth;
   warning?: string;
+  // Which seat the broker attributed the message to. Only /send-by-pid sets it:
+  // that route derives the sender from the caller's pane rather than a token, so
+  // the caller cannot know its own attributed identity without being told.
+  sender?: PeerTarget;
 }
 
 export interface SendToPeerRequest {
