@@ -51,6 +51,11 @@ export interface Message {
   id: number;
   from_id: PeerId;
   to_id: PeerId;
+  // Sender's operator-facing seat label at delivery time, so the recipient can
+  // refer to a peer the way the operator reads it on the pane border rather than
+  // by id. Null when the sender has exited or never took a name; additive, so
+  // older brokers simply omit it and the envelope falls back to the id.
+  from_name?: string | null;
   text: string;
   sent_at: string; // ISO timestamp
   delivered: boolean;

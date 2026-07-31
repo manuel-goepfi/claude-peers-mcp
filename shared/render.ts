@@ -25,5 +25,11 @@ ${safe}
 export function renderInboundLine(m: Message): string {
   const relayed = /<\s*untrusted-peer-message\b/i.test(m.text);
   const body = m.text.trim().length === 0 ? "[empty message]" : normalizeText(m.text);
-  return `<peer-message from="${attrEscape(m.from_id)}" sent_at="${attrEscape(m.sent_at)}" relayed="${relayed}">\n${body}\n</peer-message>`;
+  // from stays the id — it is the routable handle and the trust statement in the
+  // server instructions is written about it. from_name is additive and purely for
+  // reference: it is a self-chosen label, is NOT unique, and must never be used to
+  // route a reply or to decide whether to trust the body.
+  const name = typeof m.from_name === "string" ? m.from_name.trim() : "";
+  const nameAttr = name.length > 0 ? ` from_name="${attrEscape(name)}"` : "";
+  return `<peer-message from="${attrEscape(m.from_id)}"${nameAttr} sent_at="${attrEscape(m.sent_at)}" relayed="${relayed}">\n${body}\n</peer-message>`;
 }

@@ -580,6 +580,15 @@ const updateClaudeDrainHealth = db.prepare(`
   WHERE id = ? AND client_type = 'claude'
 `);
 
+// Drain telemetry for the token-authed /ack-messages route, which serves every
+// client that drains by calling check_messages. Touches ONLY last_drain_at so it
+// can never clobber client_type/receiver_mode, and is deliberately NOT scoped to
+// a client_type: cursor and kimi have no hook route at all, and they are the
+// lanes whose drain state was invisible.
+const updateDrainStamp = db.prepare(`
+  UPDATE peers SET last_drain_at = ? WHERE id = ?
+`);
+
 const updateSummary = db.prepare(`
   UPDATE peers SET summary = ? WHERE id = ?
 `);
@@ -628,11 +637,17 @@ const insertMessage = db.prepare(`
   VALUES (?, ?, ?, ?, 0)
 `);
 
+// The join exists so the recipient can name the sender. Without it the envelope
+// carries only from_id, so a lane quoting its inbox writes "2o0dtmqx" — an id the
+// operator cannot map to a pane on sight. LEFT JOIN, not JOIN: a sender that has
+// since exited must still deliver its mail, it simply arrives unnamed.
 const selectUndelivered = db.prepare(`
-  SELECT * FROM messages
-  WHERE to_id = ? AND delivered = 0
-    AND (claimed_at IS NULL OR claimed_at < ?)
-  ORDER BY sent_at ASC
+  SELECT m.*, p.name AS from_name
+  FROM messages m
+  LEFT JOIN peers p ON p.id = m.from_id
+  WHERE m.to_id = ? AND m.delivered = 0
+    AND (m.claimed_at IS NULL OR m.claimed_at < ?)
+  ORDER BY m.sent_at ASC
 `);
 
 const markDeliveredScoped = db.prepare(`
@@ -2194,6 +2209,15 @@ function handleAckMessages(body: AckMessagesRequest): { ok: boolean; acked: numb
     }
     return count;
   })();
+  // Every nudge-driven lane (cursor, kimi, codex-without-hook) and every Claude
+  // check_messages call lands HERE, not on the by-pid hook routes that stamp
+  // drain health. Without this, last_drain_at stays at whatever the last hook
+  // drain wrote — or NULL forever for a client that has no hook at all — so a
+  // lane that is draining perfectly reports as never-drained and every sender is
+  // warned its mail is going nowhere. Measured 2026-07-31: a cursor lane acked 4
+  // messages with last_drain_at NULL, and a Claude lane acked 23 while the column
+  // still read 34 minutes stale.
+  if (acked > 0) updateDrainStamp.run(nowIso, body.id);
   return { ok: true, acked, ...(acked > 0 ? { state: "acknowledged" as const } : {}) };
 }
 
