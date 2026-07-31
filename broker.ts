@@ -1909,9 +1909,13 @@ function resolveFreshPeer(selector: PeerSelector | undefined): ResolvePeerResult
   if (fields.length === 1 && fields[0] === "tmux_session") {
     return { ok: false, code: "INVALID_SELECTOR", error: "tmux_session alone is not a unique peer selector; include tmux_pane_id or another identity field" };
   }
-  if (fields.length === 1 && fields[0] === "tmux_pane_id") {
-    return { ok: false, code: "INVALID_SELECTOR", error: "tmux_pane_id alone is not a unique peer selector; include tmux_session or another identity field" };
-  }
+  // tmux_pane_id ALONE is accepted: pane ids are unique across the whole tmux
+  // server, so the session adds description, not identity. This premise was wrong
+  // in three places today — the seat key, the delivery-health check, and here — and
+  // each time it made a lane that HAS a pane unreachable by it. It matters most for
+  // clients that strip the environment they hand MCP servers (Cursor): those lanes
+  // recover their pane but never their session name, so demanding the session made
+  // "address the pane you can see" fail for exactly the lanes that needed it.
 
   const allPeers = selectAllTargetablePeers.all() as Peer[];
   const staleById = targetSelector.id ? allPeers.find((p) => p.id === targetSelector.id) ?? null : null;

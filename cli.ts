@@ -341,18 +341,19 @@ async function runCommand(command: string, args: string[], context: CliContext, 
     // tmux coordinate fallback (e.g. "infra:1.2") — and both are things a person
     // reads off the screen and types. A coordinate is resolved to a pane id HERE
     // because that needs tmux, which the broker deliberately does not run.
-    const selector = resolveSendTarget(toId);
     let result: SendMessageResponse | undefined;
-    try {
-      result = await requestBroker<SendMessageResponse>({
-        baseUrl: context.baseUrl,
-        path: "/send-by-pid",
-        body: { caller_pid: process.pid, ...selector, text: message },
-        timeoutMs: context.timeoutMs,
-      });
-      if (result && result.ok !== true) result = undefined;
-    } catch {
-      result = undefined; // no seat in our ancestry → fall through to the CLI identity
+    for (const attempt of resolveSendTarget(toId)) {
+      try {
+        const candidate = await requestBroker<SendMessageResponse>({
+          baseUrl: context.baseUrl,
+          path: "/send-by-pid",
+          body: { caller_pid: process.pid, ...attempt, text: message },
+          timeoutMs: context.timeoutMs,
+        });
+        if (candidate?.ok === true) { result = candidate; break; }
+      } catch {
+        // This shape did not resolve (or we are in no seat). Try the next.
+      }
     }
     if (!result) {
       result = await authedRequest<SendMessageResponse>(context, "/send-message", {
@@ -412,7 +413,9 @@ export
  * Ambiguity is resolved by shape, and the id/name case is left to the broker: it
  * matches an id exactly, and `send` retries as a name when no id matches.
  */
-function resolveSendTarget(target: string): Record<string, unknown> {
+function resolveSendTarget(target: string): Array<Record<string, unknown>> {
+  if (target.startsWith("%")) return [{ selector: { tmux_pane_id: target } }];
+
   if (target.includes(":") || /^[^\s]+\s+\d+\.\d+$/.test(target)) {
     const normalized = target.replace(/\s+/, ":");
     try {
@@ -420,10 +423,19 @@ function resolveSendTarget(target: string): Record<string, unknown> {
         stdout: "pipe", stderr: "ignore",
       });
       const pane = new TextDecoder().decode(probe.stdout).trim();
-      if (probe.exitCode === 0 && pane.startsWith("%")) return { selector: { tmux_pane_id: pane } };
+      if (probe.exitCode === 0 && pane.startsWith("%")) return [{ selector: { tmux_pane_id: pane } }];
     } catch { /* tmux absent or target invalid — fall through to id/name */ }
   }
-  return { to_id: target };
+
+  // Ordered attempts, because the operator types whichever handle they can SEE and
+  // those shapes overlap. An id is tried first (exact), then the name on the pane
+  // border, then the broker-unique resolved_name. Anything that resolves wins; a
+  // failure to resolve is not an error until every shape has been tried.
+  return [
+    { to_id: target },
+    { selector: { name: target } },
+    { selector: { resolved_name: target } },
+  ];
 }
 
 async function main(argv = process.argv.slice(2)): Promise<number> {

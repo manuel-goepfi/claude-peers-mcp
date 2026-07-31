@@ -138,6 +138,22 @@ describe("sender reply-route honesty", () => {
     expect(sent.recipient?.state).toBe("no_drain_path");
   });
 
+  test("a bare pane id resolves a peer — the session is description, not identity", async () => {
+    // Cursor lanes have a pane and no session, so requiring both made "address the
+    // pane you can see" fail for exactly the lanes that needed it.
+    const sender = await registerTarget("rr-sender-sel", "%910");
+    const paneOnly = await call<{ id: string }>("/register", {
+      pid: spawnHolder(), cwd: "/rr/selpane", git_root: "/rr/selpane", name: "rr-selpane",
+      client_type: "cursor", receiver_mode: "manual-drain",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null, tmux_pane_id: "%911",
+    });
+    const sent = await call<Send & { target?: { id: string } }>("/send-to-peer", {
+      id: sender.id, from_id: sender.id, selector: { tmux_pane_id: "%911" }, text: "by pane alone",
+    });
+    expect(sent.ok).toBe(true);
+    expect((sent as { target?: { id: string } }).target?.id).toBe(paneOnly.id);
+  });
+
   test("the reply-route warning composes with a recipient-health warning", async () => {
     const cli = await call<{ id: string }>("/register-cli", { pid: spawnHolder() });
     // No pane and manual drain: unreachable recipient AND unreplyable sender.
