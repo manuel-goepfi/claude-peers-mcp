@@ -336,12 +336,18 @@ async function runCommand(command: string, args: string[], context: CliContext, 
     // Falls back to the CLI identity whenever the seat cannot be established
     // (no tmux, no registered peer for the pane, or two unmerged rows on it). The
     // fallback still sends — it just carries the reply-route warning.
+    // Accept whatever the operator can SEE, not just an id. The pane border shows
+    // either the peer name (e.g. "peers") or, when a lane has no name yet, the
+    // tmux coordinate fallback (e.g. "infra:1.2") — and both are things a person
+    // reads off the screen and types. A coordinate is resolved to a pane id HERE
+    // because that needs tmux, which the broker deliberately does not run.
+    const selector = resolveSendTarget(toId);
     let result: SendMessageResponse | undefined;
     try {
       result = await requestBroker<SendMessageResponse>({
         baseUrl: context.baseUrl,
         path: "/send-by-pid",
-        body: { caller_pid: process.pid, to_id: toId, text: message },
+        body: { caller_pid: process.pid, ...selector, text: message },
         timeoutMs: context.timeoutMs,
       });
       if (result && result.ok !== true) result = undefined;
@@ -392,7 +398,35 @@ function reportError(error: CliError, json: boolean): void {
   else console.error(`${error.kind}: ${error.message}`);
 }
 
-export async function main(argv = process.argv.slice(2)): Promise<number> {
+export 
+/**
+ * Turn what the operator typed into a broker selector.
+ *
+ * Three shapes, in the order a person is likely to use them:
+ *   infra:1.2   a tmux coordinate — the pane-border fallback for an unnamed lane.
+ *               Resolved to a pane id here; the broker stores pane ids and has no
+ *               tmux to translate window/pane INDEXES with.
+ *   peers       a human name (what the border shows once a lane is named)
+ *   2o0dtmqx    a peer id
+ *
+ * Ambiguity is resolved by shape, and the id/name case is left to the broker: it
+ * matches an id exactly, and `send` retries as a name when no id matches.
+ */
+function resolveSendTarget(target: string): Record<string, unknown> {
+  if (target.includes(":") || /^[^\s]+\s+\d+\.\d+$/.test(target)) {
+    const normalized = target.replace(/\s+/, ":");
+    try {
+      const probe = Bun.spawnSync(["tmux", "display-message", "-p", "-t", normalized, "#{pane_id}"], {
+        stdout: "pipe", stderr: "ignore",
+      });
+      const pane = new TextDecoder().decode(probe.stdout).trim();
+      if (probe.exitCode === 0 && pane.startsWith("%")) return { selector: { tmux_pane_id: pane } };
+    } catch { /* tmux absent or target invalid — fall through to id/name */ }
+  }
+  return { to_id: target };
+}
+
+async function main(argv = process.argv.slice(2)): Promise<number> {
   const json = argv.includes("--json");
   const args = argv.filter((arg) => arg !== "--json");
   const command = args[0];
