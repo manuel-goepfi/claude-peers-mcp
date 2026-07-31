@@ -62,7 +62,7 @@ Do not run the direct broker beside the managed unit. Install or update the unit
 
 ## Configuration and client trust
 
-Install each client at either user or project scope, not both. The doctor reports duplicate scope, stale entries, unsafe files, and the need for restart/trust confirmation.
+Install each client at either user or project scope, not both. The doctor reports duplicate scope, stale entries, unsafe files, and the need for restart/trust confirmation. An install against a duplicate scope warns but never removes the other scope; explicitly run `--uninstall` against the scope you no longer want.
 
 ```bash
 bun bin/install-claude-hook.ts --check
@@ -70,7 +70,7 @@ bun bin/install-codex-hook.ts --check
 bun bin/install-gemini-hook.ts --check
 ```
 
-Use `--replace` for an intentional scope transfer. Correct installers are byte- and mtime-stable no-ops. A material change gets a unique 0600 sibling backup. `--restore <backup-path>` is guarded against restoring an unrelated backup or overwriting a subsequently edited install.
+Correct installers are byte- and mtime-stable no-ops. A material change gets a unique 0600 sibling backup. `--restore <backup-path>` is guarded against restoring an unrelated backup or overwriting a subsequently edited install.
 
 Alternate Claude profiles are explicit: prefix both install and check with `CLAUDE_CONFIG_DIR=/path/to/profile`. Claude standby delivery uses a 10-second cadence for the first hour after Stop, then 60 seconds while the Claude process remains alive; later Stop events atomically refresh the fast deadline and current adapter PID. The `CLAUDE_PEERS_STANDBY_*` controls are documented in the README configuration table. Watcher state is owner-only under `CLAUDE_PEERS_STANDBY_RUNTIME_DIR`, `$XDG_RUNTIME_DIR`, or `$HOME/.cache` in that order.
 
@@ -148,8 +148,8 @@ Require the final command to print `ok`, retain the pre-compaction backup, start
 | `starting`/`migrating` persists | Broker log, backup and manifest presence, service restart count | Stop restart loops; preserve all database artifacts; investigate the first migration error. |
 | Unsupported/newer schema | Doctor schema classification and running binary version | Stop the older broker; deploy a compatible broker. Do not downgrade the live database in place. |
 | Hook current but no automatic receipt | Doctor receiver mode/health, client restart, Codex `/hooks` trust | Restart, confirm trust, reinstall/check one scope, and use `check_messages` meanwhile. |
-| Hook or MCP entry stale | `--check`, doctor user/project classification | Re-run the relevant installer; use `--replace` only for an intentional scope move. |
-| Duplicate user/project scope | Doctor `duplicate_scope` | Choose one owner. Install there with `--replace` so the other managed scope is removed. |
+| Hook or MCP entry stale | `--check`, doctor user/project classification | Re-run the relevant installer. |
+| Duplicate user/project scope | Doctor `duplicate_scope` | Choose one owner. Install there, then explicitly run `--uninstall` for the other scope. |
 | Repeated auth/churn failures | Adapter stderr, broker readiness, process correlation | Restore broker reachability; the adapter receives a continuous grace period before self-exit. Restart only after the owner is stable. |
 | Messages remain `claimed` | Receiver health, claim age, hook execution | Let the 30-second lease expire, repair the receiver, then reclaim. Do not mark delivery manually. |
 | CLI refuses shutdown | CLI classification plus socket/process/owner/systemd evidence | Treat as a safety success. Correct the mismatched ownership evidence before retrying. |

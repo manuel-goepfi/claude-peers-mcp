@@ -95,10 +95,11 @@ Project scope is explicit:
 bun bin/install-codex-hook.ts --scope project /path/to/project
 ```
 
-The installer refuses the same managed hook in user and project scope. Use `--replace` to install the new scope first and then remove the old owner:
+The installer warns when the same managed hook exists in user and project scope, but installs only the scope you named. It never removes the other scope automatically. Choose one owner by explicitly uninstalling the scope you no longer want:
 
 ```bash
-bun bin/install-codex-hook.ts --scope project /path/to/project --replace
+bun bin/install-codex-hook.ts --scope project /path/to/project
+bun bin/install-codex-hook.ts --scope user --uninstall
 ```
 
 Correct configurations are byte- and mtime-stable no-ops. A material edit creates a unique 0600 backup. `--uninstall` removes only managed entries; `--restore <backup-path>` restores a generated sibling backup only when the installed bytes have not been edited since installation.

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { chmodSync, cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { classifyClientHooks, installClientHooks } from "../shared/hook-config.ts";
@@ -122,7 +122,7 @@ describe("Claude hook installer", () => {
     }
   });
 
-  test("refuses duplicate scopes unless replace transfers hook ownership", async () => {
+  test("warns about duplicate scopes without removing either owner", async () => {
     const root = mkdtempSync(join(tmpdir(), "claude-peers-claude-scope-"));
     try {
       const home = join(root, "home");
@@ -142,36 +142,45 @@ describe("Claude hook installer", () => {
         return { code, stderr };
       };
 
-      const rejected = await invoke("--scope", "project", project);
-      expect(rejected.code).toBe(1);
-      expect(rejected.stderr).toContain("duplicate Claude hook scope");
+      const checked = await invoke("--scope", "project", project, "--check");
+      expect(checked.code).toBe(1);
+      expect(checked.stderr).toContain("duplicate hook scope");
       expect(() => readFileSync(join(project, ".claude", "settings.json"))).toThrow();
 
-      mkdirSync(join(project, ".claude"), { mode: 0o700 });
-      chmodSync(join(project, ".claude"), 0o770);
-      expect((await invoke("--scope", "project", project, "--replace")).code).toBe(1);
-      const preservedUser = JSON.parse(readFileSync(userPath, "utf8")) as Record<string, unknown>;
-      expect(classifyClientHooks(preservedUser, "claude", repoRoot).exact).toBe(3);
-      chmodSync(join(project, ".claude"), 0o700);
-
-      // --drop-user-scope is now required for this transfer. The removal it performs
-      // is a DOWNGRADE, not a de-duplication: it strips hooks that serve every session
-      // of the account in favour of hooks that serve one repo, and it picks the account
-      // from CLAUDE_CONFIG_DIR rather than from anything the caller named. That is how
-      // ~/.claude-b silently lost all three peer hooks. --replace alone can no longer
-      // express it; this test asserts the transfer still WORKS when asked for
-      // explicitly, which is the behaviour the flag exists to preserve.
-      expect((await invoke("--scope", "project", project, "--replace", "--drop-user-scope")).code).toBe(0);
+      const installed = await invoke("--scope", "project", project);
+      expect(installed.code).toBe(0);
+      expect(installed.stderr).toContain("no hooks will be removed");
       const user = JSON.parse(readFileSync(userPath, "utf8")) as Record<string, unknown>;
       const projectDoc = JSON.parse(readFileSync(join(project, ".claude", "settings.json"), "utf8")) as Record<string, unknown>;
-      expect(classifyClientHooks(user, "claude", repoRoot).exact).toBe(0);
+      expect(classifyClientHooks(user, "claude", repoRoot).exact).toBe(3);
       expect(classifyClientHooks(projectDoc, "claude", repoRoot).exact).toBe(3);
+
+      const legacyReplace = await invoke("--scope", "project", project, "--replace");
+      expect(legacyReplace.code).toBe(0);
+      expect(classifyClientHooks(JSON.parse(readFileSync(userPath, "utf8")), "claude", repoRoot).exact).toBe(3);
+
+      const rejectedFlag = await invoke("--scope", "project", project, "--drop-user-scope");
+      expect(rejectedFlag.code).toBe(1);
+      expect(rejectedFlag.stderr).toContain("no longer supported");
+      expect(classifyClientHooks(JSON.parse(readFileSync(userPath, "utf8")), "claude", repoRoot).exact).toBe(3);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
   });
 
-  test("default user install rejects a project owner and failed replace rolls the target back", async () => {
+  test("rejects the retired drop-user-scope flag before writing configuration", async () => {
+    const repo = mkdtempSync(join(tmpdir(), "claude-peers-claude-retired-flag-"));
+    try {
+      const result = await run(repo, "--drop-user-scope");
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain("no longer supported");
+      expect(() => readFileSync(join(repo, ".claude", "settings.json"))).toThrow();
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  test("default user install retains a project owner and tells the operator how to choose one", async () => {
     const root = mkdtempSync(join(tmpdir(), "claude-peers-claude-default-scope-"));
     try {
       const home = join(root, "home");
@@ -183,7 +192,7 @@ describe("Claude hook installer", () => {
       const safeInstaller = join(safeClone, "bin", "install-claude-hook.ts");
       mkdirSync(join(project, ".claude"), { recursive: true, mode: 0o700 });
       const projectPath = join(project, ".claude", "settings.json");
-      writeFileSync(projectPath, `${JSON.stringify(installClientHooks({}, "claude", repoRoot), null, 2)}\n`, { mode: 0o600 });
+      writeFileSync(projectPath, `${JSON.stringify(installClientHooks({}, "claude", safeClone), null, 2)}\n`, { mode: 0o600 });
       const invoke = async (...args: string[]) => {
         const proc = Bun.spawn(["bun", safeInstaller, ...args], {
           cwd: project,
@@ -196,24 +205,13 @@ describe("Claude hook installer", () => {
       };
 
       const duplicate = await invoke();
-      expect(duplicate.code).toBe(1);
-      expect(duplicate.stderr).toContain("duplicate Claude hook scope");
-      expect(() => readFileSync(join(home, ".claude", "settings.json"))).toThrow();
-
-      rmSync(projectPath);
+      expect(duplicate.code).toBe(0);
+      expect(duplicate.stderr).toContain("no hooks will be removed");
       const userPath = join(home, ".claude", "settings.json");
-      writeFileSync(userPath, `${JSON.stringify(installClientHooks({}, "claude", repoRoot), null, 2)}\n`, { mode: 0o600 });
-      chmodSync(join(home, ".claude"), 0o770);
-      // --drop-user-scope is required to reach the transfer at all now; without it the
-      // preflight refuses BEFORE any write, so there would be no target file to roll
-      // back and this test would assert against a file that never existed. Passing the
-      // flag keeps the case being tested — a transfer that fails mid-way must leave the
-      // user scope whole and the target rolled back.
-      const failedTransfer = await invoke("--scope", "project", project, "--replace", "--drop-user-scope");
-      expect(failedTransfer.code).toBe(1);
-      expect(classifyClientHooks(JSON.parse(readFileSync(userPath, "utf8")), "claude", repoRoot).exact).toBe(3);
-      const rolledBack = JSON.parse(readFileSync(projectPath, "utf8")) as Record<string, unknown>;
-      expect(classifyClientHooks(rolledBack, "claude", repoRoot).exact).toBe(0);
+      const user = JSON.parse(readFileSync(userPath, "utf8")) as Record<string, unknown>;
+      const projectDoc = JSON.parse(readFileSync(projectPath, "utf8")) as Record<string, unknown>;
+      expect(classifyClientHooks(user, "claude", safeClone).exact).toBe(3);
+      expect(classifyClientHooks(projectDoc, "claude", safeClone).exact).toBe(3);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
