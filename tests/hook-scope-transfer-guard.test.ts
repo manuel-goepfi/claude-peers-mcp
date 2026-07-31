@@ -130,8 +130,16 @@ describe("scope transfer must not silently drop an account's user-scope hooks", 
   });
 
   test("an unrelated hook in the same file is never touched by the transfer", () => {
-    // Peer hooks are removed by identity. Proving the blast radius stays scoped is
-    // what rules out "the installer rewrote the file" as an explanation next time.
+    // CHARACTERIZATION TEST, NOT A REGRESSION GUARD — stated because the label would
+    // otherwise imply cover it does not give. Run against the unfixed installer at
+    // df4d22e this test PASSES: identity-scoped removal is pre-existing behaviour,
+    // so it cannot fail on the bug this file exists for. The other four tests here
+    // all fail at df4d22e and are the real guards.
+    //
+    // Kept anyway because it pins the blast radius, which is the diagnostic that
+    // ruled out "the installer rewrote the whole file" when ~/.claude-b shrank —
+    // and would rule it out again next time. If identity matching ever broadens,
+    // this is what catches it.
     const { home, project, userSettings } = sandbox();
     seedUserScope(userSettings, home);
     const doc = JSON.parse(readFileSync(userSettings, "utf8"));
