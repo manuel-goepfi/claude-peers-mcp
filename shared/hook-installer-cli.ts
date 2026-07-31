@@ -74,9 +74,23 @@ export async function runHookInstaller(options: HookInstallerOptions): Promise<n
     const replace = args.includes("--replace");
     if (restorePath) {
       if (check || uninstall || replace) throw new Error("--restore cannot be combined with check, uninstall, or replace");
+      // A restore can REMOVE peer hooks: it swaps the live config for a backup that
+      // may predate their installation. That made it a third silent removal path,
+      // alongside the transfer and the rollback. Count before and after rather than
+      // assuming — a restore that adds or preserves hooks must not log a removal.
+      let restoreBefore = 0;
+      try {
+        const pre = readSafeJsonConfig(configPath);
+        restoreBefore = pre ? (() => { const c = classifyClientHooks(pre, client, sourceRepo); return c.exact + c.stale; })() : 0;
+      } catch { /* unreadable — the restore itself still decides */ }
       restoreJsonConfig(configPath, resolve(restorePath), (document) => installClientHooks(document, client, sourceRepo), {
         pauseBeforeWriteMs: Number(process.env.CLAUDE_PEERS_INSTALL_TEST_PAUSE_MS ?? "0"),
       });
+      try {
+        const post = readSafeJsonConfig(configPath);
+        const after = post ? (() => { const c = classifyClientHooks(post, client, sourceRepo); return c.exact + c.stale; })() : 0;
+        if (after < restoreBefore) auditHookRemoval(configPath, label, restoreBefore - after, "restore", args);
+      } catch { /* unreadable after restore — nothing reliable to record */ }
       console.log(`restored ${label} peer hook configuration: ${configPath}`);
       return 0;
     }
@@ -125,6 +139,7 @@ export async function runHookInstaller(options: HookInstallerOptions): Promise<n
       }
     }
 
+    let pendingUninstallCount = 0;
     if (uninstall && !check) {
       // try/catch is load-bearing, not defensive habit: readSafeJsonConfig REJECTS a
       // config whose mode or owner it dislikes, and the uninstall path below tolerates
@@ -134,9 +149,7 @@ export async function runHookInstaller(options: HookInstallerOptions): Promise<n
       try {
         const existing = readSafeJsonConfig(configPath);
         const found = existing ? classifyClientHooks(existing, client, sourceRepo) : null;
-        if (found && found.exact + found.stale > 0) {
-          auditHookRemoval(configPath, label, found.exact + found.stale, "explicit-uninstall", args);
-        }
+        pendingUninstallCount = found ? found.exact + found.stale : 0;
       } catch {
         // Unreadable/unsafe config — the uninstall itself still decides what to do.
       }
@@ -149,6 +162,10 @@ export async function runHookInstaller(options: HookInstallerOptions): Promise<n
         : installClientHooks(document, client, sourceRepo),
       { check, pauseBeforeWriteMs: Number(process.env.CLAUDE_PEERS_INSTALL_TEST_PAUSE_MS ?? "0") },
     );
+    // Same rule as the transfer: record only a removal that actually landed.
+    if (uninstall && !check && result.changed && pendingUninstallCount > 0) {
+      auditHookRemoval(configPath, label, pendingUninstallCount, "explicit-uninstall", args);
+    }
     if (check) {
       if (result.needsChange) {
         console.error(`${label} peer hooks are not current: ${configPath}`);
@@ -160,14 +177,28 @@ export async function runHookInstaller(options: HookInstallerOptions): Promise<n
 
     if (alternatePathToRemove) {
       try {
-        auditHookRemoval(alternatePathToRemove, label, alternateHookCount, "scope-transfer", args);
-        installJsonConfig(alternatePathToRemove, (document) => uninstallClientHooks(document, client, sourceRepo));
+        // Audit AFTER the write, never before. Auditing first records a removal
+        // that may not happen: installJsonConfig rejects an unsafe mode or a
+        // symlinked parent, so the log claimed hooks were taken while all of them
+        // were still in place. A false removal record is worse than no record —
+        // the whole point of this log is attributing a real disappearance, and an
+        // entry for a removal that never occurred sends the next investigation at
+        // an innocent invocation. `changed` also reports what actually happened
+        // rather than the pre-flight estimate.
+        const removal = installJsonConfig(alternatePathToRemove, (document) => uninstallClientHooks(document, client, sourceRepo));
+        if (removal.changed) {
+          auditHookRemoval(alternatePathToRemove, label, alternateHookCount, "scope-transfer", args);
+        }
       } catch (transferError) {
         try {
           if (result.backupPath) {
             restoreJsonConfig(configPath, result.backupPath, (document) => installClientHooks(document, client, sourceRepo));
+            // The rollback strips the hooks we just installed at the target. That is
+            // a removal too, and it went unrecorded until now.
+            auditHookRemoval(configPath, label, alternateHookCount, "scope-transfer-rollback", args);
           } else if (result.changed) {
             installJsonConfig(configPath, (document) => uninstallClientHooks(document, client, sourceRepo));
+            auditHookRemoval(configPath, label, alternateHookCount, "scope-transfer-rollback", args);
           }
         } catch (rollbackError) {
           throw new Error(`scope transfer failed and target rollback also failed: ${String(transferError)}; ${String(rollbackError)}`);

@@ -154,7 +154,14 @@ describe("Claude hook installer", () => {
       expect(classifyClientHooks(preservedUser, "claude", repoRoot).exact).toBe(3);
       chmodSync(join(project, ".claude"), 0o700);
 
-      expect((await invoke("--scope", "project", project, "--replace")).code).toBe(0);
+      // --drop-user-scope is now required for this transfer. The removal it performs
+      // is a DOWNGRADE, not a de-duplication: it strips hooks that serve every session
+      // of the account in favour of hooks that serve one repo, and it picks the account
+      // from CLAUDE_CONFIG_DIR rather than from anything the caller named. That is how
+      // ~/.claude-b silently lost all three peer hooks. --replace alone can no longer
+      // express it; this test asserts the transfer still WORKS when asked for
+      // explicitly, which is the behaviour the flag exists to preserve.
+      expect((await invoke("--scope", "project", project, "--replace", "--drop-user-scope")).code).toBe(0);
       const user = JSON.parse(readFileSync(userPath, "utf8")) as Record<string, unknown>;
       const projectDoc = JSON.parse(readFileSync(join(project, ".claude", "settings.json"), "utf8")) as Record<string, unknown>;
       expect(classifyClientHooks(user, "claude", repoRoot).exact).toBe(0);
@@ -197,7 +204,12 @@ describe("Claude hook installer", () => {
       const userPath = join(home, ".claude", "settings.json");
       writeFileSync(userPath, `${JSON.stringify(installClientHooks({}, "claude", repoRoot), null, 2)}\n`, { mode: 0o600 });
       chmodSync(join(home, ".claude"), 0o770);
-      const failedTransfer = await invoke("--scope", "project", project, "--replace");
+      // --drop-user-scope is required to reach the transfer at all now; without it the
+      // preflight refuses BEFORE any write, so there would be no target file to roll
+      // back and this test would assert against a file that never existed. Passing the
+      // flag keeps the case being tested — a transfer that fails mid-way must leave the
+      // user scope whole and the target rolled back.
+      const failedTransfer = await invoke("--scope", "project", project, "--replace", "--drop-user-scope");
       expect(failedTransfer.code).toBe(1);
       expect(classifyClientHooks(JSON.parse(readFileSync(userPath, "utf8")), "claude", repoRoot).exact).toBe(3);
       const rolledBack = JSON.parse(readFileSync(projectPath, "utf8")) as Record<string, unknown>;
