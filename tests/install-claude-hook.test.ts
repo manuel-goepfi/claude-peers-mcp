@@ -155,8 +155,9 @@ describe("Claude hook installer", () => {
       expect(classifyClientHooks(user, "claude", repoRoot).exact).toBe(3);
       expect(classifyClientHooks(projectDoc, "claude", repoRoot).exact).toBe(3);
 
-      const legacyReplace = await invoke("--scope", "project", project, "--replace");
-      expect(legacyReplace.code).toBe(0);
+      const retiredReplace = await invoke("--scope", "project", project, "--replace");
+      expect(retiredReplace.code).toBe(1);
+      expect(retiredReplace.stderr).toContain("--replace is no longer supported");
       expect(classifyClientHooks(JSON.parse(readFileSync(userPath, "utf8")), "claude", repoRoot).exact).toBe(3);
 
       const rejectedFlag = await invoke("--scope", "project", project, "--drop-user-scope");
@@ -168,12 +169,14 @@ describe("Claude hook installer", () => {
     }
   });
 
-  test("rejects the retired drop-user-scope flag before writing configuration", async () => {
+  test("rejects retired scope-transfer flags before writing configuration", async () => {
     const repo = mkdtempSync(join(tmpdir(), "claude-peers-claude-retired-flag-"));
     try {
-      const result = await run(repo, "--drop-user-scope");
-      expect(result.code).toBe(1);
-      expect(result.stderr).toContain("no longer supported");
+      for (const flag of ["--replace", "--drop-user-scope"]) {
+        const result = await run(repo, flag);
+        expect(result.code).toBe(1);
+        expect(result.stderr).toContain(`${flag} is no longer supported`);
+      }
       expect(() => readFileSync(join(repo, ".claude", "settings.json"))).toThrow();
     } finally {
       rmSync(repo, { recursive: true, force: true });

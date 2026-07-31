@@ -401,10 +401,10 @@ flowchart LR
   - Add a Claude configuration installer and focused suite with the same install, check, replacement, uninstall/restore, no-op, ownership, and mode guarantees as the Codex and Gemini installers.
   - Complete the post-hotfix doctor: read configured port/DB once, enumerate and correlate all relevant Claude/Codex/Gemini descendants rather than `head -1`, and produce deterministic human/JSON output from coarse health plus read-only DB/process evidence without exposing messages, tokens, filesystem paths, or pane metadata.
   - Make doctor readiness-first and schema-versioned: skip DB queries while `starting|migrating`; after `ready`, dispatch a read-only decoder by `PRAGMA user_version`; if health is unreachable, refuse schema reads while a live DB lock owner exists and report unsupported/ambiguous versions without guessing.
-  - Add explicit `--scope user|project`, `--check`, replacement, and uninstall/restore behavior; make user scope the documented default.
+  - Add explicit `--scope user|project`, `--check`, and uninstall/restore behavior; make user scope the documented default.
   - Render desired configuration, compare bytes, and skip backup/write/mtime changes when already correct.
   - Back up only material changes and use a unique same-directory temporary path before atomic rename.
-  - Preserve unrelated MCP and hook entries; detect stale absolute clone paths; make duplicate-scope check nonzero and refuse creation unless explicit replacement transfers ownership.
+  - Preserve unrelated MCP and hook entries; detect stale absolute clone paths; make duplicate-scope check nonzero while installation warns and retains both scopes; require explicit uninstall to select one owner.
   - Before user-level installation, require current-UID ownership and reject group/world-writable clone path components, symlink config targets, unsafe modes, or a target changed since read; preserve restrictive ownership/mode on temp, backup, restore, and final files.
   - Generate the repository hook fixture from the same canonical entries: registration plus startup drain, prompt/run drain, and supported turn-end behavior.
   - Extend doctor with the same canonical classifier for exact event/matcher/name/command, configured-but-stale, missing, duplicate-scope, and trust/restart-required states.

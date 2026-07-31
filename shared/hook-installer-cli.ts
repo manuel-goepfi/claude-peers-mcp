@@ -22,9 +22,10 @@ export async function runHookInstaller(options: HookInstallerOptions): Promise<n
     if (scopeIndex >= 0 && !explicitScope) throw new Error("--scope requires user or project");
     if (explicitScope && explicitScope !== "user" && explicitScope !== "project") throw new Error("--scope must be user or project");
     if (restoreIndex >= 0 && !restorePath) throw new Error("--restore requires a backup path");
-    if (args.includes("--drop-user-scope")) {
+    const retiredScopeFlag = args.find((arg) => arg === "--drop-user-scope" || arg === "--replace");
+    if (retiredScopeFlag) {
       throw new Error(
-        "--drop-user-scope is no longer supported; install the desired scope, then explicitly run --uninstall for the scope you no longer want",
+        `${retiredScopeFlag} is no longer supported; install the desired scope, then explicitly run --uninstall for the scope you no longer want`,
       );
     }
     const positional = args.find((arg, index) =>
@@ -45,7 +46,7 @@ export async function runHookInstaller(options: HookInstallerOptions): Promise<n
     const check = args.includes("--check") || args.includes("check");
     const uninstall = args.includes("--uninstall") || args.includes("uninstall");
     if (restorePath) {
-      if (check || uninstall || args.includes("--replace")) throw new Error("--restore cannot be combined with check, uninstall, or replace");
+      if (check || uninstall) throw new Error("--restore cannot be combined with check or uninstall");
       restoreJsonConfig(configPath, resolve(restorePath), (document) => installClientHooks(document, client, sourceRepo), {
         pauseBeforeWriteMs: Number(process.env.CLAUDE_PEERS_INSTALL_TEST_PAUSE_MS ?? "0"),
       });
