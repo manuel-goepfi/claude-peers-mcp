@@ -15,7 +15,7 @@ import {
 import { createHash } from "node:crypto";
 import { dirname, resolve } from "node:path";
 import { fsyncDirectory } from "./fs-durability.ts";
-import { seatKeyBackfillSql } from "./seat.ts";
+import { seatKeyBackfillSql, seatKeyPaneUpgradeSql } from "./seat.ts";
 
 export const STORAGE_SCHEMA_VERSION = 1;
 export const OWNER_ONLY_UMASK = 0o077;
@@ -288,6 +288,7 @@ export function ensureAdditivePeerSchema(db: Database): void {
   ensurePeerColumns(db);
   db.run(`CREATE INDEX IF NOT EXISTS ${storageIndexes.peerSeatKey} ON peers(seat_key)`);
   db.run(seatKeyBackfillSql());
+  db.run(seatKeyPaneUpgradeSql());
 }
 
 function createMessagesTable(db: Database, name = "messages"): void {

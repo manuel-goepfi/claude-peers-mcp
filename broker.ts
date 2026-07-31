@@ -1641,10 +1641,12 @@ function peerSeatAlive(peer: Pick<Peer, "pid"> & { seat_pids?: string | null }):
   return seatPidsAlive(parseSeatPids(peer.seat_pids), peer.pid, isPidAlive);
 }
 
+// Delegates to the ONE rule in shared/seat.ts. This used to be a third hand-rolled
+// copy of it (server.ts had a fourth), and they drifted: only shared/seat.ts learned
+// that a pane without a session is still a seat, so the same row could be a pane seat
+// to registration and a tty seat to resolution.
 function activePeerKey(peer: Peer): string {
-  if (peer.tmux_session && peer.tmux_pane_id) return `pane:${peer.tmux_session}:${peer.tmux_pane_id}`;
-  if (peer.tty) return `tty:${peer.tty}`;
-  return `id:${peer.id}`;
+  return durableSeatKey(peer) ?? `id:${peer.id}`;
 }
 
 function isHookBackedClientPeer(peer: Pick<Peer, "client_type" | "receiver_mode" | "tty" | "tmux_session" | "tmux_pane_id">): boolean {

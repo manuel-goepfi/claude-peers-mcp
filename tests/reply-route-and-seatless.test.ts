@@ -42,7 +42,7 @@ describe("sender reply-route honesty", () => {
     return json as T;
   }
 
-  type Send = { ok: boolean; warning?: string; recipient?: { state: string } };
+  type Send = { ok: boolean; warning?: string; recipient?: { state: string; nudgeable?: boolean } };
 
   async function registerTarget(name: string, pane: string) {
     return call<{ id: string }>("/register", {

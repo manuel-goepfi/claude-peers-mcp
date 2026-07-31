@@ -41,6 +41,7 @@ import type {
   PeerTarget,
   TmuxPaneSnapshot,
 } from "./shared/types.ts";
+import { durableSeatKey } from "./shared/seat.ts";
 import { detectClientFromProcessChain, findBgSpareAncestor, findClientPidFromProcessChain, initialReceiverMode, isClientProcess, isCodexAppServerProcess, type ProcessInfo } from "./shared/client.ts";
 import { findNearestVisibleCodexProcessByStart, findSingleVisibleCodexProcess } from "./shared/visible-codex.ts";
 import {
@@ -1428,10 +1429,10 @@ function formatPeerCandidates(candidates: PeerTarget[] | undefined): string {
   return `\n\nLive candidate(s):\n${candidates.map((p) => `- ${formatPeerTarget(p)}`).join("\n")}`;
 }
 
+// Same single rule as the broker uses — see shared/seat.ts. Keeping a local copy is
+// how these drifted apart in the first place.
 function peerSeatKey(peer: Pick<Peer, "id" | "tty" | "tmux_session" | "tmux_pane_id">): string {
-  if (peer.tmux_session && peer.tmux_pane_id) return `pane:${peer.tmux_session}:${peer.tmux_pane_id}`;
-  if (peer.tty) return `tty:${peer.tty}`;
-  return `id:${peer.id}`;
+  return durableSeatKey(peer) ?? `id:${peer.id}`;
 }
 
 function clampTmuxLineCount(value: unknown): number {

@@ -40,8 +40,17 @@ function present(value: string | null | undefined): value is string {
  * without changing that contract.
  */
 export function durableSeatKey(location: SeatLocation): string | null {
-  if (present(location.tmux_session) && present(location.tmux_pane_id)) {
-    return `pane:${location.tmux_session}:${location.tmux_pane_id}`;
+  if (present(location.tmux_pane_id)) {
+    // Pane id alone is already unique across the whole tmux server; the session
+    // prefix is descriptive, not identifying. So a pane WITHOUT a known session is
+    // still a perfectly good seat — and that combination is real, not theoretical:
+    // Cursor strips the environment it gives MCP servers, so a cursor lane recovers
+    // its pane from the client process but never its session name. Demanding both
+    // dropped those lanes to a tty: seat, which meant they could not participate in
+    // pane-based seat merge and were addressable by name/id only.
+    return present(location.tmux_session)
+      ? `pane:${location.tmux_session}:${location.tmux_pane_id}`
+      : `pane:${location.tmux_pane_id}`;
   }
   if (present(location.tty)) return `tty:${location.tty}`;
   return null;
@@ -123,12 +132,38 @@ export function seatPidsAlive(
 export function seatKeyBackfillSql(): string {
   return `
     UPDATE peers SET seat_key = CASE
-      WHEN tmux_session IS NOT NULL AND tmux_session <> ''
-        AND tmux_pane_id IS NOT NULL AND tmux_pane_id <> ''
+      WHEN tmux_pane_id IS NOT NULL AND tmux_pane_id <> ''
+        AND tmux_session IS NOT NULL AND tmux_session <> ''
         THEN 'pane:' || tmux_session || ':' || tmux_pane_id
+      WHEN tmux_pane_id IS NOT NULL AND tmux_pane_id <> ''
+        THEN 'pane:' || tmux_pane_id
       WHEN tty IS NOT NULL AND tty <> '' THEN 'tty:' || tty
       ELSE NULL
     END
     WHERE seat_key IS NULL
+  `;
+}
+
+/**
+ * SQL that UPGRADES a weaker tty: seat key to a pane: key once a pane is known.
+ *
+ * The backfill above only fills NULLs — deliberately, so it never overwrites a
+ * considered value. But a row written before pane-only seats existed carries
+ * `tty:pts/N` even though it has a pane, and it would keep that weaker identity
+ * until the lane relaunched: excluded from pane-based seat merge, and a different
+ * seat to resolution than to registration. Every live cursor lane was in that state.
+ *
+ * Strictly one-directional: tty: -> pane: only, and only when a pane id exists.
+ * A pane: key is never rewritten, so this cannot churn a seat that is already right.
+ */
+export function seatKeyPaneUpgradeSql(): string {
+  return `
+    UPDATE peers SET seat_key = CASE
+      WHEN tmux_session IS NOT NULL AND tmux_session <> ''
+        THEN 'pane:' || tmux_session || ':' || tmux_pane_id
+      ELSE 'pane:' || tmux_pane_id
+    END
+    WHERE tmux_pane_id IS NOT NULL AND tmux_pane_id <> ''
+      AND (seat_key IS NULL OR seat_key LIKE 'tty:%')
   `;
 }
