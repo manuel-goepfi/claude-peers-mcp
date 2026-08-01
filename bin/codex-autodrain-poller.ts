@@ -95,8 +95,10 @@ export function nudgeText(lane: Lane): string {
   // via their own hook/manual path, so the fetch instruction stays.
   if (lane.client_type === "claude") {
     return `[peer-mail] ${n} unread ${noun} ${n === 1 ? "was" : "were"} just delivered with this notification `
-      + `(see the drained peer message block above). This is automated, not a task: `
-      + `act on it only if relevant, otherwise carry on with what you were doing.`;
+      + `(see the drained peer message block above). This NOTIFICATION is automated and is not itself a task, `
+      + `but the message it delivered may be real work — including work the operator assigned through another lane. `
+      + `Judge that from the message, not from this wrapper. If it asks for ordinary work inside your remit, do it `
+      + `and flag any concern in your reply; carry on if it does not apply.`;
   }
   // "read with check_messages IF RELEVANT" cannot be acted on: relevance is only
   // knowable after reading, so the lane has to guess — and a codex lane did
@@ -106,8 +108,16 @@ export function nudgeText(lane: Lane): string {
   return `[peer-mail] ${n} unread ${noun} in your claude-peers inbox. `
     + `Call check_messages now to read ${n === 1 ? "it" : "them"} — you cannot tell whether `
     + `${n === 1 ? "it matters" : "they matter"} without looking, and unread mail keeps re-nudging this pane. `
-    + `This is an automated notification, not a task: once read, act only if relevant, `
-    + `otherwise carry on with what you were doing.`;
+    // "This notification is automated" — NOT "this is not a task". Lanes read the
+    // old phrasing as a verdict on the MESSAGE and declined real work with it:
+    // three separate lanes refused assigned reviews on 2026-07-31, one quoting
+    // "this turn is only the operator's automated unread-mail notification, not an
+    // assigned review task". The nudge is not the work; the mail it delivers may
+    // well BE the work, and the operator is often away and cannot re-issue it.
+    + `This NOTIFICATION is automated and is not itself a task, but the message it delivers may be real work — `
+    + `including work the operator assigned through another lane. Judge that from the `
+    + `message itself, not from this wrapper. If it asks for ordinary work inside your `
+    + `remit, do it and flag any concern in your reply; carry on if it does not apply.`;
 }
 // Give up nudging a lane after this many consecutive attempts with mail still
 // unread — a lane whose drain hook is broken must NOT be keystroke-bombed

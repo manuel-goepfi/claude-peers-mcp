@@ -893,8 +893,15 @@ describe("nudge wording is a notification, not a task", () => {
     expect(nudgeText(laneWith(1) as never)).toContain("1 unread message");
     expect(nudgeText(laneWith(3) as never)).toContain("3 unread messages");
   });
-  test("declares itself non-actionable so a lane does not adopt it as work", () => {
-    expect(nudgeText(laneWith(2) as never)).toContain("not a task");
+  test("disclaims ITSELF as work without disclaiming the mail it carries", () => {
+    // Two properties, and they pull against each other. The nudge must not be
+    // adopted as the lane's task (the hijack this suite was written for), but it
+    // must ALSO not tell the lane that the MESSAGE is not work — three lanes read
+    // the old blanket "not a task" as a verdict on the contents and declined
+    // operator-assigned reviews with it, one quoting the phrase back verbatim.
+    const t = nudgeText(laneWith(2) as never);
+    expect(t).toContain("not itself a task");
+    expect(t).toContain("may be real work");
   });
   test("does not reuse the imperative phrasing that caused the hijack", () => {
     const t = nudgeText(laneWith(2) as never).toLowerCase();
@@ -909,7 +916,8 @@ describe("nudge wording is client-aware (claude mail rides in with the nudge)", 
     const t = nudgeText(claudeLane(2) as never);
     expect(t).not.toContain("check_messages");
     expect(t).toContain("delivered with this notification");
-    expect(t).toContain("not a task");
+    expect(t).toContain("not itself a task");
+    expect(t).toContain("may be real work");
   });
   test("codex lane keeps the fetch instruction (manual-drain path)", () => {
     expect(nudgeText(laneWith(2) as never)).toContain("check_messages");

@@ -182,11 +182,16 @@ describe("codex nudge text", () => {
   });
 
   test("keeps the non-actionable declaration that guards against nudge-as-work hijack", () => {
-    // The exact phrase is a standing invariant from an earlier incident where a
-    // lane adopted the nudge as its assignment; making the FETCH unconditional
-    // must not weaken it. Only the fetch is mandatory, never the contents.
-    expect(nudgeText(lane(3, "codex"))).toContain("not a task");
-    expect(nudgeText(lane(3, "codex"))).toContain("act only if relevant");
+    // Standing invariant from an earlier incident where a lane adopted the nudge
+    // as its assignment; making the FETCH unconditional must not weaken it. Only
+    // the fetch is mandatory, never the contents.
+    //
+    // The conditional-action clause is asserted by MEANING, not by the old literal
+    // "act only if relevant" — that exact phrasing was withdrawn because lanes
+    // generalised it from the wrapper to the mail and refused assigned work. The
+    // invariant is "the nudge is not the task"; the wording carrying it may change.
+    expect(nudgeText(lane(3, "codex"))).toContain("not itself a task");
+    expect(nudgeText(lane(3, "codex"))).toContain("carry on if it does not apply");
     expect(nudgeText(lane(3, "codex")).toLowerCase().startsWith("check ")).toBe(false);
   });
 
