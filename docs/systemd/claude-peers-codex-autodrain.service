@@ -57,7 +57,7 @@ Environment=TMUX_TMPDIR=/tmp
 # Revisit when the Codex hook-trust issue is resolved: if every lane drains via its
 # own hook, this can go back to empty. Only the env var is read — the file at
 # ~/.config/claude-peers/nudge-clients looks like config but is NOT consulted.
-Environment=NUDGE_CLIENTS=codex,claude,cursor,agy,kimi
+Environment=NUDGE_CLIENTS=codex,gemini,claude,cursor,agy,kimi
 # Tunables (defaults shown; override here if needed):
 # Environment=POLL_INTERVAL_MS=15000
 # Environment=NUDGE_COOLDOWN_MS=60000
