@@ -1389,18 +1389,21 @@ function receiverFresh(p: Pick<Peer, "receiver_mode" | "last_hook_seen_at">): bo
   return Date.now() - new Date(p.last_hook_seen_at).getTime() < 120_000;
 }
 
-function receiverLine(p: Pick<Peer, "client_type" | "receiver_mode" | "last_hook_seen_at" | "last_drain_at" | "last_drain_error">): string {
+function receiverLine(p: Pick<Peer, "client_type" | "receiver_mode" | "last_hook_seen_at" | "last_drain_at" | "last_drain_error" | "tmux_pane_id">): string {
   const parts = [`Receiver: ${p.client_type}/${p.receiver_mode}`];
   if (p.last_hook_seen_at) parts.push(`hook_seen=${p.last_hook_seen_at}`);
   if (p.last_drain_at) parts.push(`last_drain=${p.last_drain_at}`);
   if (p.last_drain_error) parts.push(`last_error=${p.last_drain_error}`);
   if (p.receiver_mode === "manual-drain" || p.receiver_mode === "unknown") {
-    parts.push("fallback=check_messages");
+    // "manual-drain" names the API the lane calls (check_messages), NOT who calls
+    // it. For a seat with a pane the autodrain poller does the calling, so this
+    // renders as an automatic path rather than a chore awaiting a human.
+    parts.push(p.tmux_pane_id ? "drains_on=autodrain-nudge" : "fallback=check_messages (no pane to nudge)");
   }
   return parts.join(" ");
 }
 
-function sendStatusHint(target: SendMessageResponse["target"] | undefined, delivered: boolean): string {
+export function sendStatusHint(target: SendMessageResponse["target"] | undefined, delivered: boolean): string {
   if (!target || delivered) return "";
   if (target.last_drain_error) {
     return ` Still queued; receiver hook last reported an error: ${target.last_drain_error}`;
@@ -1420,13 +1423,28 @@ function sendStatusHint(target: SendMessageResponse["target"] | undefined, deliv
       ? " Still queued; Gemini receiver is hook-enabled and will drain on its next prompt."
       : " Still queued; Gemini hook is stale, so the receiver may need check_messages.";
   }
+  // A pane plus a known client type IS an automatic delivery path: the autodrain
+  // poller types a nudge into that pane and the lane calls check_messages itself.
+  // Nothing manual happens.
+  //
+  // Saying "has no active hook and must use check_messages" while omitting the
+  // nudge is what taught senders — and lanes reading their own receiver_mode —
+  // that manual-drain seats do not receive. They do, automatically. "manual"
+  // names the API the lane calls, not who calls it. Measured 2026-07-31: a codex
+  // lane on manual-drain completed a full round trip in 56s on the nudge path,
+  // and agy and cursor lanes drained the same way; meanwhile senders were being
+  // told their mail needed someone to intervene.
+  const nudgeable = Boolean(target.tmux_pane_id) && target.client_type !== "unknown";
+  if (nudgeable) {
+    return ` Still queued; ${target.client_type} receiver drains on the autodrain nudge (no hook needed, typically under a minute) — no action required from you.`;
+  }
   if (target.client_type === "codex") {
-    return " Still queued; Codex receiver has no active hook yet and must use check_messages or install the Codex drain hook.";
+    return " Still queued; Codex receiver has no hook AND no tmux pane, so nothing can nudge it — it delivers only if that lane calls check_messages itself.";
   }
   if (target.client_type === "gemini") {
-    return " Still queued; Gemini receiver has no active hook yet and must use check_messages or install the Gemini drain hook.";
+    return " Still queued; Gemini receiver has no hook AND no tmux pane, so nothing can nudge it — it delivers only if that lane calls check_messages itself.";
   }
-  return " Still queued; receiver mode is unknown, so manual check_messages may be required.";
+  return " Still queued; receiver mode is unknown and it has no pane to nudge, so it delivers only if that lane calls check_messages itself.";
 }
 
 /**
@@ -1753,7 +1771,7 @@ const TOOLS = [
   {
     name: "check_messages",
     description:
-      "Manually check for new messages from other peer instances. Required for Codex/Gemini peers without an active drain hook; fallback for Claude delivery.",
+      "Check for new messages from other peer instances. This is the normal, automatic delivery path for any lane whose receiver_mode is manual-drain: the autodrain poller nudges the pane and the lane calls this. \"Manual\" names the API, not who invokes it — such lanes DO receive mail automatically and a sender needs to do nothing. Also a fallback for Claude/Codex/Gemini lanes whose drain hook is missing or stale.",
     inputSchema: {
       type: "object" as const,
       properties: {},
