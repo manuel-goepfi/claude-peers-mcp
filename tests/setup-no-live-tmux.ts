@@ -57,3 +57,25 @@ delete process.env.CLAUDE_CONFIG_DIR;
  * send_to_peer {name}. Same shape as the TMUX_PANE wedge above; cheap to prevent.
  */
 delete process.env.CLAUDE_PEER_NAME;
+
+/**
+ * Same escape, larger blast radius — latent today, so fixed before it fires.
+ *
+ * The broker resolves its database as `CLAUDE_PEERS_DB ?? $HOME/.claude-peers.db`
+ * (broker.ts:87, shared/broker-service.ts:26) and its port as
+ * `CLAUDE_PEERS_PORT ?? 7899`. Sandboxing HOME covers the fallback but NOT the
+ * override: an ambient CLAUDE_PEERS_DB would send every test write into the real
+ * message store, and an ambient CLAUDE_PEERS_PORT would point a spawned server at
+ * the LIVE broker on 7899 — writing real peer rows and real messages.
+ *
+ * That is precisely how CLAUDE_CONFIG_DIR ate the operator's peer hooks: an
+ * override the sandbox did not think to clear, defeating a HOME redirect that
+ * looked airtight. Neither variable is set on this host right now, which is the
+ * best moment to close it — the bug above was also latent until the day someone
+ * ran the suite from a shell that happened to set the variable.
+ *
+ * tests/helpers/test-broker.ts already pins CLAUDE_PEERS_PORT="0" for its own
+ * broker; this covers every OTHER spawner, including ones added later.
+ */
+delete process.env.CLAUDE_PEERS_DB;
+delete process.env.CLAUDE_PEERS_PORT;
