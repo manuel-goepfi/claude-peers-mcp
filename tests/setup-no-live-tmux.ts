@@ -1,3 +1,7 @@
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 /**
  * Test preload: keep the suite off the operator's real tmux panes.
  *
@@ -77,5 +81,38 @@ delete process.env.CLAUDE_PEER_NAME;
  * tests/helpers/test-broker.ts already pins CLAUDE_PEERS_PORT="0" for its own
  * broker; this covers every OTHER spawner, including ones added later.
  */
-delete process.env.CLAUDE_PEERS_DB;
+// PORT is deleted (its fallback, 7899, is refused by the test broker which pins
+// "0"); DB is REDIRECTED for the reason above — its fallback is a real home path.
 delete process.env.CLAUDE_PEERS_PORT;
+
+/**
+ * Every remaining path override, because scrubbing "the important ones" is how
+ * this bug keeps surviving.
+ *
+ * Adversarial review found the previous list incomplete and proved it: a full
+ * suite run wrote /home/manzo/.claude-peers-autodrain.heartbeat — the operator's
+ * live file — because the heartbeat path falls back to $HOME only when its
+ * override is unset, and the override was never cleared. Same shape as
+ * CLAUDE_CONFIG_DIR, third time in two days.
+ *
+ * The rule that generalises: ANY env var naming a writable target must be handled
+ * here, not just the ones implicated in the last incident — and handled by
+ * REDIRECTING it to a sandbox, never by deleting it. A HOME sandbox protects only
+ * the fallback branch; an override defeats it, and deleting the override hands
+ * control back to a fallback that may not honour $HOME at all.
+ */
+// ⚠ REDIRECT, do not delete. Deleting an override hands control to its fallback,
+// and these fallbacks are the operator's real home — several resolve via
+// homedir() (bin/codex-autodrain-poller.ts:79) which ignores $HOME entirely, so a
+// HOME sandbox cannot save them. They are also module-level consts evaluated at
+// IMPORT time, so the value must be in place before any test file imports.
+//
+// Deleting them is strictly worse than leaving them: it GUARANTEES the live path.
+// Proven — after a delete-only scrub, one suite still recreated
+// /home/manzo/.claude-peers-autodrain.heartbeat on every run.
+const sandbox = mkdtempSync(join(tmpdir(), "claude-peers-test-"));
+process.env.CLAUDE_PEERS_DB = join(sandbox, "peers.db");
+process.env.CLAUDE_PEERS_AUTODRAIN_HEARTBEAT = join(sandbox, "autodrain.heartbeat");
+process.env.CLAUDE_PEERS_BROKER_LOG = join(sandbox, "broker.log");
+process.env.CLAUDE_PEERS_BACKUP = join(sandbox, "backup");
+process.env.CLAUDE_PEERS_BRIDGE_TOKEN_FILE = join(sandbox, "bridge-token");

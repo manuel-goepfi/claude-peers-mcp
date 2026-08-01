@@ -1398,7 +1398,9 @@ function receiverLine(p: Pick<Peer, "client_type" | "receiver_mode" | "last_hook
     // "manual-drain" names the API the lane calls (check_messages), NOT who calls
     // it. For a seat with a pane the autodrain poller does the calling, so this
     // renders as an automatic path rather than a chore awaiting a human.
-    parts.push(p.tmux_pane_id ? "drains_on=autodrain-nudge" : "fallback=check_messages (no pane to nudge)");
+    // Report the FACT (a nudgeable pane exists) not a promise (it will be nudged).
+    // The poller's client list is invisible here and defaults to nudging nobody.
+    parts.push(p.tmux_pane_id ? "drain=check_messages (pane present; autodrain poller may nudge it)" : "drain=check_messages (no pane to nudge)");
   }
   return parts.join(" ");
 }
@@ -1434,9 +1436,26 @@ export function sendStatusHint(target: SendMessageResponse["target"] | undefined
   // lane on manual-drain completed a full round trip in 56s on the nudge path,
   // and agy and cursor lanes drained the same way; meanwhile senders were being
   // told their mail needed someone to intervene.
-  const nudgeable = Boolean(target.tmux_pane_id) && target.client_type !== "unknown";
-  if (nudgeable) {
-    return ` Still queued; ${target.client_type} receiver drains on the autodrain nudge (no hook needed, typically under a minute) — no action required from you.`;
+  // EVIDENCE, not assumption. An earlier revision inferred "this lane gets nudged"
+  // from pane + known client type and told the sender "no action required from
+  // you". The server cannot know that: parseNudgeClients defaults to [] — nudge
+  // NOBODY — so with NUDGE_CLIENTS unset the poller touches nothing; it may also be
+  // stopped, scoped to other clients, or have given up on this lane after
+  // MAX_NUDGE_ATTEMPTS while the mail still sits queued. Promising delivery on an
+  // unverifiable assumption is the silent-success this field exists to prevent, and
+  // it is worse than the pessimistic wording it replaced: a sender who is told
+  // "no action required" stops looking.
+  //
+  // A PRIOR SUCCESSFUL DRAIN is the one fact the broker actually holds. A lane that
+  // has drained before demonstrably has a working path — whatever that path is.
+  const hasDrainedBefore = Boolean(target.last_drain_at);
+  const paneBacked = Boolean(target.tmux_pane_id) && target.client_type !== "unknown";
+  if (paneBacked && hasDrainedBefore) {
+    return ` Still queued; ${target.client_type} receiver has drained before (last ${target.last_drain_at}) and has a pane the autodrain poller can nudge — it should arrive without action from you.`;
+  }
+  if (paneBacked) {
+    // Pane present but no drain on record: probably nudgeable, not demonstrated.
+    return ` Still queued; ${target.client_type} receiver has a pane the autodrain poller can nudge, but has never drained on record — if the poller is not running or not configured for ${target.client_type}, that lane must call check_messages itself.`;
   }
   if (target.client_type === "codex") {
     return " Still queued; Codex receiver has no hook AND no tmux pane, so nothing can nudge it — it delivers only if that lane calls check_messages itself.";
@@ -1779,7 +1798,7 @@ const TOOLS = [
   {
     name: "check_messages",
     description:
-      "Check for new messages from other peer instances. This is the normal, automatic delivery path for any lane whose receiver_mode is manual-drain: the autodrain poller nudges the pane and the lane calls this. \"Manual\" names the API, not who invokes it — such lanes DO receive mail automatically and a sender needs to do nothing. Also a fallback for Claude/Codex/Gemini lanes whose drain hook is missing or stale.",
+      "Check for new messages from other peer instances. This is the normal, automatic delivery path for any lane whose receiver_mode is manual-drain: the autodrain poller nudges the pane and the lane calls this. \"Manual\" names the API, not who invokes it — when that poller is running and configured for the client, such lanes receive mail without anyone intervening — but it is not guaranteed, so a lane that has never drained should call this itself. Also a fallback for Claude/Codex/Gemini lanes whose drain hook is missing or stale.",
     inputSchema: {
       type: "object" as const,
       properties: {},

@@ -2,11 +2,15 @@
  * A sender must not be told that a nudge-driven lane needs rescuing.
  *
  * `receiver_mode: "manual-drain"` names the API the lane calls (check_messages),
- * NOT who calls it. For any seat with a tmux pane the autodrain poller does the
- * calling, so those lanes receive mail automatically and the sender need do
- * nothing. Measured 2026-07-31: a codex lane on manual-drain completed a full
- * round trip in 56 seconds on that path; agy and cursor lanes drained the same
- * way.
+ * NOT who calls it — the autodrain poller does the calling. Measured 2026-07-31:
+ * a codex lane on manual-drain completed a full round trip in 56 seconds that way;
+ * agy and cursor drained the same way.
+ *
+ * But the reassurance must rest on EVIDENCE, not on a pane. parseNudgeClients
+ * defaults to [] ("nudge nobody"), and the poller can be stopped, scoped to other
+ * clients, or have given up on a lane after MAX_NUDGE_ATTEMPTS — none of which the
+ * server can see. So a prior successful drain is what licenses the promise; a pane
+ * alone licenses only "probably".
  *
  * The old wording said the opposite — "has no active hook yet and must use
  * check_messages" — and never mentioned the poller at all. The cost was not
@@ -33,10 +37,11 @@ function target(over: Partial<Target>): Target {
 }
 
 describe("send status hint for nudge-driven lanes", () => {
-  test("a manual-drain lane WITH a pane is reported as an automatic path", () => {
-    const hint = sendStatusHint(target({}), false);
-    expect(hint).toContain("autodrain nudge");
-    expect(hint).toContain("no action required");
+  test("a lane that HAS drained before is reported as an automatic path", () => {
+    // Evidence, not assumption: a prior drain proves a working path exists.
+    const hint = sendStatusHint(target({ last_drain_at: "2026-08-01T08:00:00Z" }), false);
+    expect(hint).toContain("has drained before");
+    expect(hint).toContain("without action from you");
     // The specific phrasings that taught senders the mail was stranded.
     expect(hint).not.toContain("must use check_messages");
     expect(hint).not.toContain("no active hook");
@@ -46,8 +51,8 @@ describe("send status hint for nudge-driven lanes", () => {
     // cursor / agy / kimi have no hook API at all, so manual-drain is their ONLY
     // mode. If the wording implied breakage they would look permanently broken.
     for (const client_type of ["codex", "cursor", "agy", "kimi"] as const) {
-      const hint = sendStatusHint(target({ client_type }), false);
-      expect(hint).toContain("autodrain nudge");
+      const hint = sendStatusHint(target({ client_type, last_drain_at: "2026-08-01T08:00:00Z" }), false);
+      expect(hint).toContain("has drained before");
       expect(hint).not.toContain("must use check_messages");
     }
   });
@@ -67,6 +72,15 @@ describe("send status hint for nudge-driven lanes", () => {
     const hint = sendStatusHint(target({ client_type: "unknown", receiver_mode: "unknown" }), false);
     expect(hint).not.toContain("no action required");
     expect(hint).toContain("check_messages");
+  });
+
+  test("a pane-backed lane that has NEVER drained is not promised delivery", () => {
+    // parseNudgeClients defaults to [] — nudge nobody. A pane proves the poller
+    // COULD reach the lane, never that it will, so this must stay conditional.
+    const hint = sendStatusHint(target({ last_drain_at: null }), false);
+    expect(hint).toContain("never drained on record");
+    expect(hint).toContain("check_messages");
+    expect(hint).not.toContain("without action from you");
   });
 
   test("a delivered message produces no hint at all", () => {
