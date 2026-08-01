@@ -24,3 +24,36 @@
 process.env.CLAUDE_PEERS_TMUX_IDENTITY_MIRROR = "0";
 delete process.env.TMUX_PANE;
 delete process.env.TMUX;
+
+/**
+ * Same class of escape, different variable — and this one deleted the operator's
+ * peer hooks.
+ *
+ * The installer resolves its user-scope config from CLAUDE_CONFIG_DIR and only
+ * falls back to $HOME when that is unset. Installer tests sandbox HOME to a temp
+ * dir (30 call sites) but spawn with `...process.env`, so on any shell that sets
+ * CLAUDE_CONFIG_DIR the child ignored the sandbox and resolved to the REAL config.
+ * The scope transfer then removed peer hooks from it.
+ *
+ * Measured 2026-08-01, and it is the root cause of a full day of lost mail:
+ * ~/.claude-b/settings.json lost SessionStart + Stop + UserPromptSubmit and every
+ * account-B lane went deaf. Running the 4-file installer glob three times wrote
+ * three backups of that live file within four seconds — one per run. It also made
+ * the suite unreproducible between machines: a shell WITHOUT the variable measured
+ * 27 pass / 0 fail on the same commit where a shell WITH it measured 16 / 11, and
+ * two of us spent an afternoon each believing the other had mismeasured.
+ *
+ * Deleted here rather than at the 30 spawn sites: one place covers every existing
+ * caller and every future one, which is the only version of this fix that stays
+ * fixed. Tests that genuinely exercise the variable (e.g. "honors CLAUDE_CONFIG_DIR
+ * for alternate user profiles") set it explicitly on the child they spawn, so they
+ * are unaffected.
+ */
+delete process.env.CLAUDE_CONFIG_DIR;
+
+/**
+ * CLAUDE_PEER_NAME leaks the operator's seat label into every spawned server, so a
+ * test registration can adopt the live lane's name and make it ambiguous to
+ * send_to_peer {name}. Same shape as the TMUX_PANE wedge above; cheap to prevent.
+ */
+delete process.env.CLAUDE_PEER_NAME;
