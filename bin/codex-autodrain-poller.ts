@@ -241,7 +241,12 @@ const nudgeAttempts = new Map<string, number>(); // peer id -> consecutive nudge
 // bootstrap nudge has no mail to deliver, so one attempt to wake the hook is all
 // that is ever useful. NOT pruned by the unread-clear sweep (that is what makes it
 // a process-lifetime cap rather than a per-window one).
-const bootstrapNudged = new Set<string>();       // peer id -> already got its one bootstrap nudge
+const bootstrapNudged = new Set<string>();
+
+// Last observed unread count per lane, so a RISING count can restore a lane's
+// nudge budget. Pruned with the other per-lane maps when a lane leaves the set.
+const lastUnreadSeen = new Map<string, number>();
+       // peer id -> already got its one bootstrap nudge
 
 // A1 nudge-storm guard (pure, exported for unit testing). A zero-mail lane is in
 // the nudge set only via the NULL-hook bootstrap path; once it has had its one
@@ -958,6 +963,30 @@ function tick(db: Database, snapOverride?: TickSnapshot): void {
   // MAX_NUDGE_ATTEMPTS, was never nudged again for FUTURE mail until a poller
   // restart (observed on launch.4: "giving up ... still 0 unread").
   for (const lane of lanes) if (lane.unread <= 0) nudgeAttempts.delete(lane.id);
+  // NEW MAIL ALSO RESTORES THE BUDGET — otherwise give-up is a one-way door for
+  // exactly the lanes that cannot rescue themselves.
+  //
+  // The reset above fires only when the queue reaches ZERO. A manual-drain lane
+  // clears its queue by being nudged, so once it hits MAX_NUDGE_ATTEMPTS with mail
+  // still queued it can never earn its way out: no nudge -> no drain -> unread
+  // never reaches 0 -> counter never resets -> no nudge. Permanently deaf until the
+  // poller process restarts. Live instance 2026-08-01: "giving up on orch.1: 5
+  // nudges, still 4 unread", after which the operator had to ask that lane to drain
+  // by hand.
+  //
+  // A rising unread count is proof the lane is still being talked to, and a fresh
+  // message deserves a fresh attempt budget. This does NOT re-open keystroke
+  // bombing: the cap still applies per batch, and a lane whose queue never grows
+  // stays given-up exactly as before.
+  for (const lane of lanes) {
+    const previous = lastUnreadSeen.get(lane.id);
+    if (previous !== undefined && lane.unread > previous && nudgeAttempts.has(lane.id)) {
+      log(`new mail for ${lane.name ?? lane.id} (${previous} -> ${lane.unread}) — restoring nudge budget`);
+      nudgeAttempts.delete(lane.id);
+    }
+    lastUnreadSeen.set(lane.id, lane.unread);
+  }
+  for (const id of lastUnreadSeen.keys()) if (!active.has(id)) lastUnreadSeen.delete(id);
   for (const id of lastNudge.keys()) if (!active.has(id)) lastNudge.delete(id);
   for (const id of paneCache.keys()) if (!active.has(id)) paneCache.delete(id);
   // bootstrapNudged is pruned ONLY when the lane leaves the set entirely (session
