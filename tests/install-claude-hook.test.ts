@@ -25,7 +25,7 @@ describe("Claude hook installer", () => {
     const repo = mkdtempSync(join(tmpdir(), "claude-peers-claude-install-"));
     try {
       const path = join(repo, ".claude", "settings.json");
-      mkdirSync(join(repo, ".claude"), { recursive: true });
+      mkdirSync(join(repo, ".claude"), { recursive: true, mode: 0o700 });
       writeFileSync(path, `${JSON.stringify({ permissions: { allow: ["Read"] }, hooks: { PreToolUse: [{ hooks: [{ type: "command", command: "existing.sh" }] }] } }, null, 2)}\n`, { mode: 0o600 });
       const first = await run(repo);
       expect(first.code).toBe(0);
@@ -65,7 +65,7 @@ describe("Claude hook installer", () => {
     const repo = mkdtempSync(join(tmpdir(), "claude-peers-claude-check-"));
     try {
       const path = join(repo, ".claude", "settings.json");
-      mkdirSync(join(repo, ".claude"), { recursive: true });
+      mkdirSync(join(repo, ".claude"), { recursive: true, mode: 0o700 });
       writeFileSync(path, `${JSON.stringify({ theme: "dark" }, null, 2)}\n`, { mode: 0o600 });
       const before = readFileSync(path);
       expect((await run(repo, "--check")).code).toBe(1);
@@ -85,7 +85,7 @@ describe("Claude hook installer", () => {
     const repo = mkdtempSync(join(tmpdir(), "claude-peers-claude-bad-"));
     try {
       const path = join(repo, ".claude", "settings.json");
-      mkdirSync(join(repo, ".claude"), { recursive: true });
+      mkdirSync(join(repo, ".claude"), { recursive: true, mode: 0o700 });
       writeFileSync(path, "{bad", { mode: 0o600 });
       expect((await run(repo)).code).toBe(1);
       expect(readFileSync(path, "utf8")).toBe("{bad");
@@ -224,7 +224,7 @@ describe("Claude hook installer", () => {
     const repo = mkdtempSync(join(tmpdir(), "claude-peers-claude-legacy-"));
     try {
       const path = join(repo, ".claude", "settings.json");
-      mkdirSync(join(repo, ".claude"), { recursive: true });
+      mkdirSync(join(repo, ".claude"), { recursive: true, mode: 0o700 });
       writeFileSync(path, `${JSON.stringify({
         hooks: {
           UserPromptSubmit: [{ hooks: [{ type: "command", command: "$HOME/.claude/hooks/drain-peer-inbox.sh" }] }],

@@ -13,8 +13,8 @@ describe("Codex hook installer", () => {
     const repo = mkdtempSync(join(tmpdir(), "claude-peers-install-"));
     try {
       const hooksPath = join(repo, ".codex", "hooks.json");
-      mkdirSync(join(repo, ".codex"), { recursive: true });
-      await Bun.write(hooksPath, JSON.stringify({
+      mkdirSync(join(repo, ".codex"), { recursive: true, mode: 0o700 });
+      writeFileSync(hooksPath, JSON.stringify({
         hooks: {
           UserPromptSubmit: [
             {
@@ -28,7 +28,7 @@ describe("Codex hook installer", () => {
             },
           ],
         },
-      }, null, 2));
+      }, null, 2), { mode: 0o600 });
 
       for (let i = 0; i < 2; i++) {
         const proc = Bun.spawn(["bun", installer, repo], { env: { ...process.env, HOME: repo }, stdout: "ignore", stderr: "pipe" });
@@ -78,8 +78,8 @@ describe("Codex hook installer", () => {
     const repo = mkdtempSync(join(tmpdir(), "claude-peers-install-bad-"));
     try {
       const hooksPath = join(repo, ".codex", "hooks.json");
-      mkdirSync(join(repo, ".codex"), { recursive: true });
-      writeFileSync(hooksPath, "{not-json");
+      mkdirSync(join(repo, ".codex"), { recursive: true, mode: 0o700 });
+      writeFileSync(hooksPath, "{not-json", { mode: 0o600 });
       const proc = Bun.spawn(["bun", installer, repo], { env: { ...process.env, HOME: repo }, stdout: "ignore", stderr: "pipe" });
       await new Response(proc.stderr).text();
       expect(await proc.exited).not.toBe(0);
@@ -93,8 +93,8 @@ describe("Codex hook installer", () => {
     const repo = mkdtempSync(join(tmpdir(), "claude-peers-install-stale-"));
     try {
       const hooksPath = join(repo, ".codex", "hooks.json");
-      mkdirSync(join(repo, ".codex"), { recursive: true });
-      await Bun.write(hooksPath, JSON.stringify({
+      mkdirSync(join(repo, ".codex"), { recursive: true, mode: 0o700 });
+      writeFileSync(hooksPath, JSON.stringify({
         hooks: {
           UserPromptSubmit: [
             {
@@ -118,7 +118,7 @@ describe("Codex hook installer", () => {
             },
           ],
         },
-      }, null, 2));
+      }, null, 2), { mode: 0o600 });
 
       const proc = Bun.spawn(["bun", installer, repo], { env: { ...process.env, HOME: repo }, stdout: "ignore", stderr: "pipe" });
       const stderr = await new Response(proc.stderr).text();
@@ -143,8 +143,8 @@ describe("Codex hook installer", () => {
     const repo = mkdtempSync(join(tmpdir(), "claude-peers-install-safe-"));
     try {
       const hooksPath = join(repo, ".codex", "hooks.json");
-      mkdirSync(join(repo, ".codex"), { recursive: true });
-      await Bun.write(hooksPath, JSON.stringify({
+      mkdirSync(join(repo, ".codex"), { recursive: true, mode: 0o700 });
+      writeFileSync(hooksPath, JSON.stringify({
         hooks: {
           UserPromptSubmit: [
             {
@@ -168,7 +168,7 @@ describe("Codex hook installer", () => {
             },
           ],
         },
-      }, null, 2));
+      }, null, 2), { mode: 0o600 });
 
       const proc = Bun.spawn(["bun", installer, repo], { env: { ...process.env, HOME: repo }, stdout: "ignore", stderr: "pipe" });
       const stderr = await new Response(proc.stderr).text();
@@ -193,8 +193,8 @@ describe("Codex hook installer", () => {
     const repo = mkdtempSync(join(tmpdir(), "claude-peers-install-register-"));
     try {
       const hooksPath = join(repo, ".codex", "hooks.json");
-      mkdirSync(join(repo, ".codex"), { recursive: true });
-      await Bun.write(hooksPath, JSON.stringify({
+      mkdirSync(join(repo, ".codex"), { recursive: true, mode: 0o700 });
+      writeFileSync(hooksPath, JSON.stringify({
         hooks: {
           SessionStart: [
             {
@@ -210,7 +210,7 @@ describe("Codex hook installer", () => {
             },
           ],
         },
-      }, null, 2));
+      }, null, 2), { mode: 0o600 });
 
       const proc = Bun.spawn(["bun", installer, repo], { env: { ...process.env, HOME: repo }, stdout: "ignore", stderr: "pipe" });
       const stderr = await new Response(proc.stderr).text();

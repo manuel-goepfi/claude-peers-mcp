@@ -13,8 +13,8 @@ describe("Gemini hook installer", () => {
     const repo = mkdtempSync(join(tmpdir(), "claude-peers-gemini-install-"));
     try {
       const settingsPath = join(repo, ".gemini", "settings.json");
-      mkdirSync(join(repo, ".gemini"), { recursive: true });
-      await Bun.write(settingsPath, JSON.stringify({
+      mkdirSync(join(repo, ".gemini"), { recursive: true, mode: 0o700 });
+      writeFileSync(settingsPath, JSON.stringify({
         mcpServers: {
           "claude-peers": {
             command: "bun",
@@ -35,7 +35,7 @@ describe("Gemini hook installer", () => {
             },
           ],
         },
-      }, null, 2));
+      }, null, 2), { mode: 0o600 });
 
       for (let i = 0; i < 2; i++) {
         const proc = Bun.spawn(["bun", installer, repo], { env: { ...process.env, HOME: repo }, stdout: "ignore", stderr: "pipe" });
@@ -73,8 +73,8 @@ describe("Gemini hook installer", () => {
     const repo = mkdtempSync(join(tmpdir(), "claude-peers-gemini-install-bad-"));
     try {
       const settingsPath = join(repo, ".gemini", "settings.json");
-      mkdirSync(join(repo, ".gemini"), { recursive: true });
-      writeFileSync(settingsPath, "{not-json");
+      mkdirSync(join(repo, ".gemini"), { recursive: true, mode: 0o700 });
+      writeFileSync(settingsPath, "{not-json", { mode: 0o600 });
       const proc = Bun.spawn(["bun", installer, repo], { env: { ...process.env, HOME: repo }, stdout: "ignore", stderr: "pipe" });
       await new Response(proc.stderr).text();
       expect(await proc.exited).not.toBe(0);
@@ -88,7 +88,7 @@ describe("Gemini hook installer", () => {
     const repo = mkdtempSync(join(tmpdir(), "claude-peers-gemini-install-stale-"));
     try {
       const settingsPath = join(repo, ".gemini", "settings.json");
-      mkdirSync(join(repo, ".gemini"), { recursive: true });
+      mkdirSync(join(repo, ".gemini"), { recursive: true, mode: 0o700 });
       writeFileSync(settingsPath, JSON.stringify({
         hooks: {
           BeforeAgent: [
@@ -105,7 +105,7 @@ describe("Gemini hook installer", () => {
             },
           ],
         },
-      }, null, 2));
+      }, null, 2), { mode: 0o600 });
 
       const proc = Bun.spawn(["bun", installer, repo], { env: { ...process.env, HOME: repo }, stdout: "ignore", stderr: "pipe" });
       await new Response(proc.stderr).text();
@@ -129,7 +129,7 @@ describe("Gemini hook installer", () => {
     const repo = mkdtempSync(join(tmpdir(), "claude-peers-gemini-install-register-"));
     try {
       const settingsPath = join(repo, ".gemini", "settings.json");
-      mkdirSync(join(repo, ".gemini"), { recursive: true });
+      mkdirSync(join(repo, ".gemini"), { recursive: true, mode: 0o700 });
       writeFileSync(settingsPath, JSON.stringify({
         hooks: {
           SessionStart: [
@@ -146,7 +146,7 @@ describe("Gemini hook installer", () => {
             },
           ],
         },
-      }, null, 2));
+      }, null, 2), { mode: 0o600 });
 
       const proc = Bun.spawn(["bun", installer, repo], { env: { ...process.env, HOME: repo }, stdout: "ignore", stderr: "pipe" });
       const stderr = await new Response(proc.stderr).text();

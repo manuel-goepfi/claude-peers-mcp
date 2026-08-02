@@ -93,8 +93,8 @@ describe("broker user-service installer", () => {
 
   test("uninstall removes owned files and restores pre-existing operator files", () => {
     const config = fixture();
-    mkdirSync(dirname(config.unitPath), { recursive: true });
-    mkdirSync(dirname(config.dropInPath), { recursive: true });
+    mkdirSync(dirname(config.unitPath), { recursive: true, mode: 0o700 });
+    mkdirSync(dirname(config.dropInPath), { recursive: true, mode: 0o700 });
     writeFileSync(config.unitPath, "operator unit\n", { mode: 0o600 });
     writeFileSync(config.dropInPath, "operator drop-in\n", { mode: 0o600 });
 
@@ -121,7 +121,7 @@ describe("broker user-service installer", () => {
 
   test("uninstall refuses to overwrite post-install operator edits", () => {
     const config = fixture();
-    mkdirSync(dirname(config.unitPath), { recursive: true });
+    mkdirSync(dirname(config.unitPath), { recursive: true, mode: 0o700 });
     writeFileSync(config.unitPath, "operator predecessor\n", { mode: 0o600 });
     installBrokerService(config);
     writeFileSync(config.unitPath, `${renderBrokerService(config)}# later operator edit\n`, { mode: 0o600 });
@@ -132,7 +132,7 @@ describe("broker user-service installer", () => {
 
   test("refuses a symlinked service target", () => {
     const config = fixture();
-    mkdirSync(dirname(config.unitPath), { recursive: true });
+    mkdirSync(dirname(config.unitPath), { recursive: true, mode: 0o700 });
     const target = join(dirname(config.unitPath), "operator-target.service");
     writeFileSync(target, renderBrokerService(config), { mode: 0o600 });
     symlinkSync(target, config.unitPath);
