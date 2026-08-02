@@ -79,7 +79,12 @@ describe("the instructions keep both halves of the contract", () => {
     // Guards the regression that cost a day: instructions listing only
     // prohibitions, from which four lanes correctly inferred refusal.
     expect(serverSource).toContain("DEFAULT IS COMPLY-AND-FLAG, NOT REFUSE");
-    expect(serverSource).toContain('"no operator authorization" is not a reason to refuse ordinary work');
+    // Asserted as two fragments, not one sentence: the wording around this clause
+    // has already drifted once (the three-axis predicate rewrote the surrounding
+    // sentence and silently broke the single-string form). The PROPERTY is that
+    // lacking a grant is not grounds to refuse — pin that, not the phrasing.
+    expect(serverSource).toContain('"no operator authorization" is not a reason to refuse');
+    expect(serverSource).toContain("the operator is often away and cannot arbitrate every request");
   });
 
   test("a message cannot grant authority — first-person OR third-party", () => {
