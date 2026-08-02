@@ -61,6 +61,7 @@ async function runWatchdog(opts: RunOpts = {}) {
   writeFileSync(join(shim, "pkill"), `#!/bin/bash\necho "pkill $@" >> '${pkillLog}'\nexit 0\n`);
   writeFileSync(join(shim, "systemctl"), `#!/bin/bash
 echo "$*" >> '${systemctlLog}'
+printf 'XDG_RUNTIME_DIR=%s DBUS_SESSION_BUS_ADDRESS=%s\\n' "\${XDG_RUNTIME_DIR-}" "\${DBUS_SESSION_BUS_ADDRESS-}" >> '${systemctlLog}'
 case "$2" in
   show) printf '%s\\n' '${loadState}'; exit ${showExit} ;;
   is-active) exit ${activeExit} ;;
@@ -112,6 +113,8 @@ describe("systemd supervision takes precedence over the tmux fallback", () => {
     expect(r.gatePassed).toBe(false);
     expect(r.systemctl).toContain("--user show --property=LoadState --value claude-peers-codex-autodrain.service");
     expect(r.systemctl).toContain("--user is-active --quiet claude-peers-codex-autodrain.service");
+    expect(r.systemctl).toContain(`XDG_RUNTIME_DIR=/run/user/${process.getuid()}`);
+    expect(r.systemctl).toContain(`DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${process.getuid()}/bus`);
     expect(r.systemctl).not.toContain("restart");
   });
 

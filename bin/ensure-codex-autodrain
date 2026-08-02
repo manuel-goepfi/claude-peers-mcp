@@ -58,6 +58,17 @@ if [ -z "$SYSTEMCTL_BIN" ]; then
   SYSTEMCTL_BIN="$(command -v systemctl 2>/dev/null || true)"
 fi
 if [ -n "$SYSTEMCTL_BIN" ]; then
+  # Cron does not inherit the interactive user's D-Bus environment. Supply the
+  # conventional user-runtime socket so `systemctl --user` reaches the manager
+  # instead of falsely treating a live unit as unavailable and spawning tmux.
+  if [ -z "${XDG_RUNTIME_DIR:-}" ]; then
+    XDG_RUNTIME_DIR="/run/user/$(id -u)"
+    export XDG_RUNTIME_DIR
+  fi
+  if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+    DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus"
+    export DBUS_SESSION_BUS_ADDRESS
+  fi
   SYSTEMD_LOAD_STATE="$("$SYSTEMCTL_BIN" --user show --property=LoadState --value "$SYSTEMD_UNIT" 2>/dev/null)"
   SYSTEMD_SHOW_STATUS=$?
   if [ "$SYSTEMD_SHOW_STATUS" -eq 0 ] && [ -n "$SYSTEMD_LOAD_STATE" ] && [ "$SYSTEMD_LOAD_STATE" != "not-found" ]; then
