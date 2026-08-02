@@ -4,7 +4,7 @@ import { findClientPidFromTable, findHookPeerPidsFromTable, findMcpPidFromTable 
 import { publishBrokerIdentityToTmux, registrationTmuxPaneId } from "../hooks/register-peer-session.ts";
 import { detectClientFromProcessChain, findBgSpareAncestor, initialReceiverMode, type ProcessInfo } from "../shared/client.ts";
 import { findNearestVisibleCodexProcessByStart } from "../shared/visible-codex.ts";
-import { findCodexAppServerAncestor, findVisibleCodexSession, registrationCwd, registrationCwdResult, registrationTtyPid } from "../server.ts";
+import { findCodexAppServerAncestor, findVisibleCodexSession, registrationCwd, registrationCwdResult, registrationTtyPid, selectCodexManualDrainPid } from "../server.ts";
 
 function table(rows: ProcessInfo[]): Map<number, ProcessInfo> {
   return new Map(rows.map((row) => [row.pid, row]));
@@ -303,6 +303,22 @@ describe("client detection", () => {
     expect(visible?.env.CLAUDE_PEER_NAME).toBe("infra.3");
   });
 
+  test("Codex observer manual check can resolve a proximate TTY session when Codex strips its identity environment", () => {
+    const processes = new Map([
+      [200, { pid: 200, ppid: 50, comm: "codex", args: "codex resume" }],
+      [300, { pid: 300, ppid: 100, comm: "bun", args: "bun /home/manzo/claude-peers-mcp/server.ts" }],
+    ]);
+
+    const visible = findNearestVisibleCodexProcessByStart(processes, "/home/manzo/Clause5", 300, {
+      getTty: (candidate) => candidate === 200 ? "pts/41" : null,
+      cwdOf: (candidate) => candidate === 200 ? "/home/manzo/Clause5" : "/other",
+      environOf: () => ({}),
+      processStartTicks: (candidate) => candidate === 200 ? 1_700 : candidate === 300 ? 1_880 : null,
+    }, 2_000, false);
+
+    expect(visible?.pid).toBe(200);
+  });
+
   test("Codex observer manual check refuses tied or stale start-time matches", () => {
     const processes = new Map([
       [200, { pid: 200, ppid: 50, comm: "codex", args: "codex" }],
@@ -342,6 +358,18 @@ describe("client detection", () => {
     expect(bridge).toBeGreaterThan(checkCase);
     expect(emptyResponse).toBeGreaterThan(bridge);
     expect(src).toContain(".filter((id) => !alreadyDeliveredByPid.includes(id))");
+  });
+
+  test("manual check_messages uses the exact registered Codex client pid before any observer fallback", () => {
+    let visibleFallbackCalled = false;
+
+    expect(selectCodexManualDrainPid("codex", 48_327, 99_999, () => {
+      visibleFallbackCalled = true;
+      return 22_222;
+    })).toBe(48_327);
+    expect(visibleFallbackCalled).toBe(false);
+    expect(selectCodexManualDrainPid("codex", 99_999, 99_999, () => 22_222)).toBe(22_222);
+    expect(selectCodexManualDrainPid("claude", 48_327, 99_999, () => 22_222)).toBeNull();
   });
 
   test("Codex app-server hook refuses ambiguous same-cwd visible Codex sessions", () => {

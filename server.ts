@@ -912,19 +912,35 @@ interface PollByPidResponse {
   acked?: number;
 }
 
+export function selectCodexManualDrainPid(
+  clientType: ClientType,
+  registerPid: number,
+  serverPid: number,
+  resolveVisiblePid: () => number | null,
+): number | null {
+  if (clientType !== "codex") return null;
+  // A direct Codex CLI MCP server already knows its owning client PID from the
+  // process chain. Poll that exact registered PID before attempting the
+  // app-server observer fallback below. The old guard skipped this path, then
+  // polled the transient MCP server's own peer id and reported an empty inbox.
+  if (registerPid !== serverPid) return registerPid;
+  return resolveVisiblePid();
+}
+
 function resolveVisibleCodexPidForManualCheck(): number | null {
-  if (myClientType !== "codex" || myRegisterPid !== process.pid) return null;
-  const table = processTable();
-  const appServer = findCodexAppServerAncestor(process.ppid, table);
-  if (!appServer) return null;
-  const visibleCwdHint = cwdOf(appServer.pid);
-  if (!visibleCwdHint) return null;
-  const visible = findNearestVisibleCodexProcessByStart(table, visibleCwdHint, process.pid, {
-    getTty,
-    cwdOf,
-    environOf,
+  return selectCodexManualDrainPid(myClientType, myRegisterPid, process.pid, () => {
+    const table = processTable();
+    const appServer = findCodexAppServerAncestor(process.ppid, table);
+    if (!appServer) return null;
+    const visibleCwdHint = cwdOf(appServer.pid);
+    if (!visibleCwdHint) return null;
+    const visible = findNearestVisibleCodexProcessByStart(table, visibleCwdHint, process.pid, {
+      getTty,
+      cwdOf,
+      environOf,
+    }, 2_000, false);
+    return visible?.pid ?? null;
   });
-  return visible?.pid ?? null;
 }
 
 async function drainVisibleCodexPidForManualCheck(): Promise<Message[]> {

@@ -83,6 +83,7 @@ export function findSingleVisibleCodexProcess(
   processes: Map<number, ProcessInfo> | Iterable<ProcessInfo>,
   cwdHint: string,
   readers: VisibleCodexReaders = {},
+  requireIdentityEnv = true,
 ): VisibleCodexProcess | null {
   const ttyReader = readers.getTty ?? defaultGetTty;
   const cwdReader = readers.cwdOf ?? defaultCwdOf;
@@ -97,7 +98,7 @@ export function findSingleVisibleCodexProcess(
     const cwd = cwdReader(row.pid);
     if (!cwd || cwd !== cwdHint) continue;
     const env = envReader(row.pid);
-    if (!hasVisibleCodexIdentityEnv(env)) continue;
+    if (requireIdentityEnv && !hasVisibleCodexIdentityEnv(env)) continue;
     candidates.push({ pid: row.pid, cwd, tty, env });
   }
 
@@ -110,6 +111,7 @@ export function findNearestVisibleCodexProcessByStart(
   anchorPid: number,
   readers: VisibleCodexReaders = {},
   maxStartTickDelta = 2_000,
+  requireIdentityEnv = true,
 ): VisibleCodexProcess | null {
   const startTicksReader = readers.processStartTicks ?? processStartTicks;
   const anchorStart = startTicksReader(anchorPid);
@@ -121,7 +123,7 @@ export function findNearestVisibleCodexProcessByStart(
     .map((row) => {
       const startTicks = startTicksReader(row.pid);
       if (startTicks === null) return null;
-      const visible = findSingleVisibleCodexProcess([row], cwdHint, readers);
+      const visible = findSingleVisibleCodexProcess([row], cwdHint, readers, requireIdentityEnv);
       if (!visible) return null;
       const delta = anchorStart - startTicks;
       if (delta < 0 || delta > maxStartTickDelta) return null;
