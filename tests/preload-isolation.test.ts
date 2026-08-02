@@ -32,6 +32,7 @@ const MUST_BE_ABSENT = [
   "CLAUDE_CONFIG_DIR",
   "CLAUDE_PEER_NAME",
   "CLAUDE_PEERS_PORT",
+  "INVOCATION_ID",
 ] as const;
 
 /** Variables the preload must REDIRECT into its private sandbox, never delete. */
@@ -56,6 +57,7 @@ function runPreloadWithSentinels(): { env: Record<string, string | undefined>; s
     CLAUDE_CONFIG_DIR: join(sentinelRoot, "config"),
     CLAUDE_PEER_NAME: "SENTINEL-LANE",
     CLAUDE_PEERS_PORT: "7899",
+    INVOCATION_ID: "sentinel-invocation",
     CLAUDE_PEERS_DB: join(sentinelRoot, "peers.db"),
     CLAUDE_PEERS_AUTODRAIN_HEARTBEAT: join(sentinelRoot, "heartbeat"),
     CLAUDE_PEERS_BROKER_LOG: join(sentinelRoot, "broker.log"),

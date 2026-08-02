@@ -95,6 +95,8 @@ exit 1
       expect(existsSync(pidFile)).toBe(true);
       managedPid = Number(readFileSync(pidFile, "utf8").trim());
       expect(Number.isInteger(managedPid)).toBe(true);
+      const owner = JSON.parse(readFileSync(`${env.CLAUDE_PEERS_DB}.owner/owner.json`, "utf8")) as { owner_mode: string };
+      expect(owner.owner_mode).toBe("systemd");
     } finally {
       if (previousSkip === undefined) delete process.env.CLAUDE_PEERS_INSTALL_SKIP_SYSTEMD;
       else process.env.CLAUDE_PEERS_INSTALL_SKIP_SYSTEMD = previousSkip;
@@ -290,6 +292,8 @@ describe("verified broker shutdown", () => {
   test("kill-broker stops a directly owned broker and removes its lifetime lock", async () => {
     const victim = await startTestBroker({ prefix: "cli-kill", cleanupOnStop: false });
     try {
+      const owner = JSON.parse(readFileSync(`${victim.dbPath}.owner/owner.json`, "utf8")) as { owner_mode: string };
+      expect(owner.owner_mode).toBe("direct");
       const result = await runCli(["--json", "kill-broker"], {
         CLAUDE_PEERS_PORT: String(victim.port),
         CLAUDE_PEERS_DB: victim.dbPath,

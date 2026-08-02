@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
@@ -27,8 +27,15 @@ function running(pid: number): boolean {
 }
 
 function startWatcher(env: Record<string, string>, sessionId: string): Bun.Subprocess {
+  const childEnv = { ...process.env, ...env };
+  // The fallback tests intentionally provide XDG_RUNTIME_DIR but no explicit
+  // standby override. Do not let the operator's ambient override defeat that
+  // branch; a precedence test supplies the variable explicitly below.
+  if (!Object.prototype.hasOwnProperty.call(env, "CLAUDE_PEERS_STANDBY_RUNTIME_DIR")) {
+    delete childEnv.CLAUDE_PEERS_STANDBY_RUNTIME_DIR;
+  }
   const child = Bun.spawn(["bash", watcher], {
-    env: { ...process.env, ...env },
+    env: childEnv,
     stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe",
@@ -234,4 +241,44 @@ describe("Claude standby watcher", () => {
     expect(seenPids).toContain(newAdapter.pid);
     expect(stderr).toContain("adapter replaced");
   }, 8_000);
+
+  test("an explicit standby runtime directory wins over XDG_RUNTIME_DIR", async () => {
+    const root = mkdtempSync(join(tmpdir(), "claude-peers-standby-runtime-precedence-"));
+    roots.push(root);
+    const xdg = join(root, "xdg");
+    const explicit = join(root, "explicit");
+    mkdirSync(xdg, { mode: 0o700 });
+    mkdirSync(explicit, { mode: 0o700 });
+    const broker = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch(request) {
+        if (new URL(request.url).pathname === "/claim-by-pid") {
+          return Response.json({ peer_id: "peer-test", drain_id: "empty", messages: [] });
+        }
+        return Response.json({ ok: true, acked: 0 });
+      },
+    });
+    servers.push(broker);
+    const anchor = Bun.spawn(["sleep", "20"]);
+    children.push(anchor);
+    const child = startWatcher({
+      HOME: root,
+      XDG_RUNTIME_DIR: xdg,
+      CLAUDE_PEERS_STANDBY_RUNTIME_DIR: explicit,
+      CLAUDE_PEERS_PORT: String(broker.port),
+      CLAUDE_PEERS_STANDBY_CLAUDE_PID: String(anchor.pid),
+      CLAUDE_PEERS_STANDBY_MCP_PID: String(anchor.pid),
+      CLAUDE_PEERS_STANDBY_ACTIVE_SECONDS: "10",
+      CLAUDE_PEERS_STANDBY_POLL_INTERVAL_SECONDS: "1",
+    }, "runtime-precedence-test");
+    children.push(child);
+
+    const explicitState = join(explicit, "claude-peers", "standby");
+    const deadline = Date.now() + 2_000;
+    while (!existsSync(explicitState) && Date.now() < deadline) await Bun.sleep(50);
+    expect(existsSync(explicitState)).toBe(true);
+    expect(existsSync(join(xdg, "claude-peers", "standby"))).toBe(false);
+    expect(statSync(explicitState).mode & 0o777).toBe(0o700);
+  }, 4_000);
 });

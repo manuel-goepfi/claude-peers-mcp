@@ -63,6 +63,14 @@ delete process.env.CLAUDE_CONFIG_DIR;
 delete process.env.CLAUDE_PEER_NAME;
 
 /**
+ * INVOCATION_ID is systemd's ambient marker. The broker uses it as the default
+ * owner-mode signal, so inheriting the operator's service context can make a
+ * supposedly direct test broker claim to be systemd-owned. Tests that exercise
+ * systemd set both owner mode and invocation identity explicitly on the child.
+ */
+delete process.env.INVOCATION_ID;
+
+/**
  * Same escape, larger blast radius — latent today, so fixed before it fires.
  *
  * The broker resolves its database as `CLAUDE_PEERS_DB ?? $HOME/.claude-peers.db`
