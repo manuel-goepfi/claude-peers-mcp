@@ -348,28 +348,29 @@ describe("client detection", () => {
     })).toBeNull();
   });
 
-  test("manual check_messages drains the visible Codex pid fallback before empty response", () => {
+  test("manual check_messages fails closed before broker polling when the Codex seat is unresolved", () => {
     const src = readFileSync(new URL("../server.ts", import.meta.url), "utf8");
+    const handler = src.indexOf("mcp.setRequestHandler(CallToolRequestSchema");
+    const preRegistrationGuard = src.indexOf('if (name === "check_messages" && appServerIdentityUnresolved)', handler);
+    const registration = src.indexOf("await ensureRegistered()", handler);
     const checkCase = src.indexOf('case "check_messages"');
-    const bridge = src.indexOf("const visibleMessages = await drainVisibleCodexPidForManualCheck()", checkCase);
-    const emptyResponse = src.indexOf('text: "No new messages."', checkCase);
+    const identityGuard = src.indexOf("const codexManualDrainPid = selectCodexManualDrainPid", checkCase);
+    const brokerPoll = src.indexOf('brokerFetch<PollMessagesResponse>("/poll-messages"', checkCase);
 
+    expect(handler).toBeGreaterThan(0);
+    expect(preRegistrationGuard).toBeGreaterThan(handler);
+    expect(registration).toBeGreaterThan(preRegistrationGuard);
     expect(checkCase).toBeGreaterThan(0);
-    expect(bridge).toBeGreaterThan(checkCase);
-    expect(emptyResponse).toBeGreaterThan(bridge);
-    expect(src).toContain(".filter((id) => !alreadyDeliveredByPid.includes(id))");
+    expect(identityGuard).toBeGreaterThan(checkCase);
+    expect(brokerPoll).toBeGreaterThan(identityGuard);
+    expect(src).toContain("Cannot safely resolve this Codex session");
+    expect(src).not.toContain("drainVisibleCodexPidForManualCheck");
   });
 
-  test("manual check_messages uses the exact registered Codex client pid before any observer fallback", () => {
-    let visibleFallbackCalled = false;
-
-    expect(selectCodexManualDrainPid("codex", 48_327, 99_999, () => {
-      visibleFallbackCalled = true;
-      return 22_222;
-    })).toBe(48_327);
-    expect(visibleFallbackCalled).toBe(false);
-    expect(selectCodexManualDrainPid("codex", 99_999, 99_999, () => 22_222)).toBe(22_222);
-    expect(selectCodexManualDrainPid("claude", 48_327, 99_999, () => 22_222)).toBeNull();
+  test("manual check_messages uses only an exact registered Codex client pid", () => {
+    expect(selectCodexManualDrainPid("codex", 48_327, 99_999)).toBe(48_327);
+    expect(selectCodexManualDrainPid("codex", 99_999, 99_999)).toBeNull();
+    expect(selectCodexManualDrainPid("claude", 48_327, 99_999)).toBeNull();
   });
 
   test("Codex app-server hook refuses ambiguous same-cwd visible Codex sessions", () => {

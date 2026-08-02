@@ -43,7 +43,7 @@ import type {
 } from "./shared/types.ts";
 import { durableSeatKey } from "./shared/seat.ts";
 import { detectClientFromProcessChain, findBgSpareAncestor, findClientPidFromProcessChain, initialReceiverMode, isClientProcess, isCodexAppServerProcess, type ProcessInfo } from "./shared/client.ts";
-import { findNearestVisibleCodexProcessByStart, findSingleVisibleCodexProcess } from "./shared/visible-codex.ts";
+import { findSingleVisibleCodexProcess } from "./shared/visible-codex.ts";
 import {
   brokerIdentityPaneTarget as sharedBrokerIdentityPaneTarget,
   publishBrokerIdentityToTmux as sharedPublishBrokerIdentityToTmux,
@@ -742,6 +742,7 @@ let myAbsoluteGitDir: string | null = null;
 let myClientType: ClientType = "unknown";
 let myReceiverMode: ReceiverMode = "unknown";
 let myRegisterPid = process.pid;
+let appServerIdentityUnresolved = false;
 let myTmuxInfo: TmuxPaneInfo | null = null;
 let latestTmuxMirrorFailure: string | null = null;
 
@@ -906,59 +907,17 @@ async function ackAndDedup(ids: number[], context: string): Promise<void> {
   for (const id of ids) confirmedDeliveredIds.add(id);
 }
 
-interface PollByPidResponse {
-  peer_id?: string;
-  messages?: Message[];
-  acked?: number;
-}
-
 export function selectCodexManualDrainPid(
   clientType: ClientType,
   registerPid: number,
   serverPid: number,
-  resolveVisiblePid: () => number | null,
 ): number | null {
   if (clientType !== "codex") return null;
-  // A direct Codex CLI MCP server already knows its owning client PID from the
-  // process chain. Poll that exact registered PID before attempting the
-  // app-server observer fallback below. The old guard skipped this path, then
-  // polled the transient MCP server's own peer id and reported an empty inbox.
+  // A direct Codex CLI MCP server knows its owning client PID from the process
+  // chain. An app-server-hosted MCP server without that mapping has no safe
+  // mailbox identity: selecting a nearby Codex PID can drain a different pane.
   if (registerPid !== serverPid) return registerPid;
-  return resolveVisiblePid();
-}
-
-function resolveVisibleCodexPidForManualCheck(): number | null {
-  return selectCodexManualDrainPid(myClientType, myRegisterPid, process.pid, () => {
-    const table = processTable();
-    const appServer = findCodexAppServerAncestor(process.ppid, table);
-    if (!appServer) return null;
-    const visibleCwdHint = cwdOf(appServer.pid);
-    if (!visibleCwdHint) return null;
-    const visible = findNearestVisibleCodexProcessByStart(table, visibleCwdHint, process.pid, {
-      getTty,
-      cwdOf,
-      environOf,
-    }, 2_000, false);
-    return visible?.pid ?? null;
-  });
-}
-
-async function drainVisibleCodexPidForManualCheck(): Promise<Message[]> {
-  const visiblePid = resolveVisibleCodexPidForManualCheck();
-  if (!visiblePid) return [];
-  try {
-    const result = await brokerFetch<PollByPidResponse>("/poll-by-pid", {
-      pid: visiblePid,
-      caller_pid: process.pid,
-    });
-    if ((result.messages?.length ?? 0) > 0) {
-      log(`check_messages: drained ${result.messages!.length} message(s) via visible Codex pid=${visiblePid}`);
-    }
-    return result.messages ?? [];
-  } catch (e) {
-    log(`check_messages: visible Codex pid fallback failed — ${errMsg(e)}`);
-    return [];
-  }
+  return null;
 }
 
 /**
@@ -1842,6 +1801,18 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: args } = req.params;
 
+  // An unresolved app-server spawn has no trustworthy inbox identity. Do not
+  // materialize an observer row just to tell it the mailbox cannot be read.
+  if (name === "check_messages" && appServerIdentityUnresolved) {
+    return {
+      content: [{
+        type: "text" as const,
+        text: "Cannot safely resolve this Codex session for check_messages. Mailbox access is disabled to prevent cross-session delivery; use the pane hook or reopen the Codex session.",
+      }],
+      isError: true,
+    };
+  }
+
   // bg-spare deferral: a pre-warmed spare session stays unregistered, but the
   // moment it serves a real tool call it must exist on the broker.
   if (!myId) {
@@ -2281,6 +2252,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           isError: true,
         };
       }
+      const codexManualDrainPid = selectCodexManualDrainPid(myClientType, myRegisterPid, process.pid);
+      if (myClientType === "codex" && codexManualDrainPid === null) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: "Cannot safely resolve this Codex session for check_messages. Mailbox access is disabled to prevent cross-session delivery; use the pane hook or reopen the Codex session.",
+          }],
+          isError: true,
+        };
+      }
       try {
         // Drain local buffer (messages polled by the poll loop)
         const buffered = localMessageBuffer.splice(0, localMessageBuffer.length);
@@ -2298,16 +2279,6 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             allMessages.push(m);
           }
         }
-        const alreadyDeliveredByPid: number[] = [];
-        const visibleMessages = await drainVisibleCodexPidForManualCheck();
-        for (const m of visibleMessages) {
-          if (!seen.has(m.id) && !confirmedDeliveredIds.has(m.id)) {
-            seen.add(m.id);
-            alreadyDeliveredByPid.push(m.id);
-            allMessages.push(m);
-          }
-        }
-
         if (allMessages.length === 0) {
           return {
             content: [{ type: "text" as const, text: "No new messages." }],
@@ -2316,11 +2287,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
         // Display IS delivery. ackAndDedup adds to local dedup unconditionally
         // after we build the response text below.
-        const needsAck = allMessages
-          .map((m) => m.id)
-          .filter((id) => !alreadyDeliveredByPid.includes(id));
-        await ackAndDedup(needsAck, "check_messages");
-        for (const id of alreadyDeliveredByPid) confirmedDeliveredIds.add(id);
+        await ackAndDedup(allMessages.map((m) => m.id), "check_messages");
 
         // L7: same render path as drainPendingMessages — see renderInboundLine.
         const lines = allMessages.map(renderInboundLine);
@@ -2511,7 +2478,6 @@ async function main() {
   }
   // Set when app-server-hosted identity resolution exhausts every path and
   // falls back to the MCP server's own pid — the observer-${pid} signature.
-  let appServerIdentityUnresolved = false;
   if (myClientType === "codex" || myClientType === "gemini" || myClientType === "cursor" || myClientType === "agy" || myClientType === "kimi") {
     const chainPid = findClientPidFromProcessChain(process.ppid, startupProcesses, myClientType);
     if (chainPid) {
