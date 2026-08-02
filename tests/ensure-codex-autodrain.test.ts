@@ -1,7 +1,8 @@
 /**
- * Watchdog opt-in gate (bin/ensure-codex-autodrain) — the block that decides
- * whether the poller may start at all runs BEFORE any tmux call, so it is
- * testable hermetically:
+ * Watchdog supervision and opt-in gate (bin/ensure-codex-autodrain): a
+ * reachable systemd user unit owns the poller; only when systemd is unavailable
+ * does the tmux fallback resolve the opt-in and consider starting one. The
+ * fallback gate runs BEFORE any tmux call, so it is testable hermetically:
  *   - env unset  → config file consulted (single-source opt-in)
  *   - env SET    → wins outright, including set-but-EMPTY = explicit OFF
  *   - both paths whitespace-normalized before the allowlist (grep anchors
@@ -33,6 +34,12 @@ interface RunOpts {
   env?: Record<string, string>;      // extra env (e.g. NUDGE_CLIENTS)
   file?: string | null;              // nudge-clients file content (null = absent)
   pollerRunning?: boolean;           // pgrep stub reports a live poller
+  systemd?: {
+    managerAvailable: boolean;
+    unitInstalled?: boolean;
+    active?: boolean;
+    restartSucceeds?: boolean;
+  };
 }
 
 async function runWatchdog(opts: RunOpts = {}) {
@@ -41,12 +48,29 @@ async function runWatchdog(opts: RunOpts = {}) {
   const shim = join(root, "shim");
   mkdirSync(shim);
   const pkillLog = join(root, "pkill.log");
+  const systemctlLog = join(root, "systemctl.log");
   const pgrepExit = opts.pollerRunning ? 0 : 1;
   const pgrepOut = opts.pollerRunning ? "echo 99999" : ":";
+  const systemd = opts.systemd ?? { managerAvailable: false };
+  const unitInstalled = systemd.managerAvailable && systemd.unitInstalled !== false;
+  const showExit = systemd.managerAvailable ? 0 : 1;
+  const loadState = unitInstalled ? "loaded" : "not-found";
+  const activeExit = unitInstalled && systemd.active ? 0 : 3;
+  const restartExit = unitInstalled && systemd.restartSucceeds !== false ? 0 : 1;
   writeFileSync(join(shim, "pgrep"), `#!/bin/bash\n${pgrepOut}\nexit ${pgrepExit}\n`);
   writeFileSync(join(shim, "pkill"), `#!/bin/bash\necho "pkill $@" >> '${pkillLog}'\nexit 0\n`);
+  writeFileSync(join(shim, "systemctl"), `#!/bin/bash
+echo "$*" >> '${systemctlLog}'
+case "$2" in
+  show) printf '%s\\n' '${loadState}'; exit ${showExit} ;;
+  is-active) exit ${activeExit} ;;
+  restart) exit ${restartExit} ;;
+  *) exit 1 ;;
+esac
+`);
   chmodSync(join(shim, "pgrep"), 0o755);
   chmodSync(join(shim, "pkill"), 0o755);
+  chmodSync(join(shim, "systemctl"), 0o755);
   const nudgeFile = join(root, "nudge-clients");
   if (opts.file !== null && opts.file !== undefined) writeFileSync(nudgeFile, opts.file);
   const log = join(root, "watchdog.log");
@@ -74,8 +98,43 @@ async function runWatchdog(opts: RunOpts = {}) {
     gatePassed: !existsSync(heartbeat), // rm -f fires only after validation
     log: existsSync(log) ? readFileSync(log, "utf8") : "",
     pkills: existsSync(pkillLog) ? readFileSync(pkillLog, "utf8") : "",
+    systemctl: existsSync(systemctlLog) ? readFileSync(systemctlLog, "utf8") : "",
   };
 }
+
+describe("systemd supervision takes precedence over the tmux fallback", () => {
+  test("active unit returns before the fallback opt-in gate (planted regression guard)", async () => {
+    const r = await runWatchdog({
+      file: "codex\n",
+      systemd: { managerAvailable: true, active: true },
+    });
+    expect(r.code).toBe(0);
+    expect(r.gatePassed).toBe(false);
+    expect(r.systemctl).toContain("--user show --property=LoadState --value claude-peers-codex-autodrain.service");
+    expect(r.systemctl).toContain("--user is-active --quiet claude-peers-codex-autodrain.service");
+    expect(r.systemctl).not.toContain("restart");
+  });
+
+  test("inactive reachable unit is restarted without falling through to tmux", async () => {
+    const r = await runWatchdog({
+      file: "not-an-allowlisted-client\n",
+      systemd: { managerAvailable: true, active: false, restartSucceeds: true },
+    });
+    expect(r.code).toBe(0);
+    expect(r.gatePassed).toBe(false);
+    expect(r.systemctl).toContain("--user restart claude-peers-codex-autodrain.service");
+  });
+
+  test("reachable systemd whose restart fails is surfaced instead of starting a duplicate fallback", async () => {
+    const r = await runWatchdog({
+      file: "codex\n",
+      systemd: { managerAvailable: true, active: false, restartSucceeds: false },
+    });
+    expect(r.code).toBe(1);
+    expect(r.gatePassed).toBe(false);
+    expect(r.systemctl).toContain("--user restart claude-peers-codex-autodrain.service");
+  });
+});
 
 describe("opt-in resolution: env unset → file is the single source", () => {
   test("absent file = off: exits 0 without touching anything", async () => {
@@ -95,6 +154,11 @@ describe("opt-in resolution: env unset → file is the single source", () => {
   });
   test("cursor is an allowlisted client in the file", async () => {
     const r = await runWatchdog({ file: "codex,claude,cursor\n" });
+    expect(r.code).toBe(0);
+    expect(r.gatePassed).toBe(true);
+  });
+  test("kimi is an allowlisted client in the file", async () => {
+    const r = await runWatchdog({ file: "codex,gemini,claude,cursor,agy,kimi\n" });
     expect(r.code).toBe(0);
     expect(r.gatePassed).toBe(true);
   });

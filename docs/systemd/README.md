@@ -69,18 +69,21 @@ cp docs/systemd/claude-peers-codex-autodrain.service \
 chmod 600 ~/.config/systemd/user/claude-peers-codex-autodrain.service
 systemd-analyze --user verify ~/.config/systemd/user/claude-peers-codex-autodrain.service
 systemctl --user daemon-reload
-# enable only if you want systemd (not cron) to own the poller:
+# enable the primary systemd owner; the cron watchdog delegates to it:
 # systemctl --user enable --now claude-peers-codex-autodrain.service
 ```
 
-## Two launchers — pick one
+## Primary systemd owner with tmux fallback
 
-The poller can be supervised by **either**, never both:
+`bin/ensure-codex-autodrain` is safe to leave in cron and in `.tmux.conf`. It
+uses this unit whenever the user manager can resolve it:
 
-- **cron watchdog** (`bin/ensure-codex-autodrain`) — an optional external
-  launcher. Its in-code default keeps auto-nudge disabled.
-- **this systemd unit** — `disabled`/`inactive` by default. If you enable it,
-  disable the cron line first to avoid a double-launch.
+- **active** — exits without launching a second poller;
+- **inactive** — restarts the unit and exits;
+- **unresolvable** — uses its tmux fallback, including the fallback opt-in
+  configuration.
 
-Both keep auto-nudge OFF: the systemd unit via its pinned `NUDGE_CLIENTS=`, the
-cron/in-code path via the poller's default.
+If a resolvable unit fails to restart, the watchdog exits non-zero and never
+falls back to tmux. This keeps a managed-service failure observable instead of
+creating competing supervisors. The unit's `NUDGE_CLIENTS` is authoritative
+while systemd is available; the fallback reads its own explicit opt-in.

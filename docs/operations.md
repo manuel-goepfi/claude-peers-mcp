@@ -160,4 +160,4 @@ The broker append log is created owner-only. Keep logs local and avoid copying t
 
 The AP-063 bridge is a privileged same-UID history cursor. Its 0600 bearer token grants message-history access. Set `CLAUDE_PEERS_BRIDGE_ENABLED=false` to remove token publication and the route completely, then restart the broker.
 
-The auto-drain poller is an optional extension, not a delivery prerequisite. Auto-nudge is off by default. Enabling `NUDGE_CLIENTS` authorizes that poller to type a prompt into selected tmux clients and consume a turn; scope that choice explicitly and run only one poller supervisor.
+The auto-drain poller is an optional extension, not a delivery prerequisite. Auto-nudge is off by default. Enabling `NUDGE_CLIENTS` authorizes that poller to type a prompt into selected tmux clients and consume a turn; scope that choice explicitly. When the systemd poller unit is resolvable, `ensure-codex-autodrain` delegates to it and never launches a second tmux poller; tmux is a fallback only when the managed unit cannot be resolved.
