@@ -27,6 +27,16 @@ const roots: string[] = [];
 const servers: ReturnType<typeof Bun.serve>[] = [];
 const children: Bun.Subprocess[] = [];
 
+function spawnedPid(child: { pid?: number }): number {
+  if (child.pid === undefined) throw new Error("spawned test process has no pid");
+  return child.pid;
+}
+
+function listeningPort(server: { port?: number }): number {
+  if (server.port === undefined) throw new Error("test broker has no listening port");
+  return server.port;
+}
+
 afterEach(() => {
   for (const child of children.splice(0)) {
     try { child.kill("SIGTERM"); } catch { /* already exited */ }
@@ -132,7 +142,7 @@ describe("roster rendering", () => {
     ]);
     const requests: HookRun["requests"] = [];
     const broker = mockBroker(requests, emptyClaim);
-    const r = await runHook(root, broker.port, anchor.pid, anchor.pid);
+    const r = await runHook(root, listeningPort(broker), spawnedPid(anchor), spawnedPid(anchor));
     expect(r.code).toBe(0);
     const ctx = r.output!.hookSpecificOutput.additionalContext;
     expect(r.output!.hookSpecificOutput.hookEventName).toBe("SessionStart");
@@ -164,7 +174,7 @@ describe("roster rendering", () => {
     ]);
     const requests: HookRun["requests"] = [];
     const broker = mockBroker(requests, emptyClaim);
-    const r = await runHook(root, broker.port, anchor.pid!, anchor.pid!);
+    const r = await runHook(root, listeningPort(broker), spawnedPid(anchor), spawnedPid(anchor));
     const ctx = r.output!.hookSpecificOutput.additionalContext;
     expect(ctx).toContain('pane="%11"');
     expect(ctx).toContain('pane="%22"');
@@ -187,7 +197,7 @@ describe("roster rendering", () => {
     ]);
     const requests: HookRun["requests"] = [];
     const broker = mockBroker(requests, emptyClaim);
-    const r = await runHook(root, broker.port, anchor.pid, anchor.pid);
+    const r = await runHook(root, listeningPort(broker), spawnedPid(anchor), spawnedPid(anchor));
     const ctx = r.output!.hookSpecificOutput.additionalContext;
     expect(ctx).toContain("[tag-stripped]");
     expect(ctx).not.toContain("<do-this>");
@@ -208,7 +218,7 @@ describe("roster rendering", () => {
     seedDb(root, peers);
     const requests: HookRun["requests"] = [];
     const broker = mockBroker(requests, emptyClaim);
-    const r = await runHook(root, broker.port, anchor.pid, anchor.pid);
+    const r = await runHook(root, listeningPort(broker), spawnedPid(anchor), spawnedPid(anchor));
     expect(r.output!.hookSpecificOutput.additionalContext).not.toContain("roster capped");
   });
 
@@ -219,7 +229,7 @@ describe("roster rendering", () => {
     children.push(anchor);
     const requests: HookRun["requests"] = [];
     const broker = mockBroker(requests, emptyClaim);
-    const r = await runHook(root, broker.port, anchor.pid, anchor.pid);
+    const r = await runHook(root, listeningPort(broker), spawnedPid(anchor), spawnedPid(anchor));
     expect(r.code).toBe(0);
     expect(r.output).toBeNull();
     expect(requests).toEqual([]); // no drain without a DB
@@ -243,7 +253,7 @@ describe("two-phase drain: claim → render → emit → ack", () => {
           { id: 2, from_id: null, to_id: "selfrow", text: "second message", sent_at: null }, // malformed
         ],
       }), 2);
-    const r = await runHook(root, broker.port, anchor.pid, anchor.pid);
+    const r = await runHook(root, listeningPort(broker), spawnedPid(anchor), spawnedPid(anchor));
     expect(r.code).toBe(0);
     const ctx = r.output!.hookSpecificOutput.additionalContext;
     expect(ctx).toContain("2 peer message(s) were queued");
@@ -266,7 +276,7 @@ describe("two-phase drain: claim → render → emit → ack", () => {
     ]);
     const requests: HookRun["requests"] = [];
     const broker = mockBroker(requests, () => new Response("mangled{{{", { status: 200 }));
-    const r = await runHook(root, broker.port, anchor.pid, anchor.pid);
+    const r = await runHook(root, listeningPort(broker), spawnedPid(anchor), spawnedPid(anchor));
     expect(r.code).toBe(0);
     expect(r.output!.hookSpecificOutput.additionalContext).toContain('<peer name="alpha"'); // greeting not sacrificed
     expect(requests.map((q) => q.path)).toEqual(["/claim-by-pid"]); // never acked
@@ -282,7 +292,7 @@ describe("two-phase drain: claim → render → emit → ack", () => {
       { id: "selfrow", name: "me.1", pid: anchor.pid },
       { id: "peer-a", name: "alpha", summary: "s" },
     ]);
-    const r = await runHook(root, 1, anchor.pid, anchor.pid); // port 1: connect refused
+    const r = await runHook(root, 1, spawnedPid(anchor), spawnedPid(anchor)); // port 1: connect refused
     expect(r.code).toBe(0);
     expect(r.output!.hookSpecificOutput.additionalContext).toContain('<peer name="alpha"');
   });

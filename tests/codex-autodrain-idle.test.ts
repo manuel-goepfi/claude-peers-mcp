@@ -162,7 +162,6 @@ describe("paneTextIsIdle", () => {
 // is ❯ (U+276F, not ›) and the busy vocabulary is Claude's spinner verbs + the
 // "· N tokens" in-flight status row. These fixtures replicate shapes captured
 // live from a real backgrounded Claude pane (2026-06-15).
-import { profileFor } from "../bin/codex-autodrain-poller.ts";
 const CLAUDE = profileFor("claude");
 const cPrompt = bold("❯"); // bright ❯ glyph, as Claude renders the input prompt
 

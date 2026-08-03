@@ -105,6 +105,8 @@ esac
 
 describe("systemd supervision takes precedence over the tmux fallback", () => {
   test("active unit returns before the fallback opt-in gate (planted regression guard)", async () => {
+    const uid = process.getuid?.();
+    if (uid === undefined) throw new Error("systemd supervision test requires a Unix uid");
     const r = await runWatchdog({
       file: "codex\n",
       systemd: { managerAvailable: true, active: true },
@@ -113,8 +115,8 @@ describe("systemd supervision takes precedence over the tmux fallback", () => {
     expect(r.gatePassed).toBe(false);
     expect(r.systemctl).toContain("--user show --property=LoadState --value claude-peers-codex-autodrain.service");
     expect(r.systemctl).toContain("--user is-active --quiet claude-peers-codex-autodrain.service");
-    expect(r.systemctl).toContain(`XDG_RUNTIME_DIR=/run/user/${process.getuid()}`);
-    expect(r.systemctl).toContain(`DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${process.getuid()}/bus`);
+    expect(r.systemctl).toContain(`XDG_RUNTIME_DIR=/run/user/${uid}`);
+    expect(r.systemctl).toContain(`DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${uid}/bus`);
     expect(r.systemctl).not.toContain("restart");
   });
 
