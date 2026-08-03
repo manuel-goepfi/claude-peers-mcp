@@ -33,10 +33,13 @@ import type {
   PollMessagesResponse,
   AckMessagesRequest,
   ClaimByPidRequest,
+  ClaimByThreadRequest,
   ClaimByPidResponse,
   AckByPidRequest,
+  AckByThreadRequest,
   AckByPidResponse,
   HookHeartbeatByPidRequest,
+  HookHeartbeatByThreadRequest,
   DeliveryState,
   ClientType,
   ReceiverMode,
@@ -614,7 +617,6 @@ const selectAllPeers = db.prepare(`
 const publicPeerColumns = `
   id, pid, cwd, git_root, absolute_git_dir, tty, name, resolved_name,
   tmux_session, tmux_window_index, tmux_window_name, tmux_pane_id,
-  thread_id,
   client_type, receiver_mode, last_hook_seen_at, last_drain_at,
   last_drain_error, summary, registered_at, last_seen, seat_key, seat_pids
 `;
@@ -2289,41 +2291,51 @@ type ThreadIdentityProofResult =
   | { ok: true; value: ThreadIdentityProofResponse }
   | { ok: false; status: number; error: string };
 
-function handleIdentityByThread(body: { thread_id: string; caller_pid: number }): ThreadIdentityProofResult {
-  if (!Number.isInteger(body.caller_pid) || body.caller_pid <= 1) {
-    return { ok: false, status: 400, error: "invalid caller_pid" };
-  }
-  const callerErr = verifyPidUid(body.caller_pid);
-  if (callerErr) return { ok: false, status: 403, error: `caller rejected: ${callerErr}` };
-  if (typeof body.thread_id !== "string" || body.thread_id.length === 0 || utf8Bytes(body.thread_id) > 128) {
+type ThreadIdentityRow = Omit<ThreadIdentityProofResponse, "client_type" | "receiver_mode"> & {
+  seat_pids: string | null;
+  client_type: ClientType | null;
+  receiver_mode: ReceiverMode | null;
+};
+
+function resolveLiveThreadIdentity(threadId: string):
+  | { ok: true; row: ThreadIdentityRow }
+  | { ok: false; status: number; error: string } {
+  if (typeof threadId !== "string" || threadId.length === 0 || utf8Bytes(threadId) > 128) {
     return { ok: false, status: 400, error: "invalid thread_id" };
   }
 
-  const matches = (selectIdentityProofByThread.all(body.thread_id) as Array<{
-    id: string;
-    pid: number;
-    cwd: string;
-    git_root: string | null;
-    absolute_git_dir: string | null;
-    tty: string | null;
-    name: string | null;
-    resolved_name: string | null;
-    tmux_session: string | null;
-    tmux_window_index: string | null;
-    tmux_window_name: string | null;
-    tmux_pane_id: string | null;
-    thread_id: string;
-    seat_key: string | null;
-    seat_pids: string | null;
-    client_type: ClientType | null;
-    receiver_mode: ReceiverMode | null;
-  }>).filter((row) => seatPidsAlive(parseSeatPids(row.seat_pids), row.pid, isPidAlive));
+  const matches = (selectIdentityProofByThread.all(threadId) as ThreadIdentityRow[])
+    .filter((row) => seatPidsAlive(parseSeatPids(row.seat_pids), row.pid, isPidAlive));
   if (matches.length === 0) return { ok: false, status: 404, error: "peer not found" };
   if (matches.length !== 1) return { ok: false, status: 409, error: "ambiguous live thread identity" };
 
   const row = matches[0]!;
   const targetErr = verifyPidUid(row.pid);
   if (targetErr) return { ok: false, status: 403, error: `target rejected: ${targetErr}` };
+  return { ok: true, row };
+}
+
+function authThreadDrain(threadId: string, callerPid: number):
+  | { ok: true; id: string }
+  | { ok: false; status: number; error: string } {
+  if (!Number.isInteger(callerPid) || callerPid <= 1) {
+    return { ok: false, status: 400, error: "invalid caller_pid" };
+  }
+  const callerErr = verifyPidUid(callerPid);
+  if (callerErr) return { ok: false, status: 403, error: `caller rejected: ${callerErr}` };
+  const resolved = resolveLiveThreadIdentity(threadId);
+  return resolved.ok ? { ok: true, id: resolved.row.id } : resolved;
+}
+
+function handleIdentityByThread(body: { thread_id: string; caller_pid: number }): ThreadIdentityProofResult {
+  if (!Number.isInteger(body.caller_pid) || body.caller_pid <= 1) {
+    return { ok: false, status: 400, error: "invalid caller_pid" };
+  }
+  const callerErr = verifyPidUid(body.caller_pid);
+  if (callerErr) return { ok: false, status: 403, error: `caller rejected: ${callerErr}` };
+  const resolved = resolveLiveThreadIdentity(body.thread_id);
+  if (!resolved.ok) return resolved;
+  const row = resolved.row;
   const limited = rateCheck(row.id, false);
   if (limited) return { ok: false, status: 429, error: limited };
   const { seat_pids: _seatPids, ...publicRow } = row;
@@ -2497,6 +2509,16 @@ function handleHookHeartbeatByPid(body: HookHeartbeatByPidRequest): { ok: boolea
   if (!auth.ok) {
     return { ok: false, status: auth.status, error: auth.error };
   }
+  return handleHookHeartbeatWithAuth(body, auth);
+}
+
+function handleHookHeartbeatByThread(body: HookHeartbeatByThreadRequest): { ok: boolean; peer_id?: string; error?: string; status?: number } {
+  const auth = authThreadDrain(body.thread_id, Number(body.caller_pid));
+  if (!auth.ok) return { ok: false, status: auth.status, error: auth.error };
+  return handleHookHeartbeatWithAuth(body, auth);
+}
+
+function handleHookHeartbeatWithAuth(body: Omit<HookHeartbeatByPidRequest, "pid">, auth: { ok: true; id: string }): { ok: boolean; peer_id?: string; error?: string; status?: number } {
   const limited = rateCheck(auth.id, false);
   if (limited) return { ok: false, status: 429, error: limited };
   const now = new Date().toISOString();
@@ -2519,6 +2541,16 @@ function handleClaimByPid(body: ClaimByPidRequest): ClaimByPidResponse {
   if (!auth.ok) {
     return { ok: false, status: auth.status, error: auth.error };
   }
+  return handleClaimWithAuth(body, auth);
+}
+
+function handleClaimByThread(body: ClaimByThreadRequest): ClaimByPidResponse {
+  const auth = authThreadDrain(body.thread_id, Number(body.caller_pid));
+  if (!auth.ok) return { ok: false, status: auth.status, error: auth.error };
+  return handleClaimWithAuth(body, auth);
+}
+
+function handleClaimWithAuth(body: Omit<ClaimByPidRequest, "pid">, auth: { ok: true; id: string }): ClaimByPidResponse {
   const limited = rateCheck(auth.id, false);
   if (limited) return { ok: false, status: 429, error: limited };
   const { clientType, receiverMode } = hookMetadata(auth.id, body);
@@ -2569,6 +2601,16 @@ function handleAckByPid(body: AckByPidRequest): AckByPidResponse {
   if (!auth.ok) {
     return { ok: false, status: auth.status, error: auth.error };
   }
+  return handleAckWithAuth(body, auth);
+}
+
+function handleAckByThread(body: AckByThreadRequest): AckByPidResponse {
+  const auth = authThreadDrain(body.thread_id, Number(body.caller_pid));
+  if (!auth.ok) return { ok: false, status: auth.status, error: auth.error };
+  return handleAckWithAuth(body, auth);
+}
+
+function handleAckWithAuth(body: Omit<AckByPidRequest, "pid">, auth: { ok: true; id: string }): AckByPidResponse {
   const limited = rateCheck(auth.id, false);
   if (limited) return { ok: false, status: 429, error: limited };
   const { clientType, receiverMode } = hookMetadata(auth.id, body);
@@ -2814,6 +2856,26 @@ requestHandler = async (req: Request) => {
       if (path === "/send-by-pid") {
         const res = handleSendByPid(body as Record<string, unknown>);
         if (!res.ok) return Response.json({ error: res.error, code: res.code, candidates: res.candidates }, { status: res.status ?? 400 });
+        return Response.json(res);
+      }
+
+      if (path === "/claim-by-thread" || path === "/ack-by-thread" || path === "/hook-heartbeat-by-thread") {
+        const threadBody = {
+          ...body,
+          thread_id: typeof body.thread_id === "string" ? body.thread_id : "",
+        };
+        if (path === "/claim-by-thread") {
+          const res = handleClaimByThread(threadBody as ClaimByThreadRequest);
+          if (!res.ok) return Response.json({ error: res.error }, { status: res.status ?? 400 });
+          return Response.json({ peer_id: res.peer_id, drain_id: res.drain_id, messages: res.messages, state: res.state });
+        }
+        if (path === "/ack-by-thread") {
+          const res = handleAckByThread(threadBody as AckByThreadRequest);
+          if (!res.ok) return Response.json({ error: res.error }, { status: res.status ?? 400 });
+          return Response.json({ peer_id: res.peer_id, acked: res.acked, state: res.state });
+        }
+        const res = handleHookHeartbeatByThread(threadBody as HookHeartbeatByThreadRequest);
+        if (!res.ok) return Response.json({ error: res.error }, { status: res.status ?? 400 });
         return Response.json(res);
       }
 

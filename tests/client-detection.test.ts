@@ -386,6 +386,7 @@ describe("client detection", () => {
   test("Codex hook session_id and MCP _meta.threadId expose the same opaque thread key", () => {
     const threadId = "019fc273-a35b-78f0-9a70-f63b5905540f";
     expect(sessionIdFromHookInput({ session_id: threadId, hook_event_name: "SessionStart" })).toBe(threadId);
+    expect(sessionIdFromHookInput({ session_id: threadId, hook_event_name: "Stop" })).toBe(threadId);
     expect(mcpThreadIdFromRequestMeta({ threadId })).toBe(threadId);
     expect(sessionIdFromHookInput({ session_id: "" })).toBeNull();
     expect(mcpThreadIdFromRequestMeta({})).toBeNull();

@@ -2662,7 +2662,7 @@ async function main() {
     } catch (error) {
       return { ok: false, reason: `hook-owned seat proof unavailable: ${errMsg(error)}` };
     }
-    const verdict = verifyCodexAppServerSeatProof(threadId, proof);
+    const verdict = verifyCodexAppServerSeatProof(threadId, proof, appServerBoundThreadId);
     if (!verdict.ok) return { ok: false, reason: verdict.reason };
 
     if (appServerBoundThreadId) {

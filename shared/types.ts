@@ -328,6 +328,10 @@ export interface ClaimByPidRequest {
   max_bytes?: number;
 }
 
+export type ClaimByThreadRequest = Omit<ClaimByPidRequest, "pid"> & {
+  thread_id: string;
+};
+
 export interface ClaimByPidResponse {
   ok: boolean;
   state?: DeliveryState;
@@ -348,6 +352,10 @@ export interface AckByPidRequest {
   via?: string;
 }
 
+export type AckByThreadRequest = Omit<AckByPidRequest, "pid"> & {
+  thread_id: string;
+};
+
 export interface AckByPidResponse {
   ok: boolean;
   state?: DeliveryState;
@@ -366,3 +374,7 @@ export interface HookHeartbeatByPidRequest {
   drained?: number;
   error?: string;
 }
+
+export type HookHeartbeatByThreadRequest = Omit<HookHeartbeatByPidRequest, "pid"> & {
+  thread_id: string;
+};

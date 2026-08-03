@@ -12,8 +12,21 @@ const child = spawn("bun", [serverScript], {
 });
 const probeThreadId = process.env.MCP_PROBE_THREAD_ID;
 const stdoutChunks: Buffer[] = [];
+let probeOutput = "";
+let probeComplete = false;
 if (probeThreadId) {
-  child.stdout.on("data", (chunk) => stdoutChunks.push(Buffer.from(chunk)));
+  child.stdout.on("data", (chunk) => {
+    const bytes = Buffer.from(chunk);
+    stdoutChunks.push(bytes);
+    probeOutput += bytes.toString("utf8");
+    if (!probeComplete && probeOutput.includes('"id":2')) {
+      probeComplete = true;
+      // Keep stdin open until the tool response is observable. Closing it
+      // immediately after writing the request races server.ts's stdin-EOF
+      // cleanup against the SDK dispatcher and can suppress the response.
+      child.stdin.end();
+    }
+  });
   child.stderr.pipe(process.stderr);
   for (const frame of [
     { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "appserver-proof", version: "0" } } },
@@ -22,16 +35,23 @@ if (probeThreadId) {
   ]) {
     child.stdin.write(`${JSON.stringify(frame)}\n`);
   }
-  child.stdin.end();
 } else {
   process.stdin.pipe(child.stdin);
   child.stdout.pipe(process.stdout);
   child.stderr.pipe(process.stderr);
 }
 
+const probeTimeout = probeThreadId
+  ? setTimeout(() => {
+      child.stdin.end();
+      child.kill();
+    }, 8_000)
+  : null;
+
 const exitCode = await new Promise<number>((resolve, reject) => {
   child.once("error", reject);
   child.once("exit", (code, signal) => resolve(signal ? 1 : (code ?? 0)));
 });
+if (probeTimeout) clearTimeout(probeTimeout);
 if (probeThreadId) process.stdout.write(Buffer.concat(stdoutChunks));
 process.exit(exitCode);

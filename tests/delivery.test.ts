@@ -556,6 +556,15 @@ describe("Live broker delivery features", () => {
       client_type: "codex",
     });
     expect(proof).not.toHaveProperty("token");
+
+    const peers = await brokerFetch<Array<Record<string, unknown>>>("/list-peers", {
+      id: reg.id,
+      scope: "machine",
+      cwd: "/",
+      git_root: null,
+      include_inactive: true,
+    });
+    expect(peers.find((peer) => peer.id === reg.id)).not.toHaveProperty("thread_id");
   });
 
   test("identity proof rejects missing rows and invalid callers instead of degrading to discovery", async () => {
@@ -572,6 +581,35 @@ describe("Live broker delivery features", () => {
       body: JSON.stringify({ thread_id: "missing-thread", caller_pid: 1 }),
     });
     expect(invalidCaller.status).toBe(400);
+  });
+
+  test("identity proof rejects a hook row after its visible Codex seat dies", async () => {
+    const child = spawnSleep();
+    const threadId = "019fc273-dead-hook-seat";
+    await brokerFetch("/register", {
+      pid: child.pid,
+      cwd: "/dead-thread-seat",
+      git_root: null,
+      tty: "/dev/pts/77",
+      name: "infra.dead",
+      tmux_session: "infra",
+      tmux_window_index: "1",
+      tmux_window_name: "peers",
+      tmux_pane_id: "%2493",
+      thread_id: threadId,
+      client_type: "codex",
+      receiver_mode: "codex-hook",
+      summary: "",
+    });
+    child.kill();
+    await child.exited;
+
+    const response = await fetch(`${brokerUrl}/identity-by-thread`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ thread_id: threadId, caller_pid: process.pid }),
+    });
+    expect(response.status).toBe(404);
   });
 
   test("identity proof fails closed when one thread is live in two different panes", async () => {
@@ -604,6 +642,13 @@ describe("Live broker delivery features", () => {
     });
 
     expect(response.status).toBe(409);
+    const claim = await rawPost("/claim-by-thread", {
+      thread_id: threadId,
+      caller_pid: process.pid,
+      drain_id: "ambiguous-must-not-claim",
+    });
+    expect(claim.status).toBe(409);
+    expect(claim.json.error).toBe("ambiguous live thread identity");
   });
 
   test("register-cli creates an authenticated identity that is globally non-targetable", async () => {
@@ -1137,6 +1182,95 @@ describe("Live broker delivery features", () => {
     expect(statusAfter.statuses[0]!.delivered).toBe(true);
     expect(typeof statusAfter.statuses[0]!.delivered_at).toBe("string");
     child.kill();
+  });
+
+  test("thread-bound hook routes atomically claim, ack, and heartbeat the exact Codex seat", async () => {
+    const child = spawnSleep();
+    const threadId = "019fc273-thread-drain-proof";
+    const peer = await brokerFetch<{ id: string }>("/register", {
+      pid: child.pid,
+      cwd: "/thread-drain-safe",
+      git_root: "/thread-drain-safe",
+      absolute_git_dir: "/thread-drain-safe/.git",
+      tty: "/dev/pts/76",
+      name: "infra.thread-drain",
+      tmux_session: "infra",
+      tmux_window_index: "1",
+      tmux_window_name: "peers",
+      tmux_pane_id: "%2492",
+      thread_id: threadId,
+      client_type: "codex",
+      receiver_mode: "codex-hook",
+      summary: "",
+    });
+    const sent = await brokerFetch<{ id: number }>("/send-message", {
+      from_id: peer.id,
+      to_id: peer.id,
+      text: "thread-bound claim",
+    });
+
+    const claim = await rawPost("/claim-by-thread", {
+      thread_id: threadId,
+      caller_pid: process.pid,
+      drain_id: "thread-drain-1",
+      client_type: "codex",
+      receiver_mode: "codex-hook",
+    });
+    expect(claim.status).toBe(200);
+    expect(claim.json.peer_id).toBe(peer.id);
+    expect(claim.json.state).toBe("claimed");
+    expect((claim.json.messages as Array<{ id: number; text: string }>)).toEqual([
+      expect.objectContaining({ id: sent.id, text: "thread-bound claim" }),
+    ]);
+
+    const beforeAck = await brokerFetch<{ statuses: Array<{ state: string; delivered: boolean }> }>(
+      "/message-status",
+      { id: peer.id, ids: [sent.id] },
+    );
+    expect(beforeAck.statuses[0]).toMatchObject({ state: "claimed", delivered: false });
+
+    const ack = await rawPost("/ack-by-thread", {
+      thread_id: threadId,
+      caller_pid: process.pid,
+      drain_id: "thread-drain-1",
+      ids: [sent.id],
+      via: "codex-hook-thread",
+      client_type: "codex",
+      receiver_mode: "codex-hook",
+    });
+    expect(ack.status).toBe(200);
+    expect(ack.json).toMatchObject({ peer_id: peer.id, acked: 1, state: "acknowledged" });
+
+    const heartbeat = await rawPost("/hook-heartbeat-by-thread", {
+      thread_id: threadId,
+      caller_pid: process.pid,
+      status: "ok",
+      drained: 1,
+      client_type: "codex",
+      receiver_mode: "codex-hook",
+    });
+    expect(heartbeat.status).toBe(200);
+    expect(heartbeat.json).toMatchObject({ ok: true, peer_id: peer.id });
+
+    const ro = new Database(TEST_DB, { readonly: true });
+    const row = ro.query(
+      "SELECT last_hook_seen_at, last_drain_at, receiver_mode FROM peers WHERE id = ?",
+    ).get(peer.id) as { last_hook_seen_at: string | null; last_drain_at: string | null; receiver_mode: string };
+    ro.close();
+    expect(typeof row.last_hook_seen_at).toBe("string");
+    expect(typeof row.last_drain_at).toBe("string");
+    expect(row.receiver_mode).toBe("codex-hook");
+    child.kill();
+  });
+
+  test("thread-bound claim fails closed when the hook thread has no live seat", async () => {
+    const missing = await rawPost("/claim-by-thread", {
+      thread_id: "missing-hook-thread",
+      caller_pid: process.pid,
+      drain_id: "must-not-claim",
+    });
+    expect(missing.status).toBe(404);
+    expect(missing.json.error).toBe("peer not found");
   });
 
   test("/ack-by-pid: wrong drain_id does not deliver and records a mismatch", async () => {

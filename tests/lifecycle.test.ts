@@ -94,6 +94,11 @@ function serverEnv(extra: Record<string, string> = {}): Record<string, string | 
     CLAUDE_PEERS_PORT: String(BROKER_PORT),
     CLAUDE_PEERS_DB: TEST_DB,
     CLAUDE_PEERS_BRIDGE_TOKEN_FILE: TEST_TOKEN_FILE,
+    // These fixtures exercise transport lifecycle, not client discovery. The
+    // test runner itself may be hosted below `codex app-server`; pinning the
+    // synthetic child to unknown prevents ambient test-runner ancestry from
+    // turning it into a thread-proof-deferred Codex MCP connection.
+    CLAUDE_PEERS_CLIENT_TYPE: "unknown",
     CLAUDE_PEER_NAME: "lifecycle-test-peer",
     ...extra,
   };

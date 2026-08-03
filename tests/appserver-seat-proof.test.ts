@@ -38,4 +38,11 @@ describe("app-server Codex thread seat proof", () => {
     expect(verifyCodexAppServerSeatProof(THREAD_ID, proof({ seat_key: null }))).toEqual({ ok: false, reason: "durable seat missing" });
     expect(verifyCodexAppServerSeatProof(THREAD_ID, proof({ seat_key: "pane:infra:%9999" }))).toEqual({ ok: false, reason: "durable seat mismatch" });
   });
+
+  test("rejects a second request that lost the race to another thread binding", () => {
+    expect(verifyCodexAppServerSeatProof(THREAD_ID, proof(), "019fc273-other-thread")).toEqual({
+      ok: false,
+      reason: "connection is already bound to a different Codex thread",
+    });
+  });
 });
