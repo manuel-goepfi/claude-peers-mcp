@@ -128,7 +128,7 @@ chmod 700 "$LOG_DIR" 2>/dev/null || true
 
 PANE_ID="${TMUX_PANE:-${CLAUDE_PEER_TMUX_PANE_ID:-}}"
 if [[ -n "$PANE_ID" ]]; then
-  for option in @peer_resolved_name @operator_label; do
+  for option in @operator_label @peer_resolved_name; do
     pane_label="$(tmux show-options -p -t "$PANE_ID" -v "$option" 2>/dev/null || true)"
     pane_label="${pane_label//$'\0'/}"
     if [[ -n "${pane_label//[[:space:]]/}" ]]; then
