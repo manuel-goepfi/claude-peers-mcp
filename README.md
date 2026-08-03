@@ -116,6 +116,8 @@ bun run smoke:install
 
 The doctor performs one `GET /health`, then uses same-user read-only process, config, and SQLite evidence. It never polls, claims, acknowledges, heartbeats, sends, or otherwise changes broker state. While the broker reports `starting` or `migrating`, schema queries are skipped. If health is unreachable while a live or ambiguous database owner exists, schema reads are refused.
 
+In JSON output, `processes.adapters` always contains the complete diagnostic key set: `claude`, `codex`, `gemini`, `cursor`, `agy`, `kimi`, and `unknown`. Cursor, agy, and Kimi process detection does not expand the supported installer or release-smoke boundary above.
+
 Start two client sessions and ask one to call `list_peers`, then send with `send_to_peer` or `send_message`.
 
 ## MCP tools

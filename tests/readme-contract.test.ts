@@ -19,6 +19,8 @@ const toolNames = [
   "whoami",
 ] as const;
 
+const doctorAdapterKeys = ["claude", "codex", "gemini", "cursor", "agy", "kimi", "unknown"] as const;
+
 const publicVariables = [
   "CLAUDE_PEERS_PORT",
   "CLAUDE_PEERS_HOST",
@@ -79,6 +81,14 @@ describe("public distribution contract", () => {
     expect(readme).toContain("manual-drain");
     for (const state of ["queued", "claimed", "acknowledged", "unknown"]) {
       expect(readme).toContain(`\`${state}\``);
+    }
+  });
+
+  test("public guides document the complete doctor adapter inventory", () => {
+    for (const path of ["README.md", "docs/operations.md"] as const) {
+      const guide = read(path);
+      expect(guide).toContain("`processes.adapters`");
+      for (const client of doctorAdapterKeys) expect(guide).toContain(`\`${client}\``);
     }
   });
 
