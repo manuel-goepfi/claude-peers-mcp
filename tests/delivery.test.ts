@@ -1273,6 +1273,135 @@ describe("Live broker delivery features", () => {
     expect(missing.json.error).toBe("peer not found");
   });
 
+  test("thread-bound hook self-registers a missing row with its session_id before retrying the exact claim", async () => {
+    const threadId = `019fc273-self-register-${process.pid}-${Date.now()}`;
+    const observed: Array<{
+      path: string;
+      body: Record<string, unknown> | null;
+      responseStatus: number | null;
+    }> = [];
+    const proxy = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      async fetch(request) {
+        const incoming = new URL(request.url);
+        const bodyText = request.method === "GET" || request.method === "HEAD"
+          ? ""
+          : await request.text();
+        let body: Record<string, unknown> | null = null;
+        if (bodyText) {
+          const parsed = JSON.parse(bodyText) as unknown;
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            body = parsed as Record<string, unknown>;
+          }
+        }
+        const observation = { path: incoming.pathname, body, responseStatus: null as number | null };
+        observed.push(observation);
+        const response = await fetch(`${brokerUrl}${incoming.pathname}${incoming.search}`, {
+          method: request.method,
+          headers: request.headers,
+          body: bodyText || undefined,
+        });
+        observation.responseStatus = response.status;
+        return response;
+      },
+    });
+
+    let hook: ReturnType<typeof Bun.spawn> | null = null;
+    try {
+      const missing = await rawPost("/claim-by-thread", {
+        thread_id: threadId,
+        caller_pid: process.pid,
+        drain_id: "self-register-precondition",
+      });
+      expect(missing.status).toBe(404);
+      expect(missing.json.error).toBe("peer not found");
+
+      const hookScript = new URL("../hooks/codex-drain-peer-inbox.ts", import.meta.url).pathname;
+      hook = Bun.spawn(["bash", "-c", `exec -a codex bun ${JSON.stringify(hookScript)}`], {
+        cwd: new URL("..", import.meta.url).pathname,
+        env: {
+          ...process.env,
+          HOME: broker.root,
+          TMUX: undefined,
+          TMUX_PANE: undefined,
+          CLAUDE_PEER_NAME: "thread-self-register-e2e",
+          CLAUDE_PEERS_BROKER_LOG: `${broker.root}/self-register-broker.log`,
+          CLAUDE_PEERS_MCP_PID: undefined,
+          CLAUDE_PEERS_PORT: String(proxy.port),
+          CLAUDE_PEERS_HOOK_EVENT_NAME: "UserPromptSubmit",
+        },
+        stdin: "pipe",
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      childProcesses.add(hook);
+      const hookStdin = hook.stdin;
+      const hookStdout = hook.stdout;
+      const hookStderr = hook.stderr;
+      if (!hookStdin || typeof hookStdin === "number"
+        || !(hookStdout instanceof ReadableStream)
+        || !(hookStderr instanceof ReadableStream)) {
+        throw new Error("thread self-registration hook pipes unavailable");
+      }
+      const stdoutPromise = new Response(hookStdout).text();
+      const stderrPromise = new Response(hookStderr).text();
+      hookStdin.write(JSON.stringify({
+        hook_event_name: "UserPromptSubmit",
+        session_id: threadId,
+      }));
+      hookStdin.end();
+
+      const [stdout, stderr, code] = await Promise.all([
+        stdoutPromise,
+        stderrPromise,
+        hook.exited,
+      ]);
+      expect(code).toBe(0);
+      expect(stdout.trim()).toBe("");
+      expect(stderr).toContain("peer row missing during drain; attempting bounded self-registration before one retry");
+      expect(stderr).not.toContain("claim retry failed");
+
+      const claimIndexes = observed
+        .map((request, index) => request.path === "/claim-by-thread" ? index : -1)
+        .filter((index) => index >= 0);
+      const registerIndexes = observed
+        .map((request, index) => request.path === "/register" ? index : -1)
+        .filter((index) => index >= 0);
+      expect(claimIndexes).toHaveLength(2);
+      expect(registerIndexes).toHaveLength(1);
+      const registerIndex = registerIndexes[0]!;
+      expect(registerIndex).toBeGreaterThan(claimIndexes[0]!);
+      expect(registerIndex).toBeLessThan(claimIndexes[1]!);
+      expect(observed[registerIndex]!.body?.thread_id).toBe(threadId);
+      expect(claimIndexes.map((index) => observed[index]!.body?.thread_id)).toEqual([threadId, threadId]);
+      expect(claimIndexes.map((index) => observed[index]!.responseStatus)).toEqual([404, 200]);
+      expect(observed.some((request) => request.path === "/claim-by-pid")).toBe(false);
+
+      const db = new Database(TEST_DB, { readonly: true });
+      const row = db.query(
+        "SELECT pid, thread_id, client_type, receiver_mode, last_hook_seen_at FROM peers WHERE thread_id = ?",
+      ).get(threadId) as {
+        pid: number;
+        thread_id: string;
+        client_type: string;
+        receiver_mode: string;
+        last_hook_seen_at: string | null;
+      } | null;
+      db.close();
+      expect(row).toMatchObject({
+        pid: hook.pid,
+        thread_id: threadId,
+        client_type: "codex",
+        receiver_mode: "codex-hook",
+      });
+      expect(typeof row?.last_hook_seen_at).toBe("string");
+    } finally {
+      hook?.kill();
+      proxy.stop(true);
+    }
+  }, 15_000);
+
   test("/ack-by-pid: wrong drain_id does not deliver and records a mismatch", async () => {
     const child = spawnSleep();
     const peer = await brokerFetch<{ id: string }>("/register", {
