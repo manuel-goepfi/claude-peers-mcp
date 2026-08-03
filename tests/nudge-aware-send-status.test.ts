@@ -20,7 +20,7 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { sendStatusHint } from "../server.ts";
+import { manualDrainRoutingHint, sendStatusHint } from "../server.ts";
 import type { SendMessageResponse } from "../shared/types.ts";
 
 type Target = NonNullable<SendMessageResponse["target"]>;
@@ -37,6 +37,19 @@ function target(over: Partial<Target>): Target {
 }
 
 describe("send status hint for nudge-driven lanes", () => {
+  test("a pane-backed Codex manual-drain seat is described as automatic, not a human chore", () => {
+    const hint = manualDrainRoutingHint(target({}));
+    expect(hint).toContain("automatic Codex pane-autodrain");
+    expect(hint).toContain("no human manual drain");
+    expect(hint).not.toContain("fallback=check_messages");
+  });
+
+  test("a seatless manual-drain target remains honestly unreachable", () => {
+    const hint = manualDrainRoutingHint(target({ tmux_pane_id: null }));
+    expect(hint).toContain("no pane");
+    expect(hint).toContain("check_messages");
+  });
+
   test("a lane that HAS drained before is reported as an automatic path", () => {
     // Evidence, not assumption: a prior drain proves a working path exists.
     const hint = sendStatusHint(target({ last_drain_at: "2026-08-01T08:00:00Z" }), false);

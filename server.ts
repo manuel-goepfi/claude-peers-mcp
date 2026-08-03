@@ -1364,18 +1364,30 @@ function receiverFresh(p: Pick<Peer, "receiver_mode" | "last_hook_seen_at">): bo
   return Date.now() - new Date(p.last_hook_seen_at).getTime() < 120_000;
 }
 
+/**
+ * `manual-drain` is an old protocol label, not a claim that an operator must
+ * intervene. Keep the receiver mode for wire compatibility, but render the
+ * actual pane-owned delivery route so peers do not mistake an automatic queue
+ * for a stranded one.
+ */
+export function manualDrainRoutingHint(p: Pick<Peer, "client_type" | "tmux_pane_id">): string {
+  if (!p.tmux_pane_id) return "delivery=check_messages (no pane available to receive an automatic notification)";
+  if (p.client_type === "codex") {
+    return "delivery=automatic Codex pane-autodrain (when the local poller is active; no human manual drain)";
+  }
+  if (p.client_type !== "unknown") {
+    return "delivery=automatic pane nudge then check_messages (no human manual drain)";
+  }
+  return "delivery=check_messages (pane exists but client type is unknown, so no safe automatic route is known)";
+}
+
 function receiverLine(p: Pick<Peer, "client_type" | "receiver_mode" | "last_hook_seen_at" | "last_drain_at" | "last_drain_error" | "tmux_pane_id">): string {
   const parts = [`Receiver: ${p.client_type}/${p.receiver_mode}`];
   if (p.last_hook_seen_at) parts.push(`hook_seen=${p.last_hook_seen_at}`);
   if (p.last_drain_at) parts.push(`last_drain=${p.last_drain_at}`);
   if (p.last_drain_error) parts.push(`last_error=${p.last_drain_error}`);
   if (p.receiver_mode === "manual-drain" || p.receiver_mode === "unknown") {
-    // "manual-drain" names the API the lane calls (check_messages), NOT who calls
-    // it. For a seat with a pane the autodrain poller does the calling, so this
-    // renders as an automatic path rather than a chore awaiting a human.
-    // Report the FACT (a nudgeable pane exists) not a promise (it will be nudged).
-    // The poller's client list is invisible here and defaults to nudging nobody.
-    parts.push(p.tmux_pane_id ? "drain=check_messages (pane present; autodrain poller may nudge it)" : "drain=check_messages (no pane to nudge)");
+    parts.push(manualDrainRoutingHint(p));
   }
   return parts.join(" ");
 }
@@ -2230,9 +2242,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         }
         const lines = matches.map((p) => {
           const resolved = p.resolved_name && p.resolved_name !== p.name ? ` resolved=${p.resolved_name}` : "";
-          const receiver = ` receiver=${p.client_type}/${p.receiver_mode}${receiverFresh(p) ? "" : " stale"}`;
-          const fallback = p.receiver_mode === "manual-drain" || p.receiver_mode === "unknown" ? " fallback=check_messages" : "";
-          return `${p.id}${p.name ? ` (${p.name})` : ""}${resolved}${receiver}${fallback}${p.tmux_session ? ` [tmux ${p.tmux_session}:${p.tmux_window_name}]` : ""}`;
+          const manual = p.receiver_mode === "manual-drain" || p.receiver_mode === "unknown";
+          const receiver = ` receiver=${p.client_type}/${p.receiver_mode}${!manual && !receiverFresh(p) ? " stale" : ""}`;
+          const routing = manual ? ` ${manualDrainRoutingHint(p)}` : "";
+          return `${p.id}${p.name ? ` (${p.name})` : ""}${resolved}${receiver}${routing}${p.tmux_session ? ` [tmux ${p.tmux_session}:${p.tmux_window_name}]` : ""}`;
         });
         return {
           content: [{ type: "text" as const, text: `Found ${matches.length} peer(s):\n${lines.join("\n")}${pending ?? ""}` }],
