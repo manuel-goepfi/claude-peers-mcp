@@ -2687,26 +2687,43 @@ describe("Live broker delivery features", () => {
     childS.kill(); childT.kill();
   });
 
-  test("send_to_peer rejects tmux_pane_id alone as an invalid selector", async () => {
+  test("send_to_peer accepts tmux_pane_id alone and resolves the exact pane", async () => {
+    // This test previously asserted the OPPOSITE — that tmux_pane_id alone was
+    // an INVALID_SELECTOR. That rule was deliberately reversed in broker.ts
+    // (resolveFreshPeer): pane ids are unique across the whole tmux server, so
+    // the session adds description, not identity. Demanding a session made a
+    // lane that HAS a pane unreachable by it, which bit hardest on clients that
+    // strip the environment they hand MCP servers (Cursor) — those recover their
+    // pane but never their session name.
+    //
+    // The test was never updated with that change, so it sat red and got waved
+    // through as "pre-existing" on every run. Now it pins the behaviour the code
+    // actually guarantees: pane-only addressing RESOLVES, and resolves to the
+    // right peer rather than merely being accepted.
     const childS = spawnSleep();
     const childT = spawnSleep();
     const sender = await brokerFetch<{ id: string }>("/register", {
-      pid: childS.pid, cwd: "/tmux-pane-invalid-s", git_root: null, tty: null, name: "tmux-pane-invalid-s",
+      pid: childS.pid, cwd: "/tmux-pane-only-s", git_root: null, tty: null, name: "tmux-pane-only-s",
       tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
     });
-    await brokerFetch<{ id: string }>("/register", {
-      pid: childT.pid, cwd: "/tmux-pane-invalid-t", git_root: null, tty: null, name: "tmux-pane-invalid-t",
-      tmux_session: "tmux-pane-invalid", tmux_window_index: "1", tmux_window_name: "one", tmux_pane_id: "%12", summary: "",
+    const target = await brokerFetch<{ id: string }>("/register", {
+      pid: childT.pid, cwd: "/tmux-pane-only-t", git_root: null, tty: null, name: "tmux-pane-only-t",
+      tmux_session: "tmux-pane-only", tmux_window_index: "1", tmux_window_name: "one", tmux_pane_id: "%12", summary: "",
     });
 
-    const send = await brokerFetch<{ ok: boolean; code?: string; error?: string }>("/send-to-peer", {
+    const send = await brokerFetch<{
+      ok: boolean; code?: string; error?: string; target?: { id: string; seat_key?: string };
+    }>("/send-to-peer", {
       from_id: sender.id,
       selector: { tmux_pane_id: "%12" },
-      text: "invalid tmux pane selector",
+      text: "pane-only selector",
     });
-    expect(send.ok).toBe(false);
-    expect(send.code).toBe("INVALID_SELECTOR");
-    expect(send.error).toContain("tmux_pane_id alone");
+    expect(send.error ?? null).toBeNull();
+    expect(send.ok).toBe(true);
+    // Resolution, not just acceptance: a selector that is accepted but routes to
+    // the wrong seat is worse than one that is rejected.
+    expect(send.target?.id).toBe(target.id);
+    expect(send.target?.seat_key).toBe("pane:tmux-pane-only:%12");
     childS.kill(); childT.kill();
   });
 
