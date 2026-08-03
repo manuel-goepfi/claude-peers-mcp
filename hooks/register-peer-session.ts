@@ -9,7 +9,7 @@ import {
 } from "../shared/tmux-identity.ts";
 import type { ClientType, ReceiverMode, RegisterResponse } from "../shared/types.ts";
 import { composeTmuxFromEnv, parsePsTree, parseTmuxPanes, type TmuxPaneInfo } from "../shared/tmux.ts";
-import { findSingleVisibleCodexProcess } from "../shared/visible-codex.ts";
+import { findSingleVisibleCodexProcess, findVisibleCodexProcessByPaneId } from "../shared/visible-codex.ts";
 import { brokerIsReady, openOwnerOnlyAppendLog, requestBroker } from "../shared/broker-client.ts";
 import { brokerServiceConfig, installedBrokerServiceIsCurrent } from "../shared/broker-service.ts";
 
@@ -51,7 +51,9 @@ function log(msg: string): void {
 export function sessionIdFromHookInput(value: unknown): string | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const sessionId = (value as { session_id?: unknown }).session_id;
-  return typeof sessionId === "string" && sessionId.length > 0 ? sessionId : null;
+  if (typeof sessionId !== "string") return null;
+  const trimmed = sessionId.trim();
+  return trimmed.length > 0 ? trimmed : null;
 }
 
 async function readHookSessionId(): Promise<string | null> {
@@ -228,7 +230,26 @@ export function publishBrokerIdentityToTmux(identity: {
   return result;
 }
 
-function peerName(clientType: HookClientType, pid: number, tmux: TmuxPaneInfo | null, env: Record<string, string | undefined>): string {
+export function readPaneLabel(paneId: string | undefined): string | null {
+  if (!paneId) return null;
+  for (const option of ["@peer_resolved_name", "@operator_label"] as const) {
+    try {
+      const result = Bun.spawnSync(["tmux", "show-options", "-p", "-t", paneId, "-v", option], {
+        stdout: "pipe",
+        stderr: "ignore",
+      });
+      if (result.exitCode !== 0) continue;
+      const value = new TextDecoder().decode(result.stdout).replace(/\0/g, "").trim();
+      if (value) return value;
+    } catch {
+      // Try the next stable label source.
+    }
+  }
+  return null;
+}
+
+export function peerName(clientType: HookClientType, pid: number, tmux: TmuxPaneInfo | null, env: Record<string, string | undefined>, paneLabel: string | null = readPaneLabel(tmux?.pane_id)): string {
+  if (clientType === "codex" && paneLabel) return paneLabel;
   const envName = env.CLAUDE_PEER_NAME?.trim();
   if (envName) return envName;
   if (tmux?.session && tmux.pane_index) return `${tmux.session}.${tmux.pane_index}`;
@@ -243,11 +264,20 @@ async function metadata(): Promise<RegisterMetadata | null> {
   if (!pid && CLIENT_TYPE === "codex") {
     const appServer = findCodexAppServerAncestor(process.ppid, table);
     const visibleCwdHint = appServer ? (cwdOf(appServer.pid) ?? process.cwd()) : process.cwd();
-    const visible = findSingleVisibleCodexProcess(table, visibleCwdHint, { getTty, cwdOf, environOf });
+    const readers = { getTty, cwdOf, environOf };
+    const inheritedPaneId = process.env.TMUX_PANE ?? process.env.CLAUDE_PEER_TMUX_PANE_ID;
+    const exactVisible = inheritedPaneId
+      ? findVisibleCodexProcessByPaneId(table, visibleCwdHint, inheritedPaneId, readers)
+      : null;
+    const visible = inheritedPaneId
+      ? exactVisible
+      : findSingleVisibleCodexProcess(table, visibleCwdHint, readers);
     if (visible) {
       pid = visible.pid;
       identityEnv = visible.env;
-      log(`app-server hook identity resolved via visible TTY pid=${pid} cwd=${visibleCwdHint}`);
+      log(exactVisible
+        ? `app-server hook identity resolved via inherited pane ${inheritedPaneId} pid=${pid} cwd=${visibleCwdHint}`
+        : `app-server hook identity resolved via sole visible TTY pid=${pid} cwd=${visibleCwdHint}`);
     }
   }
   if (!pid) {
@@ -335,7 +365,9 @@ async function ensureBroker(): Promise<void> {
 async function main(): Promise<void> {
   const threadId = await readHookSessionId();
   if (CLIENT_TYPE === "codex" && !threadId) {
-    log("hook input has no session_id; pane registration will remain unavailable to app-server MCP calls");
+    log("hook input has no session_id; refusing an unbound Codex registration");
+    process.exitCode = 1;
+    return;
   }
   const meta = await metadata();
   if (!meta) {
@@ -385,6 +417,7 @@ async function main(): Promise<void> {
 
 if (import.meta.main) {
   main().catch(async (e) => {
+    process.exitCode = 1;
     log(`unexpected failure: ${e instanceof Error ? e.message : String(e)}`);
   });
 }
