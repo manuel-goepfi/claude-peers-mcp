@@ -35,8 +35,9 @@
  *      NUDGE_COOLDOWN_MS (60000), DRY_RUN=1 (log what it WOULD do, send nothing).
  */
 import { Database } from "bun:sqlite";
-import { readFileSync, readlinkSync } from "node:fs";
-import { homedir } from "node:os";
+import { readFileSync, readlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { join } from "node:path";
 import { renderInboundLine } from "../shared/render.ts";
 import { publishBrokerIdentityToTmux } from "../shared/tmux-identity.ts";
 import type { AckByPidResponse, ClaimByPidResponse, Message, RegisterResponse } from "../shared/types.ts";
@@ -142,6 +143,14 @@ const MAX_NUDGE_ATTEMPTS = Number(process.env.MAX_NUDGE_ATTEMPTS ?? 5);
  */
 const SUBMIT_CONFIRM_ATTEMPTS = Number(process.env.SUBMIT_CONFIRM_ATTEMPTS ?? 6);
 const SUBMIT_CONFIRM_INTERVAL_S = process.env.SUBMIT_CONFIRM_INTERVAL_S ?? "0.25";
+
+/**
+ * Settle between pasting and Enter. Must clear Codex 0.146.0's paste-burst
+ * window (~120ms measured), inside which an Enter is taken as a newline rather
+ * than a submit. Bracketed paste is what actually fixes that race; this margin
+ * only covers the tail, and is NOT a substitute for it.
+ */
+const SUBMIT_SETTLE_S = process.env.SUBMIT_SETTLE_S ?? "0.35";
 
 // Per-client idle profile. A lane is only nudged when its profile says the pane
 // is at an empty/placeholder input prompt and shows no busy marker. The two TUIs
@@ -1050,6 +1059,39 @@ function codexPaneReadyForSubmission(lane: Lane, paneId: string): boolean {
  * opening run of characters lands adjacent to the prompt marker where we can
  * recognise it. Whitespace is collapsed because the TUI re-flows what it holds.
  */
+/**
+ * Deliver text as ONE bracketed paste rather than a burst of literal keystrokes.
+ *
+ * Root cause of the 2026-08-03 silent loss (diagnosed by infra.7): the poller
+ * pushed ~7,932 characters through `tmux send-keys -l`, and Codex 0.146.0 treats
+ * an Enter arriving during — or within ~120ms of — a rapid key burst as an
+ * inserted NEWLINE, not a submit. The batch was typed, never submitted, and
+ * acked anyway. The C-m-vs-Enter spelling was ruled out by probe: both deliver a
+ * newline.
+ *
+ * `load-buffer` + `paste-buffer -p` wraps the payload in bracketed-paste markers,
+ * so the TUI sees a single paste event instead of thousands of keypresses, and a
+ * subsequent Enter is unambiguous. `-d` drops the buffer afterwards so a large
+ * batch is not left in tmux's paste ring.
+ *
+ * A longer fixed sleep was explicitly rejected as a fix: it makes the race less
+ * likely without removing it, and the failure it hides is silent.
+ */
+function pasteIntoPane(paneId: string, text: string): boolean {
+  const name = `claude-peers-drain-${process.pid}-${Date.now()}`;
+  const path = join(tmpdir(), `${name}.txt`);
+  try {
+    writeFileSync(path, text);
+    if (!sh(["tmux", "load-buffer", "-b", name, path]).ok) return false;
+    return sh(["tmux", "paste-buffer", "-p", "-d", "-b", name, "-t", paneId]).ok;
+  } catch (e) {
+    log(`paste failed for ${paneId}: ${e instanceof Error ? e.message : String(e)}`);
+    return false;
+  } finally {
+    try { unlinkSync(path); } catch { /* best effort */ }
+  }
+}
+
 export function submissionProbe(text: string): string {
   return text.replace(/\s+/g, " ").trim().slice(0, 48);
 }
@@ -1094,14 +1136,22 @@ export function composerStillHolds(capture: string, probe: string): boolean {
  * repeated message is an annoyance, a dropped one is a broken promise.
  */
 function submitPaneText(paneId: string, text: string): boolean {
-  const sent = sh(["tmux", "send-keys", "-l", "-t", paneId, text]);
-  if (!sent.ok) return false;
-  Bun.spawnSync(["sleep", "0.3"]); // let the TUI commit the text before C-m
-  if (!sh(["tmux", "send-keys", "-t", paneId, "C-m"]).ok) return false;
+  const probe = submissionProbe(text);
+
+  // Do NOT re-type if a previous attempt is still sitting in the composer.
+  // Confirmed submission means an unconfirmed batch is retried next tick, and
+  // re-sending ~8KB each time would stack burst after burst into a composer that
+  // is already failing to submit. Re-Enter the text that is already there.
+  const before = sh(["tmux", "capture-pane", "-p", "-t", paneId]);
+  const alreadyHeld = before.ok && composerStillHolds(before.out, probe);
+  if (!alreadyHeld && !pasteIntoPane(paneId, text)) return false;
+
+  // Settle longer than the TUI's paste-burst window before submitting.
+  Bun.spawnSync(["sleep", SUBMIT_SETTLE_S]);
+  if (!sh(["tmux", "send-keys", "-t", paneId, "Enter"]).ok) return false;
 
   // Poll rather than sleep once: submission latency varies with what the TUI is
   // doing, and a fixed wait either wastes time or reports a false failure.
-  const probe = submissionProbe(text);
   for (let attempt = 0; attempt < SUBMIT_CONFIRM_ATTEMPTS; attempt++) {
     Bun.spawnSync(["sleep", SUBMIT_CONFIRM_INTERVAL_S]);
     const capture = sh(["tmux", "capture-pane", "-p", "-t", paneId]);
