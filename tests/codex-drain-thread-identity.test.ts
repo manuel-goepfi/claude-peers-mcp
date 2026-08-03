@@ -20,7 +20,13 @@
 
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
-import { readThreadId, resolveDrainRoute } from "../hooks/codex-drain-peer-inbox.ts";
+import {
+  BrokerHttpError,
+  isMissingClaimEndpointError,
+  readThreadId,
+  resolveDrainRoute,
+  shouldSelfRegisterAfterClaimError,
+} from "../hooks/codex-drain-peer-inbox.ts";
 
 const source = readFileSync(new URL("../hooks/codex-drain-peer-inbox.ts", import.meta.url), "utf8");
 
@@ -67,6 +73,52 @@ describe("route selection prefers the exact join", () => {
     const route = resolveDrainRoute("claim", 4242, null);
     expect(route.path).toBe("/claim-by-pid");
     expect(route.identity).toEqual({ pid: 4242 });
+  });
+});
+
+describe("stale-broker diagnostic covers BOTH claim route families", () => {
+  // Found by infra.7 reviewing the first cut, and reproduced before fixing: a
+  // hook installed before the broker restarts 404s on whichever claim route it
+  // uses. Recognising only /claim-by-pid dropped the "restart the broker" hint
+  // for every thread-routed drain — the NEWER path, so exactly the one most
+  // likely to outrun a running broker.
+  test.each(["/claim-by-pid", "/claim-by-thread"])("%s 404 is a missing-endpoint error", (path) => {
+    expect(isMissingClaimEndpointError(new BrokerHttpError(path, 404, "Not Found"))).toBe(true);
+  });
+
+  test.each(["/claim-by-pid", "/claim-by-thread"])("the string form is recognised for %s", (path) => {
+    expect(isMissingClaimEndpointError(new Error(`cannot POST ${path}`))).toBe(true);
+  });
+
+  test("a peer-not-found 404 is NOT a missing endpoint, on either family", () => {
+    // Load-bearing distinction: peer-not-found must stay eligible for
+    // self-registration, while a missing endpoint must not (registering cannot
+    // conjure a route). Collapsing them would make the drain retry forever
+    // against a broker that can never answer.
+    for (const path of ["/claim-by-pid", "/claim-by-thread"]) {
+      const err = new BrokerHttpError(path, 404, "peer not found");
+      expect(isMissingClaimEndpointError(err)).toBe(false);
+      expect(shouldSelfRegisterAfterClaimError(err)).toBe(true);
+    }
+  });
+});
+
+describe("self-registration must not drop the thread", () => {
+  test("the drain replays its hook payload into the registration child", () => {
+    // Also from infra.7's review. register-peer-session.ts reads session_id from
+    // ITS OWN stdin, and this hook has already consumed stdin — so a child
+    // spawned without a replay registers thread_id = NULL, and the
+    // /claim-by-thread retry that triggered the registration then 404s against
+    // the row it just created. Silent, and indistinguishable from "the thread
+    // join doesn't work".
+    expect(source).toContain("activeHookInput = hookInput");
+    expect(source).toMatch(/stdin:\s*replay === null \? "ignore" :/);
+  });
+
+  test("a null payload degrades to no stdin rather than sending 'null'", () => {
+    // Writing the literal string "null" would make the child's JSON.parse
+    // succeed with a non-object and mask the absence.
+    expect(source).toContain("activeHookInput === null ? null : JSON.stringify(activeHookInput)");
   });
 });
 

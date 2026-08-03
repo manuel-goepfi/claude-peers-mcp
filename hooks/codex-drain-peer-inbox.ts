@@ -38,6 +38,14 @@ const HOOK_EVENT_NAME = process.env.CLAUDE_PEERS_HOOK_EVENT_NAME ??
  */
 let activeThreadId: string | null = null;
 
+/**
+ * The raw hook payload, retained so self-registration can replay it.
+ * register-peer-session.ts reads session_id from stdin, and this hook has
+ * already consumed its own — without a replay the child registers a row with no
+ * thread_id and the thread-routed retry 404s against the row it just made.
+ */
+let activeHookInput: Record<string, unknown> | null = null;
+
 /** Read Codex's `session_id` out of the hook payload. Non-empty strings only. */
 export function readThreadId(hookInput: Record<string, unknown> | null): string | null {
   const raw = hookInput?.session_id;
@@ -360,12 +368,28 @@ export function isMissingPeerClaimError(error: unknown): boolean {
   return /unknown target pid|no peer|peer not found/i.test(msg);
 }
 
+/**
+ * Both claim route families count as "this broker predates the hook".
+ *
+ * A hook installed before the broker restarts gets a 404 on whichever claim
+ * route it uses, and the operator needs "restart claude-peers-broker" rather
+ * than a bare 404. Recognising only /claim-by-pid silently dropped that
+ * diagnostic for every thread-routed drain — the newer path, so precisely the
+ * one most likely to outrun a running broker.
+ */
+const CLAIM_ROUTES = ["/claim-by-pid", "/claim-by-thread"] as const;
+
 export function isMissingClaimEndpointError(error: unknown): boolean {
   if (error instanceof BrokerHttpError) {
-    return error.path === "/claim-by-pid" && error.status === 404 && !isMissingPeerClaimError(error);
+    return (CLAIM_ROUTES as readonly string[]).includes(error.path)
+      && error.status === 404
+      && !isMissingPeerClaimError(error);
   }
   const msg = errorMessage(error);
-  return /\/claim-by-pid\s+404:\s*(not found)?$/i.test(msg) || /cannot\s+post\s+\/claim-by-pid/i.test(msg);
+  return CLAIM_ROUTES.some((route) =>
+    new RegExp(`${route}\\s+404:\\s*(not found)?$`, "i").test(msg)
+    || new RegExp(`cannot\\s+post\\s+${route}`, "i").test(msg)
+  );
 }
 
 export function shouldSelfRegisterAfterClaimError(error: unknown): boolean {
@@ -401,8 +425,20 @@ export async function waitForRegistrationProcess(
 
 async function registerCurrentSessionForDrain(): Promise<boolean> {
   try {
+    // Forward the ORIGINAL hook payload to the registration child.
+    //
+    // register-peer-session.ts reads session_id from its own stdin. This hook
+    // has already consumed stdin, so a child spawned without it registers a row
+    // with thread_id = NULL — and the /claim-by-thread retry that triggered the
+    // self-registration then 404s again on the row we just created. Silent, and
+    // it would look like the thread join simply not working.
+    //
+    // Replaying the parsed payload is safe: we re-serialize what Codex sent us,
+    // so the child sees the same session_id we bound to.
+    const replay = activeHookInput === null ? null : JSON.stringify(activeHookInput);
     const proc = Bun.spawn(["bun", REGISTER_SCRIPT], {
       env: { ...process.env, CLAUDE_PEERS_CLIENT_TYPE: CLIENT_TYPE },
+      stdin: replay === null ? "ignore" : new TextEncoder().encode(replay),
       stdout: "ignore",
       stderr: "pipe",
     });
@@ -558,6 +594,7 @@ async function main(): Promise<void> {
   // session_id (Gemini, legacy Codex, unreadable payload). The PID carried
   // alongside is used for log lines only — the -by-thread routes ignore it.
   activeThreadId = readThreadId(hookInput);
+  activeHookInput = hookInput;
   let pids: { primary: number; fallbacks: number[] };
   if (activeThreadId) {
     pids = { primary: process.pid, fallbacks: [] };
