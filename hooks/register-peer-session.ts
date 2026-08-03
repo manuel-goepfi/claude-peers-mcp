@@ -211,15 +211,23 @@ export function brokerIdentityPaneTarget(tmuxInfo: TmuxPaneInfo | null, env: Rec
   return sharedBrokerIdentityPaneTarget(tmuxInfo, env);
 }
 
+export function tmuxIdentityMirrorEnabled(env: Record<string, string | undefined> = process.env): boolean {
+  const raw = env.CLAUDE_PEERS_TMUX_IDENTITY_MIRROR?.trim().toLowerCase();
+  if (raw === undefined || raw === "") return true;
+  if (["0", "false", "no", "off"].includes(raw)) return false;
+  return true;
+}
+
 export function publishBrokerIdentityToTmux(identity: {
   id: string;
   name: string | null;
   resolved_name: string | null;
   client_type: ClientType;
   receiver_mode: ReceiverMode;
-}, tmuxInfo: TmuxPaneInfo | null, env: Record<string, string | undefined> = process.env): TmuxMirrorResult {
+}, tmuxInfo: TmuxPaneInfo | null, identityEnv: Record<string, string | undefined> = process.env, controlEnv: Record<string, string | undefined> = process.env): TmuxMirrorResult {
+  if (!tmuxIdentityMirrorEnabled(controlEnv)) return { ok: true, target: null, failedOptions: [], skipped: true };
   const result = sharedPublishBrokerIdentityToTmux(identity, tmuxInfo, {
-    env,
+    env: identityEnv,
     writeOperatorLabel: false,
   });
   if (!result.target) return result;
