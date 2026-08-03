@@ -100,7 +100,12 @@ describe("Codex/Gemini drain hook claim error routing", () => {
   test("hook emits stdout before acking claimed messages", () => {
     const source = readFileSync(new URL("../hooks/codex-drain-peer-inbox.ts", import.meta.url), "utf8");
     const writeIndex = source.indexOf("await Bun.write(Bun.stdout");
-    const ackIndex = source.indexOf('const ack = await post<AckByPidResponse>("/ack-by-pid"', writeIndex);
+    // Matched on the CALL, not on the route literal: the drain now picks
+    // /ack-by-thread or /ack-by-pid at runtime via drainRoute(), so pinning the
+    // literal asserted the spelling rather than the property. The property this
+    // test exists for is the ORDERING — stdout must be emitted before the ack,
+    // so a crash mid-ack cannot lose messages that were never shown.
+    const ackIndex = source.indexOf("const ack = await post<AckByPidResponse>(", writeIndex);
 
     expect(writeIndex).toBeGreaterThan(0);
     expect(ackIndex).toBeGreaterThan(writeIndex);

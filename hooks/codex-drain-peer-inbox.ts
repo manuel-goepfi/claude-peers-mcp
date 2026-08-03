@@ -15,6 +15,34 @@ const RECEIVER_MODE: Extract<ReceiverMode, "codex-hook" | "gemini-hook"> =
   CLIENT_TYPE === "gemini" ? "gemini-hook" : "codex-hook";
 const HOOK_EVENT_NAME = process.env.CLAUDE_PEERS_HOOK_EVENT_NAME ??
   (CLIENT_TYPE === "gemini" ? "BeforeAgent" : "UserPromptSubmit");
+
+/**
+ * Codex thread identity — the exact join, and the fix for "no codex ancestor found".
+ *
+ * Codex hands every hook the SAME ThreadId it stamps into `_meta.threadId` on
+ * external MCP tool calls: SessionStart, UserPromptSubmit and StopCommandInput
+ * all carry `session_id` (codex-rs/hooks/src/schema.rs). The registration hook
+ * persists it on the peer row as `thread_id`, so when we have it we can address
+ * our own row exactly — no process table, no ancestry, no correlation.
+ *
+ * That matters because ancestry does not work under a long-lived
+ * `codex app-server`: the app-server owns the MCP guard/server children rather
+ * than the pane TUI, so walking up from this hook finds no codex parent at all.
+ * Measured 2026-08-03 in ~/.codex/logs/drain-peer-inbox.log: 553 `drain-failed
+ * rc=1` entries, 541 of them immediately preceded by "no codex ancestor found".
+ *
+ * Kept as module state rather than threaded through every call site so the
+ * claim/ack/heartbeat trio can pick their route family in one place. Null means
+ * "no thread identity available" (Gemini, legacy Codex, unreadable payload) and
+ * the pre-existing PID path is used unchanged.
+ */
+let activeThreadId: string | null = null;
+
+/** Read Codex's `session_id` out of the hook payload. Non-empty strings only. */
+export function readThreadId(hookInput: Record<string, unknown> | null): string | null {
+  const raw = hookInput?.session_id;
+  return typeof raw === "string" && raw.trim() ? raw.trim() : null;
+}
 const REGISTER_SCRIPT = new URL("./register-peer-session.ts", import.meta.url).pathname;
 const REGISTER_TIMEOUT_MS = 2_000;
 
@@ -394,10 +422,36 @@ async function registerCurrentSessionForDrain(): Promise<boolean> {
   }
 }
 
+/**
+ * Pick the route family and the identity key for this drain.
+ *
+ * The `-by-thread` routes are atomic siblings of the `-by-pid` ones: each
+ * resolves exactly one LIVE thread row server-side (404 none/dead, 409 duplicate
+ * live rows, 400 invalid, same-UID caller required). Resolving identity and then
+ * claiming as two calls would leave a TOCTOU gap — the mapping can change
+ * between them — which is why the broker exposes claim/ack/heartbeat directly
+ * keyed by thread rather than an identity lookup we join client-side.
+ */
+export function resolveDrainRoute(
+  base: string,
+  pid: number,
+  threadId: string | null,
+): { path: string; identity: Record<string, unknown> } {
+  return threadId
+    ? { path: `/${base}-by-thread`, identity: { thread_id: threadId } }
+    : { path: `/${base}-by-pid`, identity: { pid } };
+}
+
+/** Thin binding of resolveDrainRoute to this drain's resolved thread identity. */
+function drainRoute(base: string, pid: number): { path: string; identity: Record<string, unknown> } {
+  return resolveDrainRoute(base, pid, activeThreadId);
+}
+
 async function heartbeat(pid: number, status: "ok" | "error", drained = 0, error?: string): Promise<void> {
+  const route = drainRoute("hook-heartbeat", pid);
   try {
-    await post("/hook-heartbeat-by-pid", {
-      pid,
+    await post(route.path, {
+      ...route.identity,
       caller_pid: process.pid,
       client_type: CLIENT_TYPE,
       receiver_mode: RECEIVER_MODE,
@@ -411,8 +465,9 @@ async function heartbeat(pid: number, status: "ok" | "error", drained = 0, error
 }
 
 async function claim(pid: number, drainId: string): Promise<ClaimResponse> {
-  return post("/claim-by-pid", {
-    pid,
+  const route = drainRoute("claim", pid);
+  return post(route.path, {
+    ...route.identity,
     caller_pid: process.pid,
     client_type: CLIENT_TYPE,
     receiver_mode: RECEIVER_MODE,
@@ -498,15 +553,25 @@ async function main(): Promise<void> {
     }
   }
 
-  const resolvedPids = findHookPeerPids();
-  if (!resolvedPids) {
-    process.exitCode = 1;
-    return;
+  // Thread identity first: it is an exact join to our own row, so it makes the
+  // process table irrelevant. Only fall back to ancestry when Codex gave us no
+  // session_id (Gemini, legacy Codex, unreadable payload). The PID carried
+  // alongside is used for log lines only — the -by-thread routes ignore it.
+  activeThreadId = readThreadId(hookInput);
+  let pids: { primary: number; fallbacks: number[] };
+  if (activeThreadId) {
+    pids = { primary: process.pid, fallbacks: [] };
+  } else {
+    const resolvedPids = findHookPeerPids();
+    if (!resolvedPids) {
+      process.exitCode = 1;
+      return;
+    }
+    // Seatless by construction: nothing to drain and nothing wrong. Exit 0 so the
+    // wrapper does not log a failure for the expected case.
+    if ("seatless" in resolvedPids) return;
+    pids = resolvedPids;
   }
-  // Seatless by construction: nothing to drain and nothing wrong. Exit 0 so the
-  // wrapper does not log a failure for the expected case.
-  if ("seatless" in resolvedPids) return;
-  const pids = resolvedPids;
 
   const drainId = `${RECEIVER_MODE}:${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
   let claimed: { peer_id?: string; drain_id?: string; messages?: Message[] } | null = null;
@@ -606,8 +671,9 @@ async function main(): Promise<void> {
   }
 
   try {
-    const ack = await post<AckByPidResponse>("/ack-by-pid", {
-      pid,
+    const ackRoute = drainRoute("ack", pid);
+    const ack = await post<AckByPidResponse>(ackRoute.path, {
+      ...ackRoute.identity,
       caller_pid: process.pid,
       client_type: CLIENT_TYPE,
       receiver_mode: RECEIVER_MODE,

@@ -98,6 +98,28 @@ describe("failures leave a trace — the silence is the bug", () => {
   });
 });
 
+describe("survives a minimal environment", () => {
+  test("runs with only PATH set — no HOME", () => {
+    // Regression: the first cut of this wrapper did LOG_DIR="${CODEX_HOME:-$HOME/.codex}/logs"
+    // under `set -u`. Codex (and tests/hook-wrapper.test.ts) can invoke a hook
+    // with PATH and nothing else, where a bare $HOME is an unbound-variable
+    // fatal — the wrapper died before reaching the .ts AND wrote to stderr,
+    // which is exactly what a fail-open hook must never do.
+    const root = mkdtempSync(join(tmpdir(), "codex-drain-minenv-"));
+    mkdirSync(join(root, "hooks"), { recursive: true });
+    writeFileSync(join(root, "hooks", "codex-drain-peer-inbox.ts"), `console.log("{}");\n`);
+    const proc = Bun.spawnSync(["bash", WRAPPER], {
+      env: { PATH: process.env.PATH ?? "", CLAUDE_PEERS_ROOT: root },
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    expect(proc.exitCode).toBe(0);
+    expect(new TextDecoder().decode(proc.stderr)).toBe("");
+    expect(new TextDecoder().decode(proc.stdout).trim()).toBe("{}");
+  });
+});
+
 describe("stdout discipline — Codex must never see a partial payload", () => {
   test("stdout is forwarded verbatim on success", () => {
     const r = runWrapper(`console.log(JSON.stringify({hookSpecificOutput:{ok:true}}));\n`);

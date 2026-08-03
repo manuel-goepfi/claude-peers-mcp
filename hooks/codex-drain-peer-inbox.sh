@@ -29,7 +29,12 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="${CLAUDE_PEERS_ROOT:-$(cd -- "$SCRIPT_DIR/.." && pwd)}"
 SCRIPT="$ROOT/hooks/codex-drain-peer-inbox.ts"
 EVENT="${CLAUDE_PEERS_HOOK_EVENT_NAME:-UserPromptSubmit}"
-LOG_DIR="${CODEX_HOME:-$HOME/.codex}/logs"
+# HOME must be defaulted, not assumed: this wrapper runs under `set -u`, and
+# Codex (and the hook-wrapper tests) can invoke it with a minimal environment
+# that carries PATH and nothing else. A bare $HOME there is an unbound-variable
+# fatal — the wrapper would die before reaching the .ts, and write to stderr
+# while doing it, which is the one thing a fail-open hook must never do.
+LOG_DIR="${CODEX_HOME:-${HOME:-/tmp}/.codex}/logs"
 LOG="$LOG_DIR/drain-peer-inbox.log"
 mkdir -p "$LOG_DIR" 2>/dev/null || true
 
