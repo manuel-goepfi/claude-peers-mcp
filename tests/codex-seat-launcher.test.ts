@@ -84,6 +84,44 @@ afterEach(() => {
 });
 
 describe("codex-seat launcher", () => {
+  test("passes noninteractive subcommands directly without seat dependencies", () => {
+    const { root, state, fakeCodex } = fixture();
+    const bin = join(root, "bin");
+    Bun.spawnSync(["mkdir", "-p", bin]);
+    for (const command of ["bash", "readlink"]) {
+      const resolved = Bun.which(command);
+      if (resolved === null) throw new Error(`${command} is required by this test`);
+      symlinkSync(resolved, join(bin, command));
+    }
+
+    const result = Bun.spawnSync([
+      LAUNCHER,
+      "--strict-config",
+      "--enable",
+      "hooks",
+      "--search",
+      "-c",
+      'model="test"',
+      "exec",
+      "--json",
+    ], {
+      env: {
+        PATH: bin,
+        HOME: root,
+        CLAUDE_PEERS_REAL_CODEX: fakeCodex,
+        FAKE_CODEX_STATE: state,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(existsSync(join(state, "app.pid"))).toBe(false);
+    expect(readFileSync(join(state, "tui.args"), "utf8")).toBe(
+      '--strict-config\n--enable\nhooks\n--search\n-c\nmodel="test"\nexec\n--json\n',
+    );
+  });
+
   test("fails before spawning children when pgrep is unavailable", () => {
     const { root, state, fakeCodex } = fixture();
     const bin = join(root, "bin");
