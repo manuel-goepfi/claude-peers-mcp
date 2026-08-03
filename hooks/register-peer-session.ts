@@ -362,7 +362,7 @@ async function ensureBroker(): Promise<void> {
   }
 }
 
-async function main(): Promise<void> {
+export async function runRegistration(): Promise<void> {
   const threadId = await readHookSessionId();
   if (CLIENT_TYPE === "codex" && !threadId) {
     log("hook input has no session_id; refusing an unbound Codex registration");
@@ -416,7 +416,7 @@ async function main(): Promise<void> {
 }
 
 if (import.meta.main) {
-  main().catch(async (e) => {
+  runRegistration().catch(async (e) => {
     process.exitCode = 1;
     log(`unexpected failure: ${e instanceof Error ? e.message : String(e)}`);
   });

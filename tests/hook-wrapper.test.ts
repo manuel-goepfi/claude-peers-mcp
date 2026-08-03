@@ -9,6 +9,9 @@ function makeFakeInstall(wrapperName: string): { root: string; wrapper: string }
   mkdirSync(hooksDir, { recursive: true });
   const wrapper = join(hooksDir, wrapperName);
   copyFileSync(new URL(`../hooks/${wrapperName}`, import.meta.url), wrapper);
+  if (wrapperName === "codex-register-peer-session.sh") {
+    copyFileSync(new URL("../hooks/codex-register-peer-session.ts", import.meta.url), join(hooksDir, "codex-register-peer-session.ts"));
+  }
   writeFileSync(join(hooksDir, "codex-drain-peer-inbox.ts"), `
 console.log(JSON.stringify({
   cwd: process.cwd(),
@@ -17,10 +20,13 @@ console.log(JSON.stringify({
 }));
 `);
   writeFileSync(join(hooksDir, "register-peer-session.ts"), `
-console.log(JSON.stringify({
-  cwd: process.cwd(),
-  client: process.env.CLAUDE_PEERS_CLIENT_TYPE ?? null
-}));
+export async function runRegistration() {
+  console.log(JSON.stringify({
+    cwd: process.cwd(),
+    client: process.env.CLAUDE_PEERS_CLIENT_TYPE ?? null
+  }));
+}
+if (import.meta.main) await runRegistration();
 `);
   return { root, wrapper };
 }
