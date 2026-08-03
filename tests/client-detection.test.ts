@@ -1,9 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { findClientPidFromTable, findHookPeerPidsFromTable, findMcpPidFromTable } from "../hooks/codex-drain-peer-inbox.ts";
-import { publishBrokerIdentityToTmux, registrationTmuxPaneId, sessionIdFromHookInput } from "../hooks/register-peer-session.ts";
+import { peerName, publishBrokerIdentityToTmux, registrationTmuxPaneId, sessionIdFromHookInput } from "../hooks/register-peer-session.ts";
 import { detectClientFromProcessChain, findBgSpareAncestor, initialReceiverMode, type ProcessInfo } from "../shared/client.ts";
-import { findNearestVisibleCodexProcessByStart } from "../shared/visible-codex.ts";
+import { findNearestVisibleCodexProcessByStart, findVisibleCodexProcessByPaneId } from "../shared/visible-codex.ts";
 import { findCodexAppServerAncestor, findVisibleCodexSession, mcpThreadIdFromRequestMeta, registrationCwd, registrationCwdResult, registrationTtyPid, selectCodexManualDrainPid, shouldUnregisterPeerOnShutdown, unresolvedAppServerToolDiagnostic } from "../server.ts";
 
 function table(rows: ProcessInfo[]): Map<number, ProcessInfo> {
@@ -278,6 +278,34 @@ describe("client detection", () => {
     expect(visible).toBeNull();
   });
 
+  test("matches an app-server hook to the sole visible Codex process carrying its inherited pane", () => {
+    const processes = new Map<number, ProcessInfo>([
+      [200, { pid: 200, ppid: 1, comm: "codex", args: "codex resume" }],
+      [201, { pid: 201, ppid: 1, comm: "codex", args: "codex resume" }],
+    ]);
+    const readers = {
+      getTty: (candidate: number) => candidate === 200 ? "pts/10" : "pts/11",
+      cwdOf: () => "/home/manzo/Clause5",
+      environOf: (candidate: number) => candidate === 200
+        ? { CLAUDE_PEER_NAME: "orch.4", TMUX_PANE: "%2404" }
+        : { CLAUDE_PEER_NAME: "stale-name", TMUX_PANE: "%2432" },
+    };
+
+    expect(findVisibleCodexProcessByPaneId(processes, "/home/manzo/Clause5", "%2432", readers))
+      .toMatchObject({ pid: 201, env: { TMUX_PANE: "%2432" } });
+    expect(findVisibleCodexProcessByPaneId(processes, "/home/manzo/Clause5", "%9999", readers))
+      .toBeNull();
+  });
+
+  test("uses the visible pane-border label as the authoritative Codex name", () => {
+    expect(peerName("codex", 201, { session: "orch", pane_id: "%2432" }, {
+      CLAUDE_PEER_NAME: "stale-launch-name",
+    }, "orch.5")).toBe("orch.5");
+    expect(peerName("claude", 201, { session: "infra", pane_id: "%312" }, {
+      CLAUDE_PEER_NAME: "infra.2",
+    }, "infra.3")).toBe("infra.2");
+  });
+
   test("server startup never adopts a sole same-cwd lane without hook-owned seat proof", () => {
     const src = readFileSync(new URL("../server.ts", import.meta.url), "utf8");
     const startup = src.indexOf("async function main()");
@@ -347,7 +375,6 @@ describe("client detection", () => {
       ...readers,
       processStartTicks: (candidate) => candidate === 300 ? 2_000 : 1_900,
     })).toBeNull();
-
     expect(findNearestVisibleCodexProcessByStart(processes, "/home/manzo/Clause5", 300, {
       ...readers,
       processStartTicks: (candidate) => {
@@ -357,6 +384,7 @@ describe("client detection", () => {
         return null;
       },
     })).toBeNull();
+
   });
 
   test("every tool verifies an unresolved app-server seat before registration or execution", () => {
@@ -389,6 +417,8 @@ describe("client detection", () => {
     expect(sessionIdFromHookInput({ session_id: threadId, hook_event_name: "Stop" })).toBe(threadId);
     expect(mcpThreadIdFromRequestMeta({ threadId })).toBe(threadId);
     expect(sessionIdFromHookInput({ session_id: "" })).toBeNull();
+    expect(sessionIdFromHookInput({ session_id: "   " })).toBeNull();
+    expect(sessionIdFromHookInput({ session_id: `  ${threadId}  ` })).toBe(threadId);
     expect(mcpThreadIdFromRequestMeta({})).toBeNull();
   });
 
@@ -531,6 +561,42 @@ describe("client detection", () => {
 
     expect(proc.exitCode).not.toBe(0);
     expect(stderr).toContain("no gemini ancestor found");
+  });
+
+  test("Codex register hook fails loudly when session_id is missing", () => {
+    const hookPath = new URL("../hooks/register-peer-session.ts", import.meta.url).pathname;
+    const proc = Bun.spawnSync([process.execPath, hookPath], {
+      env: {
+        ...process.env,
+        CLAUDE_PEERS_CLIENT_TYPE: "codex",
+      },
+      stdin: new TextEncoder().encode(JSON.stringify({ hook_event_name: "SessionStart", source: "resume" })),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    expect(proc.exitCode).toBe(1);
+    expect(new TextDecoder().decode(proc.stderr)).toContain("refusing an unbound Codex registration");
+  });
+
+  test("Codex register hook reports an unexpected metadata failure as nonzero", () => {
+    const hookPath = new URL("../hooks/register-peer-session.ts", import.meta.url).pathname;
+    const proc = Bun.spawnSync([process.execPath, hookPath], {
+      env: {
+        CLAUDE_PEERS_CLIENT_TYPE: "codex",
+        PATH: "/definitely-missing",
+      },
+      stdin: new TextEncoder().encode(JSON.stringify({
+        session_id: "019fc273-a35b-78f0-9a70-f63b5905540f",
+        hook_event_name: "SessionStart",
+        source: "resume",
+      })),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    expect(proc.exitCode).toBe(1);
+    expect(new TextDecoder().decode(proc.stderr)).toContain("unexpected failure");
   });
 
   test("broker systemd startup is bounded by timeout", () => {

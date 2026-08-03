@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+# Run one interactive Codex lane against one pane-local app-server. The shared
+# remote app-server does not retain the launching pane environment, so hooks
+# running below it cannot prove which same-cwd Codex TUI owns a session.
+
+set -euo pipefail
+
+SELF="$(readlink -f "$0")"
+
+terminate_pid() {
+  local pid="$1"
+  kill -TERM "$pid" 2>/dev/null || true
+}
+
+pid_running() {
+  local pid="$1"
+  [[ -r "/proc/$pid/stat" ]] || return 1
+  [[ "$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null || true)" != "Z" ]]
+}
+
+tree_pids_postorder() {
+  local pid="$1"
+  local child
+  while read -r child; do
+    [[ -n "$child" ]] && tree_pids_postorder "$child"
+  done < <(pgrep -P "$pid" 2>/dev/null || true)
+  printf '%s\n' "$pid"
+}
+
+terminate_tree() {
+  local root="$1"
+  local pid
+  local -a targets=()
+  mapfile -t targets < <(tree_pids_postorder "$root")
+  for pid in "${targets[@]}"; do terminate_pid "$pid"; done
+  for _ in {1..10}; do
+    local alive=0
+    for pid in "${targets[@]}"; do pid_running "$pid" && alive=1; done
+    (( alive == 0 )) && return
+    sleep 0.1
+  done
+  for pid in "${targets[@]}"; do kill -KILL "$pid" 2>/dev/null || true; done
+}
+
+terminate_group() {
+  local leader="$1"
+  kill -TERM -- "-$leader" 2>/dev/null || true
+  for _ in {1..10}; do
+    pgrep -g "$leader" >/dev/null 2>&1 || return 0
+    sleep 0.1
+  done
+  kill -KILL -- "-$leader" 2>/dev/null || true
+}
+
+listener_owned_by_group() {
+  local port="$1"
+  local group="$2"
+  local listener_pid
+  local listener_group
+  while read -r listener_pid; do
+    [[ -n "$listener_pid" ]] || continue
+    listener_group="$(ps -o pgid= -p "$listener_pid" 2>/dev/null | tr -d '[:space:]')"
+    [[ "$listener_group" == "$group" ]] && return 0
+  done < <(ss -H -ltnp "sport = :$port" 2>/dev/null | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u)
+  return 1
+}
+
+if [[ "${1:-}" == "--watch" ]]; then
+  [[ $# -eq 5 ]] || exit 64
+  owner_pid="$2"
+  owner_start="$3"
+  app_group="$4"
+  tui_pid="$5"
+  while [[ -r "/proc/$owner_pid/stat" ]]; do
+    current_start="$(awk '{print $22}' "/proc/$owner_pid/stat" 2>/dev/null || true)"
+    [[ "$current_start" == "$owner_start" ]] || break
+    sleep 0.2
+  done
+  terminate_tree "$tui_pid"
+  terminate_group "$app_group"
+  exit 0
+fi
+
+REAL_CODEX="${CLAUDE_PEERS_REAL_CODEX:-$(type -P codex || true)}"
+if [[ -z "$REAL_CODEX" || ! -x "$REAL_CODEX" || "$(readlink -f "$REAL_CODEX")" == "$SELF" ]]; then
+  printf 'codex-seat: set CLAUDE_PEERS_REAL_CODEX to the real Codex executable\n' >&2
+  exit 127
+fi
+command -v ss >/dev/null 2>&1 || { printf 'codex-seat: ss is required for listener ownership verification\n' >&2; exit 127; }
+command -v pgrep >/dev/null 2>&1 || { printf 'codex-seat: pgrep is required for process cleanup\n' >&2; exit 127; }
+
+CODEX_STATE_HOME="${CODEX_HOME:-${HOME:-/tmp}/.codex}"
+LOG_DIR="$CODEX_STATE_HOME/logs"
+mkdir -p "$LOG_DIR"
+chmod 700 "$LOG_DIR" 2>/dev/null || true
+
+PANE_ID="${TMUX_PANE:-${CLAUDE_PEER_TMUX_PANE_ID:-}}"
+if [[ -n "$PANE_ID" ]]; then
+  for option in @peer_resolved_name @operator_label; do
+    pane_label="$(tmux show-options -p -t "$PANE_ID" -v "$option" 2>/dev/null || true)"
+    pane_label="${pane_label//$'\0'/}"
+    if [[ -n "${pane_label//[[:space:]]/}" ]]; then
+      export CLAUDE_PEER_NAME="$pane_label"
+      break
+    fi
+  done
+  export CLAUDE_PEER_TMUX_PANE_ID="$PANE_ID"
+  CLAUDE_PEER_TMUX_SESSION="$(tmux display-message -p -t "$PANE_ID" '#S' 2>/dev/null || true)"
+  CLAUDE_PEER_TMUX_WINDOW_INDEX="$(tmux display-message -p -t "$PANE_ID" '#I' 2>/dev/null || true)"
+  CLAUDE_PEER_TMUX_WINDOW_NAME="$(tmux display-message -p -t "$PANE_ID" '#W' 2>/dev/null || true)"
+  export CLAUDE_PEER_TMUX_SESSION CLAUDE_PEER_TMUX_WINDOW_INDEX CLAUDE_PEER_TMUX_WINDOW_NAME
+fi
+
+if [[ -n "${CLAUDE_PEERS_CODEX_SEAT_PORT:-}" ]]; then
+  [[ "$CLAUDE_PEERS_CODEX_SEAT_PORT" =~ ^[0-9]+$ ]] || { printf 'codex-seat: invalid fixed port\n' >&2; exit 64; }
+  (( CLAUDE_PEERS_CODEX_SEAT_PORT >= 1024 && CLAUDE_PEERS_CODEX_SEAT_PORT <= 65535 )) || {
+    printf 'codex-seat: fixed port outside 1024..65535\n' >&2
+    exit 64
+  }
+  port_seed="$CLAUDE_PEERS_CODEX_SEAT_PORT"
+  attempts=1
+else
+  pane_number="${PANE_ID#%}"
+  [[ "$pane_number" =~ ^[0-9]+$ ]] || pane_number="$$"
+  port_seed=$((40000 + (pane_number % 20000)))
+  attempts=32
+fi
+
+APP_PID=""
+TUI_PID=""
+WATCHDOG_PID=""
+
+# shellcheck disable=SC2317
+cleanup() {
+  local rc=$?
+  trap - EXIT HUP INT TERM
+  [[ -n "$TUI_PID" ]] && terminate_tree "$TUI_PID"
+  [[ -n "$APP_PID" ]] && terminate_group "$APP_PID"
+  [[ -n "$WATCHDOG_PID" ]] && terminate_pid "$WATCHDOG_PID"
+  if [[ -n "$TUI_PID" ]]; then wait "$TUI_PID" 2>/dev/null || true; fi
+  if [[ -n "$APP_PID" ]]; then wait "$APP_PID" 2>/dev/null || true; fi
+  if [[ -n "$WATCHDOG_PID" ]]; then wait "$WATCHDOG_PID" 2>/dev/null || true; fi
+  exit "$rc"
+}
+trap cleanup EXIT HUP INT TERM
+
+for ((offset = 0; offset < attempts; offset++)); do
+  port=$((port_seed + offset))
+  (( port <= 59999 )) || port=$((40000 + (port - 60000)))
+  endpoint="ws://127.0.0.1:$port"
+  safe_pane="${PANE_ID#%}"
+  [[ -n "$safe_pane" ]] || safe_pane="pid-$$"
+  app_log="$LOG_DIR/codex-seat-${safe_pane}.app-server.log"
+
+  setsid "$REAL_CODEX" -c features.code_mode_host=true app-server --listen "$endpoint" >>"$app_log" 2>&1 &
+  APP_PID=$!
+  for _ in {1..50}; do
+    kill -0 "$APP_PID" 2>/dev/null || break
+    if curl -fsS --connect-timeout 0.2 --max-time 0.5 "http://127.0.0.1:$port/readyz" >/dev/null 2>&1 \
+      && kill -0 "$APP_PID" 2>/dev/null \
+      && listener_owned_by_group "$port" "$APP_PID"; then
+      break 2
+    fi
+    sleep 0.1
+  done
+  terminate_group "$APP_PID"
+  wait "$APP_PID" 2>/dev/null || true
+  APP_PID=""
+done
+
+if [[ -z "$APP_PID" ]] || ! kill -0 "$APP_PID" 2>/dev/null; then
+  printf 'codex-seat: could not start a pane-local app-server; see %s\n' "$LOG_DIR" >&2
+  exit 1
+fi
+
+"$REAL_CODEX" --remote "$endpoint" "$@" <&0 &
+TUI_PID=$!
+owner_start="$(awk '{print $22}' "/proc/$$/stat")"
+setsid "$SELF" --watch "$$" "$owner_start" "$APP_PID" "$TUI_PID" >/dev/null 2>&1 &
+WATCHDOG_PID=$!
+
+set +e
+wait "$TUI_PID"
+tui_status=$?
+set -e
+exit "$tui_status"

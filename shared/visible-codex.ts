@@ -105,6 +105,32 @@ export function findSingleVisibleCodexProcess(
   return candidates.length === 1 ? candidates[0]! : null;
 }
 
+export function findVisibleCodexProcessByPaneId(
+  processes: Map<number, ProcessInfo> | Iterable<ProcessInfo>,
+  cwdHint: string,
+  paneId: string,
+  readers: VisibleCodexReaders = {},
+): VisibleCodexProcess | null {
+  const ttyReader = readers.getTty ?? defaultGetTty;
+  const cwdReader = readers.cwdOf ?? defaultCwdOf;
+  const envReader = readers.environOf ?? defaultEnvironOf;
+  const rows = processes instanceof Map ? processes.values() : processes;
+  const candidates: VisibleCodexProcess[] = [];
+
+  for (const row of rows) {
+    if (!isVisibleCodexProcess(row)) continue;
+    const tty = ttyReader(row.pid);
+    if (!tty) continue;
+    const cwd = cwdReader(row.pid);
+    if (!cwd || cwd !== cwdHint) continue;
+    const env = envReader(row.pid);
+    if (env.TMUX_PANE !== paneId && env.CLAUDE_PEER_TMUX_PANE_ID !== paneId) continue;
+    candidates.push({ pid: row.pid, cwd, tty, env });
+  }
+
+  return candidates.length === 1 ? candidates[0]! : null;
+}
+
 export function findNearestVisibleCodexProcessByStart(
   processes: Map<number, ProcessInfo> | Iterable<ProcessInfo>,
   cwdHint: string,
