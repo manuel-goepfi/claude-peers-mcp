@@ -15,7 +15,27 @@ POLL_INTERVAL=$(positive_int "${CLAUDE_PEERS_STANDBY_POLL_INTERVAL_SECONDS:-10}"
 IDLE_INTERVAL=$(positive_int "${CLAUDE_PEERS_STANDBY_IDLE_INTERVAL_SECONDS:-60}" 60)
 LOCK_WAIT=$(positive_int "${CLAUDE_PEERS_STANDBY_LOCK_WAIT_SECONDS:-2}" 2)
 BROKER_PORT="${CLAUDE_PEERS_PORT:-7899}"
-command -v jq >/dev/null 2>&1 || exit 0
+
+# Logging is set up BEFORE any early exit, on purpose.
+#
+# Every bail-out below used to be a bare `exit 0`. The Stop hook therefore
+# reported success, Claude's transcript listed this script with no hookErrors,
+# and no watcher existed — a failure that is invisible from every direction at
+# once. Measured 2026-08-03: idle Claude lanes stopped waking for peer mail and
+# the only way to find out why was to read the script.
+LOG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/logs"
+mkdir -p "$LOG_DIR" 2>/dev/null
+STANDBY_LOG="$LOG_DIR/standby-watcher.log"
+
+# Exit without arming the watcher, leaving a trace. Still exit 0: a Stop hook
+# must never block the turn. The point is that "did nothing" becomes visible.
+bail() {
+  printf '%s no-watch reason=%s session=%s claude_pid=%s\n' \
+    "$(date -Iseconds)" "$1" "${SESSION_ID:-none}" "${CLAUDE_PID:-none}" >> "$STANDBY_LOG" 2>/dev/null
+  exit 0
+}
+
+command -v jq >/dev/null 2>&1 || bail missing-jq
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
@@ -60,7 +80,7 @@ if [[ -z "${CLAUDE_PEERS_STANDBY_CLAUDE_PID:-}" ]]; then
     [[ -z "$walk" || "$walk" == "1" ]] && break
   done
 fi
-[[ "$CLAUDE_PID" =~ ^[0-9]+$ ]] || exit 0
+[[ "$CLAUDE_PID" =~ ^[0-9]+$ ]] || bail no-claude-pid
 
 find_mcp_pid() {
   local try walk comm
@@ -79,8 +99,24 @@ find_mcp_pid() {
   return 1
 }
 
+# Thread identity is the primary route; the MCP pid is only a fallback.
+#
+# Claude's hooks contract guarantees session_id on Stop stdin. It does NOT
+# guarantee that this hook is an ancestor-descendant of the session's MCP server
+# — and in the live detached topology it is not, so find_mcp_pid() returns
+# nothing and the watcher used to die here with no trace. session_id is the same
+# identifier the SessionStart hook persists as peers.thread_id, so it addresses
+# our own row exactly, with no process tree involved.
+#
+# The pid path is kept for rows registered before thread_id existed (most of the
+# fleet right now) and for Gemini/legacy clients. Ancestry therefore survives
+# only as a FALLBACK and as liveness (`kill -0 "$CLAUDE_PID"` in the loop below),
+# never as the primary identity.
 MCP_PID="${CLAUDE_PEERS_STANDBY_MCP_PID:-$(find_mcp_pid)}"
-[[ "$MCP_PID" =~ ^[0-9]+$ ]] || exit 0
+if [[ ! "$MCP_PID" =~ ^[0-9]+$ ]]; then
+  MCP_PID=""
+  [[ -n "$SESSION_ID" ]] || bail no-mcp-pid-and-no-session-id
+fi
 
 LOCK_KEY="${SESSION_ID:-$CLAUDE_PID}"
 if [[ ! "$LOCK_KEY" =~ ^[A-Za-z0-9._-]{1,128}$ ]]; then LOCK_KEY="$CLAUDE_PID"; fi
@@ -114,9 +150,6 @@ chmod 600 "$LOCK_FILE" 2>/dev/null || exit 0
 # contender exits without creating a duplicate poller.
 flock -w "$LOCK_WAIT" 200 || exit 0
 
-LOG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/logs"
-mkdir -p "$LOG_DIR" 2>/dev/null
-
 wake_mode() {
   local summary=""
   if command -v sqlite3 >/dev/null 2>&1; then
@@ -143,13 +176,51 @@ sleep_idle_interruptibly() {
   done
 }
 
+# Which identity route is known to work for this session. Latched on first
+# success so we stop paying for a failing probe every tick: "unknown" tries
+# thread first, "thread" and "pid" go straight to the proven one.
+ROUTE_MODE="unknown"
+
 while kill -0 "$CLAUDE_PID" 2>/dev/null; do
   read -r _ CURRENT_MCP_PID < "$STATE_FILE" 2>/dev/null || CURRENT_MCP_PID=""
   if [[ "$CURRENT_MCP_PID" =~ ^[0-9]+$ ]]; then MCP_PID="$CURRENT_MCP_PID"; fi
-  RAW=$(curl -s -m 3 -w $'\n%{http_code}' -X POST "http://127.0.0.1:${BROKER_PORT}/claim-by-pid" \
-    -H 'Content-Type: application/json' \
-    -d "{\"pid\":${MCP_PID},\"caller_pid\":${CLAUDE_PID},\"client_type\":\"claude\",\"receiver_mode\":\"claude-channel\"}" 2>/dev/null)
-  STATUS=$(printf '%s\n' "$RAW" | tail -n1)
+  # Route by thread identity when we have it; fall back to the pid path only for
+  # rows that predate thread_id. Both endpoints are atomic claims — resolving an
+  # identity and then claiming as two calls would leave a TOCTOU gap, since the
+  # mapping can change between them.
+  RAW=""
+  STATUS=""
+  if [[ -n "$SESSION_ID" && "$ROUTE_MODE" != "pid" ]]; then
+    CLAIM_BODY=$(jq -nc --arg thread "$SESSION_ID" --argjson caller "$CLAUDE_PID" \
+      '{thread_id:$thread, caller_pid:$caller, client_type:"claude", receiver_mode:"claude-channel"}')
+    RAW=$(curl -s -m 3 -w $'\n%{http_code}' -X POST "http://127.0.0.1:${BROKER_PORT}/claim-by-thread" \
+      -H 'Content-Type: application/json' -d "$CLAIM_BODY" 2>/dev/null)
+    STATUS=$(printf '%s\n' "$RAW" | tail -n1)
+    # A 200 alone is not proof the route works: it must actually be a CLAIM
+    # response. Latching on the status code would accept any 200-returning
+    # endpoint and then poll it forever finding no mail, which is a hang rather
+    # than a failure. A real claim always carries a `messages` array, empty or not.
+    if [[ "$STATUS" == "200" ]] \
+      && [[ "$(printf '%s' "$RAW" | sed '$d' | jq -r 'has("messages")' 2>/dev/null)" == "true" ]]; then
+      ROUTE_MODE="thread"
+    elif [[ -n "$MCP_PID" ]]; then
+      # No row carries this thread yet (rows registered before thread_id, which
+      # is most of the fleet today). Fall back rather than spin: this change must
+      # never be worse than the pid-only behaviour it replaces.
+      [[ "$ROUTE_MODE" == "unknown" ]] && printf '%s thread-route-unavailable status=%s session=%s falling-back=pid\n' \
+        "$(date -Iseconds)" "${STATUS:-curl_failed}" "$SESSION_ID" >> "$STANDBY_LOG" 2>/dev/null
+      ROUTE_MODE="pid"
+      RAW=""
+    fi
+  fi
+  if [[ -z "$RAW" ]]; then
+    [[ -n "$MCP_PID" ]] || { sleep "$POLL_INTERVAL"; continue; }
+    CLAIM_BODY=$(jq -nc --argjson pid "$MCP_PID" --argjson caller "$CLAUDE_PID" \
+      '{pid:$pid, caller_pid:$caller, client_type:"claude", receiver_mode:"claude-channel"}')
+    RAW=$(curl -s -m 3 -w $'\n%{http_code}' -X POST "http://127.0.0.1:${BROKER_PORT}/claim-by-pid" \
+      -H 'Content-Type: application/json' -d "$CLAIM_BODY" 2>/dev/null)
+    STATUS=$(printf '%s\n' "$RAW" | tail -n1)
+  fi
   RESP=$(printf '%s' "$RAW" | sed '$d')
 
   if [[ -z "$STATUS" || "$STATUS" != "200" ]]; then
@@ -171,9 +242,19 @@ while kill -0 "$CLAUDE_PID" 2>/dev/null; do
         DRAIN_ID=$(printf '%s' "$RESP" | jq -r '.drain_id // empty' 2>/dev/null)
         IDS=$(printf '%s' "$RESP" | jq -c '[.messages[].id]' 2>/dev/null)
         if [[ -n "$DRAIN_ID" && "$IDS" != "[]" ]]; then
-          ACK_BODY=$(jq -nc --argjson pid "$MCP_PID" --argjson caller "$CLAUDE_PID" --arg drain "$DRAIN_ID" --argjson ids "$IDS" \
-            '{pid:$pid, caller_pid:$caller, drain_id:$drain, ids:$ids, via:"claude-standby-hook", client_type:"claude", receiver_mode:"claude-channel"}')
-          ACK_RAW=$(curl -s -m 3 -w $'\n%{http_code}' -X POST "http://127.0.0.1:${BROKER_PORT}/ack-by-pid" \
+          # Ack on the SAME route family the claim used. Mixing them would ack
+          # against a different resolution of "who we are" than the one that
+          # handed us the messages.
+          if [[ "$ROUTE_MODE" == "thread" ]]; then
+            ACK_PATH="/ack-by-thread"
+            ACK_BODY=$(jq -nc --arg thread "$SESSION_ID" --argjson caller "$CLAUDE_PID" --arg drain "$DRAIN_ID" --argjson ids "$IDS" \
+              '{thread_id:$thread, caller_pid:$caller, drain_id:$drain, ids:$ids, via:"claude-standby-hook", client_type:"claude", receiver_mode:"claude-channel"}')
+          else
+            ACK_PATH="/ack-by-pid"
+            ACK_BODY=$(jq -nc --argjson pid "$MCP_PID" --argjson caller "$CLAUDE_PID" --arg drain "$DRAIN_ID" --argjson ids "$IDS" \
+              '{pid:$pid, caller_pid:$caller, drain_id:$drain, ids:$ids, via:"claude-standby-hook", client_type:"claude", receiver_mode:"claude-channel"}')
+          fi
+          ACK_RAW=$(curl -s -m 3 -w $'\n%{http_code}' -X POST "http://127.0.0.1:${BROKER_PORT}${ACK_PATH}" \
             -H 'Content-Type: application/json' -d "$ACK_BODY" 2>/dev/null)
           ACK_STATUS=$(printf '%s\n' "$ACK_RAW" | tail -n1)
           ACK_COUNT=$(printf '%s' "$ACK_RAW" | sed '$d' | jq -r '.acked // 0' 2>/dev/null)

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
@@ -151,8 +151,21 @@ describe("Claude standby watcher", () => {
     expect(stderr).toContain("[REDACTED-PEER-MSG-TAG]");
     expect(stderr).not.toContain("</PEER-MESSAGE>");
     expect(stderr).not.toContain("\u001b");
-    expect(requests.map((request) => request.path)).toEqual(["/claim-by-pid", "/ack-by-pid"]);
-    expect(requests[1]?.body).toMatchObject({ pid: anchor.pid, caller_pid: anchor.pid, drain_id: "drain-7", ids: [7] });
+    // Thread identity is probed FIRST, then the watcher falls back to the pid
+    // route because this fixture's peer row carries no thread_id — the state
+    // most of the live fleet is in. Pinning the full sequence (rather than just
+    // the last two calls) is what proves the fallback actually happened instead
+    // of the thread route silently succeeding against a stub.
+    expect(requests.map((request) => request.path)).toEqual([
+      "/claim-by-thread",
+      "/claim-by-pid",
+      "/ack-by-pid",
+    ]);
+    // index 2, not 1: [0] is the thread probe, [1] the pid claim, [2] the ack.
+    expect(requests[2]?.body).toMatchObject({ pid: anchor.pid, caller_pid: anchor.pid, drain_id: "drain-7", ids: [7] });
+    // The ack must use the SAME route family the claim succeeded on, or it acks
+    // against a different resolution of identity than the one that served the mail.
+    expect(requests[2]?.path).toBe("/ack-by-pid");
   });
 
   test("remains reachable at the low cadence after the fast window expires", async () => {
@@ -194,6 +207,83 @@ describe("Claude standby watcher", () => {
     expect(stderr).toContain("late reply");
   }, 6_000);
 
+  test("drains by thread identity when the MCP pid is NOT discoverable by ancestry", async () => {
+    // The live failure, 2026-08-03. Claude's hooks contract guarantees session_id
+    // on Stop stdin; it does NOT guarantee that this hook is an ancestor of the
+    // session's MCP server. In the real detached topology find_mcp_pid() finds
+    // nothing, and the watcher used to `exit 0` silently — Stop reported success,
+    // the transcript showed no hookErrors, and no watcher existed.
+    //
+    // This is the case every other test in this file misses, because they all
+    // INJECT CLAUDE_PEERS_STANDBY_MCP_PID and so never exercise discovery
+    // failure. Note the absence of that variable below — that is the point.
+    const root = mkdtempSync(join(tmpdir(), "claude-peers-standby-detached-"));
+    roots.push(root);
+    const runtime = join(root, "runtime");
+    mkdirSync(runtime, { mode: 0o700 });
+    const requests: Array<{ path: string; body: Record<string, unknown> }> = [];
+    const broker = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      async fetch(request) {
+        const path = new URL(request.url).pathname;
+        const body = await request.json() as Record<string, unknown>;
+        requests.push({ path, body });
+        if (path === "/claim-by-thread") {
+          return Response.json({
+            peer_id: "peer-detached",
+            drain_id: "drain-99",
+            messages: [{ id: 99, from_id: "codex-peer", to_id: "peer-detached", text: "detached delivery", sent_at: "2026-08-03T11:00:00Z", delivered: false, delivered_at: null }],
+          });
+        }
+        return Response.json({ ok: true, acked: 1 });
+      },
+    });
+    servers.push(broker);
+    const anchor = Bun.spawn(["sleep", "20"]);
+    children.push(anchor);
+
+    // Force discovery to FAIL, deterministically.
+    //
+    // Simply omitting CLAUDE_PEERS_STANDBY_MCP_PID is not enough and quietly
+    // made this test meaningless on the first attempt: the test runner is a
+    // descendant of a real `claude` process, so find_mcp_pid() walked up, found
+    // it, and resolved the OPERATOR'S OWN live MCP server. The test passed while
+    // exercising the opposite of the detached case — and worse, pointed a test
+    // at a live session's adapter.
+    //
+    // A `ps` shim that reports nothing reproduces the real detached topology
+    // honestly: no claude ancestor, no server child, discovery returns nothing.
+    const shimBin = join(root, "bin");
+    mkdirSync(shimBin, { mode: 0o700 });
+    writeFileSync(join(shimBin, "ps"), "#!/usr/bin/env bash\nexit 0\n", { mode: 0o755 });
+
+    const child = startWatcher({
+      HOME: root,
+      XDG_RUNTIME_DIR: runtime,
+      PATH: `${shimBin}:${process.env.PATH ?? ""}`,
+      CLAUDE_PEERS_PORT: String(broker.port),
+      CLAUDE_PEERS_STANDBY_CLAUDE_PID: String(anchor.pid),
+      // deliberately NO CLAUDE_PEERS_STANDBY_MCP_PID — discovery must fail
+      CLAUDE_PEERS_STANDBY_POLL_INTERVAL_SECONDS: "1",
+    }, "detached-session-id");
+    const [code, stderr] = await Promise.all([
+      child.exited,
+      new Response(child.stderr as ReadableStream<Uint8Array>).text(),
+    ]);
+
+    // exit 2 is asyncRewake: mail was found and surfaced. Before the fix this
+    // was exit 0 with an empty stderr and no broker call at all.
+    expect(code).toBe(2);
+    expect(stderr).toContain("detached delivery");
+    // It must never have needed the pid route.
+    expect(requests.map((r) => r.path)).toEqual(["/claim-by-thread", "/ack-by-thread"]);
+    expect(requests[0]?.body).toMatchObject({ thread_id: "detached-session-id" });
+    // And it must NOT smuggle a pid in as identity — that would let the broker
+    // resolve a different row than the thread names.
+    expect(requests[0]?.body).not.toHaveProperty("pid");
+  }, 15_000);
+
   test("an active watcher follows a replacement MCP adapter PID", async () => {
     const root = mkdtempSync(join(tmpdir(), "claude-peers-standby-pid-refresh-"));
     roots.push(root);
@@ -210,6 +300,13 @@ describe("Claude standby watcher", () => {
       async fetch(request) {
         const path = new URL(request.url).pathname;
         const body = await request.json() as { pid: number };
+        // Match the real broker: an unknown thread is 404, not an empty claim.
+        // This fixture's peer row carries no thread_id, so the watcher must fall
+        // back to the pid route — which is the behaviour this test exercises.
+        // Returning a well-formed empty claim here instead would let the watcher
+        // latch onto the thread route and poll it forever, and the PID-refresh
+        // path under test would never run.
+        if (path.endsWith("-by-thread")) return Response.json({ error: "peer not found" }, { status: 404 });
         seenPids.push(body.pid);
         if (path === "/ack-by-pid") return Response.json({ ok: true, acked: 1 });
         const messages = body.pid === newAdapter.pid
