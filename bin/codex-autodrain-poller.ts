@@ -132,6 +132,17 @@ export function nudgeText(lane: Lane): string {
 // forever. The counter resets to 0 the moment the lane has no unread mail.
 const MAX_NUDGE_ATTEMPTS = Number(process.env.MAX_NUDGE_ATTEMPTS ?? 5);
 
+/**
+ * How long to wait for the TUI to visibly accept a submitted turn.
+ *
+ * Bounded on purpose: an unconfirmed submit is not an error state to sit in, it
+ * just means we leave the batch unacked and let the next tick retry. Six checks
+ * at 0.25s covers a busy TUI without stalling the poll loop, which serves every
+ * other lane in the same pass.
+ */
+const SUBMIT_CONFIRM_ATTEMPTS = Number(process.env.SUBMIT_CONFIRM_ATTEMPTS ?? 6);
+const SUBMIT_CONFIRM_INTERVAL_S = process.env.SUBMIT_CONFIRM_INTERVAL_S ?? "0.25";
+
 // Per-client idle profile. A lane is only nudged when its profile says the pane
 // is at an empty/placeholder input prompt and shows no busy marker. The two TUIs
 // render differently, so the prompt glyph and the busy vocabulary differ:
@@ -1032,12 +1043,73 @@ function codexPaneReadyForSubmission(lane: Lane, paneId: string): boolean {
   );
 }
 
-/** Submit literal text as one turn. False means no ACK-safe delivery occurred. */
+/**
+ * A fragment of the submitted text distinctive enough to spot in a pane capture.
+ *
+ * Deliberately taken from the FIRST line: the composer wraps long text, but the
+ * opening run of characters lands adjacent to the prompt marker where we can
+ * recognise it. Whitespace is collapsed because the TUI re-flows what it holds.
+ */
+export function submissionProbe(text: string): string {
+  return text.replace(/\s+/g, " ").trim().slice(0, 48);
+}
+
+/**
+ * Is `probe` still sitting in the composer — i.e. typed but NOT submitted?
+ *
+ * The composer is the region from the last prompt marker to the end of the
+ * capture. Text that has been submitted moves up into the transcript, so it
+ * still appears in the capture; only its presence BELOW the marker means it is
+ * unsent. Checking mere presence would report every successful submit as failed.
+ */
+export function composerStillHolds(capture: string, probe: string): boolean {
+  if (!probe) return false;
+  const lines = capture.split("\n");
+  let marker = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (/^\s*[›>]\s/.test(lines[i] ?? "")) { marker = i; break; }
+  }
+  if (marker === -1) return false; // no composer visible — cannot claim it is held
+  const composer = lines.slice(marker).join(" ").replace(/\s+/g, " ");
+  // Compare on a shortened head: the composer may truncate or re-wrap the tail.
+  const head = probe.slice(0, 24);
+  return head.length > 0 && composer.includes(head);
+}
+
+/**
+ * Submit literal text as one turn. False means no ACK-safe delivery occurred.
+ *
+ * ⚠ tmux's exit code is NOT evidence of submission. `send-keys ... C-m` exits 0
+ * once tmux has handed the keystroke to the pane; whether the TUI consumed it as
+ * a submit is a separate question. Returning that exit code let the poller ACK
+ * mail the model never saw — measured 2026-08-03: messages 14677/14688/14691
+ * were stamped delivered_at 10:01:39.143 while the text sat unsubmitted in
+ * infra.7's composer until the operator pressed Enter a minute later. Because
+ * the ACK had already cleared them from the queue, nothing would have retried:
+ * silent LOSS, not delay.
+ *
+ * So submission is now OBSERVED. If we cannot see the composer release the text
+ * we return false, leaving the batch unacked for the next tick. That biases to
+ * DUPLICATE delivery over loss, which is the right direction for a mailbox — a
+ * repeated message is an annoyance, a dropped one is a broken promise.
+ */
 function submitPaneText(paneId: string, text: string): boolean {
   const sent = sh(["tmux", "send-keys", "-l", "-t", paneId, text]);
   if (!sent.ok) return false;
   Bun.spawnSync(["sleep", "0.3"]); // let the TUI commit the text before C-m
-  return sh(["tmux", "send-keys", "-t", paneId, "C-m"]).ok;
+  if (!sh(["tmux", "send-keys", "-t", paneId, "C-m"]).ok) return false;
+
+  // Poll rather than sleep once: submission latency varies with what the TUI is
+  // doing, and a fixed wait either wastes time or reports a false failure.
+  const probe = submissionProbe(text);
+  for (let attempt = 0; attempt < SUBMIT_CONFIRM_ATTEMPTS; attempt++) {
+    Bun.spawnSync(["sleep", SUBMIT_CONFIRM_INTERVAL_S]);
+    const capture = sh(["tmux", "capture-pane", "-p", "-t", paneId]);
+    if (!capture.ok) return false; // pane vanished — cannot claim delivery
+    if (!composerStillHolds(capture.out, probe)) return true;
+  }
+  log(`submit unconfirmed for ${paneId} — text still in composer, leaving batch unacked for retry`);
+  return false;
 }
 
 function nudge(lane: Lane, paneId: string): void {
