@@ -6,6 +6,7 @@ import { ownerProcessIsCurrent, readOwnerMetadata } from "./broker-lifecycle.ts"
 import { classifyClientHooks, type HookClassification, type HookClient } from "./hook-config.ts";
 import { STORAGE_SCHEMA_VERSION, storageTableColumns, storageUserVersion } from "./storage.ts";
 import { claimCutoffIso } from "./delivery-state.ts";
+import type { ClientType } from "./types.ts";
 
 export type SurfaceState = "current" | "stale" | "missing" | "malformed" | "unsafe";
 
@@ -27,7 +28,7 @@ export interface ClientSurface {
 
 export interface ProcessSummary {
   client_roots: { claude: number; codex: number; gemini: number };
-  adapters: { claude: number; codex: number; gemini: number; unknown: number };
+  adapters: Record<ClientType, number>;
   orphaned_adapters: number;
   spare_parented_adapters: number;
 }
@@ -211,7 +212,15 @@ export function summarizeProcesses(processes: Map<number, ProcessInfo>, repoRoot
     if (isClientProcess(row, "gemini")) clientRoots.gemini++;
   }
 
-  const adapters = { claude: 0, codex: 0, gemini: 0, unknown: 0 };
+  const adapters: Record<ClientType, number> = {
+    claude: 0,
+    codex: 0,
+    gemini: 0,
+    cursor: 0,
+    agy: 0,
+    kimi: 0,
+    unknown: 0,
+  };
   let orphaned = 0;
   let spareParented = 0;
   const expectedServer = resolve(repoRoot, "server.ts");
@@ -411,7 +420,8 @@ export function renderDoctorHuman(report: DoctorReport): string {
     lines.push(`receiver-health: observed=${a.receiver_health.observed} errors=${a.receiver_health.errors}`);
     lines.push(`correlation: registered=${a.correlation.registered_processes} live=${a.correlation.live_registered_processes} matched-adapters=${a.correlation.adapters_with_registered_client} unmatched-adapters=${a.correlation.adapters_without_registered_client}`);
   }
-  lines.push(`processes: clients=${report.processes.client_roots.claude + report.processes.client_roots.codex + report.processes.client_roots.gemini} adapters=${report.processes.adapters.claude + report.processes.adapters.codex + report.processes.adapters.gemini + report.processes.adapters.unknown} orphaned=${report.processes.orphaned_adapters} spare=${report.processes.spare_parented_adapters}`);
+  const adapterCount = Object.values(report.processes.adapters).reduce((sum, count) => sum + count, 0);
+  lines.push(`processes: clients=${report.processes.client_roots.claude + report.processes.client_roots.codex + report.processes.client_roots.gemini} adapters=${adapterCount} orphaned=${report.processes.orphaned_adapters} spare=${report.processes.spare_parented_adapters}`);
   for (const client of ["claude", "codex", "gemini"] as const) {
     const c = report.clients[client];
     lines.push(`${client}: hooks[user=${c.hooks.user.state},project=${c.hooks.project.state}] mcp[user=${c.mcp.user.state},project=${c.mcp.project.state}] duplicate=${c.duplicate_scope ? "yes" : "no"} trust=${c.trust_confirmation_required ? "confirm" : "none"} restart=${c.restart_required_to_apply ? "required-to-apply" : "none"}`);

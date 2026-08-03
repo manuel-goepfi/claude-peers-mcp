@@ -115,10 +115,18 @@ describe("schema-aware doctor", () => {
       [30, { pid: 30, ppid: 2, comm: "codex", args: "codex" }],
       [31, { pid: 31, ppid: 30, comm: "bun", args: `bun ${join(repoRoot, "server.ts")}` }],
       [40, { pid: 40, ppid: 1, comm: "bun", args: `bun ${join(repoRoot, "server.ts")}` }],
+      [50, { pid: 50, ppid: 2, comm: "agent", args: "agent --use-system-ca /home/test/.local/share/cursor-agent/versions/1/index.js" }],
+      [51, { pid: 51, ppid: 50, comm: "bun", args: `bun ${join(repoRoot, "server.ts")}` }],
+      [60, { pid: 60, ppid: 2, comm: "node", args: "node /home/test/.nvm/versions/node/v22/bin/gemini" }],
+      [61, { pid: 61, ppid: 60, comm: "bun", args: `bun ${join(repoRoot, "server.ts")}` }],
+      [70, { pid: 70, ppid: 2, comm: "agy", args: "agy" }],
+      [71, { pid: 71, ppid: 70, comm: "bun", args: `bun ${join(repoRoot, "server.ts")}` }],
+      [80, { pid: 80, ppid: 2, comm: "kimi-code", args: "kimi-code" }],
+      [81, { pid: 81, ppid: 80, comm: "bun", args: `bun ${join(repoRoot, "server.ts")}` }],
     ]);
     expect(summarizeProcesses(processes, repoRoot)).toEqual({
-      client_roots: { claude: 2, codex: 1, gemini: 0 },
-      adapters: { claude: 2, codex: 1, gemini: 0, unknown: 1 },
+      client_roots: { claude: 2, codex: 1, gemini: 1 },
+      adapters: { claude: 2, codex: 1, gemini: 1, cursor: 1, agy: 1, kimi: 1, unknown: 1 },
       orphaned_adapters: 1,
       spare_parented_adapters: 1,
     });
@@ -138,7 +146,7 @@ describe("schema-aware doctor", () => {
         registered_processes: 3,
         live_registered_processes: 1,
         adapters_with_registered_client: 1,
-        adapters_without_registered_client: 3,
+        adapters_without_registered_client: 7,
       });
       expect(report.aggregates?.peers.active).toBe(2);
     } finally {
