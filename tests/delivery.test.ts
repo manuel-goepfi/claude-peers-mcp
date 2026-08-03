@@ -2724,6 +2724,13 @@ describe("Live broker delivery features", () => {
     // the wrong seat is worse than one that is rejected.
     expect(send.target?.id).toBe(target.id);
     expect(send.target?.seat_key).toBe("pane:tmux-pane-only:%12");
+
+    // End-to-end proof, not just resolution: the message must actually land in
+    // that peer's inbox. Resolution and delivery are separate steps, and a
+    // selector that resolves correctly but drops the message would still pass
+    // every assertion above.
+    const poll = await brokerFetch<{ messages: { id: number; text: string }[] }>("/poll-messages", { id: target.id });
+    expect(poll.messages.filter((m) => m.text === "pane-only selector").length).toBe(1);
     childS.kill(); childT.kill();
   });
 
