@@ -1,10 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { findClientPidFromTable, findHookPeerPidsFromTable, findMcpPidFromTable } from "../hooks/codex-drain-peer-inbox.ts";
-import { publishBrokerIdentityToTmux, registrationTmuxPaneId } from "../hooks/register-peer-session.ts";
+import { publishBrokerIdentityToTmux, registrationTmuxPaneId, sessionIdFromHookInput } from "../hooks/register-peer-session.ts";
 import { detectClientFromProcessChain, findBgSpareAncestor, initialReceiverMode, type ProcessInfo } from "../shared/client.ts";
 import { findNearestVisibleCodexProcessByStart } from "../shared/visible-codex.ts";
-import { findCodexAppServerAncestor, findVisibleCodexSession, registrationCwd, registrationCwdResult, registrationTtyPid, selectCodexManualDrainPid } from "../server.ts";
+import { findCodexAppServerAncestor, findVisibleCodexSession, mcpThreadIdFromRequestMeta, registrationCwd, registrationCwdResult, registrationTtyPid, selectCodexManualDrainPid, shouldUnregisterPeerOnShutdown, unresolvedAppServerToolDiagnostic } from "../server.ts";
 
 function table(rows: ProcessInfo[]): Map<number, ProcessInfo> {
   return new Map(rows.map((row) => [row.pid, row]));
@@ -243,7 +243,7 @@ describe("client detection", () => {
     expect(findCodexAppServerAncestor(300, processes)?.pid).toBe(100);
   });
 
-  test("server app-server fallback resolves exactly one visible Codex session", () => {
+  test("visible Codex helper can resolve exactly one same-cwd session", () => {
     const processes = new Map([
       [100, { pid: 100, ppid: 1, comm: "codex", args: "codex app-server --listen unix://" }],
       [150, { pid: 150, ppid: 100, comm: "bash", args: "mcp-stdio-guard.sh bun server.ts" }],
@@ -276,6 +276,17 @@ describe("client detection", () => {
     });
 
     expect(visible).toBeNull();
+  });
+
+  test("server startup never adopts a sole same-cwd lane without hook-owned seat proof", () => {
+    const src = readFileSync(new URL("../server.ts", import.meta.url), "utf8");
+    const startup = src.indexOf("async function main()");
+    const proofResolver = src.indexOf("resolveAppServerIdentityForToolCall =", startup);
+    const startupBody = src.slice(startup, proofResolver);
+
+    expect(startupBody).toContain("appServerIdentityRequiresThreadProof = true");
+    expect(startupBody).not.toContain("findVisibleCodexSession(startupProcesses");
+    expect(startupBody).not.toContain("app-server identity resolved via visible TTY");
   });
 
   test("Codex observer manual check resolves the nearest visible same-cwd session by start time", () => {
@@ -348,23 +359,50 @@ describe("client detection", () => {
     })).toBeNull();
   });
 
-  test("manual check_messages fails closed before broker polling when the Codex seat is unresolved", () => {
+  test("every tool verifies an unresolved app-server seat before registration or execution", () => {
     const src = readFileSync(new URL("../server.ts", import.meta.url), "utf8");
     const handler = src.indexOf("mcp.setRequestHandler(CallToolRequestSchema");
-    const preRegistrationGuard = src.indexOf('if (name === "check_messages" && appServerIdentityUnresolved)', handler);
+    const reconciliationGuard = src.indexOf("if (appServerIdentityRequiresThreadProof)", handler);
+    const threadExtraction = src.indexOf("mcpThreadIdFromRequestMeta(req.params._meta)", reconciliationGuard);
+    const reconciliation = src.indexOf("await resolveAppServerIdentityForToolCall(threadId)", threadExtraction);
+    const loudFailure = src.indexOf("unresolvedAppServerToolDiagnostic(name, resolution.reason)", reconciliation);
     const registration = src.indexOf("await ensureRegistered()", handler);
     const checkCase = src.indexOf('case "check_messages"');
     const identityGuard = src.indexOf("const codexManualDrainPid = selectCodexManualDrainPid", checkCase);
     const brokerPoll = src.indexOf('brokerFetch<PollMessagesResponse>("/poll-messages"', checkCase);
 
     expect(handler).toBeGreaterThan(0);
-    expect(preRegistrationGuard).toBeGreaterThan(handler);
-    expect(registration).toBeGreaterThan(preRegistrationGuard);
+    expect(reconciliationGuard).toBeGreaterThan(handler);
+    expect(threadExtraction).toBeGreaterThan(reconciliationGuard);
+    expect(reconciliation).toBeGreaterThan(threadExtraction);
+    expect(loudFailure).toBeGreaterThan(reconciliation);
+    expect(registration).toBeGreaterThan(loudFailure);
     expect(checkCase).toBeGreaterThan(0);
     expect(identityGuard).toBeGreaterThan(checkCase);
     expect(brokerPoll).toBeGreaterThan(identityGuard);
-    expect(src).toContain("Cannot safely resolve this Codex session");
     expect(src).not.toContain("drainVisibleCodexPidForManualCheck");
+  });
+
+  test("Codex hook session_id and MCP _meta.threadId expose the same opaque thread key", () => {
+    const threadId = "019fc273-a35b-78f0-9a70-f63b5905540f";
+    expect(sessionIdFromHookInput({ session_id: threadId, hook_event_name: "SessionStart" })).toBe(threadId);
+    expect(mcpThreadIdFromRequestMeta({ threadId })).toBe(threadId);
+    expect(sessionIdFromHookInput({ session_id: "" })).toBeNull();
+    expect(mcpThreadIdFromRequestMeta({})).toBeNull();
+  });
+
+  test("an unresolved app-server seat names the blocked tool and the safe recovery boundary", () => {
+    const diagnostic = unresolvedAppServerToolDiagnostic("whoami", "durable seat missing");
+    expect(diagnostic).toContain("did not run whoami");
+    expect(diagnostic).toContain("durable seat missing");
+    expect(diagnostic).toContain("MCP replies and mailbox reads are disabled");
+    expect(diagnostic).toContain("Inbound pane-hook delivery may still work");
+  });
+
+  test("an MCP transport never unregisters the live TUI row it adopted from the hook", () => {
+    expect(shouldUnregisterPeerOnShutdown("peer-1", false)).toBe(true);
+    expect(shouldUnregisterPeerOnShutdown("peer-1", true)).toBe(false);
+    expect(shouldUnregisterPeerOnShutdown(null, false)).toBe(false);
   });
 
   test("manual check_messages uses only an exact registered Codex client pid", () => {

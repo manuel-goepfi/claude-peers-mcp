@@ -28,6 +28,9 @@ export interface Peer {
   tmux_window_index: string | null;
   tmux_window_name: string | null;
   tmux_pane_id: string | null;
+  // Codex thread UUID supplied by hook input (`session_id`) and MCP request
+  // metadata (`_meta.threadId`). Optional for non-Codex and legacy rows.
+  thread_id?: string | null;
   // Durable seat identity (shared/seat.ts). seat_key is the seat this row is
   // anchored to; seat_pids is the JSON set of processes serving that seat, and
   // the seat counts as alive while any of them is. Optional because rows read
@@ -78,6 +81,7 @@ export interface RegisterRequest {
   tmux_window_index: string | null;
   tmux_window_name: string | null;
   tmux_pane_id?: string | null;
+  thread_id?: string | null;
   client_type?: ClientType;
   receiver_mode?: ReceiverMode;
   // Hook-only metadata refreshes do not retain the returned token. When true,
@@ -96,6 +100,28 @@ export interface RegisterResponse {
   // Broker-unique runtime label after dedup. Debug/transport metadata only;
   // human-facing surfaces should prefer `name`.
   resolved_name: string | null;
+  client_type: ClientType;
+  receiver_mode: ReceiverMode;
+}
+
+// Read-only, PID-authenticated proof that a visible client process already owns
+// a broker seat. Deliberately excludes the peer token: callers use this only to
+// verify process/pane identity before performing a normal /register handshake.
+export interface ThreadIdentityProofResponse {
+  id: PeerId;
+  pid: number;
+  cwd: string;
+  git_root: string | null;
+  absolute_git_dir: string | null;
+  tty: string | null;
+  name: string | null;
+  resolved_name: string | null;
+  tmux_session: string | null;
+  tmux_window_index: string | null;
+  tmux_window_name: string | null;
+  tmux_pane_id: string | null;
+  thread_id: string;
+  seat_key: string | null;
   client_type: ClientType;
   receiver_mode: ReceiverMode;
 }

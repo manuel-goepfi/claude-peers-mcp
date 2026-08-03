@@ -515,6 +515,97 @@ describe("Live broker delivery features", () => {
     child.kill();
   });
 
+  test("thread-authenticated identity proof returns the exact hook-owned Codex seat without its token", async () => {
+    const child = spawnSleep();
+    const threadId = "019fc273-a35b-78f0-9a70-f63b5905540f";
+    const reg = await brokerFetch<{ id: string; token: string }>("/register", {
+      pid: child.pid,
+      cwd: "/verified-codex-seat",
+      git_root: "/verified-codex-seat",
+      absolute_git_dir: "/verified-codex-seat/.git",
+      tty: "/dev/pts/73",
+      name: "infra.7",
+      tmux_session: "infra",
+      tmux_window_index: "1",
+      tmux_window_name: "peers",
+      tmux_pane_id: "%2484",
+      thread_id: threadId,
+      client_type: "codex",
+      receiver_mode: "codex-hook",
+      summary: "",
+    });
+
+    const response = await fetch(`${brokerUrl}/identity-by-thread`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ thread_id: threadId, caller_pid: process.pid }),
+    });
+    const proof = await response.json() as Record<string, unknown>;
+
+    expect(response.status).toBe(200);
+    expect(proof).toMatchObject({
+      id: reg.id,
+      pid: child.pid,
+      cwd: "/verified-codex-seat",
+      tty: "/dev/pts/73",
+      name: "infra.7",
+      tmux_session: "infra",
+      tmux_pane_id: "%2484",
+      thread_id: threadId,
+      seat_key: "pane:infra:%2484",
+      client_type: "codex",
+    });
+    expect(proof).not.toHaveProperty("token");
+  });
+
+  test("identity proof rejects missing rows and invalid callers instead of degrading to discovery", async () => {
+    const missing = await fetch(`${brokerUrl}/identity-by-thread`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ thread_id: "missing-thread", caller_pid: process.pid }),
+    });
+    expect(missing.status).toBe(404);
+
+    const invalidCaller = await fetch(`${brokerUrl}/identity-by-thread`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ thread_id: "missing-thread", caller_pid: 1 }),
+    });
+    expect(invalidCaller.status).toBe(400);
+  });
+
+  test("identity proof fails closed when one thread is live in two different panes", async () => {
+    const first = spawnSleep();
+    const second = spawnSleep();
+    const threadId = "019fc273-ambiguous-live-thread";
+    const seat = (pid: number, pane: string, tty: string) => ({
+      pid,
+      cwd: "/ambiguous-thread-seat",
+      git_root: "/ambiguous-thread-seat",
+      absolute_git_dir: "/ambiguous-thread-seat/.git",
+      tty,
+      name: `infra.${pane}`,
+      tmux_session: "infra",
+      tmux_window_index: "1",
+      tmux_window_name: "peers",
+      tmux_pane_id: pane,
+      thread_id: threadId,
+      client_type: "codex",
+      receiver_mode: "codex-hook",
+      summary: "",
+    });
+    await brokerFetch("/register", seat(first.pid, "%2490", "/dev/pts/74"));
+    await brokerFetch("/register", seat(second.pid, "%2491", "/dev/pts/75"));
+
+    const response = await fetch(`${brokerUrl}/identity-by-thread`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ thread_id: threadId, caller_pid: process.pid }),
+    });
+
+    expect(response.status).toBe(409);
+  });
+
   test("register-cli creates an authenticated identity that is globally non-targetable", async () => {
     const targetProcess = spawnSleep();
     const ordinary = await brokerFetch<{ id: string }>("/register", {

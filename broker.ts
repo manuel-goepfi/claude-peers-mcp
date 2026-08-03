@@ -43,6 +43,7 @@ import type {
   Peer,
   PeerSelector,
   PeerTarget,
+  ThreadIdentityProofResponse,
   PeerResolveErrorCode,
   Message,
 } from "./shared/types.ts";
@@ -486,8 +487,8 @@ setTimeout(() => {
 // --- Prepared statements ---
 
 const insertPeer = db.prepare(`
-  INSERT INTO peers (id, pid, cwd, git_root, absolute_git_dir, tty, name, resolved_name, tmux_session, tmux_window_index, tmux_window_name, tmux_pane_id, client_type, receiver_mode, summary, registered_at, last_seen, token)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO peers (id, pid, cwd, git_root, absolute_git_dir, tty, name, resolved_name, tmux_session, tmux_window_index, tmux_window_name, tmux_pane_id, thread_id, client_type, receiver_mode, summary, registered_at, last_seen, token)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const insertCliPeer = db.prepare(`
@@ -517,6 +518,7 @@ const updatePeerRegistration = db.prepare(`
       tmux_window_index = ?,
       tmux_window_name = ?,
       tmux_pane_id = ?,
+      thread_id = COALESCE(?, thread_id),
       client_type = ?,
       receiver_mode = ?,
       -- Preserve a live summary on re-registration: a lane that re-registers
@@ -612,6 +614,7 @@ const selectAllPeers = db.prepare(`
 const publicPeerColumns = `
   id, pid, cwd, git_root, absolute_git_dir, tty, name, resolved_name,
   tmux_session, tmux_window_index, tmux_window_name, tmux_pane_id,
+  thread_id,
   client_type, receiver_mode, last_hook_seen_at, last_drain_at,
   last_drain_error, summary, registered_at, last_seen, seat_key, seat_pids
 `;
@@ -680,6 +683,19 @@ const selectPeerIdByPid = db.prepare(`
     AND (pid = ?1 OR (json_valid(peers.seat_pids) AND EXISTS (SELECT 1 FROM json_each(peers.seat_pids) WHERE value = ?1)))
   ORDER BY CASE WHEN pid = ?1 THEN 0 ELSE 1 END, last_seen DESC
   LIMIT 1
+`);
+
+// Exact Codex-thread proof for an app-server-owned MCP call. Codex supplies the
+// same UUID as hook input `session_id` and request `_meta.threadId`; unlike PID
+// or launch-time inference, this remains exact across app-server pooling,
+// reconnects, resumes, and delayed MCP-server respawns.
+const selectIdentityProofByThread = db.prepare(`
+  SELECT id, pid, cwd, git_root, absolute_git_dir, tty, name, resolved_name,
+         tmux_session, tmux_window_index, tmux_window_name, tmux_pane_id,
+         thread_id, seat_key, seat_pids, client_type, receiver_mode
+  FROM peers
+  WHERE non_targetable = 0 AND thread_id = ?
+  ORDER BY last_seen DESC
 `);
 
 const claimMessage = db.prepare(`
@@ -1185,6 +1201,14 @@ function handleRegister(body: RegisterRequest): RegisterResult {
       return { ok: false, status: 413, error: `name exceeds ${MAX_NAME_BYTES} bytes` };
     }
   }
+  if (body.thread_id !== undefined && body.thread_id !== null) {
+    if (typeof body.thread_id !== "string" || body.thread_id.length === 0) {
+      return { ok: false, status: 400, error: "thread_id must be a non-empty string" };
+    }
+    if (utf8Bytes(body.thread_id) > 128) {
+      return { ok: false, status: 413, error: "thread_id exceeds 128 bytes" };
+    }
+  }
 
   const now = new Date().toISOString();
   const token = generateToken();
@@ -1495,9 +1519,9 @@ function handleRegister(body: RegisterRequest): RegisterResult {
       // delivery-health warnings read.
       const rowExists = Boolean(db.query("SELECT 1 FROM peers WHERE id = ?").get(id));
       if (rowExists) {
-        updatePeerRegistration.run(body.pid, body.cwd, gitRootValue, absoluteGitDirValue, ttyWriteValue, requestedName, finalName, body.tmux_session ?? null, body.tmux_window_index ?? null, body.tmux_window_name ?? null, body.tmux_pane_id ?? null, clientType, receiverMode, summaryValue, now, issuedToken, id);
+        updatePeerRegistration.run(body.pid, body.cwd, gitRootValue, absoluteGitDirValue, ttyWriteValue, requestedName, finalName, body.tmux_session ?? null, body.tmux_window_index ?? null, body.tmux_window_name ?? null, body.tmux_pane_id ?? null, body.thread_id ?? null, clientType, receiverMode, summaryValue, now, issuedToken, id);
       } else {
-        insertPeer.run(id, body.pid, body.cwd, gitRootValue, absoluteGitDirValue, ttyWriteValue, requestedName, finalName, body.tmux_session ?? null, body.tmux_window_index ?? null, body.tmux_window_name ?? null, body.tmux_pane_id ?? null, clientType, receiverMode, summaryValue, now, now, issuedToken);
+        insertPeer.run(id, body.pid, body.cwd, gitRootValue, absoluteGitDirValue, ttyWriteValue, requestedName, finalName, body.tmux_session ?? null, body.tmux_window_index ?? null, body.tmux_window_name ?? null, body.tmux_pane_id ?? null, body.thread_id ?? null, clientType, receiverMode, summaryValue, now, now, issuedToken);
       }
       // Seat identity is written last so it lands on both the insert and update
       // paths without threading two more binds through each statement.
@@ -2261,6 +2285,58 @@ function authPidDrain(pid: number, callerPid: number): { ok: true; id: string } 
   return { ok: true, id: resolved.id };
 }
 
+type ThreadIdentityProofResult =
+  | { ok: true; value: ThreadIdentityProofResponse }
+  | { ok: false; status: number; error: string };
+
+function handleIdentityByThread(body: { thread_id: string; caller_pid: number }): ThreadIdentityProofResult {
+  if (!Number.isInteger(body.caller_pid) || body.caller_pid <= 1) {
+    return { ok: false, status: 400, error: "invalid caller_pid" };
+  }
+  const callerErr = verifyPidUid(body.caller_pid);
+  if (callerErr) return { ok: false, status: 403, error: `caller rejected: ${callerErr}` };
+  if (typeof body.thread_id !== "string" || body.thread_id.length === 0 || utf8Bytes(body.thread_id) > 128) {
+    return { ok: false, status: 400, error: "invalid thread_id" };
+  }
+
+  const matches = (selectIdentityProofByThread.all(body.thread_id) as Array<{
+    id: string;
+    pid: number;
+    cwd: string;
+    git_root: string | null;
+    absolute_git_dir: string | null;
+    tty: string | null;
+    name: string | null;
+    resolved_name: string | null;
+    tmux_session: string | null;
+    tmux_window_index: string | null;
+    tmux_window_name: string | null;
+    tmux_pane_id: string | null;
+    thread_id: string;
+    seat_key: string | null;
+    seat_pids: string | null;
+    client_type: ClientType | null;
+    receiver_mode: ReceiverMode | null;
+  }>).filter((row) => seatPidsAlive(parseSeatPids(row.seat_pids), row.pid, isPidAlive));
+  if (matches.length === 0) return { ok: false, status: 404, error: "peer not found" };
+  if (matches.length !== 1) return { ok: false, status: 409, error: "ambiguous live thread identity" };
+
+  const row = matches[0]!;
+  const targetErr = verifyPidUid(row.pid);
+  if (targetErr) return { ok: false, status: 403, error: `target rejected: ${targetErr}` };
+  const limited = rateCheck(row.id, false);
+  if (limited) return { ok: false, status: 429, error: limited };
+  const { seat_pids: _seatPids, ...publicRow } = row;
+  return {
+    ok: true,
+    value: {
+      ...publicRow,
+      client_type: validClientType(row.client_type),
+      receiver_mode: validReceiverMode(row.receiver_mode, validClientType(row.client_type)),
+    },
+  };
+}
+
 /**
  * Parent pid from /proc/<pid>/stat, or null.
  *
@@ -2714,6 +2790,19 @@ requestHandler = async (req: Request) => {
           return Response.json({ error: res.error }, { status: res.status ?? 400 });
         }
         return Response.json({ peer_id: res.peer_id, messages: res.messages, acked: res.acked, state: res.state });
+      }
+
+      // Read-only identity proof for app-server-hosted MCP calls. The request's
+      // thread UUID is joined to the same UUID persisted by the session hook;
+      // same-UID caller verification matches the hook drain boundary. No bearer
+      // token is returned.
+      if (path === "/identity-by-thread") {
+        const res = handleIdentityByThread({
+          thread_id: typeof body.thread_id === "string" ? body.thread_id : "",
+          caller_pid: Number(body.caller_pid),
+        });
+        if (!res.ok) return Response.json({ error: res.error }, { status: res.status });
+        return Response.json(res.value);
       }
 
       if (path === "/set-name-by-pid") {

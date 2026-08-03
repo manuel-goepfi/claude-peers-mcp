@@ -40,10 +40,12 @@ import type {
   PeerSelector,
   PeerTarget,
   TmuxPaneSnapshot,
+  ThreadIdentityProofResponse,
 } from "./shared/types.ts";
 import { durableSeatKey } from "./shared/seat.ts";
 import { detectClientFromProcessChain, findBgSpareAncestor, findClientPidFromProcessChain, initialReceiverMode, isClientProcess, isCodexAppServerProcess, type ProcessInfo } from "./shared/client.ts";
 import { findSingleVisibleCodexProcess } from "./shared/visible-codex.ts";
+import { verifyCodexAppServerSeatProof } from "./shared/appserver-seat-proof.ts";
 import {
   brokerIdentityPaneTarget as sharedBrokerIdentityPaneTarget,
   publishBrokerIdentityToTmux as sharedPublishBrokerIdentityToTmux,
@@ -742,7 +744,14 @@ let myAbsoluteGitDir: string | null = null;
 let myClientType: ClientType = "unknown";
 let myReceiverMode: ReceiverMode = "unknown";
 let myRegisterPid = process.pid;
-let appServerIdentityUnresolved = false;
+let appServerIdentityRequiresThreadProof = false;
+let appServerIdentityOwnedByHook = false;
+let appServerBoundThreadId: string | null = null;
+type AppServerIdentityResolution = { ok: true } | { ok: false; reason: string };
+let resolveAppServerIdentityForToolCall: (threadId: string | null) => Promise<AppServerIdentityResolution> = async () => ({
+  ok: false,
+  reason: "identity resolver is not initialized",
+});
 let myTmuxInfo: TmuxPaneInfo | null = null;
 let latestTmuxMirrorFailure: string | null = null;
 
@@ -758,6 +767,21 @@ const localBufferIds = new Set<number>(); // O(1) dedup for poll loop
 // is deleted while peers are running, IDs could collide with this set — the prune
 // timer (keeping last 500) mitigates this edge case.
 const confirmedDeliveredIds = new Set<number>();
+
+export function unresolvedAppServerToolDiagnostic(toolName: string, reason: string): string {
+  return `claude-peers did not run ${toolName}: this app-server connection could not be bound to one verified Codex pane (${reason}). ` +
+    "Inbound pane-hook delivery may still work, but MCP replies and mailbox reads are disabled to prevent cross-session routing. Reopen the Codex lane if this persists.";
+}
+
+export function mcpThreadIdFromRequestMeta(meta: unknown): string | null {
+  if (!meta || typeof meta !== "object" || Array.isArray(meta)) return null;
+  const threadId = (meta as { threadId?: unknown }).threadId;
+  return typeof threadId === "string" && threadId.length > 0 ? threadId : null;
+}
+
+export function shouldUnregisterPeerOnShutdown(peerId: PeerId | null, identityOwnedByHook: boolean): boolean {
+  return peerId !== null && !identityOwnedByHook;
+}
 
 // --- Piggyback delivery ---
 // Drains pending messages from the local buffer and returns formatted text
@@ -1813,16 +1837,23 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: args } = req.params;
 
-  // An unresolved app-server spawn has no trustworthy inbox identity. Do not
-  // materialize an observer row just to tell it the mailbox cannot be read.
-  if (name === "check_messages" && appServerIdentityUnresolved) {
-    return {
-      content: [{
-        type: "text" as const,
-        text: "Cannot safely resolve this Codex session for check_messages. Mailbox access is disabled to prevent cross-session delivery; use the pane hook or reopen the Codex session.",
-      }],
-      isError: true,
-    };
+  // Codex includes the owning ThreadId in every MCP request's `_meta`; the
+  // SessionStart hook persists that same UUID on its pane-owned broker row.
+  // Re-prove the join before EVERY tool. This remains exact across app-server
+  // pooling and delayed respawns, and a process reused across different threads
+  // fails closed instead of switching a global sender/mailbox identity.
+  if (appServerIdentityRequiresThreadProof) {
+    const threadId = mcpThreadIdFromRequestMeta(req.params._meta);
+    const resolution = await resolveAppServerIdentityForToolCall(threadId);
+    if (!resolution.ok) {
+      return {
+        content: [{
+          type: "text" as const,
+          text: unresolvedAppServerToolDiagnostic(name, resolution.reason),
+        }],
+        isError: true,
+      };
+    }
   }
 
   // bg-spare deferral: a pre-warmed spare session stays unregistered, but the
@@ -2513,18 +2544,18 @@ async function main() {
           log(`identity recovered from client pid=${chainPid}: name=${clientEnv.CLAUDE_PEER_NAME ?? "-"} pane=${clientEnv.TMUX_PANE ?? "-"} (our own env lacked it)`);
         }
       }
-    } else if (myClientType === "codex" && codexAppServerAncestor) {
-      const visibleCwdHint = cwdOf(codexAppServerAncestor.pid) ?? serverCwd;
-      const visible = findVisibleCodexSession(startupProcesses, visibleCwdHint);
-      if (visible) {
-        myRegisterPid = visible.pid;
-        identityEnv = visible.env;
-        log(`Codex app-server identity resolved via visible TTY pid=${visible.pid} tty=${visible.tty} cwd=${visibleCwdHint}`);
-      } else {
-        log(`Codex app-server identity unresolved for cwd=${visibleCwdHint}; falling back to MCP server pid to avoid misrouting same-cwd panes`);
-        myRegisterPid = process.pid;
-        appServerIdentityUnresolved = true;
-      }
+    } else if (myClientType === "codex" && codexAppServerAncestor && !spareAncestor) {
+      // An app-server can outlive and serve many same-cwd TUI lanes. Neither
+      // process ancestry, cwd, nor launch time identifies the caller. Codex
+      // supplies `_meta.threadId` on every MCP call and the SessionStart hook
+      // receives the same UUID as `session_id`; defer to that exact join below.
+      // A --bg-spare ancestor is a stronger, already-proven lifecycle state:
+      // its first real tool call refreshes identity from the promoted process.
+      // Treating the ambient app-server ancestor as its owner would block that
+      // promotion path before ensureRegistered() gets a chance to run.
+      myRegisterPid = process.pid;
+      appServerIdentityRequiresThreadProof = true;
+      log(`Codex app-server identity requires thread-bound hook seat proof (host pid=${codexAppServerAncestor.pid})`);
     } else {
       myRegisterPid = process.pid;
     }
@@ -2607,10 +2638,65 @@ async function main() {
     tmux_window_index: tmuxInfo?.window_index ?? null,
     tmux_window_name: tmuxInfo?.window_name ?? null,
     tmux_pane_id: tmuxInfo?.pane_id ?? (spareAncestor ? null : (identityEnv.TMUX_PANE ?? null)),
+    thread_id: appServerBoundThreadId,
     client_type: myClientType,
     receiver_mode: myReceiverMode,
+    preserve_token: appServerIdentityOwnedByHook,
     summary: initialSummary,
   });
+
+  resolveAppServerIdentityForToolCall = async (threadId: string | null): Promise<AppServerIdentityResolution> => {
+    if (!appServerIdentityRequiresThreadProof) return { ok: true };
+    if (!codexAppServerAncestor) return { ok: false, reason: "app-server ancestor is unavailable" };
+    if (!threadId) return { ok: false, reason: "MCP request metadata has no threadId" };
+    if (appServerBoundThreadId && appServerBoundThreadId !== threadId) {
+      return { ok: false, reason: `connection is already bound to a different Codex thread` };
+    }
+
+    let proof: ThreadIdentityProofResponse;
+    try {
+      proof = await brokerFetch<ThreadIdentityProofResponse>("/identity-by-thread", {
+        thread_id: threadId,
+        caller_pid: process.pid,
+      });
+    } catch (error) {
+      return { ok: false, reason: `hook-owned seat proof unavailable: ${errMsg(error)}` };
+    }
+    const verdict = verifyCodexAppServerSeatProof(threadId, proof);
+    if (!verdict.ok) return { ok: false, reason: verdict.reason };
+
+    if (appServerBoundThreadId) {
+      if (proof.pid !== myRegisterPid || (myId !== null && proof.id !== myId)) {
+        return { ok: false, reason: "hook-owned seat changed while this MCP connection was active" };
+      }
+      return { ok: true };
+    }
+
+    myRegisterPid = proof.pid;
+    myCwd = proof.cwd;
+    myGitRoot = proof.git_root;
+    myAbsoluteGitDir = proof.absolute_git_dir;
+    tty = proof.tty;
+    tmuxInfo = proof.tmux_session ? {
+      session: proof.tmux_session,
+      window_index: proof.tmux_window_index ?? undefined,
+      window_name: proof.tmux_window_name ?? undefined,
+      pane_id: proof.tmux_pane_id ?? undefined,
+    } : null;
+    myTmuxInfo = tmuxInfo;
+    peerName = proof.name ?? resolvePeerName(
+      null,
+      proof.tmux_session && proof.tmux_pane_id ? `${proof.tmux_session}.${proof.tmux_pane_id}` : null,
+      isSubagent,
+      proof.pid,
+    );
+    myClientType = proof.client_type;
+    myReceiverMode = proof.receiver_mode;
+    appServerBoundThreadId = threadId;
+    appServerIdentityOwnedByHook = true;
+    log(`app-server identity verified via thread=${threadId} hook-owned pid=${proof.pid} pane=${proof.tmux_pane_id} seat=${proof.seat_key}`);
+    return { ok: true };
+  };
 
   // Identity computed while still a pre-warm spare is stale by promotion time
   // (env ignored, cwd/repo may have changed since the daemon launched us).
@@ -2637,11 +2723,15 @@ async function main() {
       // Cleanup won the race while /register was in flight — tear the fresh
       // row down so no ghost outlives this process.
       myToken = reg.token;
-      try {
-        await brokerFetch("/unregister", { id: reg.id });
-        log(`registration completed after shutdown began — unregistered ${reg.id}`);
-      } catch {
-        // Row falls to the broker's dead-PID reaper.
+      if (!appServerIdentityOwnedByHook) {
+        try {
+          await brokerFetch("/unregister", { id: reg.id });
+          log(`registration completed after shutdown began — unregistered ${reg.id}`);
+        } catch {
+          // Row falls to the broker's dead-PID reaper.
+        }
+      } else {
+        log(`registration completed after shutdown began — retained hook-owned seat ${reg.id}`);
       }
       myToken = null;
       return;
@@ -2707,23 +2797,11 @@ async function main() {
     }
     return registerInFlight;
   };
-  // App-server-hosted unresolved identity: the Codex app-server spawns an MCP
-  // set per hosted thread and leaks the processes when the thread ends (the
-  // stdio-guard can't fire — its liveness anchor, the app-server, never dies).
-  // An eagerly-registered observer-${pid} row from such a spawn then heartbeats
-  // a dead thread's seat forever: roster litter plus a permanent broker
-  // connection per leaked process (observed: 90 leaked servers / 28 observer
-  // rows). Identity here is unresolvable anyway (no client ancestor, no
-  // operator-pinned name), so nothing routable is lost by waiting: defer
-  // registration to the first real tool call (ensureRegistered in the CallTool
-  // handler), exactly like bg-spare. A leaked thread never calls a tool, so it
-  // never registers, never heartbeats, and holds no broker connection.
-  // Gate: the app-server ancestry makes detectClientFromProcessChain return
-  // "codex" (never "unknown"), so the observer signature is the register-pid
-  // fallback flag — identity resolution found no visible codex TUI and keyed
-  // the row on the MCP server's own pid.
-  const appServerUnresolved =
-    appServerIdentityUnresolved && !identityEnv.CLAUDE_PEER_NAME;
+  // App-server-hosted MCP processes are pooled outside any TUI ancestry. Wait
+  // for the first tool's exact `_meta.threadId` -> hook `session_id` proof;
+  // eager registration would create the send-capable but inbox-deaf observer
+  // identity this path exists to prevent.
+  const appServerUnresolved = appServerIdentityRequiresThreadProof;
   if (appServerUnresolved) {
     log("app-server-hosted spawn with unresolved identity — deferring registration until first tool call");
   }
@@ -3053,13 +3131,15 @@ async function main() {
     heartbeatTimer = null;
     clearInterval(pruneTimer);
     clearInterval(parentWatchdogTimer);
-    if (myId) {
+    if (shouldUnregisterPeerOnShutdown(myId, appServerIdentityOwnedByHook)) {
       try {
         await brokerFetch("/unregister", { id: myId });
         log("Unregistered from broker");
       } catch {
         // Best effort
       }
+    } else if (myId && appServerIdentityOwnedByHook) {
+      log(`Retained hook-owned seat ${myId} during MCP shutdown`);
     }
     myToken = null;
     process.exit(0);

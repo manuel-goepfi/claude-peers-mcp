@@ -48,6 +48,27 @@ function log(msg: string): void {
   console.error(`[claude-peers ${CLIENT_TYPE}-register] ${msg}`);
 }
 
+export function sessionIdFromHookInput(value: unknown): string | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const sessionId = (value as { session_id?: unknown }).session_id;
+  return typeof sessionId === "string" && sessionId.length > 0 ? sessionId : null;
+}
+
+async function readHookSessionId(): Promise<string | null> {
+  if (process.stdin.isTTY) return null;
+  try {
+    const text = await Promise.race([
+      Bun.stdin.text(),
+      new Promise<string>((resolve) => setTimeout(() => resolve(""), 1500)),
+    ]);
+    if (!text.trim()) return null;
+    return sessionIdFromHookInput(JSON.parse(text));
+  } catch (error) {
+    log(`hook input unreadable: ${error instanceof Error ? error.message : String(error)}`);
+    return null;
+  }
+}
+
 function processTable(): Map<number, ProcessInfo> {
   const table = new Map<number, ProcessInfo>();
   const proc = Bun.spawnSync(["ps", "-eo", "pid=,ppid=,comm=,args="]);
@@ -312,6 +333,10 @@ async function ensureBroker(): Promise<void> {
 }
 
 async function main(): Promise<void> {
+  const threadId = await readHookSessionId();
+  if (CLIENT_TYPE === "codex" && !threadId) {
+    log("hook input has no session_id; pane registration will remain unavailable to app-server MCP calls");
+  }
   const meta = await metadata();
   if (!meta) {
     process.exitCode = 1;
@@ -331,6 +356,7 @@ async function main(): Promise<void> {
       tmux_window_index: meta.tmux?.window_index ?? null,
       tmux_window_name: meta.tmux?.window_name ?? null,
       tmux_pane_id: registrationTmuxPaneId(meta.tmux, meta.identity_env),
+      thread_id: threadId,
       client_type: CLIENT_TYPE,
       receiver_mode: RECEIVER_MODE,
       preserve_token: true,

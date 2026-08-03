@@ -107,6 +107,7 @@ const peerColumns = [
   { name: "tmux_window_index", type: "TEXT" },
   { name: "tmux_window_name", type: "TEXT" },
   { name: "tmux_pane_id", type: "TEXT" },
+  { name: "thread_id", type: "TEXT" },
   { name: "token", type: "TEXT" },
   { name: "resolved_name", type: "TEXT" },
   { name: "absolute_git_dir", type: "TEXT" },
@@ -143,6 +144,7 @@ export const storageIndexes = {
   unknownReceiverRetention: "idx_messages_unknown_retention",
   peerReceiverMode: "idx_peers_receiver_mode",
   peerSeatKey: "idx_peers_seat_key",
+  peerThreadId: "idx_peers_thread_id",
 } as const;
 
 function tableExists(db: Database, table: string): boolean {
@@ -251,6 +253,7 @@ function createPeersTable(db: Database): void {
       tmux_window_index TEXT,
       tmux_window_name TEXT,
       tmux_pane_id TEXT,
+      thread_id TEXT,
       client_type TEXT NOT NULL DEFAULT 'unknown',
       receiver_mode TEXT NOT NULL DEFAULT 'unknown',
       last_hook_seen_at TEXT,
@@ -287,6 +290,7 @@ function ensurePeerColumns(db: Database): void {
 export function ensureAdditivePeerSchema(db: Database): void {
   ensurePeerColumns(db);
   db.run(`CREATE INDEX IF NOT EXISTS ${storageIndexes.peerSeatKey} ON peers(seat_key)`);
+  db.run(`CREATE INDEX IF NOT EXISTS ${storageIndexes.peerThreadId} ON peers(thread_id)`);
   db.run(seatKeyBackfillSql());
   db.run(seatKeyPaneUpgradeSql());
 }
@@ -315,6 +319,7 @@ function createIndexes(db: Database): void {
   db.run(`CREATE INDEX ${storageIndexes.unknownReceiverRetention} ON messages(delivered, sent_at, to_id)`);
   db.run(`CREATE INDEX ${storageIndexes.peerReceiverMode} ON peers(receiver_mode, id)`);
   db.run(`CREATE INDEX ${storageIndexes.peerSeatKey} ON peers(seat_key)`);
+  db.run(`CREATE INDEX ${storageIndexes.peerThreadId} ON peers(thread_id)`);
 }
 
 function schemaObjectsExist(db: Database): boolean {
