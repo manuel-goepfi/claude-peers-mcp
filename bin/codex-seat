@@ -86,6 +86,32 @@ if [[ -z "$REAL_CODEX" || ! -x "$REAL_CODEX" || "$(readlink -f "$REAL_CODEX")" =
   printf 'codex-seat: set CLAUDE_PEERS_REAL_CODEX to the real Codex executable\n' >&2
   exit 127
 fi
+
+passthrough_command=""
+expect_option_value=0
+for argument in "$@"; do
+  if (( expect_option_value )); then
+    expect_option_value=0
+    continue
+  fi
+  case "$argument" in
+    --) break ;;
+    -h|--help|-V|--version|--remote|--remote=*) exec "$REAL_CODEX" "$@" ;;
+    -c|--config|--enable|--disable|-i|--image|-m|--model|--local-provider|-p|--profile|-s|--sandbox|-C|--cd|--add-dir|-a|--ask-for-approval|--remote-auth-token-env)
+      expect_option_value=1
+      ;;
+    --strict-config|--oss|--dangerously-bypass-approvals-and-sandbox|--dangerously-bypass-hook-trust|--search|--no-alt-screen)
+      ;;
+    --*=*|-[^-]*) ;;
+    *) passthrough_command="$argument"; break ;;
+  esac
+done
+case "$passthrough_command" in
+  exec|e|review|login|logout|mcp|plugin|mcp-server|app-server|remote-control|completion|update|doctor|sandbox|debug|apply|a|archive|delete|unarchive|cloud|exec-server|features|help)
+    exec "$REAL_CODEX" "$@"
+    ;;
+esac
+
 command -v ss >/dev/null 2>&1 || { printf 'codex-seat: ss is required for listener ownership verification\n' >&2; exit 127; }
 command -v pgrep >/dev/null 2>&1 || { printf 'codex-seat: pgrep is required for process cleanup\n' >&2; exit 127; }
 
