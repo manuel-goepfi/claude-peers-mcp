@@ -184,10 +184,31 @@ describe("codex-seat launcher", () => {
 
   test("passes exact pane identity through a dedicated app-server and reaps it after the TUI exits", () => {
     const { root, state, fakeCodex } = fixture();
+    const bin = join(root, "bin");
+    Bun.spawnSync(["mkdir", "-p", bin]);
+    const fakeTmux = join(bin, "tmux");
+    writeFileSync(fakeTmux, `#!/usr/bin/env bash
+set -euo pipefail
+if [[ "\${1:-}" == "show-options" ]]; then
+  case "\${*: -1}" in
+    @operator_label) printf 'orch.5\\n' ;;
+    @peer_resolved_name) printf 'orch.5#stale\\n' ;;
+  esac
+  exit 0
+fi
+if [[ "\${1:-}" == "display-message" ]]; then
+  case "\${*: -1}" in
+    '#S') printf 'orch\\n' ;;
+    '#I') printf '1\\n' ;;
+    '#W') printf 'peers\\n' ;;
+  esac
+fi
+`);
+    chmodSync(fakeTmux, 0o755);
     const port = freePort();
     const result = Bun.spawnSync([LAUNCHER, "resume"], {
       env: {
-        PATH: process.env.PATH ?? "",
+        PATH: `${bin}:${process.env.PATH ?? ""}`,
         HOME: root,
         CODEX_HOME: join(root, ".codex"),
         CLAUDE_PEERS_REAL_CODEX: fakeCodex,
