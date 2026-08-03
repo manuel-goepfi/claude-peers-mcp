@@ -14,7 +14,7 @@ function fixture(): { root: string; state: string; fakeCodex: string } {
   Bun.spawnSync(["mkdir", "-p", state]);
   writeFileSync(fakeCodex, `#!/usr/bin/env bash
 set -euo pipefail
-if [[ " $* " == *" app-server "* ]]; then
+if [[ "\${FAKE_CODEX_RECORD_ONLY:-}" != "1" && " $* " == *" app-server "* ]]; then
   port=""
   previous=""
   for argument in "$@"; do
@@ -110,6 +110,7 @@ describe("codex-seat launcher", () => {
         HOME: root,
         CLAUDE_PEERS_REAL_CODEX: fakeCodex,
         FAKE_CODEX_STATE: state,
+        FAKE_CODEX_RECORD_ONLY: "1",
       },
       stdout: "pipe",
       stderr: "pipe",
@@ -120,6 +121,36 @@ describe("codex-seat launcher", () => {
     expect(readFileSync(join(state, "tui.args"), "utf8")).toBe(
       '--strict-config\n--enable\nhooks\n--search\n-c\nmodel="test"\nexec\n--json\n',
     );
+  });
+
+  test.each([
+    ["interactive help", ["resume", "--help"]],
+    ["app-server", ["app-server", "--listen", "ws://127.0.0.1:45678"]],
+  ])("passes %s directly without seat dependencies", (_label, args) => {
+    const { root, state, fakeCodex } = fixture();
+    const bin = join(root, "bin");
+    Bun.spawnSync(["mkdir", "-p", bin]);
+    for (const command of ["bash", "readlink"]) {
+      const resolved = Bun.which(command);
+      if (resolved === null) throw new Error(`${command} is required by this test`);
+      symlinkSync(resolved, join(bin, command));
+    }
+
+    const result = Bun.spawnSync([LAUNCHER, ...args], {
+      env: {
+        PATH: bin,
+        HOME: root,
+        CLAUDE_PEERS_REAL_CODEX: fakeCodex,
+        FAKE_CODEX_STATE: state,
+        FAKE_CODEX_RECORD_ONLY: "1",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(existsSync(join(state, "app.pid"))).toBe(false);
+    expect(readFileSync(join(state, "tui.args"), "utf8")).toBe(`${args.join("\n")}\n`);
   });
 
   test("fails before spawning children when pgrep is unavailable", () => {

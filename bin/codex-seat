@@ -90,13 +90,19 @@ fi
 passthrough_command=""
 expect_option_value=0
 for argument in "$@"; do
+  [[ "$argument" == "--" ]] && break
+  case "$argument" in
+    -h|--help|-V|--version) exec "$REAL_CODEX" "$@" ;;
+  esac
+done
+for argument in "$@"; do
   if (( expect_option_value )); then
     expect_option_value=0
     continue
   fi
   case "$argument" in
     --) break ;;
-    -h|--help|-V|--version|--remote|--remote=*) exec "$REAL_CODEX" "$@" ;;
+    --remote|--remote=*) exec "$REAL_CODEX" "$@" ;;
     -c|--config|--enable|--disable|-i|--image|-m|--model|--local-provider|-p|--profile|-s|--sandbox|-C|--cd|--add-dir|-a|--ask-for-approval|--remote-auth-token-env)
       expect_option_value=1
       ;;
