@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { findClientPidFromTable, findHookPeerPidsFromTable, findMcpPidFromTable } from "../hooks/codex-drain-peer-inbox.ts";
-import { peerName, publishBrokerIdentityToTmux, registrationTmuxPaneId, sessionIdFromHookInput } from "../hooks/register-peer-session.ts";
+import { peerName, publishBrokerIdentityToTmux, registrationTmuxPaneId, sessionIdFromHookInput, tmuxIdentityMirrorEnabled } from "../hooks/register-peer-session.ts";
 import { detectClientFromProcessChain, findBgSpareAncestor, initialReceiverMode, type ProcessInfo } from "../shared/client.ts";
 import { findNearestVisibleCodexProcessByStart, findVisibleCodexProcessByPaneId } from "../shared/visible-codex.ts";
 import { findCodexAppServerAncestor, findVisibleCodexSession, mcpThreadIdFromRequestMeta, registrationCwd, registrationCwdResult, registrationTtyPid, selectCodexManualDrainPid, shouldUnregisterPeerOnShutdown, unresolvedAppServerToolDiagnostic } from "../server.ts";
@@ -492,7 +492,7 @@ describe("client detection", () => {
         window_index: "0",
         window_name: "0",
         pane_id: paneId,
-      });
+      }, {}, { CLAUDE_PEERS_TMUX_IDENTITY_MIRROR: "1" });
 
       const readOption = (name: string): string => {
         const result = Bun.spawnSync(["tmux", "show-options", "-p", "-t", paneId, "-v", name], {
@@ -510,9 +510,45 @@ describe("client detection", () => {
       expect(readOption("@peer_resolved_name")).toBe("pr.1");
       expect(readOption("@peer_client_type")).toBe("codex");
       expect(readOption("@peer_receiver_mode")).toBe("codex-hook");
+      const writableOptions = [
+        "@operator_label",
+        "@peer_id",
+        "@peer_label",
+        "@peer_resolved_name",
+        "@peer_client_type",
+        "@peer_receiver_mode",
+      ];
+      const beforeDisabledPublish = Object.fromEntries(writableOptions.map((option) => [option, readOption(option)]));
+
+      const skipped = publishBrokerIdentityToTmux({
+        id: "must-not-write",
+        name: "test-leak",
+        resolved_name: "test-leak",
+        client_type: "codex",
+        receiver_mode: "codex-hook",
+      }, {
+        session,
+        window_index: "0",
+        window_name: "0",
+        pane_id: paneId,
+      }, {
+        TMUX_PANE: paneId,
+      }, {
+        CLAUDE_PEERS_TMUX_IDENTITY_MIRROR: "0",
+      });
+      expect(skipped).toEqual({ ok: true, target: null, failedOptions: [], skipped: true });
+      expect(Object.fromEntries(writableOptions.map((option) => [option, readOption(option)]))).toEqual(beforeDisabledPublish);
     } finally {
       Bun.spawnSync(["tmux", "kill-session", "-t", session], { stdout: "ignore", stderr: "ignore" });
     }
+  });
+
+  test("register hook mirror opt-out accepts every supported false spelling", () => {
+    for (const value of ["0", "false", "no", "off", " FALSE "]) {
+      expect(tmuxIdentityMirrorEnabled({ CLAUDE_PEERS_TMUX_IDENTITY_MIRROR: value })).toBe(false);
+    }
+    expect(tmuxIdentityMirrorEnabled({ CLAUDE_PEERS_TMUX_IDENTITY_MIRROR: "1" })).toBe(true);
+    expect(tmuxIdentityMirrorEnabled({})).toBe(true);
   });
 
   test("register hook publishes the broker identity returned by registration", () => {
