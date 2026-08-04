@@ -2208,6 +2208,17 @@ function handleBroadcast(authedFromId: string, body: BroadcastRequest): Broadcas
   return { ok: true, sent, state: "queued" };
 }
 
+const LEGACY_POLL_HOOK_FRESH_MS = 120_000;
+
+function freshClaudeHookForLegacyPoll(peerId: string): { mode: "claude-channel"; ageMs: number } | null {
+  const peer = selectPeerById.get(peerId) as Peer | null;
+  if (peer?.receiver_mode !== "claude-channel" || !peer.last_hook_seen_at) return null;
+  const seenAt = new Date(peer.last_hook_seen_at).getTime();
+  if (!Number.isFinite(seenAt)) return null;
+  const ageMs = Math.max(0, Date.now() - seenAt);
+  return ageMs < LEGACY_POLL_HOOK_FRESH_MS ? { mode: "claude-channel", ageMs } : null;
+}
+
 function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
   const messages = selectAvailableMessages(body.id);
   const now = Date.now();
@@ -2992,8 +3003,27 @@ requestHandler = async (req: Request) => {
           return Response.json(handleMessageStatus(auth.id, { ids: (body.ids as number[]) ?? [] }));
         case "/lifecycle-identity":
           return Response.json(lifecycleIdentity());
-        case "/poll-messages":
+        case "/poll-messages": {
+          const freshHook = freshClaudeHookForLegacyPoll(auth.id);
+          const pending = freshHook ? selectAvailableMessages(auth.id) : [];
+          if (freshHook && pending.length > 0) {
+            // Compatibility fence for Claude MCP servers that predate
+            // claim-local delivery. Those old servers run a background
+            // /poll-messages buffer in parallel with the standby hook. Fence
+            // only while the hook is demonstrably fresh AND mail is pending;
+            // once the hook is stale, explicit check_messages must fail open.
+            // Codex/Gemini never ran this competing buffer and keep their
+            // legacy fallback unchanged. Return the old client's ordinary
+            // empty-200 shape: legacy brokerFetch gives 409 special
+            // supersession semantics that can terminate the MCP process.
+            console.error(`[broker] legacy-poll fenced peer=${auth.id} reason=fresh-claude-hook age_ms=${freshHook.ageMs} queued=${pending.length}`);
+            return Response.json({
+              messages: [],
+              delivery_owner: freshHook.mode,
+            });
+          }
           return Response.json(handlePollMessages({ id: auth.id }));
+        }
         case "/ack-messages":
           return Response.json(handleAckMessages({
             id: auth.id,

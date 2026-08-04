@@ -304,6 +304,7 @@ export interface PollMessagesRequest {
 
 export interface PollMessagesResponse {
   messages: Message[];
+  delivery_owner?: "claude-channel";
 }
 
 export interface AckMessagesRequest {

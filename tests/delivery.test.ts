@@ -11,6 +11,7 @@
 import { describe, test, expect, beforeAll, afterAll, afterEach } from "bun:test";
 import { Database } from "bun:sqlite";
 import { startTestBroker, type TestBroker } from "./helpers/test-broker.ts";
+import type { PollMessagesResponse } from "../shared/types.ts";
 
 // --- Broker schema + ack endpoint logic ---
 
@@ -533,6 +534,220 @@ describe("Live broker delivery features", () => {
     // Poll 3: message should be gone
     const poll3 = await brokerFetch<{ messages: { id: number }[] }>("/poll-messages", { id: receiver.id });
     expect(poll3.messages.length).toBe(0);
+  });
+
+  test("legacy observation poll fences pending mail only while the Claude hook is fresh", async () => {
+    const child = spawnSleep();
+    const peer = await brokerFetch<{ id: string }>("/register", {
+      pid: child.pid,
+      cwd: "/legacy-hook-owned-claude",
+      git_root: null,
+      tty: null,
+      name: "legacy-hook-owned-claude",
+      tmux_session: null,
+      tmux_window_index: null,
+      tmux_window_name: null,
+      client_type: "claude",
+      receiver_mode: "claude-channel",
+      summary: "",
+    });
+    const sent = await brokerFetch<{ id: number }>("/send-message", {
+      from_id: peer.id,
+      to_id: peer.id,
+      text: "only the fresh Claude hook may render this body",
+    });
+
+    // A receiver mode is persistent metadata, not proof that the hook is live.
+    // Before the first hook heartbeat, legacy clients retain their body path.
+    const beforeHeartbeat = await brokerFetch<{ messages: Array<{ id: number; text: string }> }>(
+      "/poll-messages",
+      { id: peer.id },
+    );
+    expect(beforeHeartbeat.messages).toEqual([
+      expect.objectContaining({ id: sent.id, text: "only the fresh Claude hook may render this body" }),
+    ]);
+    const beforeHeartbeatAck = await brokerFetch<{ ok: boolean; acked: number }>("/ack-messages", {
+      id: peer.id,
+      ids: [sent.id],
+      via: "legacy-before-heartbeat-test",
+    });
+    expect(beforeHeartbeatAck).toMatchObject({ ok: true, acked: 1 });
+
+    const heartbeat = await rawPost("/hook-heartbeat-by-pid", {
+      pid: child.pid,
+      caller_pid: process.pid,
+      client_type: "claude",
+      receiver_mode: "claude-channel",
+    });
+    expect(heartbeat.status).toBe(200);
+    expect(heartbeat.json).toMatchObject({ ok: true, peer_id: peer.id });
+
+    const fencedSent = await brokerFetch<{ id: number }>("/send-message", {
+      from_id: peer.id,
+      to_id: peer.id,
+      text: "only the fresh Claude hook may render this fenced body",
+    });
+    const metricsBeforeFence = await brokerFetch<{ queue_to_buffer: { count: number } }>("/metrics", { id: peer.id });
+
+    const fenced = await fetch(`${brokerUrl}/poll-messages`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Peer-Token": tokens.get(peer.id)!,
+      },
+      body: JSON.stringify({ id: peer.id }),
+    });
+    const fenceBody = await fenced.json() as PollMessagesResponse;
+    expect(fenced.status).toBe(200);
+    expect(fenceBody).toMatchObject({
+      messages: [],
+      delivery_owner: "claude-channel",
+    });
+    expect(broker.stderr()).toContain(`legacy-poll fenced peer=${peer.id} reason=fresh-claude-hook`);
+    const metricsAfterFence = await brokerFetch<{ queue_to_buffer: { count: number } }>("/metrics", { id: peer.id });
+    expect(metricsAfterFence.queue_to_buffer.count).toBe(metricsBeforeFence.queue_to_buffer.count);
+
+    const emptyChild = spawnSleep();
+    const emptyPeer = await brokerFetch<{ id: string }>("/register", {
+      pid: emptyChild.pid,
+      cwd: "/legacy-hook-owned-claude-empty",
+      git_root: null,
+      tty: null,
+      name: "legacy-hook-owned-claude-empty",
+      tmux_session: null,
+      tmux_window_index: null,
+      tmux_window_name: null,
+      client_type: "claude",
+      receiver_mode: "claude-channel",
+      summary: "",
+    });
+    const emptyHeartbeat = await rawPost("/hook-heartbeat-by-pid", {
+      pid: emptyChild.pid,
+      caller_pid: process.pid,
+      client_type: "claude",
+      receiver_mode: "claude-channel",
+    });
+    expect(emptyHeartbeat.status).toBe(200);
+    const emptyFreshPoll = await brokerFetch<{ messages: unknown[] }>("/poll-messages", { id: emptyPeer.id });
+    expect(emptyFreshPoll.messages).toEqual([]);
+    emptyChild.kill();
+
+    const queuedStatus = await brokerFetch<{ statuses: Array<{ state: string; delivered: boolean }> }>(
+      "/message-status",
+      { id: peer.id, ids: [fencedSent.id] },
+    );
+    expect(queuedStatus.statuses[0]).toMatchObject({ state: "queued", delivered: false });
+
+    // Once the hook is stale, the same legacy endpoint fails open so an
+    // explicit check_messages call can recover the still-queued body.
+    const staleDb = new Database(TEST_DB);
+    staleDb.query("UPDATE peers SET last_hook_seen_at = ? WHERE id = ?")
+      .run(new Date(Date.now() - 24 * 60 * 60 * 1_000).toISOString(), peer.id);
+    staleDb.close();
+
+    const staleFallback = await brokerFetch<{ messages: Array<{ id: number; text: string }> }>(
+      "/poll-messages",
+      { id: peer.id },
+    );
+    expect(staleFallback.messages).toEqual([
+      expect.objectContaining({ id: fencedSent.id, text: "only the fresh Claude hook may render this fenced body" }),
+    ]);
+    const metricsAfterFallback = await brokerFetch<{ queue_to_buffer: { count: number } }>("/metrics", { id: peer.id });
+    expect(metricsAfterFallback.queue_to_buffer.count).toBe(metricsBeforeFence.queue_to_buffer.count + 1);
+
+    const ack = await brokerFetch<{ ok: boolean; acked: number }>("/ack-messages", {
+      id: peer.id,
+      ids: [fencedSent.id],
+      via: "legacy-stale-hook-fallback-test",
+    });
+    expect(ack).toMatchObject({ ok: true, acked: 1 });
+    child.kill();
+  });
+
+  test.each([
+    ["codex", "codex-hook"],
+    ["gemini", "gemini-hook"],
+  ] as const)("fresh %s hooks retain the legacy %s check_messages fallback", async (clientType, receiverMode) => {
+    const child = spawnSleep();
+    const peer = await brokerFetch<{ id: string }>("/register", {
+      pid: child.pid,
+      cwd: `/legacy-hook-fallback-${clientType}`,
+      git_root: null,
+      tty: null,
+      name: `legacy-hook-fallback-${clientType}`,
+      tmux_session: null,
+      tmux_window_index: null,
+      tmux_window_name: null,
+      client_type: clientType,
+      receiver_mode: receiverMode,
+      summary: "",
+    });
+    const heartbeat = await rawPost("/hook-heartbeat-by-pid", {
+      pid: child.pid,
+      caller_pid: process.pid,
+      client_type: clientType,
+      receiver_mode: receiverMode,
+    });
+    expect(heartbeat.status).toBe(200);
+
+    const sent = await brokerFetch<{ id: number }>("/send-message", {
+      from_id: peer.id,
+      to_id: peer.id,
+      text: `${clientType} legacy fallback stays available`,
+    });
+    const legacyPoll = await brokerFetch<{ messages: Array<{ id: number; text: string }> }>(
+      "/poll-messages",
+      { id: peer.id },
+    );
+    expect(legacyPoll.messages).toEqual([
+      expect.objectContaining({ id: sent.id, text: `${clientType} legacy fallback stays available` }),
+    ]);
+
+    const ack = await brokerFetch<{ ok: boolean; acked: number }>("/ack-messages", {
+      id: peer.id,
+      ids: [sent.id],
+      via: `legacy-${clientType}-fallback-test`,
+    });
+    expect(ack).toMatchObject({ ok: true, acked: 1 });
+    child.kill();
+  });
+
+  test("legacy observation poll remains available to manual-drain clients", async () => {
+    const child = spawnSleep();
+    const peer = await brokerFetch<{ id: string }>("/register", {
+      pid: child.pid,
+      cwd: "/legacy-manual-poll",
+      git_root: null,
+      tty: null,
+      name: "legacy-manual-poll",
+      tmux_session: null,
+      tmux_window_index: null,
+      tmux_window_name: null,
+      client_type: "codex",
+      receiver_mode: "manual-drain",
+      summary: "",
+    });
+    const sent = await brokerFetch<{ id: number }>("/send-message", {
+      from_id: peer.id,
+      to_id: peer.id,
+      text: "manual drain still uses legacy poll",
+    });
+
+    const legacyPoll = await brokerFetch<{ messages: Array<{ id: number; text: string }> }>(
+      "/poll-messages",
+      { id: peer.id },
+    );
+    expect(legacyPoll.messages).toEqual([
+      expect.objectContaining({ id: sent.id, text: "manual drain still uses legacy poll" }),
+    ]);
+
+    const ack = await brokerFetch<{ ok: boolean; acked: number }>("/ack-messages", {
+      id: peer.id,
+      ids: [sent.id],
+      via: "legacy-manual-test",
+    });
+    expect(ack).toMatchObject({ ok: true, acked: 1 });
+    child.kill();
   });
 
   test("peer-scoped ack: cannot ack another peer's messages via broker", async () => {
