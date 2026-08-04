@@ -238,7 +238,7 @@ export function shouldDisableBackgroundPolling(clientType: ClientType, receiverM
   // "unknown" clients have no channel receive path (send-only bridges, observer
   // rows): a background poll can never deliver to them, it only holds a broker
   // connection open per process. check_messages still polls the broker directly.
-  return clientType === "codex" || clientType === "gemini" || clientType === "cursor" || clientType === "agy"
+  return clientType === "claude" || clientType === "codex" || clientType === "gemini" || clientType === "cursor" || clientType === "agy"
     || clientType === "kimi"
     || clientType === "unknown"
     || receiverMode === "codex-hook" || receiverMode === "gemini-hook";

@@ -575,7 +575,10 @@ describe("Operator-label fallback — human name first, pane_id metadata last", 
     expect(shouldDisableBackgroundPolling("codex", "manual-drain")).toBe(true);
     expect(shouldDisableBackgroundPolling("gemini", "manual-drain")).toBe(true);
     expect(shouldDisableBackgroundPolling("unknown", "codex-hook")).toBe(true);
-    expect(shouldDisableBackgroundPolling("claude", "claude-channel")).toBe(false);
+    // Claude's prompt hook and explicit check_messages own delivery. Leaving the
+    // MCP poll/buffer loop enabled lets it retain a pre-hook copy and re-render
+    // the same body on the next tool result.
+    expect(shouldDisableBackgroundPolling("claude", "claude-channel")).toBe(true);
     // "unknown" clients (send-only bridges, observer rows) have no channel
     // receive path — polling can never deliver to them, so it stays off.
     expect(shouldDisableBackgroundPolling("unknown", "manual-drain")).toBe(true);
