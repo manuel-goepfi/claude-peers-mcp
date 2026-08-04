@@ -249,7 +249,7 @@ describe("Claude standby watcher", () => {
     mkdirSync(runtime, { mode: 0o700 });
     const customDb = join(root, "custom-peers.db");
     const db = new Database(customDb);
-    db.run("CREATE TABLE peers (pid INTEGER PRIMARY KEY, summary TEXT NOT NULL)");
+    db.run("CREATE TABLE peers (pid INTEGER PRIMARY KEY, thread_id TEXT, summary TEXT NOT NULL)");
     const requests: Array<{ path: string; body: Record<string, unknown> }> = [];
     const broker = Bun.serve({
       hostname: "127.0.0.1",
@@ -271,7 +271,10 @@ describe("Claude standby watcher", () => {
     servers.push(broker);
     const anchor = Bun.spawn(["sleep", "20"]);
     children.push(anchor);
-    db.run("INSERT INTO peers (pid, summary) VALUES (?, ?)", [anchor.pid, "standby auto"]);
+    // A detached thread must read the summary from the same thread-owned row,
+    // not from whichever row happens to carry the visible Claude PID.
+    db.run("INSERT INTO peers (pid, thread_id, summary) VALUES (?, ?, ?)", [anchor.pid, null, "standby ask"]);
+    db.run("INSERT INTO peers (pid, thread_id, summary) VALUES (?, ?, ?)", [anchor.pid + 1, "detached-session-id", "standby auto"]);
     db.close();
 
     // Force discovery to FAIL, deterministically.

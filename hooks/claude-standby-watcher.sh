@@ -153,10 +153,15 @@ chmod 600 "$LOCK_FILE" 2>/dev/null || bail lock-chmod-failed
 flock -w "$LOCK_WAIT" 200 || exit 0
 
 wake_mode() {
-  local summary="" summary_pid="${MCP_PID:-$CLAUDE_PID}"
-  if command -v sqlite3 >/dev/null 2>&1; then
+  local summary="" query=""
+  if [[ "$ROUTE_MODE" == "thread" && "$SESSION_ID" =~ ^[A-Za-z0-9._-]{1,128}$ ]]; then
+    query="SELECT summary FROM peers WHERE thread_id='$SESSION_ID' LIMIT 1"
+  elif [[ -n "$MCP_PID" ]]; then
+    query="SELECT summary FROM peers WHERE pid=$MCP_PID LIMIT 1"
+  fi
+  if [[ -n "$query" ]] && command -v sqlite3 >/dev/null 2>&1; then
     summary=$(sqlite3 -readonly "${CLAUDE_PEERS_DB:-$FALLBACK_HOME/.claude-peers.db}" \
-      "SELECT summary FROM peers WHERE pid=$summary_pid" 2>/dev/null || true)
+      "$query" 2>/dev/null || true)
     if [[ "$(bun "$SCRIPT_DIR/claude-wake-mode.ts" "$summary" 2>/dev/null)" == "auto" ]]; then
       printf 'auto\n'
       return
