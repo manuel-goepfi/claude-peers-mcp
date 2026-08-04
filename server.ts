@@ -2426,6 +2426,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   }
 });
 
+// TODO(delivery): retire or redesign this inactive compatibility scheduler only
+// as a coordinated change across bench/peer-fleet.ts,
+// tests/adaptive-polling.test.ts, tests/peer-fleet-benchmark.test.ts,
+// README.md, and CLAUDE.md. Every current client bypasses this path.
 // --- Polling loop for inbound messages ---
 
 let pollTransportFailed = false;
