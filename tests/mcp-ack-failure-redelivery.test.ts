@@ -7,7 +7,7 @@ import { startTestBroker, type TestBroker } from "./helpers/test-broker.ts";
 const SERVER_SCRIPT = new URL("../server.ts", import.meta.url).pathname;
 const APP_SERVER_FIXTURE = new URL("./fixtures/codex-app-server-parent.ts", import.meta.url).pathname;
 const REPO_ROOT = new URL("..", import.meta.url).pathname;
-const canUseTmux = Bun.spawnSync(["tmux", "list-sessions"], {
+const canUseTmux = Bun.spawnSync(["tmux", "-V"], {
   stdout: "ignore",
   stderr: "ignore",
 }).exitCode === 0;
