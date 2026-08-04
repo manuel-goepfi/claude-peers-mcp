@@ -16,7 +16,7 @@ function invariant(condition: unknown, message: string): asserts condition {
 async function run(command: string[], options: { cwd: string; home: string }): Promise<{ stdout: string; stderr: string }> {
   const proc = Bun.spawn(command, {
     cwd: options.cwd,
-    env: { ...process.env, HOME: options.home },
+    env: { ...process.env, HOME: options.home, CODEX_HOME: join(options.home, ".codex") },
     stdout: "pipe",
     stderr: "pipe",
   });

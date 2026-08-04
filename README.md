@@ -85,6 +85,13 @@ CLAUDE_CONFIG_DIR="$HOME/.claude-b" bun bin/install-claude-hook.ts install
 CLAUDE_CONFIG_DIR="$HOME/.claude-b" bun bin/install-claude-hook.ts --check
 ```
 
+Codex profiles use the same pattern through `CODEX_HOME`:
+
+```bash
+CODEX_HOME="$HOME/.codex-b" bun bin/install-codex-hook.ts install
+CODEX_HOME="$HOME/.codex-b" bun bin/install-codex-hook.ts --check
+```
+
 - Claude: `SessionStart` registration, `UserPromptSubmit` drain, and a `Stop` `asyncRewake` standby watcher. The watcher polls every 10 seconds for the first hour after activity, then every 60 seconds while the Claude process remains alive; later Stop events refresh the fast window without spawning duplicate watchers.
 - Codex: `SessionStart` registration and drain, `UserPromptSubmit` drain, and `Stop` turn-end drain.
 - Gemini: `SessionStart` registration and `BeforeAgent` drain. The installer also renders its supported `mcpServers` entry.

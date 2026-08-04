@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -7,8 +7,38 @@ const installer = new URL("../bin/install-codex-hook.ts", import.meta.url).pathn
 const shellQuote = (value: string): string => `'${value.replace(/'/g, "'\\''")}'`;
 const expectedDrainCommand = `/usr/bin/env bash ${shellQuote(new URL("../hooks/codex-drain-peer-inbox.sh", import.meta.url).pathname)}`;
 const expectedRegisterCommand = `/usr/bin/env bash ${shellQuote(new URL("../hooks/codex-register-peer-session.sh", import.meta.url).pathname)}`;
+const isolatedEnv = (home: string): Record<string, string> => ({ ...process.env, HOME: home, CODEX_HOME: "" }) as Record<string, string>;
 
 describe("Codex hook installer", () => {
+  test("honors CODEX_HOME for alternate user profiles", async () => {
+    const root = mkdtempSync(join(tmpdir(), "claude-peers-codex-home-"));
+    try {
+      const home = join(root, "home");
+      const safeClone = join(home, "clone");
+      const codexHome = join(home, ".codex-b");
+      const hooksPath = join(codexHome, "hooks.json");
+      mkdirSync(safeClone, { recursive: true, mode: 0o700 });
+      mkdirSync(codexHome, { recursive: true, mode: 0o700 });
+      for (const entry of ["bin", "shared", "hooks"]) {
+        cpSync(join(new URL("..", import.meta.url).pathname, entry), join(safeClone, entry), { recursive: true });
+      }
+
+      const proc = Bun.spawn(["bun", join(safeClone, "bin", "install-codex-hook.ts"), "install"], {
+        env: { ...process.env, HOME: home, CODEX_HOME: codexHome },
+        cwd: home,
+        stdout: "ignore",
+        stderr: "pipe",
+      });
+      const stderr = await new Response(proc.stderr).text();
+      expect(await proc.exited).toBe(0);
+      expect(stderr).toBe("");
+      expect(readFileSync(hooksPath, "utf8")).toContain("claude-peers-codex-register");
+      expect(() => readFileSync(join(home, ".codex", "hooks.json"), "utf8")).toThrow();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("merges into existing hooks and remains idempotent", async () => {
     const repo = mkdtempSync(join(tmpdir(), "claude-peers-install-"));
     try {
@@ -31,7 +61,7 @@ describe("Codex hook installer", () => {
       }, null, 2), { mode: 0o600 });
 
       for (let i = 0; i < 2; i++) {
-        const proc = Bun.spawn(["bun", installer, repo], { env: { ...process.env, HOME: repo }, stdout: "ignore", stderr: "pipe" });
+        const proc = Bun.spawn(["bun", installer, repo], { env: isolatedEnv(repo), stdout: "ignore", stderr: "pipe" });
         const stderr = await new Response(proc.stderr).text();
         expect(await proc.exited).toBe(0);
         expect(stderr).toBe("");
@@ -80,7 +110,7 @@ describe("Codex hook installer", () => {
       const hooksPath = join(repo, ".codex", "hooks.json");
       mkdirSync(join(repo, ".codex"), { recursive: true, mode: 0o700 });
       writeFileSync(hooksPath, "{not-json", { mode: 0o600 });
-      const proc = Bun.spawn(["bun", installer, repo], { env: { ...process.env, HOME: repo }, stdout: "ignore", stderr: "pipe" });
+      const proc = Bun.spawn(["bun", installer, repo], { env: isolatedEnv(repo), stdout: "ignore", stderr: "pipe" });
       await new Response(proc.stderr).text();
       expect(await proc.exited).not.toBe(0);
       expect(readFileSync(hooksPath, "utf8")).toBe("{not-json");
@@ -120,7 +150,7 @@ describe("Codex hook installer", () => {
         },
       }, null, 2), { mode: 0o600 });
 
-      const proc = Bun.spawn(["bun", installer, repo], { env: { ...process.env, HOME: repo }, stdout: "ignore", stderr: "pipe" });
+      const proc = Bun.spawn(["bun", installer, repo], { env: isolatedEnv(repo), stdout: "ignore", stderr: "pipe" });
       const stderr = await new Response(proc.stderr).text();
       expect(await proc.exited).toBe(0);
       expect(stderr).toBe("");
@@ -170,7 +200,7 @@ describe("Codex hook installer", () => {
         },
       }, null, 2), { mode: 0o600 });
 
-      const proc = Bun.spawn(["bun", installer, repo], { env: { ...process.env, HOME: repo }, stdout: "ignore", stderr: "pipe" });
+      const proc = Bun.spawn(["bun", installer, repo], { env: isolatedEnv(repo), stdout: "ignore", stderr: "pipe" });
       const stderr = await new Response(proc.stderr).text();
       expect(await proc.exited).toBe(0);
       expect(stderr).toBe("");
@@ -212,7 +242,7 @@ describe("Codex hook installer", () => {
         },
       }, null, 2), { mode: 0o600 });
 
-      const proc = Bun.spawn(["bun", installer, repo], { env: { ...process.env, HOME: repo }, stdout: "ignore", stderr: "pipe" });
+      const proc = Bun.spawn(["bun", installer, repo], { env: isolatedEnv(repo), stdout: "ignore", stderr: "pipe" });
       const stderr = await new Response(proc.stderr).text();
       expect(await proc.exited).toBe(0);
       expect(stderr).toBe("");
