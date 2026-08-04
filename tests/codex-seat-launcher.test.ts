@@ -224,12 +224,72 @@ fi
     expect(result.exitCode).toBe(0);
     expect(readFileSync(join(state, "app.env"), "utf8")).toBe("name=orch.5\npane=%2432\n");
     expect(readFileSync(join(state, "tui.env"), "utf8")).toBe("name=orch.5\npane=%2432\n");
-    expect(readFileSync(join(state, "tui.args"), "utf8")).toBe(`--remote\nws://127.0.0.1:${port}\nresume\n`);
+    expect(readFileSync(join(state, "tui.args"), "utf8")).toBe(
+      `--remote\nws://127.0.0.1:${port}\n--cd\n${process.cwd()}\nresume\n`,
+    );
     const appPid = Number(readFileSync(join(state, "app.pid"), "utf8").trim());
     const appChildPid = Number(readFileSync(join(state, "app.child.pid"), "utf8").trim());
     expect(isAlive(appPid)).toBe(false);
     expect(isAlive(appChildPid)).toBe(false);
     expect(existsSync(join(root, ".codex", "logs", "codex-seat-2432.app-server.log"))).toBe(true);
+  });
+
+  test("supplies the launcher cwd as --cd, because wrapping always adds --remote", () => {
+    // A remote workspace does not inherit the launching cwd, and the launcher
+    // adds --remote on every wrap. Two things broke without this: `codex resume`
+    // refused outright while tui.resume_cwd is "current", and peer registration
+    // keys on the hook environment's cwd, so a lane registered under whichever
+    // directory the launcher happened to sit in rather than the one it was
+    // asked for.
+    const { root, state, fakeCodex } = fixture();
+    const port = freePort();
+    const result = Bun.spawnSync([LAUNCHER, "resume"], {
+      env: {
+        PATH: process.env.PATH ?? "",
+        HOME: root,
+        CODEX_HOME: join(root, ".codex"),
+        CLAUDE_PEERS_REAL_CODEX: fakeCodex,
+        CLAUDE_PEERS_CODEX_SEAT_PORT: String(port),
+        FAKE_CODEX_STATE: state,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    expect(result.exitCode).toBe(0);
+    const args = readFileSync(join(state, "tui.args"), "utf8").split("\n").filter(Boolean);
+    expect(args).toContain("--cd");
+    expect(args[args.indexOf("--cd") + 1]).toBe(process.cwd());
+  });
+
+  test.each([
+    ["separate long form", ["--cd", "/tmp"]],
+    ["separate short form", ["-C", "/tmp"]],
+    ["attached form", ["--cd=/tmp"]],
+  ])("leaves a caller-supplied workspace root alone (%s)", (_label, caller) => {
+    // An explicit -C/--cd must win. Injecting a second one hands Codex two
+    // conflicting workspace roots for one session, which is worse than the bug
+    // the injection exists to fix.
+    const { root, state, fakeCodex } = fixture();
+    const port = freePort();
+    const result = Bun.spawnSync([LAUNCHER, ...caller, "resume"], {
+      env: {
+        PATH: process.env.PATH ?? "",
+        HOME: root,
+        CODEX_HOME: join(root, ".codex"),
+        CLAUDE_PEERS_REAL_CODEX: fakeCodex,
+        CLAUDE_PEERS_CODEX_SEAT_PORT: String(port),
+        FAKE_CODEX_STATE: state,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    expect(result.exitCode).toBe(0);
+    const args = readFileSync(join(state, "tui.args"), "utf8").split("\n").filter(Boolean);
+    const supplied = args.filter((a) => a === "--cd" || a === "-C" || a.startsWith("--cd=")).length;
+    expect(supplied).toBe(1);
+    expect(args).not.toContain(process.cwd());
   });
 
   test("the detached owner watchdog reaps both children if the launcher is killed", async () => {

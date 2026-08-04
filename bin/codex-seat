@@ -89,6 +89,7 @@ fi
 
 passthrough_command=""
 expect_option_value=0
+seen_cd=0
 for argument in "$@"; do
   [[ "$argument" == "--" ]] && break
   case "$argument" in
@@ -103,7 +104,14 @@ for argument in "$@"; do
   case "$argument" in
     --) break ;;
     --remote|--remote=*) exec "$REAL_CODEX" "$@" ;;
-    -c|--config|--enable|--disable|-i|--image|-m|--model|--local-provider|-p|--profile|-s|--sandbox|-C|--cd|--add-dir|-a|--ask-for-approval|--remote-auth-token-env)
+    -C|--cd)
+      expect_option_value=1
+      seen_cd=1
+      ;;
+    --cd=*)
+      seen_cd=1
+      ;;
+    -c|--config|--enable|--disable|-i|--image|-m|--model|--local-provider|-p|--profile|-s|--sandbox|--add-dir|-a|--ask-for-approval|--remote-auth-token-env)
       expect_option_value=1
       ;;
     --strict-config|--oss|--dangerously-bypass-approvals-and-sandbox|--dangerously-bypass-hook-trust|--search|--no-alt-screen)
@@ -205,7 +213,15 @@ if [[ -z "$APP_PID" ]] || ! kill -0 "$APP_PID" 2>/dev/null; then
   exit 1
 fi
 
-"$REAL_CODEX" --remote "$endpoint" "$@" <&0 &
+# Wrapping ALWAYS adds --remote, which makes this a remote workspace, and a
+# remote workspace does not inherit the launching cwd. Two things break without
+# an explicit --cd: `codex resume` refuses outright when tui.resume_cwd is
+# "current", and peer registration keys on the hook environment's cwd, so a lane
+# would register under whatever directory the launcher happened to sit in.
+# Only supply it when the caller did not, so an explicit -C/--cd still wins.
+CD_ARGS=()
+(( seen_cd )) || CD_ARGS=(--cd "$PWD")
+"$REAL_CODEX" --remote "$endpoint" ${CD_ARGS[@]+"${CD_ARGS[@]}"} "$@" <&0 &
 TUI_PID=$!
 owner_start="$(awk '{print $22}' "/proc/$$/stat")"
 setsid "$SELF" --watch "$$" "$owner_start" "$APP_PID" "$TUI_PID" >/dev/null 2>&1 &
