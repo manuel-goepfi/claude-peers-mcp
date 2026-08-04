@@ -231,6 +231,26 @@ describe("codex-seat launcher", () => {
     );
   });
 
+  test("fails toward a registered seat for an unknown future short option", () => {
+    const { root, state, fakeCodex } = fixture();
+    const port = freePort();
+    const result = Bun.spawnSync([LAUNCHER, "-x", "exec", "--json"], {
+      env: {
+        PATH: process.env.PATH ?? "",
+        HOME: root,
+        CODEX_HOME: join(root, ".codex"),
+        CLAUDE_PEERS_REAL_CODEX: fakeCodex,
+        CLAUDE_PEERS_CODEX_SEAT_PORT: String(port),
+        FAKE_CODEX_STATE: state,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(existsSync(join(state, "app.pid"))).toBe(true);
+  });
+
   test.each([
     ["interactive help", ["resume", "--help"]],
     ["app-server", ["app-server", "--listen", "ws://127.0.0.1:45678"]],

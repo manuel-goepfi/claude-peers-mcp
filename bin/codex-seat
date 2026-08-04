@@ -141,7 +141,10 @@ while (( argument_index < ${#arguments[@]} )); do
     # noninteractive invocation merely starts a short-lived app-server that the
     # cleanup trap reaps when Codex exits.
     --*) unknown_option=1 ;;
-    -[^-]*) ;;
+    # Unknown short flags are ambiguous for the same reason as future long
+    # flags: a following token such as `exec` may be the option's value rather
+    # than a real subcommand. Keep the seat instead of silently bypassing it.
+    -[^-]*) unknown_option=1 ;;
     *) passthrough_command="$argument"; break ;;
   esac
   argument_index=$((argument_index + 1))
