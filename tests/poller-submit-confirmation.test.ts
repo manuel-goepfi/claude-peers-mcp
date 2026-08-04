@@ -107,6 +107,8 @@ describe("the shipped poller is wake-only", () => {
   test("contains no mailbox claim or acknowledgement route", () => {
     expect(source).not.toContain('"/claim-by-pid"');
     expect(source).not.toContain('"/ack-by-pid"');
+    expect(source).not.toContain('"/claim-by-thread"');
+    expect(source).not.toContain('"/ack-by-thread"');
     expect(source).not.toContain("deliverClaimedCodexMail");
   });
 
