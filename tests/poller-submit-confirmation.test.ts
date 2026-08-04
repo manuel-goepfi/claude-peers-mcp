@@ -1,5 +1,5 @@
 /**
- * ACK must mean the model SAW the mail, not that tmux accepted a keystroke.
+ * The poller must never ACK mail based on a tmux keystroke.
  *
  * Live P1, 2026-08-03: the autodrain poller delivered a 3-message batch into
  * infra.7's pane and immediately acked it. `submitPaneText()` returned the exit
@@ -13,10 +13,10 @@
  * had the operator cleared the composer instead of submitting it, three messages
  * would have vanished with no trace anywhere except a "delivered" row.
  *
- * The repair is to OBSERVE submission and, when it cannot be observed, leave the
- * batch unacked so the next tick retries. These tests pin the observation logic,
- * which is pure and needs no tmux; the discriminator it encodes is the subtle
- * part, so it is asserted from both directions.
+ * The durable repair is wake-only: the poller may submit a notification, while
+ * the lane's own hook claims and acknowledges mail by exact thread identity.
+ * These tests pin submission observation and prove the poller contains no broker
+ * claim/ack route that could convert a missed Enter into message loss.
  */
 
 import { describe, expect, test } from "bun:test";
@@ -93,7 +93,7 @@ describe("composerStillHolds distinguishes UNSENT from SENT", () => {
   });
 });
 
-describe("the shipped poller acks only on observed submission", () => {
+describe("the shipped poller is wake-only", () => {
   const source = require("node:fs").readFileSync(
     new URL("../bin/codex-autodrain-poller.ts", import.meta.url).pathname,
     "utf8",
@@ -104,11 +104,13 @@ describe("the shipped poller acks only on observed submission", () => {
     expect(source).not.toMatch(/return sh\(\["tmux", "send-keys", "-t", paneId, "C-m"\]\)\.ok;/);
   });
 
-  test("an unconfirmed submit is logged and left for retry", () => {
-    expect(source).toContain("leaving batch unacked for retry");
+  test("contains no mailbox claim or acknowledgement route", () => {
+    expect(source).not.toContain('"/claim-by-pid"');
+    expect(source).not.toContain('"/ack-by-pid"');
+    expect(source).not.toContain("deliverClaimedCodexMail");
   });
 
-  test("a vanished pane is never treated as delivered", () => {
-    expect(source).toContain("cannot claim delivery");
+  test("an unconfirmed submit is logged as an uncounted wake", () => {
+    expect(source).toContain("wake submit unconfirmed");
   });
 });
