@@ -42,9 +42,9 @@ two `ExecStart` paths deliberately before installation.
 
 ## What the poller does
 
-Optionally wakes idle hook-backed lanes (via a confirmed tmux submission) so
-their prompt hook can drain pending peer mail. The poller never claims or
-acknowledges mailbox rows itself.
+Optionally wakes idle supported lanes (via a confirmed tmux submission) so their
+prompt hook or explicit check_messages call can drain pending peer mail. The
+poller never claims or acknowledges mailbox rows itself.
 
 ## Managed auto-wake scope
 

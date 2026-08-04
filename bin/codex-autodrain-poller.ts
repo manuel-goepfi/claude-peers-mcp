@@ -11,15 +11,16 @@
  * shows the prompt, not active work), it uses that pane's verified visible PID.
  *
  * The poller is wake-only. It submits a small notification to an exact idle
- * pane; the lane's own hook then claims and acknowledges mail using its durable
- * thread identity. The poller never reads, claims, renders, or acknowledges
- * message payloads, so a missed Enter cannot remove mail from the queue.
+ * pane; the lane's own hook or explicit check_messages call then claims and
+ * acknowledges mail using its session identity. The poller never reads, claims,
+ * renders, or acknowledges message payloads, so a missed Enter cannot remove
+ * mail from the queue.
  *
  * Safety:
  *   - Reconciles visible Codex seats by broker /register only.
  *   - Reads candidate unread counts and identity evidence from SQLite read-only.
- *   - Refuses to wake Codex rows without an exact pane seat, thread id, and
- *     hook-backed receive mode.
+ *   - Refuses to wake Codex rows without an exact pane seat. Legacy rows without
+ *     thread/hook metadata receive an explicit compatibility instruction and log.
  *   - Only nudges a pane that is IDLE: capture-pane must show the Codex prompt
  *     glyph and NOT a busy marker ("esc to interrupt" / "Working" / "Running").
  *   - Only nudges when the input line is empty (no queued operator text to

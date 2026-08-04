@@ -133,6 +133,9 @@ describe("public distribution contract", () => {
 
   test("managed auto-wake preserves every supported legacy/manual client", () => {
     const unit = read("docs/systemd/claude-peers-codex-autodrain.service");
+    const readme = read("README.md");
     expect(unit).toContain("Environment=NUDGE_CLIENTS=codex,gemini,claude,cursor,agy,kimi");
+    expect(readme).toContain("opts every supported hook/manual client");
+    expect(readme).not.toContain("opts only verified Codex and Claude");
   });
 });
