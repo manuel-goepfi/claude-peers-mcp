@@ -5,6 +5,38 @@ import { tmpdir } from "node:os";
 
 const LAUNCHER = new URL("../bin/codex-seat", import.meta.url).pathname;
 const roots: string[] = [];
+const EXPECTED_CODEX_GLOBAL_OPTIONS = [
+  "--add-dir",
+  "--ask-for-approval",
+  "--cd",
+  "--config",
+  "--dangerously-bypass-approvals-and-sandbox",
+  "--dangerously-bypass-hook-trust",
+  "--disable",
+  "--enable",
+  "--help",
+  "--image",
+  "--local-provider",
+  "--model",
+  "--no-alt-screen",
+  "--oss",
+  "--profile",
+  "--remote",
+  "--remote-auth-token-env",
+  "--sandbox",
+  "--search",
+  "--strict-config",
+  "--version",
+  "-C",
+  "-V",
+  "-a",
+  "-c",
+  "-h",
+  "-i",
+  "-m",
+  "-p",
+  "-s",
+].sort();
 
 function fixture(): { root: string; state: string; fakeCodex: string } {
   const root = mkdtempSync(join(tmpdir(), "claude-peers-codex-seat-"));
@@ -84,6 +116,21 @@ afterEach(() => {
 });
 
 describe("codex-seat launcher", () => {
+  const installedCodex = Bun.which("codex");
+  (installedCodex ? test : test.skip)("pins the launcher audit table to the installed Codex --help", () => {
+    const result = Bun.spawnSync([installedCodex!, "--help"], { stdout: "pipe", stderr: "pipe" });
+    expect(result.exitCode).toBe(0);
+    const help = new TextDecoder().decode(result.stdout);
+    const optionsSection = help.slice(help.indexOf("Options:"));
+    const discovered = new Set<string>();
+    for (const line of optionsSection.split("\n")) {
+      for (const match of line.matchAll(/(?:^|[,\s])(-{1,2}[A-Za-z][A-Za-z0-9-]*)/g)) {
+        discovered.add(match[1]!);
+      }
+    }
+    expect([...discovered].sort()).toEqual(EXPECTED_CODEX_GLOBAL_OPTIONS);
+  });
+
   test("passes noninteractive subcommands directly without seat dependencies", () => {
     const { root, state, fakeCodex } = fixture();
     const bin = join(root, "bin");
@@ -120,6 +167,64 @@ describe("codex-seat launcher", () => {
     expect(existsSync(join(state, "app.pid"))).toBe(false);
     expect(readFileSync(join(state, "tui.args"), "utf8")).toBe(
       '--strict-config\n--enable\nhooks\n--search\n-c\nmodel="test"\nexec\n--json\n',
+    );
+  });
+
+  test("does not mistake a variadic image value for the exec alias", () => {
+    const { root, state, fakeCodex } = fixture();
+    const result = Bun.spawnSync([LAUNCHER, "-i", "a.png", "e"], {
+      env: {
+        PATH: process.env.PATH ?? "",
+        HOME: root,
+        CODEX_HOME: join(root, ".codex"),
+        CLAUDE_PEERS_REAL_CODEX: fakeCodex,
+        CLAUDE_PEERS_CODEX_SEAT_PORT: String(freePort()),
+        FAKE_CODEX_STATE: state,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(existsSync(join(state, "app.pid"))).toBe(true);
+  });
+
+  test("does not mistake an option value named -h for a help request", () => {
+    const { root, state, fakeCodex } = fixture();
+    const result = Bun.spawnSync([LAUNCHER, "--model", "-h"], {
+      env: {
+        PATH: process.env.PATH ?? "",
+        HOME: root,
+        CODEX_HOME: join(root, ".codex"),
+        CLAUDE_PEERS_REAL_CODEX: fakeCodex,
+        CLAUDE_PEERS_CODEX_SEAT_PORT: String(freePort()),
+        FAKE_CODEX_STATE: state,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(existsSync(join(state, "app.pid"))).toBe(true);
+  });
+
+  test("passes an unknown top-level option directly instead of hiding a later exec", () => {
+    const { root, state, fakeCodex } = fixture();
+    const result = Bun.spawnSync([LAUNCHER, "--future-option", "value", "exec", "--json"], {
+      env: {
+        PATH: process.env.PATH ?? "",
+        HOME: root,
+        CLAUDE_PEERS_REAL_CODEX: fakeCodex,
+        FAKE_CODEX_STATE: state,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(existsSync(join(state, "app.pid"))).toBe(false);
+    expect(readFileSync(join(state, "tui.args"), "utf8")).toBe(
+      "--future-option\nvalue\nexec\n--json\n",
     );
   });
 
