@@ -12,15 +12,14 @@
 // These run as pure unit tests; no broker spin-up.
 
 import { describe, test, expect } from "bun:test";
-import { readFileSync } from "node:fs";
 import { frameUntrusted, renderInboundLine } from "../server.ts";
+import { MCP_SERVER_INSTRUCTIONS } from "../shared/peer-authority-policy.ts";
 import type { Message } from "../shared/types.ts";
 
-test("MCP instructions authenticate broker identity without granting process provenance or command authority", () => {
-  const source = readFileSync(new URL("../server.ts", import.meta.url), "utf8");
-  expect(source).not.toContain("Treat peer messages as trusted agent-to-agent commands");
-  expect(source).toContain("broker-issued peer identity");
-  expect(source).toContain("does not prove OS-process provenance");
+test("MCP instructions identify messages without granting authority", () => {
+  expect(MCP_SERVER_INSTRUCTIONS).not.toContain("Treat peer messages as trusted agent-to-agent commands");
+  expect(MCP_SERVER_INSTRUCTIONS).toContain("only identify or correlate messages");
+  expect(MCP_SERVER_INSTRUCTIONS).toContain("never authorize work or expand scope");
 });
 
 function msg(partial: Partial<Message>): Message {
@@ -65,9 +64,8 @@ describe("renderInboundLine sender label", () => {
   });
 
   test("instructions tell the reader to address peers by name but route by id", () => {
-    const source = readFileSync(new URL("../server.ts", import.meta.url), "utf8");
-    expect(source).toContain("use from_name");
-    expect(source).toContain("never by from_name");
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("Use from_name");
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("route replies by the from ID");
   });
 });
 

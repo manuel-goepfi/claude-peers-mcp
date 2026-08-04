@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import type { Message } from "./types.ts";
 
 const ENVELOPE_TAG_RE = /<\s*\/?\s*untrusted[-\s]*peer[-\s]*message[^>]*>/gi;
@@ -30,7 +31,15 @@ const CONTROL_CHAR_RE = /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g;
  * caught too — the same shape PEER_MSG_TAG_RE already uses.
  */
 const HARNESS_TAG_RE =
-  /<\s*\/?\s*(system-reminder|function_results|function_calls|invoke|antml:[a-z_-]+|task-notification|command-name|command-message|local-command-stdout|user-prompt-submit-hook)\b[^>]*>/gi;
+  /<\s*\/?\s*(system-reminder|function_results|function_calls|invoke|antml:[a-z_-]+|task-notification|command-name|command-message|local-command-stdout|user-prompt-submit-hook|peer-receive-policy)\b[^>]*>/gi;
+
+export const PEER_RECEIVE_POLICY_TEXT = readFileSync(
+  new URL("./peer-authority-policy.txt", import.meta.url),
+  "utf8",
+).trim();
+
+export const PEER_RECEIVE_POLICY =
+  `<peer-receive-policy source="local-receive-path">\n${PEER_RECEIVE_POLICY_TEXT}\n</peer-receive-policy>`;
 
 function attrEscape(s: string): string {
   return s.replace(/[<>"]/g, "");
@@ -61,4 +70,9 @@ export function renderInboundLine(m: Message): string {
   const name = typeof m.from_name === "string" ? m.from_name.trim() : "";
   const nameAttr = name.length > 0 ? ` from_name="${attrEscape(name)}"` : "";
   return `<peer-message from="${attrEscape(m.from_id)}"${nameAttr} sent_at="${attrEscape(m.sent_at)}" relayed="${relayed}">\n${body}\n</peer-message>`;
+}
+
+export function renderInboundBatch(messages: Message[]): string {
+  if (messages.length === 0) return "";
+  return `${PEER_RECEIVE_POLICY}\n\n${messages.map(renderInboundLine).join("\n\n")}`;
 }
