@@ -42,20 +42,18 @@ two `ExecStart` paths deliberately before installation.
 
 ## What the poller does
 
-Optionally nudges idle Codex/Gemini/Claude lanes (via `tmux send-keys`) to read
-pending peer mail. **Auto-nudge is OFF by default** — see `NUDGE_CLIENTS` below.
+Optionally wakes idle hook-backed lanes (via a confirmed tmux submission) so
+their prompt hook can drain pending peer mail. The poller never claims or
+acknowledges mailbox rows itself.
 
-## Auto-nudge default: OFF
+## Managed auto-wake scope
 
-The unit pins `Environment=NUDGE_CLIENTS=` (empty = nudge nobody). Rationale:
-typing a nudge into an idle session forces a turn. Claude lanes already
-piggyback-drain pending mail on their next turn for free; idle Codex/Gemini wakes
-burn quota to drain low-value chatter. Mail still flows on each lane's next
-natural turn. To re-enable a client, set the comma-separated list
-(`codex` / `gemini` / `claude` honored):
+The shipped unit enables only the hook-backed Codex and Claude clients verified
+by the integration suite. Gemini, Cursor, agy, and kimi remain disabled. The
+standalone binary still defaults to no clients unless `NUDGE_CLIENTS` is set:
 
 ```
-Environment=NUDGE_CLIENTS=codex,gemini
+Environment=NUDGE_CLIENTS=codex,claude
 ```
 
 The poller logs its state at startup (`nudge=DISABLED` or `nudge=codex,...`), so

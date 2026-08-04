@@ -264,7 +264,7 @@ bun bin/install-broker-service.ts --uninstall
 
 The AP-063 bridge is a privileged, authenticated history cursor for a same-user observer. Compatibility keeps it enabled by default. Its token grants access to message history; protect it as a secret. Set `CLAUDE_PEERS_BRIDGE_ENABLED=false` for complete removal.
 
-The Codex auto-drain poller is separate from core delivery. Auto-nudge is disabled by default; `NUDGE_CLIENTS=codex,gemini` explicitly opts selected clients into `tmux send-keys`. Core hooks and MCP delivery do not require it. See [docs/systemd/README.md](docs/systemd/README.md).
+The hook wake poller is separate from core delivery. The binary defaults to disabled; the shipped managed unit opts only verified Codex and Claude hook-backed lanes into confirmed tmux wake submissions. It never claims or acknowledges mail itself. See [docs/systemd/README.md](docs/systemd/README.md).
 
 ## Security model
 

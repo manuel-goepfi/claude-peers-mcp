@@ -417,8 +417,8 @@ export function codexLaneReadyForWake(lane: Lane): boolean {
 // Claude, the lane's own drain hook on its next prompt for Codex/Gemini) or when
 // the operator re-engages the lane. Auto-nudge is now opt-in, not automatic.
 //
-// To opt a client back in for a session, set NUDGE_CLIENTS, e.g.
-//   NUDGE_CLIENTS=codex,gemini   (comma-separated; only codex/gemini/claude/cursor honored)
+// To opt clients in, set NUDGE_CLIENTS, e.g.
+//   NUDGE_CLIENTS=codex,claude   (comma-separated allowlisted client names)
 // The whole resolution + idle-detection machinery below is kept intact so opting
 // a client back in is a one-env-var change, not a code revert.
 // Exported + raw-injectable so the parse rules (empty default, allowlist filter,
