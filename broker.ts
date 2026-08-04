@@ -2871,12 +2871,12 @@ requestHandler = async (req: Request) => {
         if (path === "/claim-by-thread") {
           const res = handleClaimByThread(threadBody as ClaimByThreadRequest);
           if (!res.ok) return Response.json({ error: res.error }, { status: res.status ?? 400 });
-          return Response.json({ peer_id: res.peer_id, drain_id: res.drain_id, messages: res.messages, state: res.state });
+          return Response.json({ ok: true, peer_id: res.peer_id, drain_id: res.drain_id, messages: res.messages, state: res.state });
         }
         if (path === "/ack-by-thread") {
           const res = handleAckByThread(threadBody as AckByThreadRequest);
           if (!res.ok) return Response.json({ error: res.error }, { status: res.status ?? 400 });
-          return Response.json({ peer_id: res.peer_id, acked: res.acked, state: res.state });
+          return Response.json({ ok: true, peer_id: res.peer_id, acked: res.acked, state: res.state });
         }
         const res = handleHookHeartbeatByThread(threadBody as HookHeartbeatByThreadRequest);
         if (!res.ok) return Response.json({ error: res.error }, { status: res.status ?? 400 });
@@ -2887,12 +2887,12 @@ requestHandler = async (req: Request) => {
         if (path === "/claim-by-pid") {
           const res = handleClaimByPid(body as unknown as ClaimByPidRequest);
           if (!res.ok) return Response.json({ error: res.error }, { status: res.status ?? 400 });
-          return Response.json({ peer_id: res.peer_id, drain_id: res.drain_id, messages: res.messages, state: res.state });
+          return Response.json({ ok: true, peer_id: res.peer_id, drain_id: res.drain_id, messages: res.messages, state: res.state });
         }
         if (path === "/ack-by-pid") {
           const res = handleAckByPid(body as unknown as AckByPidRequest);
           if (!res.ok) return Response.json({ error: res.error }, { status: res.status ?? 400 });
-          return Response.json({ peer_id: res.peer_id, acked: res.acked, state: res.state });
+          return Response.json({ ok: true, peer_id: res.peer_id, acked: res.acked, state: res.state });
         }
         const res = handleHookHeartbeatByPid(body as unknown as HookHeartbeatByPidRequest);
         if (!res.ok) return Response.json({ error: res.error }, { status: res.status ?? 400 });

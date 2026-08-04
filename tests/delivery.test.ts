@@ -910,6 +910,7 @@ describe("Live broker delivery features", () => {
       drain_id: "test-drain-1",
     });
     expect(claim.status).toBe(200);
+    expect(claim.json.ok).toBe(true);
     expect(claim.json.peer_id).toBe(peer.id);
     expect(claim.json.state).toBe("claimed");
     const claimed = claim.json.messages as { id: number; text: string }[];
@@ -934,6 +935,7 @@ describe("Live broker delivery features", () => {
       via: "codex-hook",
     });
     expect(ack.status).toBe(200);
+    expect(ack.json.ok).toBe(true);
     expect(ack.json.acked).toBe(1);
     expect(ack.json.state).toBe("acknowledged");
 
