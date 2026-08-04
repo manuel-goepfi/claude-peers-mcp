@@ -656,7 +656,8 @@ const selectUndelivered = db.prepare(`
 `);
 
 const markDeliveredScoped = db.prepare(`
-  UPDATE messages SET delivered = 1, delivered_at = ?, retention_at = ?, claimed_by = NULL, claimed_at = NULL WHERE id = ? AND to_id = ?
+  UPDATE messages SET delivered = 1, delivered_at = ?, retention_at = ?, claimed_by = NULL, claimed_at = NULL
+  WHERE id = ? AND to_id = ? AND delivered = 0
 `);
 
 const markDeliveredClaimedScoped = db.prepare(`

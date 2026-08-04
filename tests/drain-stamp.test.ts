@@ -64,6 +64,13 @@ describe("/ack-messages drain telemetry", () => {
     return row.last_drain_at;
   }
 
+  function deliveredAt(id: number): string | null {
+    const db = new Database(broker.dbPath, { readonly: true });
+    const row = db.query("SELECT delivered_at FROM messages WHERE id = ?").get(id) as { delivered_at: string | null };
+    db.close();
+    return row.delivered_at;
+  }
+
   test("stamps last_drain_at for a client that has NO hook route at all", async () => {
     // cursor is the case the gap was found on: manual-drain, nudged by the poller,
     // and it never touches /poll-by-pid — so this route is its only chance to
@@ -101,6 +108,28 @@ describe("/ack-messages drain telemetry", () => {
     });
     expect(acked.acked).toBe(0);
     expect(drainAt(lane)).toBeNull();
+  });
+
+  test("re-acknowledging delivered mail is a no-op and preserves its first delivery timestamp", async () => {
+    const lane = await register("ds-reack", "claude", "claude-channel", "%3010");
+    const sender = await register("ds-reack-sender", "claude", "claude-channel", "%3011");
+    const sent = await call<{ id: number }>("/send-message", {
+      from_id: sender, to_id: lane, text: "display exactly once",
+    });
+
+    const first = await call<{ acked: number }>("/ack-messages", {
+      id: lane, ids: [sent.id], via: "claude-prompt-hook",
+    });
+    expect(first.acked).toBe(1);
+    const firstDeliveredAt = deliveredAt(sent.id);
+    expect(firstDeliveredAt).not.toBeNull();
+
+    await Bun.sleep(25);
+    const duplicate = await call<{ acked: number }>("/ack-messages", {
+      id: lane, ids: [sent.id], via: "drainPendingMessages",
+    });
+    expect(duplicate.acked).toBe(0);
+    expect(deliveredAt(sent.id)).toBe(firstDeliveredAt);
   });
 
   test("the stamp advances on a later drain rather than sticking at the first", async () => {
