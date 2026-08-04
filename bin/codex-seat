@@ -89,14 +89,19 @@ fi
 
 passthrough_command=""
 seen_cd=0
+unknown_option=0
 arguments=("$@")
 argument_index=0
 while (( argument_index < ${#arguments[@]} )); do
   argument="${arguments[$argument_index]}"
   case "$argument" in
     --) break ;;
-    -h|--help|-V|--version) exec "$REAL_CODEX" "$@" ;;
-    --remote|--remote=*) exec "$REAL_CODEX" "$@" ;;
+    -h|--help|-V|--version)
+      if (( unknown_option == 0 )); then exec "$REAL_CODEX" "$@"; fi
+      ;;
+    --remote|--remote=*)
+      if (( unknown_option == 0 )); then exec "$REAL_CODEX" "$@"; fi
+      ;;
     -C|--cd)
       seen_cd=1
       argument_index=$((argument_index + 2))
@@ -129,22 +134,30 @@ while (( argument_index < ${#arguments[@]} )); do
     --config=*|--enable=*|--disable=*|--model=*|--local-provider=*|--profile=*|--sandbox=*|--add-dir=*|--ask-for-approval=*|--remote-auth-token-env=*) ;;
     --strict-config|--oss|--dangerously-bypass-approvals-and-sandbox|--dangerously-bypass-hook-trust|--search|--no-alt-screen)
       ;;
-    --*) exec "$REAL_CODEX" "$@" ;;
+    # A future global flag is ambiguous until the installed --help audit table
+    # is updated: it may be boolean, attached-value, or consume the next token.
+    # Fail toward a pane-local seat. Direct passthrough could silently create an
+    # interactive lane with no durable receive identity; wrapping an actually
+    # noninteractive invocation merely starts a short-lived app-server that the
+    # cleanup trap reaps when Codex exits.
+    --*) unknown_option=1 ;;
     -[^-]*) ;;
     *) passthrough_command="$argument"; break ;;
   esac
   argument_index=$((argument_index + 1))
 done
-case "$passthrough_command" in
-  exec|e|review|login|logout|mcp|plugin|mcp-server|app-server|remote-control|completion|update|doctor|sandbox|debug|apply|a|archive|delete|unarchive|cloud|exec-server|features|help)
-    exec "$REAL_CODEX" "$@"
-    ;;
-esac
+if (( unknown_option == 0 )); then
+  case "$passthrough_command" in
+    exec|e|review|login|logout|mcp|plugin|mcp-server|app-server|remote-control|completion|update|doctor|sandbox|debug|apply|a|archive|delete|unarchive|cloud|exec-server|features|help)
+      exec "$REAL_CODEX" "$@"
+      ;;
+  esac
+fi
 
 # Subcommand help is also noninteractive. At this point the top-level parser has
 # already consumed every option value, so a pre-command `--model -h` cannot be
 # mistaken for help; only arguments following the detected command are scanned.
-if [[ -n "$passthrough_command" ]]; then
+if (( unknown_option == 0 )) && [[ -n "$passthrough_command" ]]; then
   for ((argument_index = argument_index + 1; argument_index < ${#arguments[@]}; argument_index++)); do
     case "${arguments[$argument_index]}" in
       -h|--help) exec "$REAL_CODEX" "$@" ;;

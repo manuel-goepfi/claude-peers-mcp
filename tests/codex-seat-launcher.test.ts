@@ -208,13 +208,16 @@ describe("codex-seat launcher", () => {
     expect(existsSync(join(state, "app.pid"))).toBe(true);
   });
 
-  test("passes an unknown top-level option directly instead of hiding a later exec", () => {
+  test("fails toward a registered seat when an unknown future option is ambiguous", () => {
     const { root, state, fakeCodex } = fixture();
+    const port = freePort();
     const result = Bun.spawnSync([LAUNCHER, "--future-option", "value", "exec", "--json"], {
       env: {
         PATH: process.env.PATH ?? "",
         HOME: root,
+        CODEX_HOME: join(root, ".codex"),
         CLAUDE_PEERS_REAL_CODEX: fakeCodex,
+        CLAUDE_PEERS_CODEX_SEAT_PORT: String(port),
         FAKE_CODEX_STATE: state,
       },
       stdout: "pipe",
@@ -222,9 +225,9 @@ describe("codex-seat launcher", () => {
     });
 
     expect(result.exitCode).toBe(0);
-    expect(existsSync(join(state, "app.pid"))).toBe(false);
+    expect(existsSync(join(state, "app.pid"))).toBe(true);
     expect(readFileSync(join(state, "tui.args"), "utf8")).toBe(
-      "--future-option\nvalue\nexec\n--json\n",
+      `--remote\nws://127.0.0.1:${port}\n--cd\n${process.cwd()}\n--future-option\nvalue\nexec\n--json\n`,
     );
   });
 
