@@ -131,9 +131,8 @@ describe("public distribution contract", () => {
     expect(publicDocs).not.toContain("/home/manzo");
   });
 
-  test("managed auto-wake is scoped to hook-backed Codex and Claude lanes", () => {
+  test("managed auto-wake preserves every supported legacy/manual client", () => {
     const unit = read("docs/systemd/claude-peers-codex-autodrain.service");
-    expect(unit).toContain("Environment=NUDGE_CLIENTS=codex,claude");
-    expect(unit).not.toContain("Environment=NUDGE_CLIENTS=codex,gemini,claude,cursor,agy,kimi");
+    expect(unit).toContain("Environment=NUDGE_CLIENTS=codex,gemini,claude,cursor,agy,kimi");
   });
 });

@@ -48,12 +48,12 @@ acknowledges mailbox rows itself.
 
 ## Managed auto-wake scope
 
-The shipped unit enables only the hook-backed Codex and Claude clients verified
-by the integration suite. Gemini, Cursor, agy, and kimi remain disabled. The
-standalone binary still defaults to no clients unless `NUDGE_CLIENTS` is set:
+The shipped unit enables wake-only notifications for every supported client so
+legacy/manual-drain lanes retain their receive path. The standalone binary still
+defaults to no clients unless `NUDGE_CLIENTS` is set:
 
 ```
-Environment=NUDGE_CLIENTS=codex,claude
+Environment=NUDGE_CLIENTS=codex,gemini,claude,cursor,agy,kimi
 ```
 
 The poller logs its state at startup (`nudge=DISABLED` or `nudge=codex,...`), so

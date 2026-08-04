@@ -1,5 +1,5 @@
 [Unit]
-Description=claude-peers hook wake poller (wakes idle Codex and Claude lanes for peer mail)
+Description=claude-peers wake-only poller (wakes supported idle lanes for peer mail)
 Documentation=file://%h/claude-peers-mcp/bin/codex-autodrain-poller.ts
 After=default.target claude-peers-broker.service
 Wants=claude-peers-broker.service
@@ -43,9 +43,9 @@ Environment=BUN_INSTALL=%h/.bun
 # connect). tmux appends its own current-UID socket directory.
 Environment=TMUX_TMPDIR=/tmp
 # Wake-only scope. The poller submits a notification but never claims or
-# acknowledges mailbox rows; each lane's own hook drains by session/thread
-# identity. Keep this limited to the two hook paths verified on this host.
-Environment=NUDGE_CLIENTS=codex,claude
+# acknowledges mailbox rows. Preserve every supported hook/manual client: a
+# legacy lane may depend on this wake to run its own check_messages path.
+Environment=NUDGE_CLIENTS=codex,gemini,claude,cursor,agy,kimi
 # Tunables (defaults shown; override here if needed):
 # Environment=POLL_INTERVAL_MS=15000
 # Environment=NUDGE_COOLDOWN_MS=60000

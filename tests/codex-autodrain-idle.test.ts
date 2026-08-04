@@ -882,6 +882,8 @@ import {
   nudgeText,
   hasNothingToDeliver,
   codexLaneReadyForWake,
+  codexWakeBlockReason,
+  codexWakeCompatibilityReasons,
   submitWakeOnlyNudge,
 } from "../bin/codex-autodrain-poller.ts";
 
@@ -940,15 +942,30 @@ describe("nudge wording is client-aware (claude mail rides in with the nudge)", 
     expect(t).not.toContain("check_messages");
     expect(t).toContain("delivered with this notification");
   });
+  test("legacy codex rows without a thread get the explicit manual drain instruction", () => {
+    const t = nudgeText({ ...laneWith(2), thread_id: null } as never);
+    expect(t).toContain("check_messages");
+    expect(t).not.toContain("was just delivered with this notification");
+  });
 });
 
 describe("Codex wake-only delivery", () => {
-  test("requires an exact pane seat, thread id, and hook-backed receive mode", () => {
+  test("requires exact pane-seat ownership without darkening legacy receive rows", () => {
     expect(codexLaneReadyForWake(laneWith(1) as never)).toBe(true);
     expect(codexLaneReadyForWake({ ...laneWith(1), seat_key: null } as never)).toBe(false);
-    expect(codexLaneReadyForWake({ ...laneWith(1), thread_id: null } as never)).toBe(false);
+    expect(codexLaneReadyForWake({ ...laneWith(1), thread_id: null } as never)).toBe(true);
     expect(codexLaneReadyForWake({ ...laneWith(1), tmux_pane_id: null } as never)).toBe(false);
-    expect(codexLaneReadyForWake({ ...laneWith(1), receiver_mode: "manual-drain" } as never)).toBe(false);
+    expect(codexLaneReadyForWake({ ...laneWith(1), receiver_mode: "manual-drain" } as never)).toBe(true);
+  });
+
+  test("reports exact skip and compatibility reasons for operator-visible logs", () => {
+    expect(codexWakeBlockReason({ ...laneWith(1), tmux_pane_id: null } as never)).toBe("no-pane-id");
+    expect(codexWakeBlockReason({ ...laneWith(1), seat_key: null } as never)).toBe("no-seat-key");
+    expect(codexWakeBlockReason({ ...laneWith(1), seat_key: "pane:infra:%99" } as never)).toBe("seat-pane-mismatch");
+    expect(codexWakeBlockReason(laneWith(1) as never)).toBeNull();
+    expect(codexWakeCompatibilityReasons({
+      ...laneWith(1), thread_id: null, receiver_mode: "manual-drain",
+    } as never)).toEqual(["no-thread-id", "receiver-mode=manual-drain"]);
   });
 
   test("submits only the notification that tells the hook-backed lane to drain", () => {

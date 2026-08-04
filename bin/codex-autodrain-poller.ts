@@ -94,7 +94,7 @@ export function nudgeText(lane: Lane): string {
   // the queue (normally empty, and potentially unavailable in detached MCP
   // topologies). Legacy/manual rows keep the explicit fetch instruction below.
   const hookDeliversWithWake = lane.client_type === "claude"
-    || (lane.client_type === "codex" && lane.receiver_mode === "codex-hook")
+    || (lane.client_type === "codex" && lane.receiver_mode === "codex-hook" && Boolean(lane.thread_id?.trim()))
     || (lane.client_type === "gemini" && lane.receiver_mode === "gemini-hook");
   if (hookDeliversWithWake) {
     return `[peer-mail] ${n} unread ${noun} ${n === 1 ? "was" : "were"} just delivered with this notification `
@@ -271,6 +271,7 @@ export function paneQuiescent(paneId: string): boolean {
 const lastNudge = new Map<string, number>();  // peer id -> epoch ms of last nudge
 const nudgeAttempts = new Map<string, number>(); // peer id -> consecutive nudge count
 const unreadyCodexWakeWarned = new Set<string>(); // avoid logging the same bad identity every tick
+const legacyCodexWakeWarned = new Set<string>(); // compatibility metadata is visible once, without log spam
 // A lane selected purely by the NULL-hook bootstrap path (zero unread mail, hook
 // never attached) gets ONE bootstrap nudge for the LIFE OF THIS PROCESS — then
 // never again from the bootstrap path. This Set is in-memory, so the cap does NOT
@@ -385,23 +386,35 @@ export interface Lane {
   last_hook_seen_at: string | null;  // NULL = drain hook never attached (needs bootstrap nudge)
 }
 
+export type CodexWakeBlockReason = "no-pane-id" | "no-seat-key" | "seat-pane-mismatch";
+
 /**
- * Codex wake notifications are safe only when the broker row already proves the
- * full receive route. A pane id alone can identify where to type, but cannot
- * prove that the hook will claim this seat's queue. The seat key must name that
- * exact pane, and the hook must have persisted a thread id plus codex-hook mode.
+ * Why a Codex row cannot safely receive a pane wake. The poller never claims or
+ * acknowledges mail, so thread/hook metadata is not part of the safety proof:
+ * a legacy row can be woken and let its own prompt hook self-register, or call
+ * check_messages explicitly. Typing into the wrong pane is the irreversible
+ * boundary, so exact pane-seat ownership remains mandatory.
  */
-export function codexLaneReadyForWake(lane: Lane): boolean {
-  if (lane.client_type !== "codex") return true;
+export function codexWakeBlockReason(lane: Lane): CodexWakeBlockReason | null {
+  if (lane.client_type !== "codex") return null;
   const paneId = lane.tmux_pane_id?.trim();
   const seatKey = lane.seat_key?.trim();
-  const threadId = lane.thread_id?.trim();
-  const seatMatchesPane = Boolean(
-    paneId
-      && seatKey
-      && (seatKey === `pane:${paneId}` || seatKey.endsWith(`:${paneId}`)),
-  );
-  return seatMatchesPane && Boolean(threadId) && lane.receiver_mode === "codex-hook";
+  if (!paneId) return "no-pane-id";
+  if (!seatKey) return "no-seat-key";
+  if (seatKey !== `pane:${paneId}` && !seatKey.endsWith(`:${paneId}`)) return "seat-pane-mismatch";
+  return null;
+}
+
+export function codexWakeCompatibilityReasons(lane: Lane): string[] {
+  if (lane.client_type !== "codex") return [];
+  const reasons: string[] = [];
+  if (!lane.thread_id?.trim()) reasons.push("no-thread-id");
+  if (lane.receiver_mode !== "codex-hook") reasons.push(`receiver-mode=${lane.receiver_mode || "unknown"}`);
+  return reasons;
+}
+
+export function codexLaneReadyForWake(lane: Lane): boolean {
+  return codexWakeBlockReason(lane) === null;
 }
 
 // Which client types the poller will auto-nudge. DEFAULT IS EMPTY — no lane is
@@ -1175,6 +1188,7 @@ function tick(db: Database, snapOverride?: TickSnapshot): void {
   for (const id of lastUnreadSeen.keys()) if (!active.has(id)) lastUnreadSeen.delete(id);
   for (const id of lastNudge.keys()) if (!active.has(id)) lastNudge.delete(id);
   for (const id of unreadyCodexWakeWarned) if (!active.has(id)) unreadyCodexWakeWarned.delete(id);
+  for (const id of legacyCodexWakeWarned) if (!active.has(id)) legacyCodexWakeWarned.delete(id);
   for (const id of paneCache.keys()) if (!active.has(id)) paneCache.delete(id);
   // bootstrapNudged is pruned ONLY when the lane leaves the set entirely (session
   // gone / hook finally attached → no longer NULL-hook). It is deliberately NOT
@@ -1204,14 +1218,22 @@ function tick(db: Database, snapOverride?: TickSnapshot): void {
     // Log it and move to the next lane.
     try {
       if (!isPidAlive(lane.pid)) continue;                       // dead lane — reaper handles it
-      if (!codexLaneReadyForWake(lane)) {
+      const codexBlockReason = codexWakeBlockReason(lane);
+      if (codexBlockReason) {
         if (!unreadyCodexWakeWarned.has(lane.id)) {
           unreadyCodexWakeWarned.add(lane.id);
-          log(`skip Codex wake for ${lane.name ?? lane.id}: broker row lacks exact pane seat + thread + codex-hook identity`);
+          log(`skip Codex wake for ${lane.name ?? lane.id}: reason=${codexBlockReason} pane=${lane.tmux_pane_id ?? "none"} seat=${lane.seat_key ?? "none"}`);
         }
         continue;
       }
       unreadyCodexWakeWarned.delete(lane.id);
+      const compatibilityReasons = codexWakeCompatibilityReasons(lane);
+      if (compatibilityReasons.length > 0 && !legacyCodexWakeWarned.has(lane.id)) {
+        legacyCodexWakeWarned.add(lane.id);
+        log(`compatibility Codex wake for ${lane.name ?? lane.id}: reason=${compatibilityReasons.join(",")} exact-pane-seat=verified; lane hook/manual drain owns claim+ack`);
+      } else if (compatibilityReasons.length === 0) {
+        legacyCodexWakeWarned.delete(lane.id);
+      }
       if ((nudgeAttempts.get(lane.id) ?? 0) >= MAX_NUDGE_ATTEMPTS) {
         // Drain hook likely broken — stop hammering. One warning, then silent
         // until the lane's unread clears (which resets the counter via the prune
