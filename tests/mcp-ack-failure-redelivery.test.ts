@@ -297,6 +297,20 @@ test("check_messages returns a claimed body when ACK fails and the lease can be 
   expect(ackRequest?.body.thread_id).toBe(threadId);
   expect(ackRequest?.body.ids).toEqual([sent.id]);
 
+  const beforeExpiry = await post<{ ok: boolean; messages: Array<{ id: number; text: string }> }>(
+    broker,
+    "/claim-by-thread",
+    {
+      thread_id: threadId,
+      caller_pid: process.pid,
+      client_type: "codex",
+      receiver_mode: "codex-hook",
+      drain_id: "mcp-thread-before-expiry",
+    },
+  );
+  expect(beforeExpiry.ok).toBe(true);
+  expect(beforeExpiry.messages).toEqual([]);
+
   const db = new Database(broker.dbPath);
   try {
     const afterFailure = db.query(
