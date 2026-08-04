@@ -33,6 +33,8 @@ import type {
   HeartbeatResponse,
   PollMessagesResponse,
   Message,
+  ClaimByPidResponse,
+  AckByPidResponse,
   ClientType,
   ReceiverMode,
   SendMessageResponse,
@@ -756,19 +758,6 @@ let resolveAppServerIdentityForToolCall: (threadId: string | null) => Promise<Ap
 let myTmuxInfo: TmuxPaneInfo | null = null;
 let latestTmuxMirrorFailure: string | null = null;
 
-// Local buffer for messages fetched by the poll loop, awaiting delivery
-// via piggyback (drainPendingMessages) or check_messages.
-const localMessageBuffer: Message[] = [];
-const localBufferIds = new Set<number>(); // O(1) dedup for poll loop
-
-// Messages confirmed delivered to Claude via tool response (piggyback or check_messages).
-// Only these two paths count — channel push is unreliable and never confirms delivery.
-// Note: IDs are SQLite AUTOINCREMENT from the broker's messages table. These are
-// monotonically increasing and never recycled within the same DB. If the broker DB
-// is deleted while peers are running, IDs could collide with this set — the prune
-// timer (keeping last 500) mitigates this edge case.
-const confirmedDeliveredIds = new Set<number>();
-
 export function unresolvedAppServerToolDiagnostic(toolName: string, reason: string): string {
   return `claude-peers did not run ${toolName}: this app-server connection could not be bound to one verified Codex pane (${reason}). ` +
     "Inbound pane-hook delivery may still work, but MCP replies and mailbox reads are disabled to prevent cross-session routing. Reopen the Codex lane if this persists.";
@@ -785,25 +774,9 @@ export function shouldUnregisterPeerOnShutdown(peerId: PeerId | null, identityOw
 }
 
 // --- Piggyback delivery ---
-// Drains pending messages from the local buffer and returns formatted text
-// to append to any tool response. This ensures messages arrive even when
-// channel push fails — Claude gets them on the next tool call of any kind.
-
-// Acknowledge a batch of message IDs to the broker AND mark them locally as
-// confirmed-delivered. This is the SHARED logic between drainPendingMessages
-// (piggyback path) and check_messages (explicit path).
-//
-// Critical invariant: this function is called AFTER the messages have been
-// rendered into a tool response that Claude will read. The display itself is
-// the actual delivery point — once Claude has the text, the message has been
-// delivered regardless of whether the broker's `delivered=1` flag gets set.
-//
-// Therefore we add to confirmedDeliveredIds UNCONDITIONALLY after the display.
-// If the broker ack fails (network error, old broker without /ack-messages),
-// the broker keeps its `delivered=0` row but we know we already showed it; the
-// dedup add prevents re-display from this session. On session restart the
-// dedup set is gone and any still-undelivered broker rows will re-deliver,
-// which is the safety net.
+// Claims pending messages atomically and returns formatted text to append to a
+// tool response. The broker lease is the only dedupe state: every body-rendering
+// receive path must win a claim before it can see the message text.
 
 // R6.1: detect Task-tool subagent context.
 //
@@ -916,22 +889,6 @@ function isTaskSubagent(): boolean {
   }
 }
 
-async function ackAndDedup(ids: number[], context: string): Promise<void> {
-  if (!myId || ids.length === 0) return;
-  try {
-    // `context` doubles as the broker-side delivery-path label for latency
-    // telemetry (see broker handleAckMessages). Stable strings:
-    // "drainPendingMessages" (piggyback) and "check_messages" (explicit).
-    await brokerFetch("/ack-messages", { id: myId, ids, via: context });
-  } catch (e) {
-    // Either an old broker without /ack-messages or a transient network blip.
-    // Surface in log — the local dedup add below is still correct (we already
-    // showed the messages to Claude before calling this function).
-    log(`${context}: ack failed — ${errMsg(e)}`);
-  }
-  for (const id of ids) confirmedDeliveredIds.add(id);
-}
-
 export function selectCodexManualDrainPid(
   clientType: ClientType,
   registerPid: number,
@@ -943,6 +900,84 @@ export function selectCodexManualDrainPid(
   // mailbox identity: selecting a nearby Codex PID can drain a different pane.
   if (registerPid !== serverPid) return registerPid;
   return null;
+}
+
+export type InboxClaimIdentity =
+  | { kind: "thread"; thread_id: string }
+  | { kind: "pid"; pid: number };
+
+export function selectInboxClaimIdentity(
+  clientType: ClientType,
+  registerPid: number,
+  serverPid: number,
+  threadId: string | null,
+): InboxClaimIdentity | null {
+  if (threadId) return { kind: "thread", thread_id: threadId };
+  if (clientType === "codex") {
+    const pid = selectCodexManualDrainPid(clientType, registerPid, serverPid);
+    return pid === null ? null : { kind: "pid", pid };
+  }
+  return Number.isInteger(registerPid) && registerPid > 1 ? { kind: "pid", pid: registerPid } : null;
+}
+
+interface ClaimedInboxBatch {
+  identity: InboxClaimIdentity;
+  drainId: string;
+  messages: Message[];
+}
+
+async function claimCurrentInbox(): Promise<ClaimedInboxBatch> {
+  const identity = selectInboxClaimIdentity(
+    myClientType,
+    myRegisterPid,
+    process.pid,
+    appServerBoundThreadId,
+  );
+  if (!identity) throw new Error("no exact session identity is available for inbox claim");
+
+  const common = {
+    caller_pid: process.pid,
+    client_type: myClientType,
+    receiver_mode: myReceiverMode,
+  };
+  const path = identity.kind === "thread" ? "/claim-by-thread" : "/claim-by-pid";
+  const body = identity.kind === "thread"
+    ? { ...common, thread_id: identity.thread_id }
+    : { ...common, pid: identity.pid };
+  const claim = await brokerFetch<ClaimByPidResponse>(path, body);
+  if (!claim.ok) throw new Error(claim.error ?? "inbox claim failed");
+  const messages = claim.messages ?? [];
+  if (messages.length > 0 && !claim.drain_id) throw new Error("inbox claim returned messages without drain_id");
+  return { identity, drainId: claim.drain_id ?? "", messages };
+}
+
+async function ackClaimedInbox(batch: ClaimedInboxBatch, via: string): Promise<boolean> {
+  if (batch.messages.length === 0) return true;
+  try {
+    const common = {
+      caller_pid: process.pid,
+      client_type: myClientType,
+      receiver_mode: myReceiverMode,
+      drain_id: batch.drainId,
+      ids: batch.messages.map((message) => message.id),
+      via,
+    };
+    const path = batch.identity.kind === "thread" ? "/ack-by-thread" : "/ack-by-pid";
+    const body = batch.identity.kind === "thread"
+      ? { ...common, thread_id: batch.identity.thread_id }
+      : { ...common, pid: batch.identity.pid };
+    const ack = await brokerFetch<AckByPidResponse>(path, body);
+    if (!ack.ok || ack.acked !== batch.messages.length) {
+      throw new Error(ack.error ?? `inbox ack mismatch: requested ${batch.messages.length}, acked ${ack.acked ?? 0}`);
+    }
+    return true;
+  } catch (e) {
+    // The body is already held by this consumer. Return it even if the ACK
+    // fails so the failure mode is a later duplicate after lease expiry, never
+    // a message that was marked delivered without reaching the model.
+    log(`${via}: claimed inbox ack failed; message may be retried — ${errMsg(e)}`);
+    return false;
+  }
 }
 
 /**
@@ -1365,21 +1400,20 @@ function resolveTmuxOperatorLabel(tmuxInfo: TmuxPaneInfo | null): string | null 
 
 async function drainPendingMessages(): Promise<string | null> {
   if (!myId) return null;
-  const buffered = localMessageBuffer.splice(0, localMessageBuffer.length);
-  localBufferIds.clear();
-  const unseen = buffered.filter((m) => !confirmedDeliveredIds.has(m.id));
-  if (unseen.length === 0) return null;
+  try {
+    const batch = await claimCurrentInbox();
+    if (batch.messages.length === 0) return null;
 
-  // L7: all three receive paths (drain here, check_messages, channel push)
-  // share renderInboundLine so attribution + relayed flag + normalization are
-  // consistent. See the comment block above renderInboundLine for rationale.
-  const display = `\n\n---\n${unseen.length} pending peer message(s):\n\n${renderInboundBatch(unseen)}`;
-
-  // Display IS delivery — ack + dedup unconditionally after building the
-  // response text (which the caller appends to the tool result).
-  await ackAndDedup(unseen.map((m) => m.id), "drainPendingMessages");
-
-  return display;
+    // Claim-before-render is the global dedupe primitive. The prompt hook,
+    // check_messages, and piggyback path all use the broker's same CAS lease;
+    // only the winning consumer can render a body.
+    const display = `\n\n---\n${batch.messages.length} pending peer message(s):\n\n${renderInboundBatch(batch.messages)}`;
+    await ackClaimedInbox(batch, "drainPendingMessages");
+    return display;
+  } catch (e) {
+    log(`drainPendingMessages: ${errMsg(e)}`);
+    return null;
+  }
 }
 
 function receiverFresh(p: Pick<Peer, "receiver_mode" | "last_hook_seen_at">): boolean {
@@ -2286,8 +2320,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           isError: true,
         };
       }
-      const codexManualDrainPid = selectCodexManualDrainPid(myClientType, myRegisterPid, process.pid);
-      if (myClientType === "codex" && codexManualDrainPid === null) {
+      const claimIdentity = selectInboxClaimIdentity(
+        myClientType,
+        myRegisterPid,
+        process.pid,
+        appServerBoundThreadId,
+      );
+      if (!claimIdentity) {
         return {
           content: [{
             type: "text" as const,
@@ -2297,38 +2336,21 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         };
       }
       try {
-        // Drain local buffer (messages polled by the poll loop)
-        const buffered = localMessageBuffer.splice(0, localMessageBuffer.length);
-        localBufferIds.clear();
-
-        // Also check broker directly for anything poll loop hasn't grabbed
-        const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
-
-        // Merge and deduplicate by message ID
-        const seen = new Set<number>();
-        const allMessages: Message[] = [];
-        for (const m of [...buffered, ...result.messages]) {
-          if (!seen.has(m.id) && !confirmedDeliveredIds.has(m.id)) {
-            seen.add(m.id);
-            allMessages.push(m);
-          }
-        }
-        if (allMessages.length === 0) {
+        const batch = await claimCurrentInbox();
+        if (batch.messages.length === 0) {
           return {
             content: [{ type: "text" as const, text: "No new messages." }],
           };
         }
 
-        // Display IS delivery. ackAndDedup adds to local dedup unconditionally
-        // after we build the response text below.
-        await ackAndDedup(allMessages.map((m) => m.id), "check_messages");
-
         // Same policy + framing path as drainPendingMessages.
+        const text = `${batch.messages.length} new message(s):\n\n${renderInboundBatch(batch.messages)}`;
+        await ackClaimedInbox(batch, "check_messages");
         return {
           content: [
             {
               type: "text" as const,
-              text: `${allMessages.length} new message(s):\n\n${renderInboundBatch(allMessages)}`,
+              text,
             },
           ],
         };
@@ -2421,65 +2443,10 @@ async function pollAndPushMessages(): Promise<PollOutcome> {
     const recovered = pollTransportFailed;
     pollTransportFailed = false;
 
-    // Collect new messages that need buffering + channel push
-    const newMessages: Message[] = [];
-    for (const msg of result.messages) {
-      if (confirmedDeliveredIds.has(msg.id)) continue;
-      if (localBufferIds.has(msg.id)) continue;
-
-      localMessageBuffer.push(msg);
-      localBufferIds.add(msg.id);
-      newMessages.push(msg);
-    }
-
-    if (newMessages.length === 0) return successfulPollOutcome(0, recovered);
-
-    // Fetch peer list once for sender metadata (not per-message)
-    let peerCache: Peer[] | null = null;
-    try {
-      peerCache = await brokerFetch<Peer[]>("/list-peers", {
-        id: myId,
-        scope: "machine",
-        cwd: myCwd,
-        git_root: myGitRoot,
-        absolute_git_dir: myAbsoluteGitDir,
-      });
-    } catch {
-      // Non-critical — channel push proceeds without sender context
-    }
-
-    // Best-effort channel push — fire and forget, never ack, never confirm.
-    // mcp.notification() is fire-and-forget over stdio and never throws even
-    // when the channel listener isn't active or the platform drops the notification.
-    for (const msg of newMessages) {
-      try {
-        const sender = peerCache?.find((p) => p.id === msg.from_id);
-        await mcp.notification({
-          method: "notifications/claude/channel",
-          params: {
-            // Channel push uses the same structural wrapper as the other two
-            // read paths (see renderInboundLine). This is what gives the
-            // receiving Claude non-forgeable attribution + a parseable
-            // `relayed=` flag even when the message lands via channel push
-            // rather than through a tool-result drain.
-            content: renderInboundBatch([msg]),
-            meta: {
-              from_id: msg.from_id,
-              from_summary: sender?.summary ?? "",
-              from_cwd: sender?.cwd ?? "",
-              sent_at: msg.sent_at,
-              message_id: String(msg.id),
-            },
-          },
-        });
-        log(`Channel push attempted for message ${msg.id} from ${msg.from_id}`);
-      } catch (e) {
-        log(`Channel push failed for ${msg.from_id}: ${e instanceof Error ? e.message : String(e)}`);
-      }
-      // Delivery confirmed ONLY when drainPendingMessages() or check_messages
-      // includes this message in a tool response that Claude actually reads.
-    }
-    return successfulPollOutcome(newMessages.length, recovered);
+    // Observe only. Polling may tune the scheduler, but it must never cache or
+    // render message bodies. A cache races prompt hooks and can replay a body
+    // after another consumer has already claimed and acknowledged it.
+    return successfulPollOutcome(result.messages.length, recovered);
   } catch (e) {
     pollTransportFailed = true;
     log(`Poll error: ${e instanceof Error ? e.message : String(e)}`);
@@ -2824,14 +2791,9 @@ async function main() {
   await mcp.connect(new StdioServerTransport());
   log("MCP connected");
 
-  // 6. Start serialized polling for inbound messages.
-  //
-  // Codex and Gemini use prompt-time hooks as their receive path. Keeping the
-  // Claude poll/buffer loop enabled for hook-based clients creates duplicate displays:
-  // the hook can claim+ACK a message while the MCP server's local buffer still
-  // holds a pre-ACK copy, then the next tool call piggybacks the stale copy.
-  // Manual check_messages remains available for these clients because it polls the
-  // broker directly instead of relying on this local buffer.
+  // 6. Retain the serialized observation-poll scheduler for compatibility.
+  // Every current client disables it: hooks and check_messages own delivery,
+  // and any future poller may observe queue depth but cannot cache/render bodies.
   let pollActive = false;
   let pollInFlight = false;
   let pollTimer: ReturnType<typeof setTimeout> | null = null;
@@ -2877,7 +2839,7 @@ async function main() {
   function startBackgroundPoll(reason: string) {
     if (pollActive) return;
     pollActive = true;
-    log(`background channel poll enabled (${reason})`);
+    log(`background observation poll enabled (${reason})`);
     if (ADAPTIVE_POLLING_ENABLED) {
       const decision = pollScheduler.activity("poll-start", performance.now());
       recordPollDecision(decision);
@@ -2893,7 +2855,7 @@ async function main() {
     if (pollTimer) clearTimeout(pollTimer);
     pollTimer = null;
     pollDeadline = null;
-    log(`background channel poll disabled (${reason})`);
+    log(`background observation poll disabled (${reason})`);
   }
 
   function applyReceiverMetadata(clientType: ClientType, receiverMode: ReceiverMode, reason: string): boolean {
@@ -3059,46 +3021,7 @@ async function main() {
   };
   scheduleHeartbeat();
 
-  // 8. Prune confirmedDeliveredIds and localMessageBuffer periodically.
-  //
-  // Cap history (this fork's main):
-  //   - upstream louislva PR #25 originally:    DEDUP_CAP=1000 / BUFFER_CAP=200
-  //   - fork commit 9264a0b raised to:          DEDUP_CAP=5000 / BUFFER_CAP=1000
-  //   - fork commit e3f535f raised again to:    DEDUP_CAP=5000 / BUFFER_CAP=10000
-  //
-  // BUFFER_CAP=10000 makes overflow practically unreachable. At 1 message/sec
-  // sustained without ANY tool call (which would drain via piggyback), that is
-  // ~2.8 hours of pure inbound before the buffer overflows.
-  //
-  // Overflow handling change from upstream: we DO NOT ack pruned messages to
-  // the broker. Upstream's behavior was silent data loss (broker thinks delivered,
-  // Claude never saw them). Our behavior: drop from local buffer + add to local
-  // dedup (preventing infinite re-poll loop), but leave broker state untouched
-  // so a fresh session restart will re-deliver. Surfaces as a loud ERROR log so
-  // operators can act if it ever fires.
-  const DEDUP_CAP = 5000;
-  const DEDUP_DRAIN_TO = 2500;
-  const BUFFER_CAP = 10000;
-  const BUFFER_DRAIN_TO = 5000;
-  const pruneTimer = setInterval(() => {
-    if (confirmedDeliveredIds.size > DEDUP_CAP) {
-      const arr = [...confirmedDeliveredIds];
-      const toRemove = arr.slice(0, arr.length - DEDUP_DRAIN_TO);
-      for (const id of toRemove) confirmedDeliveredIds.delete(id);
-    }
-    if (localMessageBuffer.length > BUFFER_CAP) {
-      const removed = localMessageBuffer.splice(0, localMessageBuffer.length - BUFFER_DRAIN_TO);
-      // Add to local dedup so the next poll cycle does not infinitely re-buffer
-      // the same messages. We deliberately do NOT ack the broker — the messages
-      // remain server-side as undelivered, so a fresh session can re-deliver.
-      for (const m of removed) confirmedDeliveredIds.add(m.id);
-      localBufferIds.clear();
-      for (const m of localMessageBuffer) localBufferIds.add(m.id);
-      log(`ERROR: localMessageBuffer overflow — dropped ${removed.length} messages from local buffer (cap=${BUFFER_CAP}). Messages remain UNACKED at broker; restart this peer to re-deliver. This indicates the peer was idle for hours while receiving heavy traffic.`);
-    }
-  }, 60_000);
-
-  // 9. Clean up on exit
+  // 8. Clean up on exit
   const cleanup = async (reason: string) => {
     // Re-entry guard: stdin EOF, transport close, parent-death watchdog, and
     // signals can all fire around the same shutdown — only the first wins.
@@ -3118,7 +3041,6 @@ async function main() {
     notePollingActivity = () => {};
     if (heartbeatTimer) clearTimeout(heartbeatTimer);
     heartbeatTimer = null;
-    clearInterval(pruneTimer);
     clearInterval(parentWatchdogTimer);
     if (shouldUnregisterPeerOnShutdown(myId, appServerIdentityOwnedByHook)) {
       try {

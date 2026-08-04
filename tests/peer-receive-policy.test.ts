@@ -74,9 +74,8 @@ describe("per-batch peer authority policy", () => {
     const codexHook = readFileSync(new URL("../hooks/codex-drain-peer-inbox.ts", import.meta.url), "utf8");
     const claudeRenderer = readFileSync(new URL("../hooks/claude-render-peer-messages.ts", import.meta.url), "utf8");
 
-    expect(server).toContain("renderInboundBatch(unseen)");
-    expect(server).toContain("renderInboundBatch(allMessages)");
-    expect(server).toContain("renderInboundBatch([msg])");
+    expect(server.match(/renderInboundBatch\(batch\.messages\)/g)).toHaveLength(2);
+    expect(server).not.toContain("renderInboundBatch([msg])");
     expect(codexHook).toContain("const batch = renderInboundBatch(messages)");
     expect(claudeRenderer).toContain("renderInboundBatch(parsed.messages)");
   });

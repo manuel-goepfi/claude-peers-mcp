@@ -4,7 +4,7 @@ import { findClientPidFromTable, findHookPeerPidsFromTable, findMcpPidFromTable 
 import { peerName, publishBrokerIdentityToTmux, registrationTmuxPaneId, sessionIdFromHookInput, tmuxIdentityMirrorEnabled } from "../hooks/register-peer-session.ts";
 import { detectClientFromProcessChain, findBgSpareAncestor, initialReceiverMode, type ProcessInfo } from "../shared/client.ts";
 import { findNearestVisibleCodexProcessByStart, findVisibleCodexProcessByPaneId } from "../shared/visible-codex.ts";
-import { findCodexAppServerAncestor, findVisibleCodexSession, mcpThreadIdFromRequestMeta, registrationCwd, registrationCwdResult, registrationTtyPid, selectCodexManualDrainPid, shouldUnregisterPeerOnShutdown, unresolvedAppServerToolDiagnostic } from "../server.ts";
+import { findCodexAppServerAncestor, findVisibleCodexSession, mcpThreadIdFromRequestMeta, registrationCwd, registrationCwdResult, registrationTtyPid, selectCodexManualDrainPid, selectInboxClaimIdentity, shouldUnregisterPeerOnShutdown, unresolvedAppServerToolDiagnostic } from "../server.ts";
 
 function table(rows: ProcessInfo[]): Map<number, ProcessInfo> {
   return new Map(rows.map((row) => [row.pid, row]));
@@ -120,12 +120,12 @@ describe("client detection", () => {
     expect(initialReceiverMode("gemini")).toBe("manual-drain");
   });
 
-  test("hook-based clients disable the Claude background poll buffer", () => {
+  test("every current client disables the background observation poll", () => {
     const src = readFileSync(new URL("../server.ts", import.meta.url), "utf8");
-    // kimi joins the list: it has no drain hook either, so it must take the same
-    // client-pid registration path and keep the Claude poll buffer disabled.
-    expect(src).toContain('if (myClientType === "codex" || myClientType === "gemini" || myClientType === "cursor" || myClientType === "agy" || myClientType === "kimi")');
-    expect(src).toContain("background channel poll disabled");
+    expect(src).toContain('return clientType === "claude" || clientType === "codex" || clientType === "gemini"');
+    expect(src).toContain('|| clientType === "kimi"');
+    expect(src).toContain('|| clientType === "unknown"');
+    expect(src).toContain("background observation poll disabled");
   });
 
   test("startup derives git metadata from the registration cwd", () => {
@@ -396,8 +396,10 @@ describe("client detection", () => {
     const loudFailure = src.indexOf("unresolvedAppServerToolDiagnostic(name, resolution.reason)", reconciliation);
     const registration = src.indexOf("await ensureRegistered()", handler);
     const checkCase = src.indexOf('case "check_messages"');
-    const identityGuard = src.indexOf("const codexManualDrainPid = selectCodexManualDrainPid", checkCase);
-    const brokerPoll = src.indexOf('brokerFetch<PollMessagesResponse>("/poll-messages"', checkCase);
+    const identityGuard = src.indexOf("const claimIdentity = selectInboxClaimIdentity", checkCase);
+    const brokerClaim = src.indexOf("const batch = await claimCurrentInbox()", identityGuard);
+    const bodyRender = src.indexOf("renderInboundBatch(batch.messages)", brokerClaim);
+    const brokerAck = src.indexOf('await ackClaimedInbox(batch, "check_messages")', bodyRender);
 
     expect(handler).toBeGreaterThan(0);
     expect(reconciliationGuard).toBeGreaterThan(handler);
@@ -407,7 +409,10 @@ describe("client detection", () => {
     expect(registration).toBeGreaterThan(loudFailure);
     expect(checkCase).toBeGreaterThan(0);
     expect(identityGuard).toBeGreaterThan(checkCase);
-    expect(brokerPoll).toBeGreaterThan(identityGuard);
+    expect(brokerClaim).toBeGreaterThan(identityGuard);
+    expect(bodyRender).toBeGreaterThan(brokerClaim);
+    expect(brokerAck).toBeGreaterThan(bodyRender);
+    expect(src.slice(checkCase, bodyRender)).not.toContain('"/poll-messages"');
     expect(src).not.toContain("drainVisibleCodexPidForManualCheck");
   });
 
@@ -440,6 +445,17 @@ describe("client detection", () => {
     expect(selectCodexManualDrainPid("codex", 48_327, 99_999)).toBe(48_327);
     expect(selectCodexManualDrainPid("codex", 99_999, 99_999)).toBeNull();
     expect(selectCodexManualDrainPid("claude", 48_327, 99_999)).toBeNull();
+  });
+
+  test("inbox claims prefer thread identity and otherwise fail closed for an unbound Codex app-server", () => {
+    expect(selectInboxClaimIdentity("codex", 99_999, 99_999, "thread-123")).toEqual({
+      kind: "thread",
+      thread_id: "thread-123",
+    });
+    expect(selectInboxClaimIdentity("codex", 48_327, 99_999, null)).toEqual({ kind: "pid", pid: 48_327 });
+    expect(selectInboxClaimIdentity("codex", 99_999, 99_999, null)).toBeNull();
+    expect(selectInboxClaimIdentity("claude", 48_327, 99_999, null)).toEqual({ kind: "pid", pid: 48_327 });
+    expect(selectInboxClaimIdentity("claude", 1, 99_999, null)).toBeNull();
   });
 
   test("Codex app-server hook refuses ambiguous same-cwd visible Codex sessions", () => {

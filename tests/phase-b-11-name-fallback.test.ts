@@ -571,13 +571,11 @@ describe("Operator-label fallback — human name first, pane_id metadata last", 
     });
   });
 
-  test("background polling policy follows hook-capable receiver metadata", () => {
+  test("background body polling stays disabled for every current client", () => {
     expect(shouldDisableBackgroundPolling("codex", "manual-drain")).toBe(true);
     expect(shouldDisableBackgroundPolling("gemini", "manual-drain")).toBe(true);
     expect(shouldDisableBackgroundPolling("unknown", "codex-hook")).toBe(true);
-    // Claude's prompt hook and explicit check_messages own delivery. Leaving the
-    // MCP poll/buffer loop enabled lets it retain a pre-hook copy and re-render
-    // the same body on the next tool result.
+    // Claude's prompt hook and explicit check_messages own delivery.
     expect(shouldDisableBackgroundPolling("claude", "claude-channel")).toBe(true);
     // "unknown" clients (send-only bridges, observer rows) have no channel
     // receive path — polling can never deliver to them, so it stays off.

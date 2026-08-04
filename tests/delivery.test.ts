@@ -5,9 +5,7 @@
  * - Transaction wrapping
  * - Backward compat: old broker schemas
  *
- * Plus tests for our fork-local improvements:
- * - Buffer cap data-loss path
- * - find_peer piggyback delivery
+ * Plus tests for our fork-local delivery behavior.
  */
 
 import { describe, test, expect, beforeAll, afterAll, afterEach } from "bun:test";
@@ -107,242 +105,6 @@ describe("PR #25 ack endpoint logic", () => {
     expect(() => markScoped.run(99999, "bob")).not.toThrow();
     const result = markScoped.run(99999, "bob");
     expect(result.changes).toBe(0);
-  });
-});
-
-// --- Buffer cap data-loss path (fork-local improvement) ---
-
-describe("Local buffer cap behavior", () => {
-  // Replicate the prune logic from server.ts main() with the raised caps.
-  // Caps must match server.ts: post-review-army these are 10000 / 5000.
-
-  const BUFFER_CAP = 10000;
-  const BUFFER_DRAIN_TO = 5000;
-
-  function runPruneLogic(buffer: number[], confirmedDelivered: Set<number>): { removed: number[]; remaining: number[] } {
-    if (buffer.length > BUFFER_CAP) {
-      const removed = buffer.splice(0, buffer.length - BUFFER_DRAIN_TO);
-      for (const id of removed) confirmedDelivered.add(id);
-      return { removed, remaining: buffer };
-    }
-    return { removed: [], remaining: buffer };
-  }
-
-  test("cap not reached: no pruning", () => {
-    const buffer = Array.from({ length: 9999 }, (_, i) => i);
-    const dedup = new Set<number>();
-    const { removed, remaining } = runPruneLogic(buffer, dedup);
-    expect(removed.length).toBe(0);
-    expect(remaining.length).toBe(9999);
-    expect(dedup.size).toBe(0);
-  });
-
-  test("cap exceeded: prune to drain target", () => {
-    const buffer = Array.from({ length: 11000 }, (_, i) => i);
-    const dedup = new Set<number>();
-    const { removed, remaining } = runPruneLogic(buffer, dedup);
-    expect(removed.length).toBe(6000); // 11000 - 5000
-    expect(remaining.length).toBe(5000);
-    expect(dedup.size).toBe(6000); // pruned messages added to dedup to prevent re-delivery
-  });
-
-  test("pruned messages are oldest first (FIFO)", () => {
-    const buffer = Array.from({ length: 10500 }, (_, i) => i);
-    const dedup = new Set<number>();
-    const { removed, remaining } = runPruneLogic(buffer, dedup);
-    expect(removed[0]).toBe(0); // oldest
-    expect(removed[removed.length - 1]).toBe(5499); // last pruned (10500 - 5000 - 1)
-    expect(remaining[0]).toBe(5500); // first kept
-    expect(remaining[remaining.length - 1]).toBe(10499); // newest
-  });
-
-  test("fork-local cap is 50x larger than upstream (10000 vs 200)", () => {
-    // Regression guard: if someone reverts to upstream cap, this fails.
-    // Cap raised post-review-army to make overflow practically unreachable.
-    expect(BUFFER_CAP).toBe(10000);
-    expect(BUFFER_CAP).toBeGreaterThanOrEqual(200 * 50);
-  });
-
-  // F1 post-review: symmetric coverage for the confirmedDeliveredIds prune.
-  // Off-by-one or wrong-half eviction would cause re-display of delivered messages.
-  test("confirmedDeliveredIds prune evicts oldest, retains newest (FIFO)", () => {
-    const DEDUP_CAP = 5000;
-    const DEDUP_DRAIN_TO = 2500;
-    const confirmed = new Set<number>();
-    for (let i = 0; i < 5001; i++) confirmed.add(i);
-
-    if (confirmed.size > DEDUP_CAP) {
-      const arr = [...confirmed];
-      const toRemove = arr.slice(0, arr.length - DEDUP_DRAIN_TO);
-      for (const id of toRemove) confirmed.delete(id);
-    }
-
-    expect(confirmed.size).toBe(DEDUP_DRAIN_TO);
-    // Oldest (smallest) IDs evicted
-    expect(confirmed.has(0)).toBe(false);
-    expect(confirmed.has(2499)).toBe(false);
-    // Newest (largest) IDs retained
-    expect(confirmed.has(2501)).toBe(true);
-    expect(confirmed.has(5000)).toBe(true);
-  });
-
-  test("confirmedDeliveredIds prune does not fire below cap", () => {
-    const DEDUP_CAP = 5000;
-    const confirmed = new Set<number>();
-    for (let i = 0; i < 4999; i++) confirmed.add(i);
-    if (confirmed.size > DEDUP_CAP) throw new Error("should not fire");
-    expect(confirmed.size).toBe(4999);
-  });
-
-  // F2 post-review: after overflow prune, localBufferIds must be rebuilt
-  // from the surviving buffer — stale IDs would block re-delivery of messages
-  // the broker still has as undelivered.
-  test("overflow prune rebuilds localBufferIds from survivors only", () => {
-    const buffer: { id: number }[] = Array.from({ length: 11000 }, (_, i) => ({ id: i }));
-    const localBufferIds = new Set<number>(buffer.map((m) => m.id));
-    const confirmedDelivered = new Set<number>();
-
-    if (buffer.length > BUFFER_CAP) {
-      const removed = buffer.splice(0, buffer.length - BUFFER_DRAIN_TO);
-      for (const m of removed) confirmedDelivered.add(m.id);
-      // Replicate the rebuild logic from server.ts main()
-      localBufferIds.clear();
-      for (const m of buffer) localBufferIds.add(m.id);
-    }
-
-    expect(buffer.length).toBe(BUFFER_DRAIN_TO);
-    expect(localBufferIds.size).toBe(BUFFER_DRAIN_TO);
-    // Pruned IDs MUST NOT be in localBufferIds (else poll would block re-delivery)
-    expect(localBufferIds.has(0)).toBe(false);
-    expect(localBufferIds.has(5999)).toBe(false);
-    // Survivor IDs ARE in localBufferIds
-    expect(localBufferIds.has(6000)).toBe(true);
-    expect(localBufferIds.has(10999)).toBe(true);
-    // And they're in confirmedDelivered (pruned path)
-    expect(confirmedDelivered.has(0)).toBe(true);
-    expect(confirmedDelivered.has(5999)).toBe(true);
-    expect(confirmedDelivered.has(6000)).toBe(false);
-  });
-});
-
-// --- drainPendingMessages dedup filter behavior ---
-
-describe("drainPendingMessages dedup filter (T1)", () => {
-  // Replicate the filter logic from drainPendingMessages: messages already
-  // in confirmedDeliveredIds must be excluded from the unseen set.
-
-  function filterUnseen<T extends { id: number }>(
-    buffered: T[],
-    confirmedDeliveredIds: Set<number>
-  ): T[] {
-    return buffered.filter((m) => !confirmedDeliveredIds.has(m.id));
-  }
-
-  test("excludes messages already in confirmedDeliveredIds", () => {
-    const buffered = [{ id: 1, text: "a" }, { id: 2, text: "b" }, { id: 3, text: "c" }];
-    const confirmed = new Set<number>([2]);
-    const unseen = filterUnseen(buffered, confirmed);
-    expect(unseen.length).toBe(2);
-    expect(unseen.map((m) => m.id)).toEqual([1, 3]);
-  });
-
-  test("returns empty when ALL buffered messages already confirmed", () => {
-    const buffered = [{ id: 1 }, { id: 2 }];
-    const confirmed = new Set<number>([1, 2]);
-    expect(filterUnseen(buffered, confirmed).length).toBe(0);
-  });
-
-  test("returns all when confirmed is empty", () => {
-    const buffered = [{ id: 1 }, { id: 2 }, { id: 3 }];
-    expect(filterUnseen(buffered, new Set()).length).toBe(3);
-  });
-
-  // Display IS delivery — the post-pr-review-toolkit fix reverts the C5 ackOk
-  // gate. Once the message text is rendered into a tool response Claude WILL
-  // see, dedup must be added unconditionally to prevent duplication on the
-  // next poll cycle (broker still has delivered=0 so it will re-send).
-  test("post-fix: dedup populated even when ack fails (display = delivery)", async () => {
-    // Simulate the ackAndDedup helper logic: ack throws, dedup still populated.
-    const confirmed = new Set<number>();
-    const ids = [10, 20, 30];
-    const fakeBrokerFetch = async () => {
-      throw new Error("simulated broker unreachable");
-    };
-    try {
-      await fakeBrokerFetch();
-    } catch {
-      // Caught and logged in real code
-    }
-    // Critical post-fix invariant: dedup add runs UNCONDITIONALLY after the
-    // catch, NOT inside an if(ackOk).
-    for (const id of ids) confirmed.add(id);
-    expect(confirmed.size).toBe(3);
-    expect(confirmed.has(10)).toBe(true);
-    // Re-running the same drain on the same buffer would now filter out these
-    // IDs, preventing duplicate display.
-  });
-
-  test("regression guard: ackAndDedup must add to dedup BEFORE the next drain", () => {
-    // Two-step: first drain shows messages [1,2], second drain on a freshly
-    // re-buffered set must not show them again.
-    const confirmed = new Set<number>();
-    // Drain 1
-    const buffered1 = [{ id: 1 }, { id: 2 }];
-    const unseen1 = buffered1.filter((m) => !confirmed.has(m.id));
-    for (const m of unseen1) confirmed.add(m.id); // unconditional dedup add
-    expect(unseen1.length).toBe(2);
-
-    // Broker re-sends the same messages (because ack failed earlier).
-    const buffered2 = [{ id: 1 }, { id: 2 }, { id: 3 }];
-    const unseen2 = buffered2.filter((m) => !confirmed.has(m.id));
-    expect(unseen2.length).toBe(1); // only id=3 — 1 and 2 already in dedup
-    expect(unseen2[0]!.id).toBe(3);
-  });
-});
-
-// --- Buffer overflow with myId=null edge case (T4) ---
-
-describe("Buffer overflow prune with null peer ID (T4)", () => {
-  // Post-review-army: pruned messages must NOT be acked to the broker.
-  // The myId=null guard must not crash, and dedup must still be populated.
-
-  test("overflow prune adds to dedup even when myId is null", () => {
-    const myId: string | null = null;
-    const buffer = Array.from({ length: 11000 }, (_, i) => ({ id: i }));
-    const confirmedDelivered = new Set<number>();
-    const BUFFER_CAP = 10000;
-    const BUFFER_DRAIN_TO = 5000;
-
-    if (buffer.length > BUFFER_CAP) {
-      const removed = buffer.splice(0, buffer.length - BUFFER_DRAIN_TO);
-      for (const m of removed) confirmedDelivered.add(m.id);
-      // The post-fix code does NOT ack on overflow — verify we'd never reach
-      // brokerFetch when myId is null.
-      expect(myId).toBeNull();
-    }
-
-    expect(buffer.length).toBe(5000);
-    expect(confirmedDelivered.size).toBe(6000);
-  });
-
-  test("post-fix overflow does NOT ack broker (silent loss prevention)", () => {
-    // Regression test for the post-review-army behavior change: the upstream
-    // PR #25 logic acked pruned messages (silent data loss). Our fix removes
-    // the ack call entirely so messages remain undelivered server-side and
-    // can be re-delivered on next session.
-    const buffer = Array.from({ length: 11000 }, (_, i) => ({ id: i }));
-    const BUFFER_CAP = 10000;
-    const BUFFER_DRAIN_TO = 5000;
-    let brokerFetchCalled = false;
-
-    if (buffer.length > BUFFER_CAP) {
-      const removed = buffer.splice(0, buffer.length - BUFFER_DRAIN_TO);
-      // Simulate the real prune logic — dedup add only, no broker call
-      const confirmed = new Set<number>();
-      for (const m of removed) confirmed.add(m.id);
-      // brokerFetch SHOULD NOT be called here in the post-fix code
-      expect(brokerFetchCalled).toBe(false);
-    }
   });
 });
 
@@ -1181,6 +943,58 @@ describe("Live broker delivery features", () => {
     expect(statusAfter.statuses[0]!.state).toBe("acknowledged");
     expect(statusAfter.statuses[0]!.delivered).toBe(true);
     expect(typeof statusAfter.statuses[0]!.delivered_at).toBe("string");
+    child.kill();
+  });
+
+  test("concurrent claimers cannot render the same message body twice", async () => {
+    const child = spawnSleep();
+    const peer = await brokerFetch<{ id: string }>("/register", {
+      pid: child.pid, cwd: "/claim-race", git_root: null, tty: null, name: "claim-race",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null,
+      client_type: "claude", receiver_mode: "claude-hook", summary: "",
+    });
+    const sent = await brokerFetch<{ id: number }>("/send-message", {
+      from_id: peer.id, to_id: peer.id, text: "render exactly once",
+    });
+
+    const [left, right] = await Promise.all([
+      rawPost("/claim-by-pid", {
+        pid: child.pid, caller_pid: process.pid, drain_id: "claim-race-left",
+      }),
+      rawPost("/claim-by-pid", {
+        pid: child.pid, caller_pid: process.pid, drain_id: "claim-race-right",
+      }),
+    ]);
+    expect(left.status).toBe(200);
+    expect(right.status).toBe(200);
+
+    const claims = [left, right].map((response) => ({
+      drainId: response.json.drain_id as string,
+      messages: response.json.messages as Array<{ id: number; text: string }>,
+    }));
+    expect(claims[0]!.messages.length + claims[1]!.messages.length).toBe(1);
+    const winner = claims.find((claim) => claim.messages.length === 1)!;
+    const loser = claims.find((claim) => claim.messages.length === 0)!;
+    expect(winner.messages).toEqual([
+      expect.objectContaining({ id: sent.id, from_id: peer.id, text: "render exactly once", sent_at: expect.any(String) }),
+    ]);
+    expect(loser.messages).toEqual([]);
+
+    const ack = await rawPost("/ack-by-pid", {
+      pid: child.pid,
+      caller_pid: process.pid,
+      drain_id: winner.drainId,
+      ids: [sent.id],
+      via: "claim-race-test",
+    });
+    expect(ack.status).toBe(200);
+    expect(ack.json.acked).toBe(1);
+
+    const afterAck = await rawPost("/claim-by-pid", {
+      pid: child.pid, caller_pid: process.pid, drain_id: "claim-race-after-ack",
+    });
+    expect(afterAck.status).toBe(200);
+    expect(afterAck.json.messages).toEqual([]);
     child.kill();
   });
 
