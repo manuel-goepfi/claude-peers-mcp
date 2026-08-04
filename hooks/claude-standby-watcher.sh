@@ -15,6 +15,7 @@ POLL_INTERVAL=$(positive_int "${CLAUDE_PEERS_STANDBY_POLL_INTERVAL_SECONDS:-10}"
 IDLE_INTERVAL=$(positive_int "${CLAUDE_PEERS_STANDBY_IDLE_INTERVAL_SECONDS:-60}" 60)
 LOCK_WAIT=$(positive_int "${CLAUDE_PEERS_STANDBY_LOCK_WAIT_SECONDS:-2}" 2)
 BROKER_PORT="${CLAUDE_PEERS_PORT:-7899}"
+FALLBACK_HOME="${HOME:-${TMPDIR:-/tmp}}"
 
 # Logging is set up BEFORE any early exit, on purpose.
 #
@@ -23,7 +24,7 @@ BROKER_PORT="${CLAUDE_PEERS_PORT:-7899}"
 # and no watcher existed — a failure that is invisible from every direction at
 # once. Measured 2026-08-03: idle Claude lanes stopped waking for peer mail and
 # the only way to find out why was to read the script.
-LOG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/logs"
+LOG_DIR="${CLAUDE_CONFIG_DIR:-$FALLBACK_HOME/.claude}/logs"
 mkdir -p "$LOG_DIR" 2>/dev/null
 STANDBY_LOG="$LOG_DIR/standby-watcher.log"
 
@@ -81,6 +82,7 @@ if [[ -z "${CLAUDE_PEERS_STANDBY_CLAUDE_PID:-}" ]]; then
   done
 fi
 [[ "$CLAUDE_PID" =~ ^[0-9]+$ ]] || bail no-claude-pid
+kill -0 "$CLAUDE_PID" 2>/dev/null || bail claude-pid-not-live
 
 find_mcp_pid() {
   local try walk comm
@@ -124,37 +126,37 @@ if [[ ! "$LOCK_KEY" =~ ^[A-Za-z0-9._-]{1,128}$ ]]; then LOCK_KEY="$CLAUDE_PID"; 
 # Keep coordination files below an owner-only runtime directory. Unlike the old
 # public /tmp lock, the persistent lock inode is never removed, avoiding an
 # unlink/recreate split-lock race while another Stop invocation is waiting.
-RUNTIME_BASE="${CLAUDE_PEERS_STANDBY_RUNTIME_DIR:-${XDG_RUNTIME_DIR:-$HOME/.cache}}"
+RUNTIME_BASE="${CLAUDE_PEERS_STANDBY_RUNTIME_DIR:-${XDG_RUNTIME_DIR:-$FALLBACK_HOME/.cache}}"
 STATE_DIR="$RUNTIME_BASE/claude-peers/standby"
 umask 077
-[[ ! -L "$STATE_DIR" ]] || exit 0
-mkdir -p "$STATE_DIR" 2>/dev/null || exit 0
-chmod 700 "$STATE_DIR" 2>/dev/null || exit 0
+[[ ! -L "$STATE_DIR" ]] || bail unsafe-state-dir-symlink
+mkdir -p "$STATE_DIR" 2>/dev/null || bail state-dir-create-failed
+chmod 700 "$STATE_DIR" 2>/dev/null || bail state-dir-chmod-failed
 OWNER=$(stat -c '%u' "$STATE_DIR" 2>/dev/null || true)
-[[ "$OWNER" == "$(id -u)" ]] || exit 0
+[[ "$OWNER" == "$(id -u)" ]] || bail state-dir-owner-mismatch
 
 LOCK_FILE="$STATE_DIR/$LOCK_KEY.lock"
 STATE_FILE="$STATE_DIR/$LOCK_KEY.state"
 NOW=$(date +%s)
 DEADLINE=$((NOW + ACTIVE_SECONDS))
 STATE_TMP="$STATE_DIR/.$LOCK_KEY.state.$$"
-printf '%s %s\n' "$DEADLINE" "$MCP_PID" > "$STATE_TMP" 2>/dev/null || exit 0
-chmod 600 "$STATE_TMP" 2>/dev/null || exit 0
-mv -f "$STATE_TMP" "$STATE_FILE" 2>/dev/null || exit 0
+printf '%s %s\n' "$DEADLINE" "$MCP_PID" > "$STATE_TMP" 2>/dev/null || bail state-write-failed
+chmod 600 "$STATE_TMP" 2>/dev/null || bail state-chmod-failed
+mv -f "$STATE_TMP" "$STATE_FILE" 2>/dev/null || bail state-publish-failed
 
-command -v flock >/dev/null 2>&1 || exit 0
-exec 200>>"$LOCK_FILE" || exit 0
-chmod 600 "$LOCK_FILE" 2>/dev/null || exit 0
+command -v flock >/dev/null 2>&1 || bail missing-flock
+exec 200>>"$LOCK_FILE" || bail lock-open-failed
+chmod 600 "$LOCK_FILE" 2>/dev/null || bail lock-chmod-failed
 # If a prior watcher is approaching its deadline, wait briefly so this process
 # can take over. Otherwise the lease write above refreshes that watcher and this
 # contender exits without creating a duplicate poller.
 flock -w "$LOCK_WAIT" 200 || exit 0
 
 wake_mode() {
-  local summary=""
+  local summary="" summary_pid="${MCP_PID:-$CLAUDE_PID}"
   if command -v sqlite3 >/dev/null 2>&1; then
-    summary=$(sqlite3 -readonly "${CLAUDE_PEERS_DB:-$HOME/.claude-peers.db}" \
-      "SELECT summary FROM peers WHERE pid=$MCP_PID" 2>/dev/null || true)
+    summary=$(sqlite3 -readonly "${CLAUDE_PEERS_DB:-$FALLBACK_HOME/.claude-peers.db}" \
+      "SELECT summary FROM peers WHERE pid=$summary_pid" 2>/dev/null || true)
     if [[ "$(bun "$SCRIPT_DIR/claude-wake-mode.ts" "$summary" 2>/dev/null)" == "auto" ]]; then
       printf 'auto\n'
       return

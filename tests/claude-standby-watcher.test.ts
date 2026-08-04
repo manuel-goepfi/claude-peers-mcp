@@ -47,6 +47,32 @@ function startWatcher(env: Record<string, string>, sessionId: string): Bun.Subpr
 }
 
 describe("Claude standby watcher", () => {
+  test("fails open without HOME and records why it did not arm", async () => {
+    const root = mkdtempSync(join(tmpdir(), "claude-peers-standby-minimal-env-"));
+    roots.push(root);
+    const child = Bun.spawn(["env", "-i",
+      `PATH=${process.env.PATH ?? "/usr/bin:/bin"}`,
+      `TMPDIR=${root}`,
+      "CLAUDE_PEERS_STANDBY_CLAUDE_PID=999999999",
+      "bash", watcher,
+    ], {
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    children.push(child);
+    child.stdin.write(`${JSON.stringify({ session_id: "minimal-env-session" })}\n`);
+    child.stdin.end();
+    const [code, stderr] = await Promise.all([
+      child.exited,
+      new Response(child.stderr as ReadableStream<Uint8Array>).text(),
+    ]);
+
+    expect(code).toBe(0);
+    expect(stderr).not.toContain("HOME: unbound variable");
+    expect(existsSync(join(root, ".claude", "logs", "standby-watcher.log"))).toBe(true);
+  });
+
   test("a later Stop refreshes the active watch instead of losing the re-arm behind the lock", async () => {
     const root = mkdtempSync(join(tmpdir(), "claude-peers-standby-"));
     roots.push(root);
@@ -221,6 +247,9 @@ describe("Claude standby watcher", () => {
     roots.push(root);
     const runtime = join(root, "runtime");
     mkdirSync(runtime, { mode: 0o700 });
+    const customDb = join(root, "custom-peers.db");
+    const db = new Database(customDb);
+    db.run("CREATE TABLE peers (pid INTEGER PRIMARY KEY, summary TEXT NOT NULL)");
     const requests: Array<{ path: string; body: Record<string, unknown> }> = [];
     const broker = Bun.serve({
       hostname: "127.0.0.1",
@@ -242,6 +271,8 @@ describe("Claude standby watcher", () => {
     servers.push(broker);
     const anchor = Bun.spawn(["sleep", "20"]);
     children.push(anchor);
+    db.run("INSERT INTO peers (pid, summary) VALUES (?, ?)", [anchor.pid, "standby auto"]);
+    db.close();
 
     // Force discovery to FAIL, deterministically.
     //
@@ -262,6 +293,7 @@ describe("Claude standby watcher", () => {
       HOME: root,
       XDG_RUNTIME_DIR: runtime,
       PATH: `${shimBin}:${process.env.PATH ?? ""}`,
+      CLAUDE_PEERS_DB: customDb,
       CLAUDE_PEERS_PORT: String(broker.port),
       CLAUDE_PEERS_STANDBY_CLAUDE_PID: String(anchor.pid),
       // deliberately NO CLAUDE_PEERS_STANDBY_MCP_PID — discovery must fail
@@ -276,6 +308,7 @@ describe("Claude standby watcher", () => {
     // was exit 0 with an empty stderr and no broker call at all.
     expect(code).toBe(2);
     expect(stderr).toContain("detached delivery");
+    expect(stderr).toContain("Autonomous mode is enabled");
     // It must never have needed the pid route.
     expect(requests.map((r) => r.path)).toEqual(["/claim-by-thread", "/ack-by-thread"]);
     expect(requests[0]?.body).toMatchObject({ thread_id: "detached-session-id" });
