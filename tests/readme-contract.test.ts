@@ -84,6 +84,15 @@ describe("public distribution contract", () => {
     }
   });
 
+  test("README describes claim-local delivery without the removed MCP body buffer", () => {
+    const readme = read("README.md");
+    expect(readme).toContain("Every current client disables the MCP background observation poll");
+    expect(readme).toContain("A consumer claims a batch only when it can render that batch");
+    expect(readme).toContain("compatibility scheduler remains configurable");
+    expect(readme).not.toContain("adaptive MCP polling");
+    expect(readme).not.toContain("Local Claude buffer");
+  });
+
   test("public guides document the complete doctor adapter inventory", () => {
     for (const path of ["README.md", "docs/operations.md"] as const) {
       const guide = read(path);

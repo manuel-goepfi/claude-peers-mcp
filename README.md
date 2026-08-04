@@ -171,13 +171,13 @@ Queue insertion is not receipt, so every send also returns the recipient's live 
 
 | Client | Receiver mode | Receipt path |
 | --- | --- | --- |
-| Claude Code | `claude/claude-channel` | Prompt-time hook drain plus refreshable idle `asyncRewake` watcher; adaptive MCP polling and explicit `check_messages` remain safety nets. |
-| Codex with current hooks | `codex/codex-hook` | Prompt/start/turn-end hook claim and acknowledgement. Background MCP polling stays disabled. |
-| Gemini with current hooks | `gemini/gemini-hook` | `BeforeAgent` hook claim and acknowledgement. Background MCP polling stays disabled. |
+| Claude Code | `claude/claude-channel` | Prompt-time hook claim and acknowledgement plus a refreshable idle `asyncRewake` watcher; explicit `check_messages` remains the safety net. |
+| Codex with current hooks | `codex/codex-hook` | Prompt/start/turn-end hook claim and acknowledgement. |
+| Gemini with current hooks | `gemini/gemini-hook` | `BeforeAgent` hook claim and acknowledgement. |
 | Codex or Gemini without a proven hook | `*/manual-drain` | `check_messages` until the hook registers and heartbeats successfully. |
 | Unknown/send-only | `unknown/unknown` | Not a normal automatic receiver; bounded retention applies. |
 
-Adaptive Claude empty-poll delays are 1s, 1s, 2s, 4s, 8s, then a phase-spread 10s ceiling. Tool activity, non-empty poll, re-registration, or broker recovery returns to the one-second active cadence with a five-second grace. Idle requires 30 seconds without a trigger plus two empty ceiling polls.
+Every current client disables the MCP background observation poll. A consumer claims a batch only when it can render that batch into a hook result or an explicit `check_messages` tool response, then acknowledges the same claim. A failed acknowledgement leaves the claim available for redelivery after its lease expires. The compatibility scheduler remains configurable for benchmark and future-client work, but it never caches or renders a polled body.
 
 ## Limits and retention
 
@@ -185,7 +185,6 @@ Adaptive Claude empty-poll delays are 1s, 1s, 2s, 4s, 8s, then a phase-spread 10
 - Per peer: 600 protected requests and 60 message slots per rolling minute. Heartbeats are exempt from request throttling.
 - Broadcast: at most 60 targets. Hook claim: at most 25 messages and 64 KiB. Claim lease: 30 seconds.
 - Tmux capture: default 80 lines, maximum 200 lines and 8 KiB.
-- Local Claude buffer: 10,000 messages; local acknowledgement dedup: 5,000 IDs.
 - Delivered history: seven days by default, anchored at acknowledgement or migration retention time.
 - Undelivered mail to an `unknown` receiver: seven days by default.
 - A dead recoverable seat keeps undelivered mail for 24 hours by default, with a one-hour floor.
@@ -214,7 +213,7 @@ History intentionally outlives ephemeral peer rows. Schema version 1 has no mess
 | `CLAUDE_PEERS_BRIDGE_ENABLED` | `true` | Compatibility-on bridge cursor. Set `false` to remove its token and endpoint completely. |
 | `CLAUDE_PEERS_BRIDGE_TOKEN_FILE` | `$HOME/.claude-peers-bridge.token` | 0600 bearer token for privileged history reads. |
 | `CLAUDE_PEERS_METRICS_ENABLED` | `true` | Authenticated aggregate route and latency metrics; never content or IDs. |
-| `CLAUDE_PEERS_ADAPTIVE_POLLING` | `true` | Adaptive Claude receive polling. |
+| `CLAUDE_PEERS_ADAPTIVE_POLLING` | `true` | Compatibility observation-poll scheduler; inactive for every current client. |
 | `CLAUDE_CONFIG_DIR` | `$HOME/.claude` | Claude profile directory used by the hook installer and hook logs. |
 | `CLAUDE_PEERS_STANDBY_ACTIVE_SECONDS` | `3600` | Fast standby-poll window after each Claude Stop event. |
 | `CLAUDE_PEERS_STANDBY_POLL_INTERVAL_SECONDS` | `10` | Poll cadence during the fast standby window. |
