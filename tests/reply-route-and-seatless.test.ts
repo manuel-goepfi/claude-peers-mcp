@@ -173,18 +173,16 @@ describe("sender reply-route honesty", () => {
 describe("codex nudge text", () => {
   const lane = (n: number, client: string) => ({ unread: n, client_type: client } as never);
 
-  test("tells a codex lane to fetch unconditionally", () => {
+  test("tells a codex lane how to recover when no hook-delivered block is present", () => {
     const text = nudgeText(lane(1, "codex"));
-    expect(text).toContain("check_messages");
-    // The old wording made the FETCH conditional, which a lane cannot evaluate.
+    expect(text).toContain("If a peer-message block is attached above, process it; otherwise call check_messages");
+    expect(text).not.toContain("was just delivered with this notification");
     expect(text).not.toMatch(/check_messages if\s+relevant/);
-    expect(text).toContain("cannot tell whether");
   });
 
   test("keeps the non-actionable declaration that guards against nudge-as-work hijack", () => {
     // Standing invariant from an earlier incident where a lane adopted the nudge
-    // as its assignment; making the FETCH unconditional must not weaken it. Only
-    // the fetch is mandatory, never the contents.
+    // as its assignment; adding a missing-hook recovery path must not weaken it.
     //
     // The conditional-action clause is asserted by MEANING, not by the old literal
     // "act only if relevant" — that exact phrasing was withdrawn because lanes
@@ -195,11 +193,11 @@ describe("codex nudge text", () => {
     expect(nudgeText(lane(3, "codex")).toLowerCase().startsWith("check ")).toBe(false);
   });
 
-  test("pluralises and keeps the claude branch untouched", () => {
+  test("pluralises and gives Claude the same observable-state fallback", () => {
     expect(nudgeText(lane(2, "codex"))).toContain("2 unread messages");
     expect(nudgeText(lane(1, "codex"))).toContain("1 unread message");
-    // Claude drains via the prompt hook, so it must NOT be told to fetch again.
-    expect(nudgeText(lane(1, "claude"))).not.toContain("Call check_messages");
+    expect(nudgeText(lane(1, "claude"))).toContain("otherwise call check_messages");
+    expect(nudgeText(lane(1, "claude"))).not.toContain("was just delivered");
   });
 });
 

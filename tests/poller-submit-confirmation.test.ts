@@ -20,7 +20,13 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { composerStillHolds, submissionProbe } from "../bin/codex-autodrain-poller.ts";
+import { Database } from "bun:sqlite";
+import {
+  composerStillHolds,
+  submissionProbe,
+  tick,
+  type TickSnapshot,
+} from "../bin/codex-autodrain-poller.ts";
 
 const PROMPT = "› ";
 
@@ -114,5 +120,78 @@ describe("the shipped poller is wake-only", () => {
 
   test("an unconfirmed submit is logged as an uncounted wake", () => {
     expect(source).toContain("wake submit unconfirmed");
+  });
+
+  test("the real tick wakes an exact seat without claiming or acknowledging its mail", () => {
+    const db = new Database(":memory:");
+    db.run(`CREATE TABLE peers (
+      id TEXT PRIMARY KEY, name TEXT, pid INTEGER NOT NULL, client_type TEXT NOT NULL,
+      tmux_pane_id TEXT, thread_id TEXT, seat_key TEXT, receiver_mode TEXT,
+      last_hook_seen_at TEXT
+    )`);
+    db.run("CREATE TABLE messages (id INTEGER PRIMARY KEY, to_id TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0)");
+    db.run("INSERT INTO peers VALUES ('seat-1', 'infra.9', ?, 'codex', '%42', 'thread-1', 'pane:infra:%42', 'codex-hook', NULL)", [process.pid]);
+    db.run("INSERT INTO messages (id, to_id, delivered) VALUES (1, 'seat-1', 0)");
+    const snap: TickSnapshot = {
+      procs: [{ pid: process.pid, ppid: 1, args: "codex resume" }],
+      paneByPid: new Map([["%42", process.pid]]),
+      paneMap: new Map([[process.pid, {
+        session: "infra", window_index: "1", window_name: "peers", pane_index: "9", pane_id: "%42",
+      }]]),
+    };
+    const submissions: Array<{ id: string; paneId: string }> = [];
+    const brokerRequests: string[] = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = Object.assign(
+      async (input: Parameters<typeof fetch>[0]) => {
+        brokerRequests.push(String(input));
+        throw new Error("poller tick must not call the broker");
+      },
+      { preconnect: originalFetch.preconnect },
+    );
+    try {
+      tick(db, snap, {
+        nudgeableClients: ["codex"],
+        isPidAlive: () => true,
+        paneIsIdle: () => true,
+        nudgeLane: (lane, paneId) => submissions.push({ id: lane.id, paneId }),
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+
+    expect(submissions).toEqual([{ id: "seat-1", paneId: "%42" }]);
+    expect(brokerRequests).toEqual([]);
+    expect(db.query("SELECT delivered FROM messages WHERE id = 1").get()).toEqual({ delivered: 0 });
+    db.close();
+  });
+
+  test("the real tick refuses a mismatched seat before the transport boundary", () => {
+    const db = new Database(":memory:");
+    db.run(`CREATE TABLE peers (
+      id TEXT PRIMARY KEY, name TEXT, pid INTEGER NOT NULL, client_type TEXT NOT NULL,
+      tmux_pane_id TEXT, thread_id TEXT, seat_key TEXT, receiver_mode TEXT,
+      last_hook_seen_at TEXT
+    )`);
+    db.run("CREATE TABLE messages (id INTEGER PRIMARY KEY, to_id TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0)");
+    db.run("INSERT INTO peers VALUES ('seat-2', 'infra.8', ?, 'codex', '%42', 'thread-2', 'pane:infra:%99', 'codex-hook', NULL)", [process.pid]);
+    db.run("INSERT INTO messages (id, to_id, delivered) VALUES (2, 'seat-2', 0)");
+    const submissions: string[] = [];
+    tick(db, {
+      procs: [{ pid: process.pid, ppid: 1, args: "codex resume" }],
+      paneByPid: new Map([["%42", process.pid]]),
+      paneMap: new Map([[process.pid, {
+        session: "infra", window_index: "1", window_name: "peers", pane_index: "8", pane_id: "%42",
+      }]]),
+    }, {
+      nudgeableClients: ["codex"],
+      isPidAlive: () => true,
+      paneIsIdle: () => true,
+      nudgeLane: (_lane, paneId) => submissions.push(paneId),
+    });
+
+    expect(submissions).toEqual([]);
+    expect(db.query("SELECT delivered FROM messages WHERE id = 2").get()).toEqual({ delivered: 0 });
+    db.close();
   });
 });

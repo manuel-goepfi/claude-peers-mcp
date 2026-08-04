@@ -928,24 +928,19 @@ describe("nudge wording is a notification, not a task", () => {
   });
 });
 
-describe("nudge wording is client-aware (claude mail rides in with the nudge)", () => {
-  const claudeLane = (unread: number) => ({ ...laneWith(unread), client_type: "claude" });
-  test("claude lane is NOT told to fetch — its drain hook already delivered the mail with this prompt", () => {
-    const t = nudgeText(claudeLane(2) as never);
-    expect(t).not.toContain("check_messages");
-    expect(t).toContain("delivered with this notification");
+describe("nudge wording reports only observable delivery state", () => {
+  test.each([
+    ["claude", { ...laneWith(2), client_type: "claude" }],
+    ["hook-backed codex", laneWith(2)],
+    ["manual codex", { ...laneWith(2), thread_id: null, receiver_mode: "manual-drain" }],
+    ["gemini", { ...laneWith(2), client_type: "gemini", receiver_mode: "gemini-hook" }],
+  ])("%s gets the same self-verifying fallback", (_label, lane) => {
+    const t = nudgeText(lane as never);
+    expect(t).toContain("If a peer-message block is attached above, process it; otherwise call check_messages");
+    expect(t).not.toContain("was just delivered with this notification");
+    expect(t).not.toContain("were just delivered with this notification");
     expect(t).toContain("not itself a task");
     expect(t).toContain("may be real work");
-  });
-  test("hook-backed codex lane is NOT told to re-fetch mail its UserPromptSubmit hook delivered", () => {
-    const t = nudgeText(laneWith(2) as never);
-    expect(t).not.toContain("check_messages");
-    expect(t).toContain("delivered with this notification");
-  });
-  test("legacy codex rows without a thread get the explicit manual drain instruction", () => {
-    const t = nudgeText({ ...laneWith(2), thread_id: null } as never);
-    expect(t).toContain("check_messages");
-    expect(t).not.toContain("was just delivered with this notification");
   });
 });
 
@@ -977,7 +972,7 @@ describe("Codex wake-only delivery", () => {
 
     expect(result).toBe("submitted");
     expect(submissions).toEqual([{ paneId: "%42", text: nudgeText(lane as never) }]);
-    expect(submissions[0]!.text).toContain("delivered with this notification");
+    expect(submissions[0]!.text).toContain("otherwise call check_messages");
     expect(submissions[0]!.text).not.toContain("<peer-message");
   });
 

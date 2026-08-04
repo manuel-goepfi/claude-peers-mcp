@@ -89,6 +89,7 @@ fi
 
 passthrough_command=""
 seen_cd=0
+seen_remote=0
 unknown_option=0
 arguments=("$@")
 argument_index=0
@@ -99,7 +100,14 @@ while (( argument_index < ${#arguments[@]} )); do
     -h|--help|-V|--version)
       if (( unknown_option == 0 )); then exec "$REAL_CODEX" "$@"; fi
       ;;
-    --remote|--remote=*)
+    --remote)
+      seen_remote=1
+      if (( unknown_option == 0 )); then exec "$REAL_CODEX" "$@"; fi
+      argument_index=$((argument_index + 2))
+      continue
+      ;;
+    --remote=*)
+      seen_remote=1
       if (( unknown_option == 0 )); then exec "$REAL_CODEX" "$@"; fi
       ;;
     -C|--cd)
@@ -149,6 +157,10 @@ while (( argument_index < ${#arguments[@]} )); do
   esac
   argument_index=$((argument_index + 1))
 done
+if (( unknown_option != 0 && seen_remote != 0 )); then
+  printf 'codex-seat: explicit --remote conflicts with a pane-local seat after an unknown option; rerun with CLAUDE_PEERS_CODEX_SEAT=0 to use the caller endpoint\n' >&2
+  exit 2
+fi
 if (( unknown_option == 0 )); then
   case "$passthrough_command" in
     exec|e|review|login|logout|mcp|plugin|mcp-server|app-server|remote-control|completion|update|doctor|sandbox|debug|apply|a|archive|delete|unarchive|cloud|exec-server|features|help)

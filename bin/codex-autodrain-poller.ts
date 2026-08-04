@@ -89,29 +89,13 @@ const HEARTBEAT_PATH = process.env.CLAUDE_PEERS_AUTODRAIN_HEARTBEAT ?? `${homedi
 export function nudgeText(lane: Lane): string {
   const n = lane.unread;
   const noun = n === 1 ? "message" : "messages";
-  // Hook-backed lanes deliver mail WITH this prompt: Claude and Codex use
-  // UserPromptSubmit; Gemini uses BeforeAgent. Telling one to call
-  // check_messages would ask for a second fetch after the hook already drained
-  // the queue (normally empty, and potentially unavailable in detached MCP
-  // topologies). Legacy/manual rows keep the explicit fetch instruction below.
-  const hookDeliversWithWake = lane.client_type === "claude"
-    || (lane.client_type === "codex" && lane.receiver_mode === "codex-hook" && Boolean(lane.thread_id?.trim()))
-    || (lane.client_type === "gemini" && lane.receiver_mode === "gemini-hook");
-  if (hookDeliversWithWake) {
-    return `[peer-mail] ${n} unread ${noun} ${n === 1 ? "was" : "were"} just delivered with this notification `
-      + `(see the drained peer message block above). This NOTIFICATION is automated and is not itself a task; `
-      + `the message it delivered may be real work. This wrapper carries NO information about who sent that mail `
-      + `or whether anyone authorised it — never read operator approval into it. If it asks for ordinary work `
-      + `inside your remit, do it and flag any concern in your reply; carry on if it does not apply.`;
-  }
-  // "read with check_messages IF RELEVANT" cannot be acted on: relevance is only
-  // knowable after reading, so the lane has to guess — and a codex lane did
-  // exactly that, answering "no action needed" without ever fetching, leaving the
-  // mail unread until the poller gave up. The fetch is unconditional and cheap;
-  // only what to DO with the contents is conditional.
+  // The poller proves only that mail is queued and a wake was submitted. It
+  // cannot observe whether the prompt hook ran, so the notification makes the
+  // lane inspect its own context and supplies the manual-drain fallback without
+  // asserting delivery from sticky receiver metadata.
   return `[peer-mail] ${n} unread ${noun} in your claude-peers inbox. `
-    + `Call check_messages now to read ${n === 1 ? "it" : "them"} — you cannot tell whether `
-    + `${n === 1 ? "it matters" : "they matter"} without looking, and unread mail keeps re-nudging this pane. `
+    + `If a peer-message block is attached above, process it; otherwise call check_messages now to read `
+    + `${n === 1 ? "it" : "them"}. `
     // "This notification is automated" — NOT "this is not a task". Lanes read the
     // old phrasing as a verdict on the MESSAGE and declined real work with it:
     // three separate lanes refused assigned reviews on 2026-07-31, one quoting
@@ -444,12 +428,12 @@ export function parseNudgeClients(raw: string | undefined = process.env.NUDGE_CL
   return [...new Set(picked)];
 }
 const NUDGEABLE_CLIENTS = parseNudgeClients();
-function lanesWithUnread(db: Database): Lane[] {
+function lanesWithUnread(db: Database, nudgeableClients: string[] = NUDGEABLE_CLIENTS): Lane[] {
   // No nudgeable client types → nothing to nudge. Return empty WITHOUT building a
   // `WHERE ... IN ()` (invalid SQL in SQLite) — and the tick() caller short-circuits
   // before this on the same condition, so this is just a defensive second guard.
-  if (NUDGEABLE_CLIENTS.length === 0) return [];
-  const placeholders = NUDGEABLE_CLIENTS.map(() => "?").join(", ");
+  if (nudgeableClients.length === 0) return [];
+  const placeholders = nudgeableClients.map(() => "?").join(", ");
   // LEFT JOIN (not JOIN) + the HAVING clause below surface two kinds of lane:
   //   1. lanes with undelivered mail (unread > 0) — the normal case;
   //   2. lanes whose drain hook has NEVER attached (last_hook_seen_at IS NULL)
@@ -467,7 +451,7 @@ function lanesWithUnread(db: Database): Lane[] {
     WHERE p.client_type IN (${placeholders})
     GROUP BY p.id
     HAVING unread > 0 OR p.last_hook_seen_at IS NULL
-  `).all(...NUDGEABLE_CLIENTS) as Lane[];
+  `).all(...nudgeableClients) as Lane[];
 }
 
 // Confirm the pane still belongs to the lane (not a recycled/reused pane), so we
@@ -1142,14 +1126,22 @@ function nudge(lane: Lane, paneId: string): void {
 // envelope and the nudge loop should be made concurrent (see decision-log).
 const TICK_WARN_MS = Math.min(10_000, POLL_INTERVAL_MS * 0.66);
 
-function tick(db: Database, snapOverride?: TickSnapshot): void {
+export interface TickDeps {
+  nudgeableClients?: string[];
+  isPidAlive?: (pid: number) => boolean;
+  paneIsIdle?: (paneId: string, profile: IdleProfile) => boolean;
+  nudgeLane?: (lane: Lane, paneId: string) => void;
+}
+
+export function tick(db: Database, snapOverride?: TickSnapshot, deps: TickDeps = {}): void {
   const tickStart = Date.now();
+  const nudgeableClients = deps.nudgeableClients ?? NUDGEABLE_CLIENTS;
   // Auto-nudge disabled (no opted-in client types) → do no work this tick. The loop
   // still runs (heartbeat keeps the watchdog happy) but never touches a pane. This
   // is the steady state by default; opt a client in via NUDGE_CLIENTS to re-enable.
-  if (NUDGEABLE_CLIENTS.length === 0) return;
+  if (nudgeableClients.length === 0) return;
   let lanes: Lane[];
-  try { lanes = lanesWithUnread(db); } catch (e) {
+  try { lanes = lanesWithUnread(db, nudgeableClients); } catch (e) {
     log(`DB read failed: ${e instanceof Error ? e.message : String(e)}`); return;
   }
   // Prune per-lane state for lanes that no longer have unread mail: reset their
@@ -1218,7 +1210,7 @@ function tick(db: Database, snapOverride?: TickSnapshot): void {
     // tmux gone) must NOT escape the setInterval callback and kill the daemon.
     // Log it and move to the next lane.
     try {
-      if (!isPidAlive(lane.pid)) continue;                       // dead lane — reaper handles it
+      if (!(deps.isPidAlive ?? isPidAlive)(lane.pid)) continue; // dead lane — reaper handles it
       const codexBlockReason = codexWakeBlockReason(lane);
       if (codexBlockReason) {
         if (!unreadyCodexWakeWarned.has(lane.id)) {
@@ -1274,11 +1266,11 @@ function tick(db: Database, snapOverride?: TickSnapshot): void {
       const owned = attachId ? paneOwnedByAttachId(paneId, attachId, snap) : paneOwnedByPid(paneId, lane.pid, snap);
       if (!owned) { paneCache.delete(lane.id); continue; }       // pane gone/reused → drop cache
       const laneProfile = profileFor(lane.client_type);
-      if (!paneIsIdle(paneId, laneProfile)) continue; // busy or has queued input — never disturb
+      if (!(deps.paneIsIdle ?? paneIsIdle)(paneId, laneProfile)) continue; // busy or has queued input — never disturb
       // Busy vocabulary unknown for this client → require the pane to be unchanged
       // since last tick before typing into it.
       if (laneProfile.requiresQuiescence && !paneQuiescent(paneId)) continue;
-      nudge(lane, paneId);
+      (deps.nudgeLane ?? nudge)(lane, paneId);
       nudgedPanesThisTick.add(paneId);                           // A2: claim the pane for the rest of this tick
     } catch (e) {
       log(`tick: error handling lane ${lane.name ?? lane.id} — ${e instanceof Error ? e.message : String(e)} (continuing)`);

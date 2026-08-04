@@ -252,6 +252,70 @@ describe("codex-seat launcher", () => {
   });
 
   test.each([
+    ["separate", ["--future-option", "--remote", "ws://127.0.0.1:45678", "resume"]],
+    ["attached", ["--future-option", "--remote=ws://127.0.0.1:45678", "resume"]],
+  ])("fails loudly instead of wrapping an explicit remote after an unknown option (%s)", (_label, args) => {
+    const { root, state, fakeCodex } = fixture();
+    const result = Bun.spawnSync([LAUNCHER, ...args], {
+      env: {
+        PATH: process.env.PATH ?? "",
+        HOME: root,
+        CODEX_HOME: join(root, ".codex"),
+        CLAUDE_PEERS_REAL_CODEX: fakeCodex,
+        CLAUDE_PEERS_CODEX_SEAT_PORT: String(freePort()),
+        FAKE_CODEX_STATE: state,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    expect(result.exitCode).toBe(2);
+    expect(new TextDecoder().decode(result.stderr)).toContain("explicit --remote conflicts with a pane-local seat");
+    expect(new TextDecoder().decode(result.stderr)).toContain("CLAUDE_PEERS_CODEX_SEAT=0");
+    expect(existsSync(join(state, "app.pid"))).toBe(false);
+    expect(existsSync(join(state, "tui.pid"))).toBe(false);
+  });
+
+  test("passes an explicit remote through when it precedes an unknown option", () => {
+    const { root, state, fakeCodex } = fixture();
+    const args = ["--remote", "ws://127.0.0.1:45678", "--future-option", "resume"];
+    const result = Bun.spawnSync([LAUNCHER, ...args], {
+      env: {
+        PATH: process.env.PATH ?? "",
+        HOME: root,
+        CLAUDE_PEERS_REAL_CODEX: fakeCodex,
+        FAKE_CODEX_STATE: state,
+        FAKE_CODEX_RECORD_ONLY: "1",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(existsSync(join(state, "app.pid"))).toBe(false);
+    expect(readFileSync(join(state, "tui.args"), "utf8")).toBe(`${args.join("\n")}\n`);
+  });
+
+  test("keeps an unknown-option help request on the fail-toward-seat path", () => {
+    const { root, state, fakeCodex } = fixture();
+    const result = Bun.spawnSync([LAUNCHER, "--future-option", "--help"], {
+      env: {
+        PATH: process.env.PATH ?? "",
+        HOME: root,
+        CODEX_HOME: join(root, ".codex"),
+        CLAUDE_PEERS_REAL_CODEX: fakeCodex,
+        CLAUDE_PEERS_CODEX_SEAT_PORT: String(freePort()),
+        FAKE_CODEX_STATE: state,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(existsSync(join(state, "app.pid"))).toBe(true);
+  });
+
+  test.each([
     ["interactive help", ["resume", "--help"]],
     ["app-server", ["app-server", "--listen", "ws://127.0.0.1:45678"]],
   ])("passes %s directly without seat dependencies", (_label, args) => {
