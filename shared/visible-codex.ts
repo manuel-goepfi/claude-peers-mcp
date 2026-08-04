@@ -107,7 +107,7 @@ export function findSingleVisibleCodexProcess(
 
 export function findVisibleCodexProcessByPaneId(
   processes: Map<number, ProcessInfo> | Iterable<ProcessInfo>,
-  cwdHint: string,
+  cwdHint: string | null,
   paneId: string,
   readers: VisibleCodexReaders = {},
 ): VisibleCodexProcess | null {
@@ -122,7 +122,7 @@ export function findVisibleCodexProcessByPaneId(
     const tty = ttyReader(row.pid);
     if (!tty) continue;
     const cwd = cwdReader(row.pid);
-    if (!cwd || cwd !== cwdHint) continue;
+    if (!cwd || (cwdHint !== null && cwd !== cwdHint)) continue;
     const env = envReader(row.pid);
     if (env.TMUX_PANE !== paneId && env.CLAUDE_PEER_TMUX_PANE_ID !== paneId) continue;
     candidates.push({ pid: row.pid, cwd, tty, env });

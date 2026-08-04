@@ -135,6 +135,90 @@ const canUseTmux = Bun.spawnSync(["tmux", "list-sessions"], { stdout: "ignore", 
   }
 }, 20_000);
 
+(canUseTmux ? test : test.skip)("SessionStart registers from exact inherited pane proof without a Codex ancestor", async () => {
+  const broker = await startTestBroker({ prefix: "hook-register-pane-proof" });
+  const cwd = mkdtempSync(join(tmpdir(), "claude-peers-hook-register-pane-"));
+  const session = `cp-hook-pane-${process.pid}-${Date.now()}`;
+  try {
+    const created = Bun.spawnSync([
+      "tmux", "new-session", "-d", "-s", session, "-c", cwd,
+      "env", "CLAUDE_PEER_NAME=stale-launch-name", "bash", "-c", "exec -a codex sleep 60",
+    ], { stdout: "pipe", stderr: "pipe" });
+    expect(created.exitCode).toBe(0);
+
+    const pane = new TextDecoder().decode(Bun.spawnSync([
+      "tmux", "list-panes", "-t", session, "-F", "#{pane_id}\t#{pane_pid}\t#{pane_tty}",
+    ]).stdout).trim().split("\t");
+    const [paneId, panePidText, paneTty] = pane;
+    const panePid = Number(panePidText);
+    expect(paneId).toMatch(/^%\d+$/);
+    expect(Number.isInteger(panePid)).toBe(true);
+    let visibleCodexReady = false;
+    for (let attempt = 0; attempt < 40; attempt++) {
+      const args = new TextDecoder().decode(Bun.spawnSync([
+        "ps", "-o", "args=", "-p", String(panePid),
+      ]).stdout).trim();
+      if (/^codex(?:\s|$)/.test(args)) {
+        visibleCodexReady = true;
+        break;
+      }
+      await Bun.sleep(25);
+    }
+    expect(visibleCodexReady).toBe(true);
+    expect(await Bun.file(`/proc/${panePid}/environ`).text()).toContain(`TMUX_PANE=${paneId}\0`);
+    expect(new TextDecoder().decode(Bun.spawnSync(["readlink", `/proc/${panePid}/cwd`]).stdout).trim()).toBe(cwd);
+    expect(Bun.spawnSync([
+      "tmux", "set-option", "-p", "-t", paneId!, "@operator_label", "infra.9",
+    ]).exitCode).toBe(0);
+
+    const threadId = `019fc273-hook-pane-${process.pid}`;
+    const registration = Bun.spawn([process.execPath, REGISTER_SCRIPT], {
+      cwd,
+      env: {
+        ...process.env,
+        TMUX: undefined,
+        TMUX_PANE: paneId,
+        CLAUDE_PEERS_CLIENT_TYPE: "codex",
+        CLAUDE_PEER_NAME: "stale-launch-name",
+        CLAUDE_PEERS_PORT: String(broker.port),
+        CLAUDE_PEERS_DB: broker.dbPath,
+        CLAUDE_PEERS_BRIDGE_TOKEN_FILE: broker.tokenPath,
+        CLAUDE_PEERS_TMUX_IDENTITY_MIRROR: "0",
+      },
+      stdin: new TextEncoder().encode(JSON.stringify({
+        session_id: threadId,
+        hook_event_name: "SessionStart",
+      })),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    if (!(registration.stderr instanceof ReadableStream)) throw new Error("registration stderr unavailable");
+    const stderr = new Response(registration.stderr).text();
+    const [exitCode, stderrText] = await Promise.all([registration.exited, stderr]);
+    expect({ exitCode, stderr: stderrText }).toMatchObject({ exitCode: 0 });
+    expect(stderrText).toContain(`identity resolved via inherited pane ${paneId}`);
+
+    const db = new Database(broker.dbPath, { readonly: true });
+    const row = db.query(
+      "SELECT name, pid, tty, thread_id, tmux_session, tmux_pane_id, seat_key FROM peers WHERE thread_id = ?",
+    ).get(threadId) as Record<string, unknown> | null;
+    db.close();
+    expect(row).toEqual({
+      name: "infra.9",
+      pid: panePid,
+      tty: paneTty?.replace(/^\/dev\//, ""),
+      thread_id: threadId,
+      tmux_session: session,
+      tmux_pane_id: paneId,
+      seat_key: `pane:${session}:${paneId}`,
+    });
+  } finally {
+    Bun.spawnSync(["tmux", "kill-session", "-t", session], { stdout: "ignore", stderr: "ignore" });
+    await broker.stop();
+    rmSync(cwd, { recursive: true, force: true });
+  }
+}, 20_000);
+
 (canUseTmux ? test : test.skip)("delayed app-server respawn binds by thread to the hook-owned pane and retains it on close", async () => {
   const broker = await startTestBroker({ prefix: "appserver-seat" });
   const cwd = mkdtempSync(join(tmpdir(), "claude-peers-appserver-seat-"));

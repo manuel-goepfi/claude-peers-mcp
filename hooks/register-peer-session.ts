@@ -275,7 +275,7 @@ async function metadata(): Promise<RegisterMetadata | null> {
     const readers = { getTty, cwdOf, environOf };
     const inheritedPaneId = process.env.TMUX_PANE ?? process.env.CLAUDE_PEER_TMUX_PANE_ID;
     const exactVisible = inheritedPaneId
-      ? findVisibleCodexProcessByPaneId(table, visibleCwdHint, inheritedPaneId, readers)
+      ? findVisibleCodexProcessByPaneId(table, null, inheritedPaneId, readers)
       : null;
     const visible = inheritedPaneId
       ? exactVisible
@@ -284,7 +284,7 @@ async function metadata(): Promise<RegisterMetadata | null> {
       pid = visible.pid;
       identityEnv = visible.env;
       log(exactVisible
-        ? `app-server hook identity resolved via inherited pane ${inheritedPaneId} pid=${pid} cwd=${visibleCwdHint}`
+        ? `app-server hook identity resolved via inherited pane ${inheritedPaneId} pid=${pid} cwd=${visible.cwd}`
         : `app-server hook identity resolved via sole visible TTY pid=${pid} cwd=${visibleCwdHint}`);
     }
   }
