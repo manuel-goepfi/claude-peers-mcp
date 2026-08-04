@@ -658,6 +658,7 @@ const selectUndelivered = db.prepare(`
 const markDeliveredScoped = db.prepare(`
   UPDATE messages SET delivered = 1, delivered_at = ?, retention_at = ?, claimed_by = NULL, claimed_at = NULL
   WHERE id = ? AND to_id = ? AND delivered = 0
+    AND (claimed_at IS NULL OR claimed_at < ?)
 `);
 
 const markDeliveredClaimedScoped = db.prepare(`
@@ -2218,6 +2219,7 @@ function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
 function handleAckMessages(body: AckMessagesRequest): { ok: boolean; acked: number; state?: "acknowledged" } {
   const nowIso = new Date().toISOString();
   const nowMs = Date.now();
+  const claimCutoff = claimCutoffIso(nowMs);
   const via = typeof body.via === "string" && body.via.length > 0 ? body.via : "unknown";
   const acked = db.transaction(() => {
     let count = 0;
@@ -2226,7 +2228,7 @@ function handleAckMessages(body: AckMessagesRequest): { ok: boolean; acked: numb
       // Row is null if id doesn't belong to this peer — scoped UPDATE below
       // will also return changes=0 in that case, so we skip the log line.
       const row = selectMsgForLatency.get(id, body.id) as { from_id: string; sent_at: string } | null;
-      const result = markDeliveredScoped.run(nowIso, nowIso, id, body.id);
+      const result = markDeliveredScoped.run(nowIso, nowIso, id, body.id, claimCutoff);
       if (result.changes > 0 && row) {
         const latencyMs = nowMs - new Date(row.sent_at).getTime();
         runtimeMetrics.recordQueueToAck(row.sent_at, nowMs);
@@ -2672,12 +2674,13 @@ function handlePollByPid(body: { pid: number; caller_pid: number }): {
   // acked so the wire response matches broker state (no duplicate delivery).
   const nowIso = new Date().toISOString();
   const nowMs = Date.now();
+  const claimCutoff = claimCutoffIso(nowMs);
   const fetched = selectAvailableMessages(auth.id);
   const ackedMessages: Message[] = [];
   const acked = db.transaction(() => {
     let count = 0;
     for (const m of fetched) {
-      const result = markDeliveredScoped.run(nowIso, nowIso, m.id, auth.id);
+      const result = markDeliveredScoped.run(nowIso, nowIso, m.id, auth.id, claimCutoff);
       if (result.changes > 0) {
         ackedMessages.push(m);
         const latencyMs = nowMs - new Date(m.sent_at).getTime();

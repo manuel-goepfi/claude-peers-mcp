@@ -946,6 +946,50 @@ describe("Live broker delivery features", () => {
     child.kill();
   });
 
+  test("an active claim cannot be stolen by the legacy acknowledgement route", async () => {
+    const child = spawnSleep();
+    const peer = await brokerFetch<{ id: string }>("/register", {
+      pid: child.pid, cwd: "/claim-vs-legacy-ack", git_root: null, tty: null, name: "claim-vs-legacy-ack",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null,
+      client_type: "claude", receiver_mode: "claude-channel", summary: "",
+    });
+    const sent = await brokerFetch<{ id: number }>("/send-message", {
+      from_id: peer.id, to_id: peer.id, text: "one consumer owns this lease",
+    });
+
+    const claim = await rawPost("/claim-by-pid", {
+      pid: child.pid,
+      caller_pid: process.pid,
+      drain_id: "claim-vs-legacy-ack-drain",
+    });
+    expect(claim.status).toBe(200);
+    expect((claim.json.messages as Array<{ id: number }>).map((message) => message.id)).toEqual([sent.id]);
+
+    // A stale MCP server may have read this id through /poll-messages just
+    // before the claim. Its compatibility ACK must not invalidate the active
+    // consumer's lease or turn the claimed consumer's later ACK into a false
+    // mismatch.
+    const legacyAck = await brokerFetch<{ ok: boolean; acked: number }>("/ack-messages", {
+      id: peer.id,
+      ids: [sent.id],
+      via: "legacy-check-messages",
+    });
+    expect(legacyAck.ok).toBe(true);
+    expect(legacyAck.acked).toBe(0);
+
+    const claimAck = await rawPost("/ack-by-pid", {
+      pid: child.pid,
+      caller_pid: process.pid,
+      drain_id: "claim-vs-legacy-ack-drain",
+      ids: [sent.id],
+      via: "claimed-check-messages",
+    });
+    expect(claimAck.status).toBe(200);
+    expect(claimAck.json.acked).toBe(1);
+    expect(claimAck.json.state).toBe("acknowledged");
+    child.kill();
+  });
+
   test("concurrent claimers cannot render the same message body twice", async () => {
     const child = spawnSleep();
     const peer = await brokerFetch<{ id: string }>("/register", {
