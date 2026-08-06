@@ -766,7 +766,10 @@ describe("client detection", () => {
     const stderr = new TextDecoder().decode(proc.stderr);
 
     expect(proc.exitCode).toBe(0);
-    expect(stderr).toContain(`skipping non-root Codex registration reason=${reason}`);
+    expect(stderr).toContain(`skipping unproven Codex registration reason=${reason}`);
+    if (reason === "missing-transcript-path") {
+      expect(stderr).toContain("possible=internal-session-or-root-rollout-io correlate=codex-warning-log");
+    }
     expect(stderr).not.toContain("unexpected failure");
   });
 
@@ -789,7 +792,7 @@ describe("client detection", () => {
 
     expect(proc.exitCode).toBe(1);
     expect(stderr).toContain("root proof degraded reason=unparseable-transcript-path; continuing fail-open");
-    expect(stderr).not.toContain("skipping non-root Codex registration");
+    expect(stderr).not.toContain("skipping unproven Codex registration");
   });
 
   test("Codex register hook reports an unexpected metadata failure as nonzero", () => {

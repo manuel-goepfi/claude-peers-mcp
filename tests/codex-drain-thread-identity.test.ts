@@ -149,7 +149,10 @@ describe("the shipped drain wires it up", () => {
 
     expect(proc.exitCode).toBe(0);
     expect(new TextDecoder().decode(proc.stdout)).toBe("");
-    expect(stderr).toContain(`skipping non-root Codex drain reason=${reason}`);
+    expect(stderr).toContain(`skipping unproven Codex drain reason=${reason}`);
+    if (reason === "missing-transcript-path") {
+      expect(stderr).toContain("possible=internal-session-or-root-rollout-io correlate=codex-warning-log");
+    }
     expect(stderr).not.toContain("no codex ancestor found");
   });
 
@@ -173,7 +176,7 @@ describe("the shipped drain wires it up", () => {
     const stderr = new TextDecoder().decode(proc.stderr);
 
     expect(stderr).toContain("root proof degraded reason=unparseable-transcript-path; continuing fail-open");
-    expect(stderr).not.toContain("skipping non-root Codex drain");
+    expect(stderr).not.toContain("skipping unproven Codex drain");
   });
 
   test("thread identity is resolved BEFORE any process-table walk", () => {

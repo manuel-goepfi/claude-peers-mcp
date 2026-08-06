@@ -4,7 +4,7 @@ import { isClientProcess as sharedIsClientProcess, isCodexAppServerProcess as sh
 import { renderInboundBatch } from "../shared/render.ts";
 import type { ClientType, Message, ReceiverMode } from "../shared/types.ts";
 import { findSingleVisibleCodexProcess } from "../shared/visible-codex.ts";
-import { codexHookRootDegradedReason, codexHookRootRefusalReason } from "./register-peer-session.ts";
+import { codexHookRefusalDiagnostic, codexHookRootDegradedReason, codexHookRootRefusalReason } from "./register-peer-session.ts";
 
 const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
@@ -597,7 +597,7 @@ async function main(): Promise<void> {
       HOOK_EVENT_NAME as "SessionStart" | "UserPromptSubmit" | "Stop",
     );
     if (refusalReason) {
-      log(`skipping non-root Codex drain reason=${refusalReason} event=${HOOK_EVENT_NAME}`);
+      log(`skipping unproven Codex drain ${codexHookRefusalDiagnostic(refusalReason)} event=${HOOK_EVENT_NAME}`);
       return;
     }
     const degradedReason = codexHookRootDegradedReason(hookInput);

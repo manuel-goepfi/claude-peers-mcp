@@ -111,6 +111,13 @@ export type CodexHookRootRefusalReason =
 
 export type CodexHookRootDegradedReason = "unparseable-transcript-path";
 
+export function codexHookRefusalDiagnostic(reason: CodexHookRootRefusalReason): string {
+  if (reason === "missing-transcript-path") {
+    return "reason=missing-transcript-path possible=internal-session-or-root-rollout-io correlate=codex-warning-log";
+  }
+  return `reason=${reason}`;
+}
+
 /**
  * Codex runs user hooks for more than the operator-facing root thread. A
  * thread-spawned child is serialized as SubagentStart, while internal sessions
@@ -528,7 +535,7 @@ export async function runRegistration(): Promise<void> {
         log("hook input has no session_id; refusing an unbound Codex registration");
         process.exitCode = 1;
       } else {
-        log(`skipping non-root Codex registration reason=${refusalReason}`);
+        log(`skipping unproven Codex registration ${codexHookRefusalDiagnostic(refusalReason)}`);
       }
       return;
     }
