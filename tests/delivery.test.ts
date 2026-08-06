@@ -1478,6 +1478,86 @@ describe("Live broker delivery features", () => {
     }
   }, 15_000);
 
+  test("internal SessionStart cannot rebind or drain an existing root seat", async () => {
+    const rootThreadId = crypto.randomUUID();
+    const internalThreadId = crypto.randomUUID();
+    const fixture = new URL("./fixtures/codex-app-server-hook-parent.ts", import.meta.url).pathname;
+    const registerHook = new URL("../hooks/register-peer-session.ts", import.meta.url).pathname;
+    const drainHook = new URL("../hooks/codex-drain-peer-inbox.ts", import.meta.url).pathname;
+    const probe = Bun.spawn([
+      "bash",
+      "-c",
+      `exec -a codex bun ${JSON.stringify(fixture)} ${JSON.stringify(registerHook)}`,
+    ], {
+      cwd: new URL("..", import.meta.url).pathname,
+      env: {
+        ...process.env,
+        HOME: broker.root,
+        TMUX: undefined,
+        TMUX_PANE: undefined,
+        CLAUDE_PEER_NAME: "root-seat-preservation-e2e",
+        CLAUDE_PEERS_PORT: String(BROKER_PORT),
+        CLAUDE_PEERS_HOOK_EVENT_NAME: "SessionStart",
+        CLAUDE_PEERS_MCP_PID: undefined,
+        HOOK_PROBE_SESSION_ID: internalThreadId,
+        HOOK_PROBE_INPUT: JSON.stringify({
+          hook_event_name: "SessionStart",
+          source: "startup",
+          session_id: internalThreadId,
+        }),
+        HOOK_PROBE_SECOND_SCRIPT: drainHook,
+        HOOK_PROBE_WAIT_FOR_STDIN: "1",
+      },
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    childProcesses.add(probe);
+
+    const peer = await brokerFetch<{ id: string }>("/register", {
+      pid: probe.pid,
+      cwd: new URL("..", import.meta.url).pathname,
+      git_root: new URL("..", import.meta.url).pathname,
+      tty: null,
+      name: "root-seat-preservation-e2e",
+      tmux_session: null,
+      tmux_window_index: null,
+      tmux_window_name: null,
+      thread_id: rootThreadId,
+      client_type: "codex",
+      receiver_mode: "codex-hook",
+      summary: "",
+    });
+    const sent = await brokerFetch<{ id: number }>("/send-message", {
+      from_id: peer.id,
+      to_id: peer.id,
+      text: "must remain queued for the root session",
+    });
+
+    if (!probe.stdin || typeof probe.stdin === "number") throw new Error("hook probe stdin unavailable");
+    probe.stdin.write("run");
+    probe.stdin.end();
+    const [stdout, stderr, code] = await Promise.all([
+      new Response(probe.stdout).text(),
+      new Response(probe.stderr).text(),
+      probe.exited,
+    ]);
+
+    expect(code).toBe(0);
+    expect(stdout).toBe("");
+    expect(stderr).toContain("skipping unproven Codex registration reason=missing-transcript-path");
+    expect(stderr).toContain("skipping unproven Codex drain reason=missing-transcript-path");
+
+    const db = new Database(TEST_DB, { readonly: true });
+    const row = db.query("SELECT thread_id FROM peers WHERE id = ?").get(peer.id) as { thread_id: string };
+    const message = db.query(
+      "SELECT delivered, claimed_by, claimed_at FROM messages WHERE id = ?",
+    ).get(sent.id) as { delivered: number; claimed_by: string | null; claimed_at: string | null };
+    db.close();
+    expect(row.thread_id).toBe(rootThreadId);
+    expect(message).toEqual({ delivered: 0, claimed_by: null, claimed_at: null });
+  }, 15_000);
+
   test("/ack-by-pid: wrong drain_id does not deliver and records a mismatch", async () => {
     const child = spawnSleep();
     const peer = await brokerFetch<{ id: string }>("/register", {

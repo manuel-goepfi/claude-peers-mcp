@@ -83,7 +83,7 @@ After MCP or hook changes:
 3. Run the doctor again.
 4. Call `whoami`, then use a second session to prove discovery and acknowledgement.
 
-Missing or unproven Codex/Gemini hooks intentionally produce `manual-drain`; use `check_messages` until registration and hook heartbeats prove the automatic path.
+Missing or unproven Codex/Gemini hooks intentionally produce `manual-drain`; use `check_messages` until registration and hook heartbeats prove the automatic path. For Codex, automatic registration and drain require a root-session hook whose `session_id` matches the rollout transcript filename. Internal or child hooks that cannot prove that join do not claim mail; the queued batch remains available to `check_messages` or the next proven root hook.
 
 ## Upgrade order
 

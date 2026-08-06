@@ -93,7 +93,7 @@ CODEX_HOME="$HOME/.codex-b" bun bin/install-codex-hook.ts --check
 ```
 
 - Claude: `SessionStart` registration, `UserPromptSubmit` drain, and a `Stop` `asyncRewake` standby watcher. The watcher polls every 10 seconds for the first hour after activity, then every 60 seconds while the Claude process remains alive; later Stop events refresh the fast window without spawning duplicate watchers.
-- Codex: `SessionStart` registration and drain, `UserPromptSubmit` drain, and `Stop` turn-end drain.
+- Codex: proven root-session hooks register and drain at `SessionStart`, drain at `UserPromptSubmit`, and drain at `Stop`. The hook proves the root by matching `session_id` to the rollout transcript filename. Unproven internal or child hooks leave mail queued for `check_messages` or the next proven root hook.
 - Gemini: `SessionStart` registration and `BeforeAgent` drain. The installer also renders its supported `mcpServers` entry.
 
 Project scope is explicit:
