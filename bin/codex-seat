@@ -72,8 +72,8 @@ if [[ "${1:-}" == "--watch" ]]; then
   app_group="$4"
   tui_pid="$5"
   while [[ -r "/proc/$owner_pid/stat" ]]; do
-    current_start="$(awk '{print $22}' "/proc/$owner_pid/stat" 2>/dev/null || true)"
-    [[ "$current_start" == "$owner_start" ]] || break
+    read -r current_state current_start < <(awk '{print $3, $22}' "/proc/$owner_pid/stat" 2>/dev/null || true)
+    [[ "$current_state" != "Z" && "$current_start" == "$owner_start" ]] || break
     sleep 0.2
   done
   terminate_tree "$tui_pid"
