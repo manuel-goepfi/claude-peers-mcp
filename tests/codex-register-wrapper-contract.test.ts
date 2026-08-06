@@ -94,7 +94,7 @@ describe("Codex registration wrapper", () => {
         CLAUDE_PEERS_ROOT: new URL("..", import.meta.url).pathname,
         CODEX_HOME: join(root, "codexhome"),
       },
-      stdin: new TextEncoder().encode("{}"),
+      stdin: new TextEncoder().encode(JSON.stringify({ hook_event_name: "SessionStart" })),
       stdout: "pipe",
       stderr: "pipe",
     });
