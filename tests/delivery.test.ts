@@ -1349,7 +1349,7 @@ describe("Live broker delivery features", () => {
   });
 
   test("thread-bound hook self-registers a missing row with its session_id before retrying the exact claim", async () => {
-    const threadId = `019fc273-self-register-${process.pid}-${Date.now()}`;
+    const threadId = crypto.randomUUID();
     const observed: Array<{
       path: string;
       body: Record<string, unknown> | null;
@@ -1424,6 +1424,7 @@ describe("Live broker delivery features", () => {
       hookStdin.write(JSON.stringify({
         hook_event_name: "UserPromptSubmit",
         session_id: threadId,
+        transcript_path: `/not-yet-created/rollout-${threadId}.jsonl`,
       }));
       hookStdin.end();
 
@@ -2323,10 +2324,11 @@ describe("Live broker delivery features", () => {
 
   test("Codex hook script emits UserPromptSubmit additionalContext and ACKs", async () => {
     const child = spawnSleep();
+    const threadId = crypto.randomUUID();
     const peer = await brokerFetch<{ id: string }>("/register", {
       pid: child.pid, cwd: "/codex-hook-script", git_root: null, tty: null, name: "codex-hook-script",
       tmux_session: null, tmux_window_index: null, tmux_window_name: null,
-      client_type: "codex", receiver_mode: "manual-drain", summary: "",
+      thread_id: threadId, client_type: "codex", receiver_mode: "manual-drain", summary: "",
     });
     const send = await brokerFetch<{ id: number }>("/send-message", {
       from_id: peer.id, to_id: peer.id, text: "hook-visible",
@@ -2339,9 +2341,16 @@ describe("Live broker delivery features", () => {
         CLAUDE_PEERS_PORT: String(BROKER_PORT),
         CLAUDE_PEERS_MCP_PID: String(child.pid),
       },
+      stdin: "pipe",
       stdout: "pipe",
       stderr: "pipe",
     });
+    hook.stdin.write(JSON.stringify({
+      hook_event_name: "UserPromptSubmit",
+      session_id: threadId,
+      transcript_path: `/not-yet-created/rollout-${threadId}.jsonl`,
+    }));
+    hook.stdin.end();
     const stdout = await new Response(hook.stdout).text();
     const stderr = await new Response(hook.stderr).text();
     const code = await hook.exited;
@@ -2367,10 +2376,11 @@ describe("Live broker delivery features", () => {
 
   test("Codex Stop-event hook emits decision:block with reason and ACKs", async () => {
     const child = spawnSleep();
+    const threadId = crypto.randomUUID();
     const peer = await brokerFetch<{ id: string }>("/register", {
       pid: child.pid, cwd: "/codex-stop-hook", git_root: null, tty: null, name: "codex-stop-hook",
       tmux_session: null, tmux_window_index: null, tmux_window_name: null,
-      client_type: "codex", receiver_mode: "manual-drain", summary: "",
+      thread_id: threadId, client_type: "codex", receiver_mode: "manual-drain", summary: "",
     });
     const send = await brokerFetch<{ id: number }>("/send-message", {
       from_id: peer.id, to_id: peer.id, text: "stop-hook-visible",
@@ -2388,7 +2398,12 @@ describe("Live broker delivery features", () => {
       stdout: "pipe",
       stderr: "pipe",
     });
-    hook.stdin.write(JSON.stringify({ hook_event_name: "Stop", stop_hook_active: false }));
+    hook.stdin.write(JSON.stringify({
+      hook_event_name: "Stop",
+      stop_hook_active: false,
+      session_id: threadId,
+      transcript_path: `/not-yet-created/rollout-${threadId}.jsonl`,
+    }));
     hook.stdin.end();
     const stdout = await new Response(hook.stdout).text();
     const code = await hook.exited;
@@ -2453,6 +2468,7 @@ describe("Live broker delivery features", () => {
     // "peer not found" error strings — this test pins that contract: reword
     // the broker error and the drain silently gives up on attempt 1.
     const child = spawnSleep();
+    const threadId = crypto.randomUUID();
 
     const hook = Bun.spawn(["bun", new URL("../hooks/codex-drain-peer-inbox.ts", import.meta.url).pathname], {
       cwd: new URL("..", import.meta.url).pathname,
@@ -2462,9 +2478,16 @@ describe("Live broker delivery features", () => {
         CLAUDE_PEERS_MCP_PID: String(child.pid),
         CLAUDE_PEERS_HOOK_EVENT_NAME: "SessionStart",
       },
+      stdin: "pipe",
       stdout: "pipe",
       stderr: "ignore",
     });
+    hook.stdin.write(JSON.stringify({
+      hook_event_name: "SessionStart",
+      session_id: threadId,
+      transcript_path: `/not-yet-created/rollout-${threadId}.jsonl`,
+    }));
+    hook.stdin.end();
 
     // Let the hook burn its first claim attempt(s) against an unregistered
     // pid, then SIGSTOP it so no claim can land in the gap between /register
@@ -2474,7 +2497,7 @@ describe("Live broker delivery features", () => {
     const peer = await brokerFetch<{ id: string }>("/register", {
       pid: child.pid, cwd: "/codex-sessionstart-race", git_root: null, tty: null, name: "codex-ss-race",
       tmux_session: null, tmux_window_index: null, tmux_window_name: null,
-      client_type: "codex", receiver_mode: "manual-drain", summary: "",
+      thread_id: threadId, client_type: "codex", receiver_mode: "manual-drain", summary: "",
     });
     const send = await brokerFetch<{ id: number }>("/send-message", {
       from_id: peer.id, to_id: peer.id, text: "race-visible",

@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { findClientPidFromTable, findHookPeerPidsFromTable, findMcpPidFromTable } from "../hooks/codex-drain-peer-inbox.ts";
-import { codexHookSessionDiagnostic, peerName, publishBrokerIdentityToTmux, registrationTmuxPaneId, sessionIdFromHookInput, tmuxIdentityMirrorEnabled } from "../hooks/register-peer-session.ts";
+import { codexHookRootDegradedReason, codexHookRootRefusalReason, codexHookSessionDiagnostic, peerName, publishBrokerIdentityToTmux, registrationTmuxPaneId, sessionIdFromHookInput, tmuxIdentityMirrorEnabled } from "../hooks/register-peer-session.ts";
 import { detectClientFromProcessChain, findBgSpareAncestor, initialReceiverMode, type ProcessInfo } from "../shared/client.ts";
 import { findNearestVisibleCodexProcessByStart, findVisibleCodexProcessByPaneId } from "../shared/visible-codex.ts";
 import { findCodexAppServerAncestor, findVisibleCodexSession, mcpThreadIdFromRequestMeta, registrationCwd, registrationCwdResult, registrationTtyPid, selectCodexManualDrainPid, selectInboxClaimIdentity, shouldUnregisterPeerOnShutdown, unresolvedAppServerToolDiagnostic } from "../server.ts";
@@ -465,6 +465,42 @@ describe("client detection", () => {
     })).toMatchObject({ eventName: "unknown", source: "unknown", transcript: "present", rootMatch: "unknown" });
   });
 
+  test("Codex root proof rejects child and internal-session lifecycle payloads", () => {
+    const rootThreadId = "019fc273-a35b-78f0-9a70-f63b5905540f";
+    const hiddenSessionId = "019fd84b-4556-7fd2-8e21-3fac2582d757";
+    const rootTranscript = `/not-yet-created/rollout-${rootThreadId}.jsonl`;
+
+    expect(codexHookRootRefusalReason({
+      session_id: rootThreadId,
+      hook_event_name: "SessionStart",
+      transcript_path: rootTranscript,
+    }, "SessionStart")).toBeNull();
+    expect(codexHookRootRefusalReason({
+      session_id: rootThreadId,
+      hook_event_name: "SubagentStart",
+      transcript_path: rootTranscript,
+    }, "SessionStart")).toBe("event-mismatch");
+    expect(codexHookRootRefusalReason({
+      session_id: hiddenSessionId,
+      hook_event_name: "SessionStart",
+    }, "SessionStart")).toBe("missing-transcript-path");
+    expect(codexHookRootRefusalReason({
+      session_id: hiddenSessionId,
+      hook_event_name: "SessionStart",
+      transcript_path: "/memory/rollout-not-a-uuid.jsonl",
+    }, "SessionStart")).toBeNull();
+    expect(codexHookRootDegradedReason({
+      session_id: hiddenSessionId,
+      hook_event_name: "SessionStart",
+      transcript_path: "/memory/rollout-not-a-uuid.jsonl",
+    })).toBe("unparseable-transcript-path");
+    expect(codexHookRootRefusalReason({
+      session_id: hiddenSessionId,
+      hook_event_name: "SessionStart",
+      transcript_path: rootTranscript,
+    }, "SessionStart")).toBe("transcript-session-mismatch");
+  });
+
   test("an unresolved app-server seat names the blocked tool and the safe recovery boundary", () => {
     const diagnostic = unresolvedAppServerToolDiagnostic("whoami", "durable seat missing");
     expect(diagnostic).toContain("did not run whoami");
@@ -669,6 +705,56 @@ describe("client detection", () => {
     expect(new TextDecoder().decode(proc.stderr)).toContain("refusing an unbound Codex registration");
   });
 
+  test.each([
+    ["thread-spawn child", {
+      session_id: "019fc273-a35b-78f0-9a70-f63b5905540f",
+      hook_event_name: "SubagentStart",
+      transcript_path: "/tmp/rollout-019fc273-a35b-78f0-9a70-f63b5905540f.jsonl",
+    }, "event-mismatch"],
+    ["ephemeral internal session", {
+      session_id: "019fd84b-4556-7fd2-8e21-3fac2582d757",
+      hook_event_name: "SessionStart",
+    }, "missing-transcript-path"],
+  ])("Codex register hook skips a %s before resolving or mutating a seat", (_label, payload, reason) => {
+    const hookPath = new URL("../hooks/register-peer-session.ts", import.meta.url).pathname;
+    const proc = Bun.spawnSync([process.execPath, hookPath], {
+      env: {
+        CLAUDE_PEERS_CLIENT_TYPE: "codex",
+        PATH: "/definitely-missing",
+      },
+      stdin: new TextEncoder().encode(JSON.stringify(payload)),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const stderr = new TextDecoder().decode(proc.stderr);
+
+    expect(proc.exitCode).toBe(0);
+    expect(stderr).toContain(`skipping non-root Codex registration reason=${reason}`);
+    expect(stderr).not.toContain("unexpected failure");
+  });
+
+  test("Codex register hook logs and fails open when an upstream transcript filename is unparseable", () => {
+    const hookPath = new URL("../hooks/register-peer-session.ts", import.meta.url).pathname;
+    const proc = Bun.spawnSync([process.execPath, hookPath], {
+      env: {
+        CLAUDE_PEERS_CLIENT_TYPE: "codex",
+        PATH: "/definitely-missing",
+      },
+      stdin: new TextEncoder().encode(JSON.stringify({
+        session_id: "019fc273-a35b-78f0-9a70-f63b5905540f",
+        hook_event_name: "SessionStart",
+        transcript_path: "/future-codex/thread-transcript.jsonl",
+      })),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const stderr = new TextDecoder().decode(proc.stderr);
+
+    expect(proc.exitCode).toBe(1);
+    expect(stderr).toContain("root proof degraded reason=unparseable-transcript-path; continuing fail-open");
+    expect(stderr).not.toContain("skipping non-root Codex registration");
+  });
+
   test("Codex register hook reports an unexpected metadata failure as nonzero", () => {
     const hookPath = new URL("../hooks/register-peer-session.ts", import.meta.url).pathname;
     const proc = Bun.spawnSync([process.execPath, hookPath], {
@@ -680,6 +766,7 @@ describe("client detection", () => {
         session_id: "019fc273-a35b-78f0-9a70-f63b5905540f",
         hook_event_name: "SessionStart",
         source: "resume",
+        transcript_path: "/tmp/rollout-019fc273-a35b-78f0-9a70-f63b5905540f.jsonl",
       })),
       stdout: "pipe",
       stderr: "pipe",

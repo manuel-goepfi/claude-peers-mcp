@@ -103,6 +103,54 @@ export function codexHookSessionDiagnostic(value: unknown): CodexHookSessionDiag
   };
 }
 
+export type CodexHookRootRefusalReason =
+  | "event-mismatch"
+  | "missing-session-id"
+  | "missing-transcript-path"
+  | "transcript-session-mismatch";
+
+export type CodexHookRootDegradedReason = "unparseable-transcript-path";
+
+/**
+ * Codex runs user hooks for more than the operator-facing root thread. A
+ * thread-spawned child is serialized as SubagentStart, while internal sessions
+ * such as memory consolidation can be serialized as SessionStart. The durable
+ * root is the event whose transcript filename carries the same UUID as the
+ * hook session_id. This is field comparison only: the file may not exist yet.
+ */
+export function codexHookRootRefusalReason(
+  value: unknown,
+  expectedEventName: "SessionStart" | "UserPromptSubmit" | "Stop" | ReadonlyArray<"SessionStart" | "UserPromptSubmit" | "Stop">,
+): CodexHookRootRefusalReason | null {
+  const input = value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+  const allowedEvents = Array.isArray(expectedEventName) ? expectedEventName : [expectedEventName];
+  if (typeof input.hook_event_name !== "string" || !allowedEvents.includes(
+    input.hook_event_name as "SessionStart" | "UserPromptSubmit" | "Stop",
+  )) return "event-mismatch";
+  const sessionId = sessionIdFromHookInput(input);
+  if (!sessionId) return "missing-session-id";
+  if (typeof input.transcript_path !== "string" || !input.transcript_path.trim()) {
+    return "missing-transcript-path";
+  }
+  const transcriptId = transcriptSessionId(input.transcript_path);
+  // A present-but-unparseable path is not proof of a child session. Codex owns
+  // the rollout filename format, so a future upstream rename must not darken
+  // every root lane. Callers log the degraded proof and continue fail-open.
+  if (!transcriptId) return null;
+  return transcriptId === sessionId.toLowerCase() ? null : "transcript-session-mismatch";
+}
+
+export function codexHookRootDegradedReason(value: unknown): CodexHookRootDegradedReason | null {
+  const input = value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+  if (!sessionIdFromHookInput(input)) return null;
+  if (typeof input.transcript_path !== "string" || !input.transcript_path.trim()) return null;
+  return transcriptSessionId(input.transcript_path) ? null : "unparseable-transcript-path";
+}
+
 async function readHookInput(): Promise<Record<string, unknown> | null> {
   if (process.stdin.isTTY) return null;
   try {
@@ -430,11 +478,23 @@ export async function runRegistration(): Promise<void> {
       `session_id=${diagnostic.sessionId ?? "absent"} transcript=${diagnostic.transcript} ` +
       `root_match=${diagnostic.rootMatch}`,
     );
-  }
-  if (CLIENT_TYPE === "codex" && !threadId) {
-    log("hook input has no session_id; refusing an unbound Codex registration");
-    process.exitCode = 1;
-    return;
+    const refusalReason = codexHookRootRefusalReason(
+      hookInput,
+      ["SessionStart", "UserPromptSubmit", "Stop"],
+    );
+    if (refusalReason) {
+      if (refusalReason === "missing-session-id") {
+        log("hook input has no session_id; refusing an unbound Codex registration");
+        process.exitCode = 1;
+      } else {
+        log(`skipping non-root Codex registration reason=${refusalReason}`);
+      }
+      return;
+    }
+    const degradedReason = codexHookRootDegradedReason(hookInput);
+    if (degradedReason) {
+      log(`Codex root proof degraded reason=${degradedReason}; continuing fail-open`);
+    }
   }
   const meta = await metadata();
   if (!meta) {

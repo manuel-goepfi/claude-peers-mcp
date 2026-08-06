@@ -4,6 +4,7 @@ import { isClientProcess as sharedIsClientProcess, isCodexAppServerProcess as sh
 import { renderInboundBatch } from "../shared/render.ts";
 import type { ClientType, Message, ReceiverMode } from "../shared/types.ts";
 import { findSingleVisibleCodexProcess } from "../shared/visible-codex.ts";
+import { codexHookRootDegradedReason, codexHookRootRefusalReason } from "./register-peer-session.ts";
 
 const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
@@ -17,13 +18,14 @@ const HOOK_EVENT_NAME = process.env.CLAUDE_PEERS_HOOK_EVENT_NAME ??
   (CLIENT_TYPE === "gemini" ? "BeforeAgent" : "UserPromptSubmit");
 
 /**
- * Codex thread identity — the exact join, and the fix for "no codex ancestor found".
+ * Codex root-thread identity — the exact join, and the fix for
+ * "no codex ancestor found".
  *
- * Codex hands every hook the SAME ThreadId it stamps into `_meta.threadId` on
- * external MCP tool calls: SessionStart, UserPromptSubmit and StopCommandInput
- * all carry `session_id` (codex-rs/hooks/src/schema.rs). The registration hook
- * persists it on the peer row as `thread_id`, so when we have it we can address
- * our own row exactly — no process table, no ancestry, no correlation.
+ * Root SessionStart, UserPromptSubmit and Stop inputs carry the same session_id
+ * that Codex stamps into `_meta.threadId` on the root thread's MCP calls. Codex
+ * also runs lifecycle hooks for child/internal sessions, so main() first proves
+ * that the hook transcript filename carries that same UUID. Only then is the
+ * id persisted or used to claim mail.
  *
  * That matters because ancestry does not work under a long-lived
  * `codex app-server`: the app-server owns the MCP guard/server children rather
@@ -589,10 +591,25 @@ async function main(): Promise<void> {
     }
   }
 
+  if (CLIENT_TYPE === "codex") {
+    const refusalReason = codexHookRootRefusalReason(
+      hookInput,
+      HOOK_EVENT_NAME as "SessionStart" | "UserPromptSubmit" | "Stop",
+    );
+    if (refusalReason) {
+      log(`skipping non-root Codex drain reason=${refusalReason} event=${HOOK_EVENT_NAME}`);
+      return;
+    }
+    const degradedReason = codexHookRootDegradedReason(hookInput);
+    if (degradedReason) {
+      log(`Codex root proof degraded reason=${degradedReason}; continuing fail-open`);
+    }
+  }
+
   // Thread identity first: it is an exact join to our own row, so it makes the
-  // process table irrelevant. Only fall back to ancestry when Codex gave us no
-  // session_id (Gemini, legacy Codex, unreadable payload). The PID carried
-  // alongside is used for log lines only — the -by-thread routes ignore it.
+  // process table irrelevant. Codex reaches here only with proven root-session
+  // evidence. Gemini still uses the pre-existing PID fallback. The PID carried
+  // alongside a thread route is used for log lines only.
   activeThreadId = readThreadId(hookInput);
   activeHookInput = hookInput;
   let pids: { primary: number; fallbacks: number[] };

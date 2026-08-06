@@ -18,6 +18,7 @@ child.stdin.end(JSON.stringify({
   session_id: sessionId,
   hook_event_name: "SessionStart",
   source: "resume",
+  transcript_path: `/not-yet-created/rollout-${sessionId}.jsonl`,
   cwd: process.cwd(),
 }));
 

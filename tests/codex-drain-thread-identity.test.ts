@@ -123,6 +123,59 @@ describe("self-registration must not drop the thread", () => {
 });
 
 describe("the shipped drain wires it up", () => {
+  test.each([
+    ["SubagentStart", {
+      hook_event_name: "SubagentStart",
+      session_id: "019fc273-a35b-78f0-9a70-f63b5905540f",
+      transcript_path: "/tmp/rollout-019fc273-a35b-78f0-9a70-f63b5905540f.jsonl",
+    }, "event-mismatch"],
+    ["internal SessionStart", {
+      hook_event_name: "SessionStart",
+      session_id: "019fd84b-4556-7fd2-8e21-3fac2582d757",
+    }, "missing-transcript-path"],
+  ])("%s returns before process discovery, claim, or self-registration", (_label, payload, reason) => {
+    const hookPath = new URL("../hooks/codex-drain-peer-inbox.ts", import.meta.url).pathname;
+    const proc = Bun.spawnSync([process.execPath, hookPath], {
+      env: {
+        CLAUDE_PEERS_CLIENT_TYPE: "codex",
+        CLAUDE_PEERS_HOOK_EVENT_NAME: "SessionStart",
+        PATH: "/definitely-missing",
+      },
+      stdin: new TextEncoder().encode(JSON.stringify(payload)),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const stderr = new TextDecoder().decode(proc.stderr);
+
+    expect(proc.exitCode).toBe(0);
+    expect(new TextDecoder().decode(proc.stdout)).toBe("");
+    expect(stderr).toContain(`skipping non-root Codex drain reason=${reason}`);
+    expect(stderr).not.toContain("no codex ancestor found");
+  });
+
+  test("an unparseable transcript filename is logged and allowed through to thread routing", () => {
+    const hookPath = new URL("../hooks/codex-drain-peer-inbox.ts", import.meta.url).pathname;
+    const proc = Bun.spawnSync([process.execPath, hookPath], {
+      env: {
+        CLAUDE_PEERS_CLIENT_TYPE: "codex",
+        CLAUDE_PEERS_HOOK_EVENT_NAME: "SessionStart",
+        CLAUDE_PEERS_PORT: "1",
+        PATH: process.env.PATH,
+      },
+      stdin: new TextEncoder().encode(JSON.stringify({
+        hook_event_name: "SessionStart",
+        session_id: "019fc273-a35b-78f0-9a70-f63b5905540f",
+        transcript_path: "/future-codex/thread-transcript.jsonl",
+      })),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const stderr = new TextDecoder().decode(proc.stderr);
+
+    expect(stderr).toContain("root proof degraded reason=unparseable-transcript-path; continuing fail-open");
+    expect(stderr).not.toContain("skipping non-root Codex drain");
+  });
+
   test("thread identity is resolved BEFORE any process-table walk", () => {
     // The whole point: when the join is available the ancestry walk that
     // produced "no codex ancestor found" must never run.

@@ -45,7 +45,7 @@ const canUseTmux = Bun.spawnSync(["tmux", "list-sessions"], { stdout: "ignore", 
       "tmux", "set-option", "-p", "-t", currentPane, "@operator_label", "stale-human",
     ]).exitCode).toBe(0);
 
-    const threadId = `019fc273-register-pane-${process.pid}`;
+    const threadId = crypto.randomUUID();
     const command = `exec -a codex bun ${JSON.stringify(APP_SERVER_HOOK_FIXTURE)} ${JSON.stringify(REGISTER_SCRIPT)} app-server`;
     appServer = Bun.spawn(["bash", "-c", command], {
       cwd,
@@ -99,7 +99,7 @@ const canUseTmux = Bun.spawnSync(["tmux", "list-sessions"], { stdout: "ignore", 
     })).toBe("operator-fallback");
 
     Bun.spawnSync(["tmux", "kill-session", "-t", otherSession], { stdout: "ignore", stderr: "ignore" });
-    const mismatchThreadId = `${threadId}-mismatch`;
+    const mismatchThreadId = crypto.randomUUID();
     appServer = Bun.spawn(["bash", "-c", command], {
       cwd,
       env: {
@@ -171,7 +171,7 @@ const canUseTmux = Bun.spawnSync(["tmux", "list-sessions"], { stdout: "ignore", 
       "tmux", "set-option", "-p", "-t", paneId!, "@operator_label", "infra.9",
     ]).exitCode).toBe(0);
 
-    const threadId = `019fc273-hook-pane-${process.pid}`;
+    const threadId = crypto.randomUUID();
     const registration = Bun.spawn([process.execPath, REGISTER_SCRIPT], {
       cwd,
       env: {
@@ -188,6 +188,7 @@ const canUseTmux = Bun.spawnSync(["tmux", "list-sessions"], { stdout: "ignore", 
       stdin: new TextEncoder().encode(JSON.stringify({
         session_id: threadId,
         hook_event_name: "SessionStart",
+        transcript_path: `/tmp/rollout-${threadId}.jsonl`,
       })),
       stdout: "pipe",
       stderr: "pipe",
