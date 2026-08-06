@@ -336,20 +336,61 @@ export function publishBrokerIdentityToTmux(identity: {
   return result;
 }
 
-export function readPaneLabel(paneId: string | undefined): string | null {
+interface PaneLabelRead {
+  ok: boolean;
+  peerResolvedName: string | null;
+  operatorLabel: string | null;
+}
+
+type PaneLabelReader = (paneId: string) => PaneLabelRead;
+
+function readPaneLabels(paneId: string): PaneLabelRead {
+  try {
+    const result = Bun.spawnSync([
+      "tmux", "display-message", "-p", "-t", paneId,
+      "#{@peer_resolved_name}\t#{@operator_label}",
+    ], {
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+    if (result.exitCode !== 0) return { ok: false, peerResolvedName: null, operatorLabel: null };
+    const [peerResolvedName = "", operatorLabel = ""] = new TextDecoder()
+      .decode(result.stdout)
+      .replace(/\0/g, "")
+      .trimEnd()
+      .split("\t", 2);
+    return {
+      ok: true,
+      peerResolvedName: peerResolvedName.trim() || null,
+      operatorLabel: operatorLabel.trim() || null,
+    };
+  } catch {
+    return { ok: false, peerResolvedName: null, operatorLabel: null };
+  }
+}
+
+export function readPaneLabel(
+  paneId: string | undefined,
+  readLabels: PaneLabelReader = readPaneLabels,
+  warn: (message: string) => void = log,
+): string | null {
   if (!paneId) return null;
-  for (const option of ["@peer_resolved_name", "@operator_label"] as const) {
-    try {
-      const result = Bun.spawnSync(["tmux", "show-options", "-p", "-t", paneId, "-v", option], {
-        stdout: "pipe",
-        stderr: "ignore",
-      });
-      if (result.exitCode !== 0) continue;
-      const value = new TextDecoder().decode(result.stdout).replace(/\0/g, "").trim();
-      if (value) return value;
-    } catch {
-      // Try the next stable label source.
+  // tmux can briefly reject a read while another client updates pane options.
+  // One display-message reads the full precedence chain. Retry only genuine
+  // failures or a transient empty snapshot. A pane that remains unlabeled may
+  // use its launch identity without producing log noise.
+  let failures = 0;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const result = readLabels(paneId);
+    if (!result.ok) {
+      failures++;
+      continue;
     }
+    const label = result.peerResolvedName ?? result.operatorLabel;
+    if (label) return label;
+  }
+  if (failures === 2) {
+    warn(`tmux pane-label read failed twice pane=${paneId}; falling back to launch identity`);
   }
   return null;
 }

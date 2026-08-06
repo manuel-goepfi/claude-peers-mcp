@@ -198,6 +198,7 @@ const canUseTmux = Bun.spawnSync(["tmux", "list-sessions"], { stdout: "ignore", 
     const [exitCode, stderrText] = await Promise.all([registration.exited, stderr]);
     expect({ exitCode, stderr: stderrText }).toMatchObject({ exitCode: 0 });
     expect(stderrText).toContain(`identity resolved via inherited pane ${paneId}`);
+    expect(stderrText).not.toContain("pane-label read failed twice");
 
     const db = new Database(broker.dbPath, { readonly: true });
     const row = db.query(

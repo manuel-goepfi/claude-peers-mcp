@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { findClientPidFromTable, findHookPeerPidsFromTable, findMcpPidFromTable } from "../hooks/codex-drain-peer-inbox.ts";
-import { codexHookRootDegradedReason, codexHookRootRefusalReason, codexHookSessionDiagnostic, peerName, publishBrokerIdentityToTmux, registrationTmuxPaneId, sessionIdFromHookInput, tmuxIdentityMirrorEnabled } from "../hooks/register-peer-session.ts";
+import { codexHookRootDegradedReason, codexHookRootRefusalReason, codexHookSessionDiagnostic, peerName, publishBrokerIdentityToTmux, readPaneLabel, registrationTmuxPaneId, sessionIdFromHookInput, tmuxIdentityMirrorEnabled } from "../hooks/register-peer-session.ts";
 import { detectClientFromProcessChain, findBgSpareAncestor, initialReceiverMode, type ProcessInfo } from "../shared/client.ts";
 import { findNearestVisibleCodexProcessByStart, findVisibleCodexProcessByPaneId } from "../shared/visible-codex.ts";
 import { findCodexAppServerAncestor, findVisibleCodexSession, mcpThreadIdFromRequestMeta, registrationCwd, registrationCwdResult, registrationTtyPid, selectCodexManualDrainPid, selectInboxClaimIdentity, shouldUnregisterPeerOnShutdown, unresolvedAppServerToolDiagnostic } from "../server.ts";
@@ -304,6 +304,43 @@ describe("client detection", () => {
     expect(peerName("claude", 201, { session: "infra", pane_id: "%312" }, {
       CLAUDE_PEER_NAME: "infra.2",
     }, "infra.3")).toBe("infra.2");
+  });
+
+  test("retries the pane label precedence chain before using a stale launch name", () => {
+    let reads = 0;
+    const label = readPaneLabel("%42", () => {
+      reads++;
+      return reads === 1
+        ? { ok: false, peerResolvedName: null, operatorLabel: null }
+        : { ok: true, peerResolvedName: "orch.5", operatorLabel: "stale-human" };
+    });
+
+    expect(label).toBe("orch.5");
+    expect(reads).toBe(2);
+  });
+
+  test("a persistently unlabeled pane retries once but stays quiet", () => {
+    let reads = 0;
+    const warnings: string[] = [];
+    expect(readPaneLabel("%42", () => {
+      reads++;
+      return { ok: true, peerResolvedName: null, operatorLabel: null };
+    }, (message) => warnings.push(message))).toBeNull();
+    expect(reads).toBe(2);
+    expect(warnings).toEqual([]);
+  });
+
+  test("two real pane-label read failures are surfaced before launch-name fallback", () => {
+    let reads = 0;
+    const warnings: string[] = [];
+    expect(readPaneLabel("%42", () => {
+      reads++;
+      return { ok: false, peerResolvedName: null, operatorLabel: null };
+    }, (message) => warnings.push(message))).toBeNull();
+    expect(reads).toBe(2);
+    expect(warnings).toEqual([
+      "tmux pane-label read failed twice pane=%42; falling back to launch identity",
+    ]);
   });
 
   test("server startup never adopts a sole same-cwd lane without hook-owned seat proof", () => {
