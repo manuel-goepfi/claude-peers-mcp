@@ -430,6 +430,10 @@ export async function waitForRegistrationProcess(
   }
 }
 
+export function isRegistrationTimeoutError(error: unknown): boolean {
+  return error instanceof Error && /^registration timed out after \d+ms$/.test(error.message);
+}
+
 async function registerCurrentSessionForDrain(): Promise<boolean> {
   try {
     // Forward the ORIGINAL hook payload to the registration child.
@@ -460,7 +464,16 @@ async function registerCurrentSessionForDrain(): Promise<boolean> {
     }
     return true;
   } catch (e) {
-    log(`self-registration failed: ${e instanceof Error ? e.message : String(e)}`);
+    const message = e instanceof Error ? e.message : String(e);
+    if (isRegistrationTimeoutError(e)) {
+      // The registration child can persist the exact thread row before later
+      // heartbeat/tmux bookkeeping finishes. A timeout therefore cannot prove
+      // registration failed. The one exact claim below is the authoritative
+      // check: a missing row stays queued; a persisted row drains normally.
+      log(`self-registration timed out: ${message}; verifying the exact claim once`);
+      return true;
+    }
+    log(`self-registration failed: ${message}`);
     return false;
   }
 }

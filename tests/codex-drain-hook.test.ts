@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import {
   BrokerHttpError,
+  isRegistrationTimeoutError,
   isMissingClaimEndpointError,
   isMissingPeerClaimError,
   REGISTER_TIMEOUT_MS,
@@ -101,6 +102,12 @@ describe("Codex/Gemini drain hook claim error routing", () => {
 
     await expect(waitForRegistrationProcess(proc, 1)).rejects.toThrow("registration timed out");
     expect(killed).toBe(true);
+  });
+
+  test("a registration timeout still permits one exact claim as the proof", () => {
+    expect(isRegistrationTimeoutError(new Error("registration timed out after 6000ms"))).toBe(true);
+    expect(isRegistrationTimeoutError(new Error("registration failed"))).toBe(false);
+    expect(isRegistrationTimeoutError("registration timed out after 6000ms")).toBe(false);
   });
 
   test("hook emits stdout before acking claimed messages", () => {
