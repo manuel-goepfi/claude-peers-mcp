@@ -4,12 +4,18 @@ import {
   BrokerHttpError,
   isMissingClaimEndpointError,
   isMissingPeerClaimError,
+  REGISTER_TIMEOUT_MS,
   retryClaimAfterSelfRegistration,
   shouldSelfRegisterAfterClaimError,
   waitForRegistrationProcess,
 } from "../hooks/codex-drain-peer-inbox.ts";
 
 describe("Codex/Gemini drain hook claim error routing", () => {
+  test("self-registration budget survives measured host contention within the hook deadline", () => {
+    expect(REGISTER_TIMEOUT_MS).toBe(6_000);
+    expect(REGISTER_TIMEOUT_MS).toBeLessThan(10_000);
+  });
+
   test("missing peer rows are eligible for bounded self-registration", () => {
     const msg = "/claim-by-pid 404: peer not found";
     expect(isMissingPeerClaimError(msg)).toBe(true);

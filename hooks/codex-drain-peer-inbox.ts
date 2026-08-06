@@ -54,7 +54,12 @@ export function readThreadId(hookInput: Record<string, unknown> | null): string 
   return typeof raw === "string" && raw.trim() ? raw.trim() : null;
 }
 const REGISTER_SCRIPT = new URL("./register-peer-session.ts", import.meta.url).pathname;
-const REGISTER_TIMEOUT_MS = 2_000;
+// UserPromptSubmit and Stop wrappers allow 10s; SessionStart allows 15s. The
+// registration child performs process, git, tmux, and broker probes, and has
+// exceeded 2s under the same host contention that triggers this recovery path.
+// Six seconds leaves at least four seconds for the claim retry and hook output
+// while preventing a contended child from sustaining a peer-not-found loop.
+export const REGISTER_TIMEOUT_MS = 6_000;
 
 type ProcRow = ProcessInfo;
 
