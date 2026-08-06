@@ -1398,6 +1398,7 @@ describe("Live broker delivery features", () => {
         env: {
           ...process.env,
           HOME: broker.root,
+          CODEX_HOME: `${broker.root}/.codex`,
           TMUX: undefined,
           TMUX_PANE: undefined,
           CLAUDE_PEER_NAME: "thread-self-register-e2e",
@@ -1493,6 +1494,7 @@ describe("Live broker delivery features", () => {
       env: {
         ...process.env,
         HOME: broker.root,
+        CODEX_HOME: `${broker.root}/.codex`,
         TMUX: undefined,
         TMUX_PANE: undefined,
         CLAUDE_PEER_NAME: "root-seat-preservation-e2e",
@@ -2418,6 +2420,7 @@ describe("Live broker delivery features", () => {
       cwd: new URL("..", import.meta.url).pathname,
       env: {
         ...process.env,
+        CODEX_HOME: `${broker.root}/.codex`,
         CLAUDE_PEERS_PORT: String(BROKER_PORT),
         CLAUDE_PEERS_MCP_PID: String(child.pid),
       },
@@ -2470,6 +2473,7 @@ describe("Live broker delivery features", () => {
       cwd: new URL("..", import.meta.url).pathname,
       env: {
         ...process.env,
+        CODEX_HOME: `${broker.root}/.codex`,
         CLAUDE_PEERS_PORT: String(BROKER_PORT),
         CLAUDE_PEERS_MCP_PID: String(child.pid),
         CLAUDE_PEERS_HOOK_EVENT_NAME: "Stop",
@@ -2519,6 +2523,7 @@ describe("Live broker delivery features", () => {
       cwd: new URL("..", import.meta.url).pathname,
       env: {
         ...process.env,
+        CODEX_HOME: `${broker.root}/.codex`,
         CLAUDE_PEERS_PORT: String(BROKER_PORT),
         CLAUDE_PEERS_MCP_PID: String(child.pid),
         CLAUDE_PEERS_HOOK_EVENT_NAME: "Stop",
@@ -2554,6 +2559,7 @@ describe("Live broker delivery features", () => {
       cwd: new URL("..", import.meta.url).pathname,
       env: {
         ...process.env,
+        CODEX_HOME: `${broker.root}/.codex`,
         CLAUDE_PEERS_PORT: String(BROKER_PORT),
         CLAUDE_PEERS_MCP_PID: String(child.pid),
         CLAUDE_PEERS_HOOK_EVENT_NAME: "SessionStart",
