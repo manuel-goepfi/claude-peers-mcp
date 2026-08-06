@@ -56,7 +56,54 @@ export function sessionIdFromHookInput(value: unknown): string | null {
   return trimmed.length > 0 ? trimmed : null;
 }
 
-async function readHookSessionId(): Promise<string | null> {
+type TranscriptEvidence = "absent" | "present";
+type RootSessionMatch = "unknown" | "yes" | "no";
+
+export interface CodexHookSessionDiagnostic {
+  eventName: string;
+  source: string;
+  sessionId: string | null;
+  transcript: TranscriptEvidence;
+  rootMatch: RootSessionMatch;
+}
+
+function boundedHookLabel(value: unknown): string {
+  if (typeof value !== "string") return "unknown";
+  const trimmed = value.trim();
+  return /^[A-Za-z0-9._-]{1,64}$/.test(trimmed) ? trimmed : "unknown";
+}
+
+function transcriptSessionId(value: unknown): string | null {
+  if (typeof value !== "string" || !value.trim()) return null;
+  const filename = value.trim().replaceAll("\\", "/").split("/").at(-1) ?? "";
+  const match = filename.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i);
+  return match?.[1]?.toLowerCase() ?? null;
+}
+
+/**
+ * Report whether a Codex hook looks like the durable root session without
+ * reading the transcript from disk. SessionStart can race transcript creation,
+ * so field evidence is diagnostic while file existence is deliberately not.
+ */
+export function codexHookSessionDiagnostic(value: unknown): CodexHookSessionDiagnostic {
+  const input = value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+  const sessionId = sessionIdFromHookInput(input);
+  const transcriptPresent = typeof input.transcript_path === "string" && input.transcript_path.trim().length > 0;
+  const transcriptId = transcriptSessionId(input.transcript_path);
+  return {
+    eventName: boundedHookLabel(input.hook_event_name),
+    source: boundedHookLabel(input.source),
+    sessionId,
+    transcript: transcriptPresent ? "present" : "absent",
+    rootMatch: !sessionId || !transcriptPresent || !transcriptId
+      ? "unknown"
+      : sessionId.toLowerCase() === transcriptId ? "yes" : "no",
+  };
+}
+
+async function readHookInput(): Promise<Record<string, unknown> | null> {
   if (process.stdin.isTTY) return null;
   try {
     const text = await Promise.race([
@@ -64,7 +111,10 @@ async function readHookSessionId(): Promise<string | null> {
       new Promise<string>((resolve) => setTimeout(() => resolve(""), 1500)),
     ]);
     if (!text.trim()) return null;
-    return sessionIdFromHookInput(JSON.parse(text));
+    const parsed = JSON.parse(text);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null;
   } catch (error) {
     log(`hook input unreadable: ${error instanceof Error ? error.message : String(error)}`);
     return null;
@@ -371,7 +421,16 @@ async function ensureBroker(): Promise<void> {
 }
 
 export async function runRegistration(): Promise<void> {
-  const threadId = await readHookSessionId();
+  const hookInput = await readHookInput();
+  const threadId = sessionIdFromHookInput(hookInput);
+  if (CLIENT_TYPE === "codex") {
+    const diagnostic = codexHookSessionDiagnostic(hookInput);
+    log(
+      `hook-input event=${diagnostic.eventName} source=${diagnostic.source} ` +
+      `session_id=${diagnostic.sessionId ?? "absent"} transcript=${diagnostic.transcript} ` +
+      `root_match=${diagnostic.rootMatch}`,
+    );
+  }
   if (CLIENT_TYPE === "codex" && !threadId) {
     log("hook input has no session_id; refusing an unbound Codex registration");
     process.exitCode = 1;

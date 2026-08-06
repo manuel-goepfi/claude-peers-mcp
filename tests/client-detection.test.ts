@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { findClientPidFromTable, findHookPeerPidsFromTable, findMcpPidFromTable } from "../hooks/codex-drain-peer-inbox.ts";
-import { peerName, publishBrokerIdentityToTmux, registrationTmuxPaneId, sessionIdFromHookInput, tmuxIdentityMirrorEnabled } from "../hooks/register-peer-session.ts";
+import { codexHookSessionDiagnostic, peerName, publishBrokerIdentityToTmux, registrationTmuxPaneId, sessionIdFromHookInput, tmuxIdentityMirrorEnabled } from "../hooks/register-peer-session.ts";
 import { detectClientFromProcessChain, findBgSpareAncestor, initialReceiverMode, type ProcessInfo } from "../shared/client.ts";
 import { findNearestVisibleCodexProcessByStart, findVisibleCodexProcessByPaneId } from "../shared/visible-codex.ts";
 import { findCodexAppServerAncestor, findVisibleCodexSession, mcpThreadIdFromRequestMeta, registrationCwd, registrationCwdResult, registrationTtyPid, selectCodexManualDrainPid, selectInboxClaimIdentity, shouldUnregisterPeerOnShutdown, unresolvedAppServerToolDiagnostic } from "../server.ts";
@@ -425,6 +425,44 @@ describe("client detection", () => {
     expect(sessionIdFromHookInput({ session_id: "   " })).toBeNull();
     expect(sessionIdFromHookInput({ session_id: `  ${threadId}  ` })).toBe(threadId);
     expect(mcpThreadIdFromRequestMeta({})).toBeNull();
+  });
+
+  test("Codex hook diagnostics match a durable root transcript without touching the filesystem", () => {
+    const threadId = "019fc273-a35b-78f0-9a70-f63b5905540f";
+    expect(codexHookSessionDiagnostic({
+      session_id: threadId,
+      hook_event_name: "SessionStart",
+      source: "resume",
+      transcript_path: `/definitely/not/materialized/rollout-2026-08-06T20-16-02-${threadId}.jsonl`,
+    })).toEqual({
+      eventName: "SessionStart",
+      source: "resume",
+      sessionId: threadId,
+      transcript: "present",
+      rootMatch: "yes",
+    });
+  });
+
+  test("Codex hook diagnostics expose inherited and absent transcript evidence", () => {
+    const rootThreadId = "019fc273-a35b-78f0-9a70-f63b5905540f";
+    const hiddenThreadId = "019fd84b-4556-7fd2-8e21-3fac2582d757";
+    expect(codexHookSessionDiagnostic({
+      session_id: hiddenThreadId,
+      hook_event_name: "SessionStart",
+      source: "startup",
+      transcript_path: `C:\\Codex\\sessions\\rollout-${rootThreadId}.jsonl`,
+    })).toMatchObject({ transcript: "present", rootMatch: "no" });
+    expect(codexHookSessionDiagnostic({
+      session_id: hiddenThreadId,
+      hook_event_name: "SessionStart",
+      source: "startup",
+    })).toMatchObject({ transcript: "absent", rootMatch: "unknown" });
+    expect(codexHookSessionDiagnostic({
+      session_id: hiddenThreadId,
+      hook_event_name: "Session Start with spaces",
+      source: { untrusted: true },
+      transcript_path: "/tmp/not-a-rollout.jsonl",
+    })).toMatchObject({ eventName: "unknown", source: "unknown", transcript: "present", rootMatch: "unknown" });
   });
 
   test("an unresolved app-server seat names the blocked tool and the safe recovery boundary", () => {
