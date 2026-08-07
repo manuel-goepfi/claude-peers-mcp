@@ -24,7 +24,9 @@ import { Database } from "bun:sqlite";
 import {
   composerStillHolds,
   submissionProbe,
+  submitWakeOnlyNudge,
   tick,
+  type Lane,
   type TickSnapshot,
 } from "../bin/codex-autodrain-poller.ts";
 
@@ -100,26 +102,46 @@ describe("composerStillHolds distinguishes UNSENT from SENT", () => {
 });
 
 describe("the shipped poller is wake-only", () => {
-  const source = require("node:fs").readFileSync(
-    new URL("../bin/codex-autodrain-poller.ts", import.meta.url).pathname,
-    "utf8",
-  ) as string;
+  // These were six `expect(source).not.toContain(...)` greps over this file's own
+  // text. They are gone deliberately, not lost.
+  //
+  // A negative source grep passes on an empty file, on a rename, on a refactor,
+  // and on any spelling nobody thought to enumerate — which is exactly how the
+  // by-thread routes slipped past the first version of that guard, when it named
+  // only the -by-pid pair. The assertion sat in a different layer from the defect,
+  // so the suite stayed green while the property was unproven.
+  //
+  // The tick tests below supersede all of them and are strictly stronger: fetch is
+  // stubbed to THROW, so `brokerRequests` catches ANY route — including one that
+  // does not exist yet — and the row is asserted to remain undelivered. That
+  // observes the layer the defect actually lives in.
+  const laneFor = (overrides: Partial<Lane> = {}): Lane => ({
+    id: "seat-1", name: "infra.9", pid: process.pid, client_type: "codex",
+    tmux_pane_id: "%42", thread_id: "thread-1", seat_key: "pane:infra:%42",
+    receiver_mode: "codex-hook", unread: 2, last_hook_seen_at: null, ...overrides,
+  } as Lane);
 
-  test("submitPaneText no longer returns the C-m exit code directly", () => {
-    // The exact regression: `return sh([... "C-m"]).ok` was the whole failure.
-    expect(source).not.toMatch(/return sh\(\["tmux", "send-keys", "-t", paneId, "C-m"\]\)\.ok;/);
+  test("an unobserved submit reports failure instead of claiming delivery", () => {
+    // The P1 in behavioural form. submitPaneText used to return the `send-keys`
+    // exit code, so tmux accepting a keystroke counted as the model having read
+    // the mail. The contract now is that an unconfirmed submit says so, and it is
+    // this return value that nudge() branches on to skip consuming cooldown and
+    // attempt budget — so a failed wake is retried rather than silently burned.
+    expect(submitWakeOnlyNudge(laneFor(), "%42", { submit: () => false })).toBe("submit-failed");
   });
 
-  test("contains no mailbox claim or acknowledgement route", () => {
-    expect(source).not.toContain('"/claim-by-pid"');
-    expect(source).not.toContain('"/ack-by-pid"');
-    expect(source).not.toContain('"/claim-by-thread"');
-    expect(source).not.toContain('"/ack-by-thread"');
-    expect(source).not.toContain("deliverClaimedCodexMail");
+  test("a submit that throws is also a failure, never a silent success", () => {
+    // The catch path had no coverage at all. A tmux call that throws must not be
+    // indistinguishable from a delivered wake.
+    expect(submitWakeOnlyNudge(laneFor(), "%42", {
+      submit: () => { throw new Error("tmux vanished"); },
+    })).toBe("submit-failed");
   });
 
-  test("an unconfirmed submit is logged as an uncounted wake", () => {
-    expect(source).toContain("wake submit unconfirmed");
+  test("a confirmed submit is the only thing that reports success", () => {
+    // Asserted from both directions: without this, an implementation that always
+    // returned "submit-failed" would pass the two tests above.
+    expect(submitWakeOnlyNudge(laneFor(), "%42", { submit: () => true })).toBe("submitted");
   });
 
   test("the real tick wakes an exact seat without claiming or acknowledging its mail", () => {
