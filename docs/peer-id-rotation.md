@@ -1,6 +1,15 @@
-# Peer IDs rotate, and the protection against it cannot survive an MCP reconnect
+# Indicators that report clean on the axis that matters
 
-Measured 2026-08-07 by infra.3.
+Measured 2026-08-07 by infra.3. Three instances in one week of the same shape:
+**a guard exists, it reports healthy, and it does not observe the property it is
+read as guaranteeing.** The first is the substance of this document; the other
+two are recorded at the end because the pattern is the finding.
+
+1. The same-id guard is keyed on a pid that changes in the one case it must survive.
+2. `Drift: none` never compares the seat, so it cannot detect a wrong-pane binding.
+3. `offline` in the GitHub runner list does not mean capacity is missing.
+
+---
 
 ## The claim
 
@@ -111,3 +120,79 @@ why it does not reintroduce that.
 An alternative worth weighing: keep the gate as-is and make rotation **loud**
 instead of silent — emit the old and new id on rotation so a stale reference is
 diagnosable from a log rather than from a failed send hours later.
+
+---
+
+# Instance 2 — `Drift: none` does not check the seat
+
+`server.ts:2384-2388` builds the drift report:
+
+```ts
+if (self.name !== myOperatorName)          drift.push(...)
+if (self.resolved_name !== myResolvedName) drift.push(...)
+if (self.client_type !== myClientType)     drift.push(...)
+if (self.receiver_mode !== myReceiverMode) drift.push(...)
+```
+
+It compares **name, resolved_name, client_type, receiver_mode**. It does not
+compare **seat_key** or **tmux_pane_id** — the fields that decide where mail is
+actually routed.
+
+So a row bound to the wrong pane prints `Drift: none`. The indicator covers
+labels and modes, not routing identity.
+
+Surfaced 2026-08-07 by orch.4, which suspected its session had been bound to
+another lane's seat after a reconnect. **Its specific case was benign** — I
+verified its process (`pid 1635608`, started `claude -r` at 08:53:56) carries
+`TMUX_PANE=%4520` and its row says `pane:orch:%4520`; they agree, and the pane it
+believed it was in (`%2314`) no longer exists. It had resumed into a different
+pane than it remembered.
+
+But it could not have told a benign case from a real hijack, because the only
+tool available reports clean either way. That is why escalating was correct even
+though the instance was not.
+
+---
+
+# Instance 3 — `offline` in the runner list is not missing capacity
+
+Not a claude-peers defect. Recorded here because it is the same shape, and
+because the pattern is worth more than any one instance.
+
+`github-runner-local` and `github-runner-heavy` carry no `container_name` and no
+`RUNNER_NAME` (`RANDOM_RUNNER_SUFFIX` defaults true), so every `compose up -d`
+recreate mints a **new random registration name**. The previous name remains in
+GitHub's runner list as an `offline` entry forever. Counting offline entries
+measures name history, not capacity.
+
+Diagnosed 2026-08-07 by infra.4, which also caused it — its watchdog ran an
+unscoped `docker compose down --remove-orphans` at 08:30:18 SAST. It asked for
+independent confirmation on the grounds that it was both diagnoser and cause.
+Confirmed here by reading each container's own `.runner` `agentName`:
+
+```
+github-runner-github-runner-heavy-1  ->  clause5-heavy-nTgaVFSBFTqYO   online, busy
+github-runner-github-runner-local-1  ->  clause5-local-SYI0fevte51Ni   online, busy
+github-runner-manzoops-1             ->  manzoops-1                    online, busy
+```
+
+Both `offline` entries — `clause5-heavy-f4pdAK1PkhtdE`, `clause5-local-9oSmZWEX8EYvK`
+— are prior names of containers that are currently running and busy. Zero
+capacity lost. (Scope: only the three containers on this host were checked; the
+other four online runners live elsewhere and were not inspected. The disputed
+pair is fully covered.)
+
+**The settling check is comparing the ONLINE set against running containers.**
+Never count offline entries.
+
+This matters because it presents identically to the documented
+"sole-eligible-dark" signature when read from the runner list alone, and demands
+the opposite response: nothing. Two jobs were killed mid-flight by the unscoped
+recreate, so expect two false-red "runner lost communication" failures — do not
+diagnose a branch from them.
+
+**Placement caveat:** the canonical home for this is Clause5's CI signature set
+in its `CLAUDE.md`, alongside the six already documented — nobody debugging a
+runner queue will look in the claude-peers repo. It is recorded here rather than
+there because an agent-authored edit to that rule text requires explicit operator
+opt-in for that specific change. Promote it when that opt-in exists.
