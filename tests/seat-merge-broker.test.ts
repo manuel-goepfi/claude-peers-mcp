@@ -208,6 +208,67 @@ describe("seat-anchored registration", () => {
     expect(b.id).not.toBe(a.id);
   });
 
+  test("an EMPTY-inbox unregister keeps the seat row, so the reconnect inherits the id", async () => {
+    // handleUnregister's preserve branch was written from a LOST-MAIL incident, so
+    // it only ever asked whether the inbox held anything. An empty inbox deleted the
+    // row — and that row is the seat occupant registration elects `inheritedId`
+    // from. With it gone there is nothing to elect, samePidRefresh also misses (new
+    // MCP server pid AND no `existing`), and the seat gets a brand-new id.
+    // Measured live 2026-08-08: mswxq0on → 1h9j5wzn across one /mcp reconnect with
+    // seat_key = pane:infra:%4441 unchanged, leaving the lane unaddressable by id,
+    // name and row simultaneously while its pane sat there alive. It hid for so long
+    // because it loses the IDENTITY, not the mail, and every prior fix here was
+    // hunting mail.
+    const firstHolder = Bun.spawn(["sleep", "60"], { stdout: "ignore", stderr: "ignore" });
+    const a = await register(firstHolder.pid, { tmux_pane_id: "%712", name: "reconnect.1" });
+
+    // The precondition the bug hid behind. Without this assert a seeded message
+    // would make the test pass via the OLD pending>0 branch and prove nothing.
+    const before = new Database(broker.dbPath, { readonly: true });
+    const queued = before.query(
+      "SELECT COUNT(*) AS n FROM messages WHERE to_id = ? AND delivered = 0",
+    ).get(a.id) as { n: number };
+    before.close();
+    expect(queued.n).toBe(0);
+
+    await call("/unregister", { id: a.id });
+
+    // Production shape: the old MCP server is GONE, and a new one comes up on the
+    // same pane with a different pid.
+    firstHolder.kill();
+    await Bun.sleep(120);
+    const secondHolder = spawnHolder();
+    const b = await register(secondHolder, { tmux_pane_id: "%712", name: "reconnect.1" });
+
+    expect(b.id).toBe(a.id);
+  });
+
+  test("an EMPTY-inbox unregister still deletes a SEATLESS row", async () => {
+    // The counterpart guarantee. A headless registration can never be merged into,
+    // so preserving it would accumulate rows that help nobody. This also pins the
+    // gate to durableSeatKey and away from peerSeatAlive: at unregister time the
+    // row's pid IS the process calling unregister and is therefore always alive, so
+    // a liveness gate would preserve EVERY row and turn unregister into a no-op.
+    const pid = spawnHolder();
+    const a = await call<{ id: string }>("/register", {
+      pid,
+      cwd: "/seat/headless-unreg",
+      git_root: "/seat/headless-unreg",
+      name: "headless-unreg",
+      client_type: "codex",
+      tmux_session: null,
+      tmux_pane_id: null,
+      tty: null,
+    });
+
+    await call("/unregister", { id: a.id });
+
+    const db = new Database(broker.dbPath, { readonly: true });
+    const rows = db.query("SELECT id FROM peers WHERE id = ?").all(a.id) as Array<{ id: string }>;
+    db.close();
+    expect(rows).toHaveLength(0);
+  });
+
   test("a different project in the same pane does not inherit the previous occupant's identity", async () => {
     const first = spawnHolder();
     const second = spawnHolder();

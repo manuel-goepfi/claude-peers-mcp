@@ -23,13 +23,36 @@ let TEST_TOKEN_FILE = "";
 let BROKER_PORT = 0;
 let broker: TestBroker | null = null;
 
-function peerRows(): { id: string; pid: number }[] {
+function peerRows(): { id: string; pid: number; seat_key: string | null }[] {
   const db = new Database(TEST_DB, { readonly: true });
   try {
-    return db.query("SELECT id, pid FROM peers").all() as { id: string; pid: number }[];
+    return db.query("SELECT id, pid, seat_key FROM peers").all() as {
+      id: string; pid: number; seat_key: string | null;
+    }[];
   } finally {
     db.close();
   }
+}
+
+/**
+ * Rows whose process is STILL ALIVE — i.e. seats that are actually occupied.
+ *
+ * These fixtures assert on occupancy, not on row existence, because a
+ * SEAT-ANCHORED row deliberately outlives unregister: the broker keeps it so a
+ * reconnect on the same seat inherits the id instead of minting a new one
+ * (handleUnregister's durableSeatKey branch; regression coverage lives in
+ * seat-merge-broker.test.ts). Counting rows would therefore report a reclaimable
+ * tombstone as a failure, and — because every row here lands in ONE shared test
+ * DB — would also let each fixture see its predecessors' leftovers.
+ *
+ * Occupancy is also the sharper assertion for what this file is actually about.
+ * The bug in the header is a server that keeps RUNNING and HEARTBEATING after it
+ * should have gone: "the broker saw a live ghost on the seat". A live ghost has a
+ * live pid and is still counted here, so these fixtures keep exactly the
+ * discriminating power they had.
+ */
+function occupiedRows(): { id: string; pid: number; seat_key: string | null }[] {
+  return peerRows().filter((row) => isLiveNonZombieProcess(row.pid));
 }
 
 async function waitFor(predicate: () => boolean, timeoutMs: number, label: string): Promise<void> {
@@ -126,7 +149,12 @@ describe("server.ts lifecycle", () => {
         stderr: "ignore",
       });
       try {
-        await waitFor(() => peerRows().length === 1, 10000, "server registration");
+        await waitFor(() => occupiedRows().length === 1, 10000, "server registration");
+        // Which post-exit contract applies depends on whether this server managed to
+        // anchor a seat, so read that BEFORE it exits rather than assuming either
+        // way. Asserting a fixed answer here would quietly cement whatever seat the
+        // harness happens to hand a spawned server.
+        const wasSeated = occupiedRows()[0]!.seat_key !== null;
 
         proc.stdin.end();
 
@@ -135,7 +163,25 @@ describe("server.ts lifecycle", () => {
           Bun.sleep(8000).then(() => "timeout" as const),
         ]);
         expect(exitCode).toBe(0);
-        await waitFor(() => peerRows().length === 0, 5000, "peer row unregistered");
+        await waitFor(() => occupiedRows().length === 0, 5000, "seat released (row may persist as a reclaimable tombstone)");
+
+        // Row-level contract after a clean exit. Worth pinning HERE, in the file that
+        // owns exit behaviour, because seat-anchored preservation is what makes the
+        // reconnect inherit its id rather than mint a new one — and because the
+        // occupancy assertion above deliberately cannot see the difference.
+        // NOTE, so the gap is recorded rather than discovered later: for a SEATED row
+        // /unregister is now a no-op, so no assertion here can still distinguish "the
+        // server unregistered gracefully" from "the server just died". The exit-code
+        // check above remains the guard for the header's actual bug (a server that
+        // keeps running and heartbeating). End-to-end proof that the identity is
+        // reclaimable lives in seat-merge-broker.test.ts.
+        const survivors = peerRows().filter((row) => row.pid === proc.pid);
+        if (wasSeated) {
+          expect(survivors).toHaveLength(1);
+          expect(survivors[0]!.seat_key).not.toBeNull();
+        } else {
+          expect(survivors).toHaveLength(0);
+        }
       } finally {
         proc.kill();
       }
@@ -160,12 +206,12 @@ describe("server.ts lifecycle", () => {
       );
       try {
         const serverPid = await readSpawnedPid(wrapper.stdout);
-        await waitFor(() => peerRows().length === 1, 10000, "server registration");
+        await waitFor(() => occupiedRows().length === 1, 10000, "server registration");
 
         await wrapper.exited; // parent (bash) is now gone -> server reparented
 
         // Watchdog tick (200ms) should unregister and exit the server.
-        await waitFor(() => peerRows().length === 0, 8000, "peer row unregistered after parent death");
+        await waitFor(() => occupiedRows().length === 0, 8000, "seat released after parent death (row may persist as a reclaimable tombstone)");
         await waitFor(
           () => !isLiveNonZombieProcess(serverPid),
           8000,
@@ -199,7 +245,7 @@ describe("server.ts lifecycle", () => {
       try {
         // Give the server ample time to start and (wrongly) register.
         await Bun.sleep(3000);
-        expect(peerRows().length).toBe(0);
+        expect(occupiedRows().length).toBe(0);
       } finally {
         wrapper.stdin.end();
         wrapper.kill();
@@ -224,7 +270,7 @@ describe("server.ts lifecycle", () => {
         // Confirm deferral, then drive the MCP handshake + one tool call over
         // stdio. The CallTool handler must register before serving the tool.
         await Bun.sleep(2500);
-        expect(peerRows().length).toBe(0);
+        expect(occupiedRows().length).toBe(0);
 
         const frames = [
           { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "lifecycle-test", version: "0" } } },
@@ -236,7 +282,7 @@ describe("server.ts lifecycle", () => {
         }
         wrapper.stdin.flush();
 
-        await waitFor(() => peerRows().length === 1, 10000, "deferred registration on first tool call");
+        await waitFor(() => occupiedRows().length === 1, 10000, "deferred registration on first tool call");
       } finally {
         wrapper.stdin.end();
         wrapper.kill();
@@ -261,7 +307,7 @@ describe("server.ts lifecycle", () => {
         }
       );
       try {
-        await waitFor(() => peerRows().length === 1, 10000, "promotion-watcher registration");
+        await waitFor(() => occupiedRows().length === 1, 10000, "promotion-watcher registration");
       } finally {
         wrapper.stdin.end();
         wrapper.kill();

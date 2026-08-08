@@ -2274,6 +2274,38 @@ function handleUnregister(body: { id: string }): void {
   // rehydration (relaunches) — inheriting the id AND the queued mail.
   const pending = (countUndelivered.get(body.id) as { n: number } | null)?.n ?? 0;
   if (pending > 0) return;
+  // ★ A SEAT-ANCHORED row is kept even with an EMPTY inbox — the identity is
+  // worth preserving on its own, not only as a container for mail.
+  //
+  // The pending>0 branch above was added from a live incident about LOST MAIL, so
+  // it only ever asked "is anything in the inbox". With an empty inbox the row was
+  // deleted, and that deletes the SEAT OCCUPANT the next registration needs:
+  // registration elects `inheritedId` from selectSeatOccupants(seatKey) and that
+  // election OUTRANKS samePidRefresh (see `const id = inheritedId ?? ...`). With no
+  // row left there is nothing to elect, samePidRefresh also misses (the MCP server
+  // pid changed AND `existing` is gone), and the seat gets a brand-new id:
+  //
+  //   disconnect → row deleted (inbox empty) → reconnect → no occupant → generateId()
+  //
+  // Measured 2026-08-08 on a live lane: id mswxq0on → 1h9j5wzn across one /mcp
+  // reconnect with seat_key = pane:infra:%4441 unchanged the whole time. The lane
+  // became unaddressable by id, by name, and by row while its pane sat there alive.
+  // The empty branch stayed invisible for so long because it loses the IDENTITY
+  // rather than the mail, and every prior fix here was hunting mail.
+  //
+  // Bounded, not a leak: this only defers to the reaper, which already treats a
+  // dead seat's row as inheritable for REHYDRATE_WINDOW_MS (1h) and then deletes it
+  // (`shouldPermanentlyReapPeer` → pending==0 → deletePeer). Unregister was
+  // short-circuiting that window at the front door. The reaper is now the single
+  // authority on when a seat-anchored row dies.
+  //
+  // Gated on durableSeatKey, NOT on peerSeatAlive: at unregister time the row's pid
+  // IS the process calling unregister and is still alive, so a liveness gate would
+  // preserve every row and turn unregister into a no-op. Seatless/headless rows
+  // (no tmux pane, no tty — they can never be merged into) still delete immediately,
+  // which is what keeps short-lived anonymous registrations from accumulating.
+  const peer = selectPeerById.get(body.id) as Peer | null;
+  if (peer && durableSeatKey(peer)) return;
   deletePeer.run(body.id);
 }
 
