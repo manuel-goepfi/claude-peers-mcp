@@ -1,3 +1,33 @@
+> **CORRECTION 2026-08-08 — instance 1's stated cause is WRONG.** Refuted by
+> infra.4 with measurements I confirmed. Read this before the section below.
+>
+> **The pid gate is not the cause.** `broker.ts:1436` is
+> `const id = inheritedId ?? (samePidRefresh ? existing!.id : null) ?? generateId();`
+> — seat inheritance is checked FIRST and outranks the pid gate. Seat-as-address
+> is already built (`broker.ts:1284-1330` elects a seat survivor and sets
+> `inheritedId`). I quoted line 1436 verbatim below and still blamed the fallback
+> clause, having missed that the clause I proposed adding already sits ahead of it.
+>
+> **The real cause is a DELETE.** `handleUnregister` (`broker.ts:2264-2278`) is
+> `if (pending > 0) return; deletePeer.run(body.id)`. A graceful MCP shutdown with
+> an EMPTY inbox deletes the row, so the reconnect finds no seat occupant to merge
+> with and mints a fresh id. Its own comment documents keeping the row when mail
+> IS pending — as a fix for a prior orphaning bug — and never covers the empty case.
+> A seat-keyed queue would not have helped: the same delete removes it.
+>
+> **And "pane id never lost" was survivorship bias.** I measured only across MCP
+> reconnects, which do not touch tmux. tmux pane ids RESET TO %0 on server restart
+> — infra.4 proved it on an isolated `tmux -L` socket. `shared/seat.ts:44` scopes
+> its uniqueness claim to "across the whole tmux server", i.e. ONE LIFETIME. So a
+> restarted server hands out low ids first and seat collision becomes the default,
+> not an edge case. My durability ranking is void.
+>
+> **Better candidate:** `peers.thread_id` — already exists, already indexed,
+> content-addressed, set on 10 of 16 peers, and survives a tmux restart.
+>
+> The label-decay observation reproduces and stands. Instances 2 and 3 stand.
+> Operator has authorized infra.4 to make the `handleUnregister` fix.
+
 # Indicators that report clean on the axis that matters
 
 Measured 2026-08-07 by infra.3. Three instances in one week of the same shape:
