@@ -109,9 +109,14 @@ function classifyMcpDocument(document: Record<string, unknown>, configPath: stri
     return { state: "stale" };
   }
   const command = basename(entry.command).toLowerCase();
-  const bunCommand = command === "bun" || resolve(entry.command) === resolve(process.execPath);
+  const args = entry.args as string[];
+  // An operator launch wrapper (e.g. mcp-stdio-guard.sh, parent-death cleanup)
+  // that execs `bun <server.ts>` verbatim is a current registration: the client
+  // still runs the canonical adapter, the wrapper only supervises it.
+  const wrapperExecsBun = basename(args[0] ?? "").toLowerCase() === "bun";
+  const bunCommand = command === "bun" || resolve(entry.command) === resolve(process.execPath) || wrapperExecsBun;
   const expectedServer = resolve(repoRoot, "server.ts");
-  const serverCurrent = (entry.args as string[]).some((arg) => resolve(dirname(configPath), arg) === expectedServer);
+  const serverCurrent = args.some((arg) => resolve(dirname(configPath), arg) === expectedServer);
   return { state: bunCommand && serverCurrent ? "current" : "stale" };
 }
 
