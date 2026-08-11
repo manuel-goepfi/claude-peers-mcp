@@ -143,11 +143,18 @@ function installed(state: SurfaceState): boolean {
   return state === "current" || state === "stale";
 }
 
-export function inspectClientSurfaces(home: string, projectRoot: string, repoRoot: string): DoctorReport["clients"] {
+export function inspectClientSurfaces(home: string, projectRoot: string, repoRoot: string, claudeConfigDir?: string): DoctorReport["clients"] {
+  // claudeConfigDir: explicit CLAUDE_CONFIG_DIR override for alternate Claude
+  // profiles (e.g. ~/.claude-b). Threaded as a parameter from the entrypoint,
+  // never read from env here — see tests/setup-no-live-tmux.ts for why silent
+  // env reads in shared code are hazardous in this repo. A profile dir keeps
+  // hooks in <dir>/settings.json and user-scope MCP in <dir>/.claude.json.
+  const claudeDir = claudeConfigDir ?? resolve(home, ".claude");
+  const claudeUserMcp = claudeConfigDir ? resolve(claudeConfigDir, ".claude.json") : resolve(home, ".claude.json");
   const paths = {
     claude: {
-      hooks: { user: resolve(home, ".claude/settings.json"), project: resolve(projectRoot, ".claude/settings.json") },
-      mcp: { user: resolve(home, ".claude.json"), project: resolve(projectRoot, ".mcp.json") },
+      hooks: { user: resolve(claudeDir, "settings.json"), project: resolve(projectRoot, ".claude/settings.json") },
+      mcp: { user: claudeUserMcp, project: resolve(projectRoot, ".mcp.json") },
     },
     codex: {
       hooks: { user: resolve(home, ".codex/hooks.json"), project: resolve(projectRoot, ".codex/hooks.json") },
@@ -381,12 +388,12 @@ export async function inspectHealth(port: number): Promise<HealthReport> {
   }
 }
 
-export async function buildDoctorReport(options: { port: number; dbPath: string; home: string; projectRoot: string; repoRoot: string; processes?: Map<number, ProcessInfo> }): Promise<DoctorReport> {
+export async function buildDoctorReport(options: { port: number; dbPath: string; home: string; projectRoot: string; repoRoot: string; claudeConfigDir?: string; processes?: Map<number, ProcessInfo> }): Promise<DoctorReport> {
   const broker = await inspectHealth(options.port);
   const processSnapshot = options.processes ?? readProcessSnapshot();
   const database = inspectDatabase(options.dbPath, broker.readiness, processSnapshot, options.repoRoot);
   const processes = summarizeProcesses(processSnapshot, options.repoRoot);
-  const clients = inspectClientSurfaces(options.home, options.projectRoot, options.repoRoot);
+  const clients = inspectClientSurfaces(options.home, options.projectRoot, options.repoRoot, options.claudeConfigDir);
 
   let errors = 0;
   let warnings = 0;

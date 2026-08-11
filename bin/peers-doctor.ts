@@ -7,7 +7,11 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
   const home = process.env.HOME ?? "";
   const dbPath = process.env.CLAUDE_PEERS_DB ?? resolve(home, ".claude-peers.db");
   const repoRoot = resolve(import.meta.dir, "..");
-  const report = await buildDoctorReport({ port, dbPath, home, projectRoot: process.cwd(), repoRoot });
+  // Entrypoint is the single place env is consulted (shared code takes it as a
+  // parameter): a CLAUDE_CONFIG_DIR profile keeps its hooks/MCP config in that
+  // directory, and inspecting ~/.claude for it reports the wrong profile.
+  const claudeConfigDir = process.env.CLAUDE_CONFIG_DIR || undefined;
+  const report = await buildDoctorReport({ port, dbPath, home, projectRoot: process.cwd(), repoRoot, claudeConfigDir });
   process.stdout.write(args.includes("--json") ? `${JSON.stringify(report, null, 2)}\n` : renderDoctorHuman(report));
   return report.summary.errors === 0 ? 0 : 1;
 }
