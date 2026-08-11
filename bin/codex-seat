@@ -140,7 +140,7 @@ while (( argument_index < ${#arguments[@]} )); do
       continue
       ;;
     --config=*|--enable=*|--disable=*|--model=*|--local-provider=*|--profile=*|--sandbox=*|--add-dir=*|--ask-for-approval=*|--remote-auth-token-env=*) ;;
-    --strict-config|--oss|--dangerously-bypass-approvals-and-sandbox|--dangerously-bypass-hook-trust|--search|--no-alt-screen)
+    --strict-config|--oss|--dangerously-bypass-approvals-and-sandbox|--dangerously-bypass-hook-trust|--search|--no-alt-screen|--approve-for-me)
       ;;
     # A future global flag is ambiguous until the installed --help audit table
     # is updated: it may be boolean, attached-value, or consume the next token.

@@ -7,6 +7,7 @@ const LAUNCHER = new URL("../bin/codex-seat", import.meta.url).pathname;
 const roots: string[] = [];
 const EXPECTED_CODEX_GLOBAL_OPTIONS = [
   "--add-dir",
+  "--approve-for-me",
   "--ask-for-approval",
   "--cd",
   "--config",
