@@ -175,7 +175,7 @@ describe("codex nudge text", () => {
 
   test("tells a codex lane how to recover when no hook-delivered block is present", () => {
     const text = nudgeText(lane(1, "codex"));
-    expect(text).toContain("If a peer-message block is attached above, process it; otherwise call check_messages");
+    expect(text).toContain("Process the attached peer block; otherwise call check_messages once");
     expect(text).not.toContain("was just delivered with this notification");
     expect(text).not.toMatch(/check_messages if\s+relevant/);
   });
@@ -188,22 +188,22 @@ describe("codex nudge text", () => {
     // "act only if relevant" — that exact phrasing was withdrawn because lanes
     // generalised it from the wrapper to the mail and refused assigned work. The
     // invariant is "the nudge is not the task"; the wording carrying it may change.
-    expect(nudgeText(lane(3, "codex"))).toContain("not itself a task");
-    expect(nudgeText(lane(3, "codex"))).toContain("carry on if it does not apply");
+    expect(nudgeText(lane(3, "codex"))).toContain("The wake is not the work");
+    expect(nudgeText(lane(3, "codex"))).toContain("Handle ordinary in-scope mail");
     expect(nudgeText(lane(3, "codex")).toLowerCase().startsWith("check ")).toBe(false);
   });
 
-  test("owns the toolless app-server lane: one off-bus reply, no retries, back to work", () => {
+  test("owns the toolless app-server lane: one unverifiable reply, no retries, back to work", () => {
     // codexd / shared-host lanes have no claude-peers MCP by design, so the
     // wrapper's check_messages instruction is impossible there. Without this
     // clause a lane was knocked repeatedly and burned a turn per knock
     // re-stating "Still BLOCKED" (observed 2026-08-12). The wrapper must name
     // the case and bound the lane's response.
     const text = nudgeText(lane(1, "codex"));
-    expect(text).toContain("If check_messages is unavailable or fails with a closed transport");
-    expect(text).toContain("off the peers bus");
+    expect(text).toContain("If the tool is unavailable or Transport closed");
+    expect(text).toContain("peer content UNVERIFIABLE once");
     expect(text).toContain("do not retry");
-    expect(text).toContain("resume your prior work");
+    expect(text).toContain("continue prior work");
   });
 
   test("pluralises and gives Claude the same observable-state fallback", () => {
