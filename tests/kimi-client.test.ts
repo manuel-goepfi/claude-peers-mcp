@@ -94,7 +94,10 @@ describe("quiescence gate (real tmux)", () => {
   (tmuxAvailable ? test : test.skip)("first sight is never quiescent; unchanged is; changed is not", () => {
     const session = `quiescence-${process.pid}`;
     Bun.spawnSync(["tmux", "kill-session", "-t", session], { stdout: "ignore", stderr: "ignore" });
-    Bun.spawnSync(["tmux", "new-session", "-d", "-s", session, "-x", "80", "-y", "20"], { stdout: "ignore", stderr: "ignore" });
+    // Use a deterministic echoing process instead of the operator's login shell.
+    // A freshly spawned shell can paint its prompt after the first two captures,
+    // making an unchanged pane look active for reasons unrelated to quiescence.
+    Bun.spawnSync(["tmux", "new-session", "-d", "-s", session, "-x", "80", "-y", "20", "cat"], { stdout: "ignore", stderr: "ignore" });
     try {
       const pane = new TextDecoder()
         .decode(Bun.spawnSync(["tmux", "list-panes", "-t", session, "-F", "#{pane_id}"]).stdout).trim().split("\n")[0]!;
