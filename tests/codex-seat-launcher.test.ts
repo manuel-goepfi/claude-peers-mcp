@@ -171,6 +171,46 @@ describe("codex-seat launcher", () => {
     );
   });
 
+  test("strips a bare --remote unix:// (shared default app-server) and warns, keeping explicit endpoints", () => {
+    // The bare form targets Codex's days-old shared app-server whose MCP state
+    // is typically dead — a lane attached there has no peers tools for its
+    // whole life ("Transport closed") and TUI restarts can never fix it. The
+    // launcher treats the bare form as "wants remote hosting" and provides the
+    // pane-local seat instead; a named endpoint remains a deliberate choice.
+    const { root, state, fakeCodex } = fixture();
+    const bin = join(root, "bin");
+    Bun.spawnSync(["mkdir", "-p", bin]);
+    for (const command of ["bash", "readlink"]) {
+      const resolved = Bun.which(command);
+      if (resolved === null) throw new Error(`${command} is required by this test`);
+      symlinkSync(resolved, join(bin, command));
+    }
+    const env = {
+      PATH: bin,
+      HOME: root,
+      CLAUDE_PEERS_REAL_CODEX: fakeCodex,
+      FAKE_CODEX_STATE: state,
+      FAKE_CODEX_RECORD_ONLY: "1",
+    };
+
+    // Bare form (both spellings) is stripped before dispatch: the noninteractive
+    // exec passes through WITHOUT the poisoned flag, and the operator is told.
+    const bare = Bun.spawnSync([LAUNCHER, "--remote", "unix://", "exec", "--json"], { env, stdout: "pipe", stderr: "pipe" });
+    expect(bare.exitCode).toBe(0);
+    expect(new TextDecoder().decode(bare.stderr)).toContain("stale-MCP footgun");
+    expect(readFileSync(join(state, "tui.args"), "utf8")).toBe("exec\n--json\n");
+
+    const bareEq = Bun.spawnSync([LAUNCHER, "--remote=unix://", "exec", "--json"], { env, stdout: "pipe", stderr: "pipe" });
+    expect(bareEq.exitCode).toBe(0);
+    expect(new TextDecoder().decode(bareEq.stderr)).toContain("stale-MCP footgun");
+
+    // An explicit endpoint is a deliberate target: passthrough, no warning.
+    const explicit = Bun.spawnSync([LAUNCHER, "--remote", "ws://127.0.0.1:41999", "exec", "--json"], { env, stdout: "pipe", stderr: "pipe" });
+    expect(explicit.exitCode).toBe(0);
+    expect(new TextDecoder().decode(explicit.stderr)).not.toContain("stale-MCP footgun");
+    expect(readFileSync(join(state, "tui.args"), "utf8")).toBe("--remote\nws://127.0.0.1:41999\nexec\n--json\n");
+  });
+
   test("does not mistake a variadic image value for the exec alias", () => {
     const { root, state, fakeCodex } = fixture();
     const result = Bun.spawnSync([LAUNCHER, "-i", "a.png", "e"], {
