@@ -536,6 +536,7 @@ import {
   envRecordFromText,
   gitValue,
   reconcileVisibleCodexSeats,
+  threadIdFromCodexPaneStatus,
   visibleCodexSeatsFromSnapshot,
 } from "../bin/codex-autodrain-poller.ts";
 
@@ -656,6 +657,48 @@ describe("visibleCodexSeatsFromSnapshot", () => {
   });
 });
 
+describe("threadIdFromCodexPaneStatus", () => {
+  const thread = "019ff65b-9ea6-7751-898a-9c645d30b1e6";
+
+  test("reads one exact UUID segment from the final Codex status line", () => {
+    expect(threadIdFromCodexPaneStatus([
+      "• Finished the previous turn",
+      "",
+      "› Implement {feature}",
+      `peerstestfix · ${thread} · gpt-5.6-sol xhigh · Context 88% used`,
+    ].join("\n"))).toBe(thread);
+  });
+
+  test("fails quiet when thread-id is not configured", () => {
+    expect(threadIdFromCodexPaneStatus(
+      "› Implement {feature}\npeerstestfix · gpt-5.6-sol xhigh · Context 88% used\n",
+    )).toBeNull();
+  });
+
+  test("does not take a UUID from transcript content above the status line", () => {
+    expect(threadIdFromCodexPaneStatus([
+      `Log mentioned ${thread}`,
+      "› Implement {feature}",
+      "peerstestfix · gpt-5.6-sol xhigh · Context 88% used",
+    ].join("\n"))).toBeNull();
+  });
+
+  test("rejects ambiguous or non-segment UUIDs", () => {
+    expect(threadIdFromCodexPaneStatus(
+      `peerstestfix · ${thread} · 11111111-2222-4333-8444-555555555555 · model`,
+    )).toBeNull();
+    expect(threadIdFromCodexPaneStatus(
+      `peerstestfix-${thread} · gpt-5.6-sol xhigh · Context 88% used`,
+    )).toBeNull();
+  });
+
+  test("strips terminal color escapes before parsing", () => {
+    expect(threadIdFromCodexPaneStatus(
+      `\u001b[2mpeerstestfix · ${thread} · gpt-5.6-sol xhigh\u001b[0m`,
+    )).toBe(thread);
+  });
+});
+
 describe("gitValue", () => {
   test("returns trimmed stdout when the git probe exits successfully", async () => {
     const encoder = new TextEncoder();
@@ -753,6 +796,61 @@ describe("reconcileVisibleCodexSeats", () => {
     });
     expect(publishes.map((p) => `${p.identity.id}:${p.identity.receiver_mode}:${p.pane}`)).toEqual(["peer-pr.1:manual-drain:%200"]);
     expect(posts.map((p) => p.path).some((path) => /claim|ack/i.test(path))).toBe(false);
+  });
+
+  test("binds an exact pane status thread after registering the visible seat", async () => {
+    __resetCodexSeatReconcileStateForTest();
+    const posts: Array<{ path: string; body: any }> = [];
+    const thread = "019ff65b-9ea6-7751-898a-9c645d30b1e6";
+
+    await reconcileVisibleCodexSeats(emptySeatSnap(), {
+      now: () => 50_000,
+      intervalMs: 10_000,
+      visibleSeats: () => [visibleSeat()],
+      gitValue: async () => null,
+      threadIdForPane: () => thread,
+      callerPid: 999,
+      postBroker: async (path, body) => {
+        posts.push({ path, body });
+        return path === "/register" ? registerResponse() as any : {
+          ok: true,
+          id: "peer-pr.1",
+          thread_id: thread,
+          folded: 0,
+          migrated: 0,
+        } as any;
+      },
+      publishBrokerIdentityToTmux: () => ({ ok: true, target: null, failedOptions: [] }),
+    });
+
+    expect(posts.map((post) => post.path)).toEqual(["/register", "/reconcile-pane-thread"]);
+    expect(posts[1]!.body).toEqual({
+      id: "peer-pr.1",
+      pid: 200,
+      caller_pid: 999,
+      tmux_pane_id: "%200",
+      thread_id: thread,
+    });
+  });
+
+  test("does not call the thread endpoint when status parsing fails quiet", async () => {
+    __resetCodexSeatReconcileStateForTest();
+    const paths: string[] = [];
+
+    await reconcileVisibleCodexSeats(emptySeatSnap(), {
+      now: () => 50_000,
+      intervalMs: 10_000,
+      visibleSeats: () => [visibleSeat()],
+      gitValue: async () => null,
+      threadIdForPane: () => null,
+      postBroker: async (path) => {
+        paths.push(path);
+        return registerResponse() as any;
+      },
+      publishBrokerIdentityToTmux: () => ({ ok: true, target: null, failedOptions: [] }),
+    });
+
+    expect(paths).toEqual(["/register"]);
   });
 
   test("dry-run discovers seats but posts and publishes nothing", async () => {

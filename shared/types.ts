@@ -104,6 +104,25 @@ export interface RegisterResponse {
   receiver_mode: ReceiverMode;
 }
 
+// PID-authenticated bridge between the visible Codex pane row and the exact
+// thread UUID rendered by that pane's status line. The broker may fold only
+// thread-only duplicates; concrete pane identities always fail closed.
+export interface ReconcilePaneThreadRequest {
+  id: PeerId;
+  pid: number;
+  caller_pid: number;
+  tmux_pane_id: string;
+  thread_id: string;
+}
+
+export interface ReconcilePaneThreadResponse {
+  ok: true;
+  id: PeerId;
+  thread_id: string;
+  folded: number;
+  migrated: number;
+}
+
 // Read-only, PID-authenticated proof that a visible client process already owns
 // a broker seat. Deliberately excludes the peer token: callers use this only to
 // verify process/pane identity before performing a normal /register handshake.

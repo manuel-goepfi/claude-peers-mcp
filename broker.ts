@@ -17,6 +17,8 @@ import { DELIVERY_STATES } from "./shared/types.ts";
 import type {
   RegisterRequest,
   RegisterResponse,
+  ReconcilePaneThreadRequest,
+  ReconcilePaneThreadResponse,
   RegisterCliRequest,
   RegisterCliResponse,
   HeartbeatRequest,
@@ -204,6 +206,7 @@ const BROKER_CAPABILITIES = {
     claimByPid: true,
     ackByPid: true,
     hookHeartbeatByPid: true,
+    reconcilePaneThread: true,
   },
   bridge: {
     ...(BRIDGE_ENABLED ? { messagesSinceId: true } : {}),
@@ -543,6 +546,12 @@ const selectPeerByToken = db.prepare(`
 
 const selectPeerById = db.prepare(`
   SELECT * FROM peers WHERE id = ?
+`);
+
+const selectPeersByThread = db.prepare(`
+  SELECT * FROM peers
+  WHERE non_targetable = 0 AND lower(thread_id) = ?
+  ORDER BY last_seen DESC
 `);
 
 const updateLastSeen = db.prepare(`
@@ -2397,6 +2406,96 @@ function authPidDrain(pid: number, callerPid: number): { ok: true; id: string } 
   return { ok: true, id: resolved.id };
 }
 
+const THREAD_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+type ReconcilePaneThreadResult =
+  | { ok: true; value: ReconcilePaneThreadResponse }
+  | { ok: false; status: number; error: string };
+
+/**
+ * Join the exact visible Codex pane identity to the exact thread UUID that its
+ * status line renders. This is intentionally narrower than /register: it never
+ * infers by cwd/name, never moves a concrete pane identity, and never adds the
+ * shared app-server PID to the visible seat's liveness set.
+ */
+function handleReconcilePaneThread(body: ReconcilePaneThreadRequest): ReconcilePaneThreadResult {
+  if (typeof body.id !== "string" || body.id.length === 0) {
+    return { ok: false, status: 400, error: "invalid id" };
+  }
+  if (!Number.isInteger(body.pid) || body.pid <= 1) {
+    return { ok: false, status: 400, error: "invalid pid" };
+  }
+  if (!Number.isInteger(body.caller_pid) || body.caller_pid <= 1) {
+    return { ok: false, status: 400, error: "invalid caller_pid" };
+  }
+  if (typeof body.tmux_pane_id !== "string" || !/^%\d+$/.test(body.tmux_pane_id)) {
+    return { ok: false, status: 400, error: "invalid tmux_pane_id" };
+  }
+  if (typeof body.thread_id !== "string" || !THREAD_UUID_RE.test(body.thread_id)) {
+    return { ok: false, status: 400, error: "invalid thread_id" };
+  }
+
+  const callerErr = verifyPidUid(body.caller_pid);
+  if (callerErr) return { ok: false, status: 403, error: `caller rejected: ${callerErr}` };
+  const targetErr = verifyPidUid(body.pid);
+  if (targetErr) return { ok: false, status: 403, error: `target rejected: ${targetErr}` };
+
+  const normalizedThreadId = body.thread_id.toLowerCase();
+  const foldedIds: string[] = [];
+  let migrated = 0;
+
+  const outcome = db.transaction((): { ok: true } | { ok: false; status: number; error: string } => {
+    const target = selectPeerById.get(body.id) as Peer | null;
+    if (
+      !target ||
+      target.non_targetable === 1 ||
+      target.client_type !== "codex" ||
+      target.pid !== body.pid ||
+      target.tmux_pane_id !== body.tmux_pane_id
+    ) {
+      return { ok: false, status: 404, error: "pane peer not found" };
+    }
+    if (target.thread_id && target.thread_id.toLowerCase() !== normalizedThreadId) {
+      return { ok: false, status: 409, error: "pane already belongs to a different thread" };
+    }
+
+    const duplicates = (selectPeersByThread.all(normalizedThreadId) as Peer[])
+      .filter((peer) => peer.id !== target.id);
+    if (duplicates.some((peer) => peer.tmux_pane_id !== null || peer.seat_key !== null)) {
+      return { ok: false, status: 409, error: "thread is already bound to another pane" };
+    }
+
+    for (const duplicate of duplicates) {
+      const moved = db.run(
+        "UPDATE messages SET to_id = ? WHERE to_id = ? AND delivered = 0",
+        [target.id, duplicate.id],
+      );
+      migrated += moved.changes;
+      deletePeer.run(duplicate.id);
+      foldedIds.push(duplicate.id);
+    }
+    db.run("UPDATE peers SET thread_id = ?, last_seen = ? WHERE id = ?", [
+      normalizedThreadId,
+      new Date().toISOString(),
+      target.id,
+    ]);
+    return { ok: true };
+  })();
+
+  if (!outcome.ok) return outcome;
+  for (const foldedId of foldedIds) buckets.delete(foldedId);
+  return {
+    ok: true,
+    value: {
+      ok: true,
+      id: body.id,
+      thread_id: normalizedThreadId,
+      folded: foldedIds.length,
+      migrated,
+    },
+  };
+}
+
 type ThreadIdentityProofResult =
   | { ok: true; value: ThreadIdentityProofResponse }
   | { ok: false; status: number; error: string };
@@ -2918,6 +3017,15 @@ requestHandler = async (req: Request) => {
         }
         // S5: count the registration request against the new peer's bucket.
         rateCheck(result.value.id, false);
+        return Response.json(result.value);
+      }
+
+      // Loopback + same-UID PID proof, with exact id/pid/pane matching. This is
+      // intentionally tokenless because the poller performs a preserve-token
+      // /register but never retains or impersonates the pane's bearer token.
+      if (path === "/reconcile-pane-thread") {
+        const result = handleReconcilePaneThread(body as unknown as ReconcilePaneThreadRequest);
+        if (!result.ok) return Response.json({ error: result.error }, { status: result.status });
         return Response.json(result.value);
       }
 

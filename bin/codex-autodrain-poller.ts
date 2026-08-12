@@ -17,7 +17,8 @@
  * mail from the queue.
  *
  * Safety:
- *   - Reconciles visible Codex seats by broker /register only.
+ *   - Reconciles visible Codex seats by exact pane registration and, when the
+ *     pane status exposes it, an exact broker-side thread identity join.
  *   - Reads candidate unread counts and identity evidence from SQLite read-only.
  *   - Refuses to wake Codex rows without an exact pane seat. Legacy rows without
  *     thread/hook metadata receive an explicit compatibility instruction and log.
@@ -38,7 +39,7 @@ import { readFileSync, readlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { publishBrokerIdentityToTmux } from "../shared/tmux-identity.ts";
-import type { RegisterResponse } from "../shared/types.ts";
+import type { ReconcilePaneThreadResponse, RegisterResponse } from "../shared/types.ts";
 import { isVisibleCodexArgs } from "../shared/visible-codex.ts";
 import {
   parseTmuxPanes,
@@ -319,6 +320,34 @@ function log(msg: string): void {
 function sh(cmd: string[]): { ok: boolean; out: string } {
   const p = Bun.spawnSync(cmd);
   return { ok: p.exitCode === 0, out: new TextDecoder().decode(p.stdout) };
+}
+
+const ANSI_ESCAPE_RE = /\u001b\[[0-?]*[ -/]*[@-~]/g;
+const THREAD_UUID_SEGMENT_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Parse only the final non-empty pane line, where Codex renders configured
+ * status-line items. A UUID elsewhere in the transcript is never identity
+ * evidence, and zero/multiple exact UUID segments fail quiet.
+ */
+export function threadIdFromCodexPaneStatus(capture: string): string | null {
+  const finalLine = capture
+    .replace(ANSI_ESCAPE_RE, "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .at(-1);
+  if (!finalLine) return null;
+  const matches = finalLine
+    .split(" · ")
+    .map((segment) => segment.trim())
+    .filter((segment) => THREAD_UUID_SEGMENT_RE.test(segment));
+  return matches.length === 1 ? matches[0]!.toLowerCase() : null;
+}
+
+function threadIdForPane(paneId: string): string | null {
+  const capture = sh(["tmux", "capture-pane", "-p", "-t", paneId, "-S", "-12"]);
+  return capture.ok ? threadIdFromCodexPaneStatus(capture.out) : null;
 }
 
 function cwdOfPid(pid: number): string | null {
@@ -814,6 +843,8 @@ export interface ReconcileVisibleCodexSeatsDeps {
   gitValue?: typeof gitValue;
   postBroker?: PostBrokerFn;
   publishBrokerIdentityToTmux?: PublishIdentityFn;
+  threadIdForPane?: (paneId: string) => string | null;
+  callerPid?: number;
 }
 
 export function __resetCodexSeatReconcileStateForTest(): void {
@@ -835,6 +866,7 @@ export async function reconcileVisibleCodexSeats(snap: TickSnapshot, deps: Recon
     const git = deps.gitValue ?? gitValue;
     const post = deps.postBroker ?? postBroker;
     const publish = deps.publishBrokerIdentityToTmux ?? publishBrokerIdentityToTmux;
+    const readThreadId = deps.threadIdForPane ?? threadIdForPane;
     for (const seat of seats) {
       try {
         if (deps.dryRun ?? DRY_RUN) {
@@ -861,6 +893,17 @@ export async function reconcileVisibleCodexSeats(snap: TickSnapshot, deps: Recon
           summary: "",
         });
         publish(reg, seat.tmux);
+        const paneId = seat.tmux.pane_id;
+        const threadId = paneId ? readThreadId(paneId) : null;
+        if (paneId && threadId) {
+          await post<ReconcilePaneThreadResponse>("/reconcile-pane-thread", {
+            id: reg.id,
+            pid: seat.pid,
+            caller_pid: deps.callerPid ?? process.pid,
+            tmux_pane_id: paneId,
+            thread_id: threadId,
+          });
+        }
       } catch (e) {
         log(`codex seat reconcile failed for ${seat.name} pid=${seat.pid} pane=${seat.tmux.pane_id ?? "?"}: ${e instanceof Error ? e.message : String(e)}`);
       }
