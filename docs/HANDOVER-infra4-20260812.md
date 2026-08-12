@@ -110,4 +110,5 @@ codexd() { codex --remote unix:// --cd "$PWD" "$@"; }
 
 - Old Codex TUIs started before `thread-id` was added will not render it until restart. Their genuinely undelivered mail remains nudgeable, but the hard five-attempt episode cap stops repeated knocks.
 - Claude B's peer-specific acceptance retry ended in provider HTTP 529 with zero model tokens; this did not change its connected MCP/config proof or the earlier completed Opus review.
-- Cursor's 3.5-day live agent cannot add an MCP child mid-session. A separate, read-only-verified wrapper/config repair will apply on the next Cursor launch; that work is outside this branch.
+- Cursor's 3.5-day `traffic.1.1` agent cannot add an MCP child mid-session. The separate wrapper/config repair was read-only verified: it derives `session.window.pane` through process ancestry and will apply on the next Cursor launch; that work is outside this branch. Its stale broker row correctly refused a send.
+- Closure report `16967` was instead sent to live Cursor `traffic.1.3` on `%2732`; NudgeR produced one wake and the row acknowledged it at `2026-08-12T17:37:59.170Z`. No stale Claude row was deleted.
