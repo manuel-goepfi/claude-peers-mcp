@@ -456,7 +456,7 @@ export function peerName(clientType: HookClientType, pid: number, tmux: TmuxPane
   return `${clientType}-${pid}`;
 }
 
-async function metadata(): Promise<RegisterMetadata | null> {
+async function metadata(threadId: string | null = null): Promise<RegisterMetadata | null> {
   const table = processTable();
   let identityEnv: Record<string, string | undefined> = process.env;
   let pid = findClientPidFromTable(table);
@@ -477,6 +477,30 @@ async function metadata(): Promise<RegisterMetadata | null> {
       log(exactVisible
         ? `app-server hook identity resolved via inherited pane ${inheritedPaneId} pid=${pid} cwd=${visible.cwd}`
         : `app-server hook identity resolved via sole visible TTY pid=${pid} cwd=${visibleCwdHint}`);
+    } else if (appServer && threadId) {
+      // Thread-keyed seat: the shared app-server hosts threads with NO visible
+      // TUI anchor — no pane env, or several visible TUIs making "sole visible"
+      // ambiguous (the codexd/Desktop co-attach topology). The caller has
+      // already proven this hook belongs to the root thread (transcript match),
+      // and the ThreadId IS the durable identity: content-addressed, survives
+      // tmux restarts, and the thread-routed drain claims land on it exactly.
+      // Anchor liveness to the app-server pid (threads die with their host),
+      // and deliberately DROP the host env: it may carry the FIRST launcher's
+      // TMUX_PANE, which would pin every thread of this host to one pane.
+      // Trade, documented: the row is not nudgeable (no pane) — these lanes are
+      // operator-interactive by definition, so drains ride their real turns.
+      log(`app-server hook identity resolved via thread key t${threadId.slice(-8)} pid=${appServer.pid} (no visible TUI anchor)`);
+      const cwd = process.cwd();
+      return {
+        pid: appServer.pid,
+        cwd,
+        git_root: await getGitRoot(cwd),
+        absolute_git_dir: await getAbsoluteGitDir(cwd),
+        tty: null,
+        name: `codex-t${threadId.slice(-8)}`,
+        tmux: null,
+        identity_env: {},
+      };
     }
   }
   if (!pid) {
@@ -589,7 +613,7 @@ export async function runRegistration(): Promise<void> {
       log(`Codex root proof degraded reason=${degradedReason}; continuing fail-open`);
     }
   }
-  const meta = await metadata();
+  const meta = await metadata(threadId);
   if (!meta) {
     process.exitCode = 1;
     return;

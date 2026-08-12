@@ -1567,6 +1567,47 @@ describe("Live broker delivery features", () => {
     expect(message).toEqual({ delivered: 0, claimed_by: null, claimed_at: null });
   }, 15_000);
 
+  test("thread-keyed seats: one shared-host pid holds one row PER thread, refresh stays thread-exact", async () => {
+    // The codexd topology: every thread of a shared app-server anchors its
+    // liveness to the HOST pid. Before the thread-aware refresh, the second
+    // thread's registration adopted the first thread's row (same pid, same
+    // cwd) — stealing its id, token, and inbox.
+    const host = spawnSleep();
+    const threadA = "019faaaa-1111-7000-8000-000000000001";
+    const threadB = "019fbbbb-2222-7000-8000-000000000002";
+    const common = {
+      pid: host.pid, cwd: "/thread-keyed-host", git_root: null, tty: null,
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null,
+      client_type: "codex", receiver_mode: "codex-hook", summary: "",
+    };
+    const a = await brokerFetch<{ id: string }>("/register", { ...common, name: "codex-t00000001", thread_id: threadA });
+    const b = await brokerFetch<{ id: string }>("/register", { ...common, name: "codex-t00000002", thread_id: threadB });
+    expect(b.id).not.toBe(a.id);
+
+    // Same thread registering again (next hook event) refreshes ITS row.
+    const a2 = await brokerFetch<{ id: string }>("/register", { ...common, name: "codex-t00000001", thread_id: threadA });
+    expect(a2.id).toBe(a.id);
+
+    // Mail addressed to thread A is claimable by thread A's exact join and
+    // invisible to thread B — the whole point of keying on the thread.
+    const sent = await brokerFetch<{ id: number }>("/send-message", {
+      from_id: b.id, to_id: a.id, text: "for thread A only",
+    });
+    const wrongThread = await rawPost("/claim-by-thread", {
+      thread_id: threadB, caller_pid: host.pid, client_type: "codex",
+      receiver_mode: "codex-hook", drain_id: "test-thread-b",
+    });
+    const rightThread = await rawPost("/claim-by-thread", {
+      thread_id: threadA, caller_pid: host.pid, client_type: "codex",
+      receiver_mode: "codex-hook", drain_id: "test-thread-a",
+    });
+    const rightBody = rightThread.json as { peer_id?: string; messages?: Array<{ id: number }> };
+    expect(rightBody.peer_id).toBe(a.id);
+    expect((rightBody.messages ?? []).map((m) => m.id)).toContain(sent.id);
+    const wrongBody = wrongThread.json as { messages?: Array<{ id: number }> };
+    expect((wrongBody.messages ?? []).map((m) => m.id)).not.toContain(sent.id);
+  });
+
   test("a send to a live session with no adapter process reports mcp_transport dead", async () => {
     // The "Transport closed" lane state: a recognizable CLIENT session lives
     // (argv0 forged to "claude" — isClientProcess reads the cmdline), so the

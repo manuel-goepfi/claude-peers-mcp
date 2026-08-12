@@ -1392,12 +1392,17 @@ function handleRegister(body: RegisterRequest): RegisterResult {
     }
   }
 
-  const existing = db.query(`
+  // Thread-keyed seats put SEVERAL rows on one pid (every thread of a shared
+  // app-server anchors liveness to the host). The refresh row must be the one
+  // for THIS thread — preferring an exact thread match, then a thread-less
+  // legacy row; a different thread's row is never a refresh candidate (matching
+  // it would hand this thread another thread's id, token, and inbox).
+  const existingRows = db.query(`
     SELECT id, token, cwd, git_root, absolute_git_dir, tty, tmux_session,
            tmux_window_index, tmux_window_name, tmux_pane_id, client_type,
-           receiver_mode
+           receiver_mode, thread_id
     FROM peers WHERE pid = ?
-  `).get(body.pid) as {
+  `).all(body.pid) as Array<{
     id: string;
     token: string;
     cwd: string;
@@ -1410,7 +1415,19 @@ function handleRegister(body: RegisterRequest): RegisterResult {
     tmux_pane_id: string | null;
     client_type: ClientType | null;
     receiver_mode: ReceiverMode | null;
-  } | null;
+    thread_id: string | null;
+  }>;
+  // Preference: exact thread match (including both-null), then a row where
+  // either side is thread-less (legacy compatibility), then any row (a
+  // cross-thread pick fails the thread-compatibility gate below and correctly
+  // mints a fresh id). Ranked in JS: bun:sqlite mis-binds repeated ?N
+  // placeholders against positional args, which silently randomized an
+  // SQL CASE version of this ranking.
+  const bodyThreadId = body.thread_id ?? null;
+  const existing = existingRows.find((row) => (row.thread_id ?? null) === bodyThreadId)
+    ?? existingRows.find((row) => (row.thread_id ?? null) === null || bodyThreadId === null)
+    ?? existingRows[0]
+    ?? null;
   const existingClientType = validClientType(existing?.client_type);
   const clientType = requestedClientType === "unknown" && existingClientType !== "unknown" ? existingClientType : requestedClientType;
   // Same-pid refresh: a live peer re-registering (e.g. 401 recovery after a
@@ -1433,6 +1450,11 @@ function handleRegister(body: RegisterRequest): RegisterResult {
     nullableStableValueCompatible(existing.git_root, body.git_root) &&
     nullableStableValueCompatible(existing.absolute_git_dir, body.absolute_git_dir ?? null) &&
     ttyCompatibleForSamePid(existing.tty, body.tty) &&
+    // Thread-keyed seats: one shared-host pid serves many threads. A row with a
+    // DIFFERENT thread id is another thread's identity, never this one's refresh
+    // — adopting it would steal that thread's id, token, and inbox. Null on
+    // either side stays compatible (legacy rows, thread-less registrants).
+    nullableStableValueCompatible(existing.thread_id, body.thread_id ?? null) &&
     (requestedClientType === "unknown" || existingClientType === "unknown" || existingClientType === clientType));
   const id = inheritedId ?? (samePidRefresh ? existing!.id : null) ?? generateId();
 
@@ -1506,7 +1528,12 @@ function handleRegister(body: RegisterRequest): RegisterResult {
       }
       // Existing PID-dedup: a live peer re-registering must replace its own row.
       // Guarded against clobbering the inherited row we re-created above.
-      if (existing && existing.id !== id) {
+      // Thread-keyed seats: a row carrying a DIFFERENT thread id is another
+      // thread of the same shared-host pid — someone else's row, not a stale
+      // self to replace. Deleting it (and its mail) was exactly how the second
+      // codexd thread's registration erased the first thread's inbox. Null on
+      // either side keeps the legacy same-pid dedup.
+      if (existing && existing.id !== id && nullableStableValueCompatible(existing.thread_id, bodyThreadId)) {
         deletePeer.run(existing.id);
         // Clean the abandoned id's undelivered mail too. Unlike the rehydrate
         // path (which INHERITS the old id so mail still resolves), this dedup

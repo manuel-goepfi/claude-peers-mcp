@@ -119,13 +119,25 @@ const canUseTmux = Bun.spawnSync(["tmux", "list-sessions"], { stdout: "ignore", 
     });
     if (!(appServer.stderr instanceof ReadableStream)) throw new Error("mismatch hook stderr unavailable");
     const mismatchStderr = new Response(appServer.stderr).text();
-    expect(await appServer.exited).toBe(1);
-    expect(await mismatchStderr).toContain("no codex ancestor found");
+    // Sharpened contract (thread-keyed seats): an inherited pane that does not
+    // verify still NEVER registers pane identity — but a PROVEN thread no
+    // longer becomes nothing. It degrades to a thread-keyed row: no tmux
+    // fields, no seat key, name derived from the thread (the polluted
+    // CLAUDE_PEER_NAME env is deliberately dropped). This is the codexd /
+    // shared-host case, where the host env carries a stale first-launcher pane.
+    expect(await appServer.exited).toBe(0);
+    expect(await mismatchStderr).toContain("resolved via thread key");
     const afterMismatch = new Database(broker.dbPath, { readonly: true });
-    const mismatchCount = afterMismatch.query("SELECT COUNT(*) AS count FROM peers WHERE thread_id = ?")
-      .get(mismatchThreadId) as { count: number };
+    const mismatchRows = afterMismatch.query(
+      "SELECT name, tmux_session, tmux_pane_id, seat_key FROM peers WHERE thread_id = ?",
+    ).all(mismatchThreadId) as Array<{ name: string; tmux_session: string | null; tmux_pane_id: string | null; seat_key: string | null }>;
     afterMismatch.close();
-    expect(mismatchCount.count).toBe(0);
+    expect(mismatchRows).toHaveLength(1);
+    expect(mismatchRows[0]!.name).toBe(`codex-t${mismatchThreadId.slice(-8)}`);
+    expect(mismatchRows[0]!.name).not.toBe("wrong-pane");
+    expect(mismatchRows[0]!.tmux_session).toBeNull();
+    expect(mismatchRows[0]!.tmux_pane_id).toBeNull();
+    expect(mismatchRows[0]!.seat_key).toBeNull();
   } finally {
     appServer?.kill();
     Bun.spawnSync(["tmux", "kill-session", "-t", otherSession], { stdout: "ignore", stderr: "ignore" });
