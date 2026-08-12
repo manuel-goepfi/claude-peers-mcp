@@ -58,6 +58,16 @@ function hasCursorAgentLauncher(args: string): boolean {
 export function isClientProcess(row: ProcessInfo, clientType: Exclude<ClientType, "unknown">): boolean {
   const comm = commandName(row.comm);
   const firstArg = commandName(row.args);
+  // Node-shim launch shape: `node /.../bin/codex --remote unix:// ...` — the
+  // Codex TUI attached to an app-server runs under the npm bin shim, so its
+  // first token classifies as "node" and the ancestor walk saw no codex client
+  // at all. Registration then refused the lane's hooks outright ("no codex
+  // ancestor found"), which kept codexd relaunches off the peers bus even
+  // after thread-keyed seats landed. The client identity is the SECOND token.
+  if (clientType === "codex" && (comm === "node" || firstArg === "node" || comm === "bun")) {
+    const second = row.args.split(/\s+/)[1];
+    if (second && commandName(second) === "codex") return true;
+  }
   if (clientType === "claude") return comm === "claude" || firstArg === "claude";
   // kimi ships as `kimi` (installed at ~/.kimi-code/bin/kimi) but its process is
   // commonly seen as `kimi-code`. Match both; the generic prefix rule below would

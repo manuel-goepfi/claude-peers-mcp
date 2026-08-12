@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
+import { isClientProcess } from "../shared/client.ts";
 import { findClientPidFromTable, findHookPeerPidsFromTable, findMcpPidFromTable } from "../hooks/codex-drain-peer-inbox.ts";
 import { codexDrainRootDecision, codexHookRootDegradedReason, codexHookRootRefusalReason, codexHookSessionDiagnostic, peerName, publishBrokerIdentityToTmux, readPaneLabel, registrationTmuxPaneId, sessionIdFromHookInput, tmuxIdentityMirrorEnabled } from "../hooks/register-peer-session.ts";
 import { detectClientFromProcessChain, findBgSpareAncestor, initialReceiverMode, type ProcessInfo } from "../shared/client.ts";
@@ -948,5 +949,19 @@ describe("findBgSpareAncestor", () => {
       { pid: 30, ppid: 30, comm: "bun", args: "bun server.ts" },
     ]);
     expect(findBgSpareAncestor(30, processes)).toBeNull();
+  });
+});
+
+describe("node-shim codex TUI detection", () => {
+  test("classifies `node .../bin/codex --remote` as a codex client", () => {
+    // The codexd relaunch shape that kept lanes off the bus: the TUI runs
+    // under the npm bin shim, so comm/firstArg say "node", and the ancestor
+    // walk found no codex client at all ("no codex ancestor found").
+    const row = { pid: 1, ppid: 0, comm: "node", args: "node /home/x/.nvm/versions/node/v22/bin/codex --remote unix:// --cd /repo resume t" };
+    expect(isClientProcess(row, "codex")).toBe(true);
+    // A node process running something else stays non-codex.
+    expect(isClientProcess({ pid: 2, ppid: 0, comm: "node", args: "node /srv/app/server.js" }, "codex")).toBe(false);
+    // And the shim never leaks into other client types.
+    expect(isClientProcess(row, "claude")).toBe(false);
   });
 });
