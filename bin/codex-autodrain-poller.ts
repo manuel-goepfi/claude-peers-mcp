@@ -35,9 +35,19 @@
  *      NUDGE_COOLDOWN_MS (60000), DRY_RUN=1 (log what it WOULD do, send nothing).
  */
 import { Database } from "bun:sqlite";
-import { readFileSync, readlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  fchmodSync,
+  fsyncSync,
+  openSync,
+  readFileSync,
+  readlinkSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { publishBrokerIdentityToTmux } from "../shared/tmux-identity.ts";
 import type { ReconcilePaneThreadResponse, RegisterResponse } from "../shared/types.ts";
 import { isVisibleCodexArgs } from "../shared/visible-codex.ts";
@@ -79,6 +89,7 @@ const RECONCILE_CODEX_SEATS = process.env.RECONCILE_CODEX_SEATS !== "0";
 // longer TICKING (the 'silent for 16h' zombie) passes a bare pgrep check but
 // fails the freshness check. mtime is the signal; the body is human-readable.
 const HEARTBEAT_PATH = process.env.CLAUDE_PEERS_AUTODRAIN_HEARTBEAT ?? `${homedir()}/.claude-peers-autodrain.heartbeat`;
+const NUDGE_BUDGET_PATH = process.env.CLAUDE_PEERS_NUDGE_BUDGET_FILE ?? `${homedir()}/.claude-peers-nudge-budget.json`;
 // The nudge is typed into the pane as a REAL user turn, so its wording decides
 // how the lane treats it. The original text ("check your peer inbox and handle
 // any pending messages") was phrased as an INSTRUCTION and was indistinguishable
@@ -243,6 +254,117 @@ const nudgeAttempts = new Map<string, number>(); // peer id -> consecutive nudge
 const nudgeEpisode = new Map<string, number>(); // peer id -> broker-authored unread episode
 const unreadyCodexWakeWarned = new Set<string>(); // avoid logging the same bad identity every tick
 const legacyCodexWakeWarned = new Set<string>(); // compatibility metadata is visible once, without log spam
+let nudgeBudgetPersistencePath: string | null = null;
+let nudgeBudgetPersistenceHealthy = true;
+
+interface PersistedNudgeBudgetEntry {
+  episode: number;
+  attempts: number;
+  last_nudge_at?: number;
+}
+
+interface PersistedNudgeBudget {
+  version: 1;
+  peers: Record<string, PersistedNudgeBudgetEntry>;
+}
+
+function validBudgetEntry(value: unknown): value is PersistedNudgeBudgetEntry {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const entry = value as Record<string, unknown>;
+  return Number.isSafeInteger(entry.episode) && Number(entry.episode) >= 0
+    && Number.isSafeInteger(entry.attempts) && Number(entry.attempts) >= 0
+    && (entry.last_nudge_at === undefined
+      || (Number.isSafeInteger(entry.last_nudge_at) && Number(entry.last_nudge_at) >= 0));
+}
+
+function persistedNudgeBudget(): PersistedNudgeBudget {
+  const peers = Object.create(null) as Record<string, PersistedNudgeBudgetEntry>;
+  for (const [id, episode] of nudgeEpisode) {
+    const attempts = nudgeAttempts.get(id) ?? 0;
+    const lastNudgeAt = lastNudge.get(id);
+    peers[id] = {
+      episode,
+      attempts,
+      ...(lastNudgeAt === undefined ? {} : { last_nudge_at: lastNudgeAt }),
+    };
+  }
+  return { version: 1, peers };
+}
+
+/**
+ * Load the durable attempt ledger used by the daemon.
+ *
+ * A corrupt ledger fails closed: the process stays alive for observability but
+ * refuses transport instead of silently minting five fresh attempts. Writes are
+ * atomic and happen before each real pane submission, so a service restart
+ * cannot replenish one continuous unread episode.
+ */
+export function loadNudgeBudgetState(path = NUDGE_BUDGET_PATH): boolean {
+  nudgeBudgetPersistencePath = path;
+  nudgeBudgetPersistenceHealthy = true;
+  nudgeAttempts.clear();
+  nudgeEpisode.clear();
+  lastNudge.clear();
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("root must be an object");
+    const root = parsed as Record<string, unknown>;
+    if (root.version !== 1 || !root.peers || typeof root.peers !== "object" || Array.isArray(root.peers)) {
+      throw new Error("unsupported nudge-budget format");
+    }
+    for (const [id, value] of Object.entries(root.peers as Record<string, unknown>)) {
+      if (!id || !validBudgetEntry(value)) throw new Error(`invalid entry for ${id || "<empty>"}`);
+      nudgeEpisode.set(id, value.episode);
+      nudgeAttempts.set(id, value.attempts);
+      if (value.last_nudge_at !== undefined) lastNudge.set(id, value.last_nudge_at);
+    }
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      // The first installation has no prior budget to preserve. Materialize an
+      // empty ledger immediately so every later service restart has durable
+      // state; a missing parent or failed bootstrap still fails closed.
+      log(`nudge budget ledger absent at ${path} — initializing empty ledger`);
+      return persistNudgeBudgetState();
+    }
+    nudgeBudgetPersistenceHealthy = false;
+    log(`nudge budget ledger unreadable at ${path}: ${error instanceof Error ? error.message : String(error)} — transport disabled`);
+    return false;
+  }
+}
+
+function persistNudgeBudgetState(): boolean {
+  if (!nudgeBudgetPersistencePath) return true;
+  if (!nudgeBudgetPersistenceHealthy) return false;
+  const tmp = `${nudgeBudgetPersistencePath}.tmp-${process.pid}-${crypto.randomUUID()}`;
+  let fd: number | null = null;
+  let directoryFd: number | null = null;
+  try {
+    fd = openSync(tmp, "wx", 0o600);
+    writeFileSync(fd, `${JSON.stringify(persistedNudgeBudget())}\n`);
+    fchmodSync(fd, 0o600);
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = null;
+    renameSync(tmp, nudgeBudgetPersistencePath);
+    directoryFd = openSync(dirname(nudgeBudgetPersistencePath), "r");
+    fsyncSync(directoryFd);
+    closeSync(directoryFd);
+    directoryFd = null;
+    return true;
+  } catch (error) {
+    if (fd !== null) try { closeSync(fd); } catch { /* best effort */ }
+    if (directoryFd !== null) try { closeSync(directoryFd); } catch { /* best effort */ }
+    try { unlinkSync(tmp); } catch { /* best effort */ }
+    nudgeBudgetPersistenceHealthy = false;
+    log(`nudge budget ledger write failed at ${nudgeBudgetPersistencePath}: ${error instanceof Error ? error.message : String(error)} — transport disabled`);
+    return false;
+  }
+}
+
+export function nudgeBudgetHealthStatus(): "ready" | "degraded" {
+  return nudgeBudgetPersistenceHealthy ? "ready" : "degraded";
+}
 // A lane with no unread mail has nothing to receive, so a nudge could only ever
 // cost it a turn. Exported so the final defensive check remains independently
 // assertable even though the candidate SQL also excludes empty inboxes.
@@ -1105,7 +1227,6 @@ function submitPaneText(paneId: string, text: string): boolean {
 }
 
 export type WakeOnlyNudgeResult = "submitted" | "submit-failed";
-export type NudgeLaneResult = WakeOnlyNudgeResult | "skipped";
 
 /** Keep one bounded attempt budget for the entire non-zero unread episode. */
 export function nudgeAttemptCountAfterUnread(
@@ -1121,22 +1242,6 @@ export function unreadEpisodeRestartedBetweenTicks(
   currentEpisode: number,
 ): boolean {
   return currentEpisode !== observedEpisode;
-}
-
-/** Every real paste/Enter transport attempt is bounded; safety skips are free. */
-export function nudgeAttemptCountAfterTransport(
-  current: number | undefined,
-  result: WakeOnlyNudgeResult,
-): number;
-export function nudgeAttemptCountAfterTransport(
-  current: number | undefined,
-  result: NudgeLaneResult,
-): number | undefined;
-export function nudgeAttemptCountAfterTransport(
-  current: number | undefined,
-  result: NudgeLaneResult,
-): number | undefined {
-  return result === "skipped" ? current : (current ?? 0) + 1;
 }
 
 export interface WakeOnlyNudgeDeps {
@@ -1162,22 +1267,16 @@ export function submitWakeOnlyNudge(
   }
 }
 
-function nudge(lane: Lane, paneId: string): NudgeLaneResult {
-  const tag = `${lane.name ?? "?"}/${lane.id} pane=${paneId}`;
-  if (DRY_RUN) { log(`DRY_RUN would nudge ${tag} (${lane.unread} unread)`); return "skipped"; }
-  // A pane sitting in copy-mode (operator wheel-scrolled to read) treats every
-  // nudge character as a copy-mode COMMAND, not typed input — the 'g' in
-  // "check msgs" opens the "(goto line)" prompt over the operator's status bar
-  // (recurring 2026-07-22). Skip; the next tick retries after they scroll out.
-  if (paneIsInCopyMode(paneId)) { log(`skip nudge ${tag} — pane in copy-mode (operator scrolled)`); return "skipped"; }
-  const result = submitWakeOnlyNudge(lane, paneId);
-  return result;
+function nudge(lane: Lane, paneId: string): WakeOnlyNudgeResult {
+  return submitWakeOnlyNudge(lane, paneId);
 }
 
 export function __resetNudgeBudgetStateForTest(): void {
   nudgeAttempts.clear();
   lastNudge.clear();
   nudgeEpisode.clear();
+  nudgeBudgetPersistencePath = null;
+  nudgeBudgetPersistenceHealthy = true;
 }
 
 export function __nudgeAttemptCountForTest(id: string): number | undefined {
@@ -1195,7 +1294,8 @@ export interface TickDeps {
   nudgeableClients?: string[];
   isPidAlive?: (pid: number) => boolean;
   paneIsIdle?: (paneId: string, profile: IdleProfile) => boolean;
-  nudgeLane?: (lane: Lane, paneId: string) => NudgeLaneResult;
+  paneIsInCopyMode?: (paneId: string) => boolean;
+  nudgeLane?: (lane: Lane, paneId: string) => WakeOnlyNudgeResult;
   now?: () => number;
 }
 
@@ -1211,25 +1311,57 @@ export function tick(db: Database, snapOverride?: TickSnapshot, deps: TickDeps =
   try { lanes = lanesWithUnread(db, nudgeableClients); } catch (e) {
     log(`DB read failed: ${e instanceof Error ? e.message : String(e)}`); return;
   }
-  // Prune per-lane state for lanes that no longer have unread mail: reset their
-  // attempt counter (so a future stuck episode starts fresh) AND bound all maps
-  // to current lanes so they cannot grow unbounded over a multi-day run.
+  // Reconcile attempt state with current mailboxes. The in-memory seam prunes
+  // absent lanes; the durable daemon prunes only rows proven to be at zero so a
+  // temporary client exclusion, death, or rehydration cannot replenish a cap.
   const active = new Set(lanes.map((l) => l.id));
-  for (const id of nudgeAttempts.keys()) if (!active.has(id)) nudgeAttempts.delete(id);
-  for (const id of nudgeEpisode.keys()) if (!active.has(id)) nudgeEpisode.delete(id);
+  let budgetDirty = false;
+  // The durable ledger deliberately keeps absent lanes. A lane may be
+  // temporarily excluded by client opt-in, die and rehydrate with the same id,
+  // or disappear during reconciliation while its queued mailbox survives.
+  // Its broker-authored episode changes on a real drain/refill boundary, so the
+  // next candidate resets safely without us mistaking absence for zero unread.
+  // The legacy in-memory test seam still prunes to retain its old bounded-map
+  // behavior when persistence has not been enabled.
+  if (!nudgeBudgetPersistencePath) {
+    for (const id of nudgeAttempts.keys()) if (!active.has(id)) { nudgeAttempts.delete(id); budgetDirty = true; }
+    for (const id of nudgeEpisode.keys()) if (!active.has(id)) { nudgeEpisode.delete(id); budgetDirty = true; }
+  } else {
+    // Pending messages, not peer-row presence, define a live unread episode.
+    // This retains a mailbox while reconciliation temporarily deletes its peer
+    // row, but reaps both drained live rows and deleted rows with no queued mail.
+    const pendingRecipients = new Set((db.query(`
+      SELECT DISTINCT to_id AS id
+      FROM messages
+      WHERE delivered = 0
+    `).all() as Array<{ id: string }>).map(({ id }) => id));
+    const budgetIds = new Set([
+      ...nudgeAttempts.keys(),
+      ...nudgeEpisode.keys(),
+      ...lastNudge.keys(),
+    ]);
+    for (const id of budgetIds) {
+      if (pendingRecipients.has(id)) continue;
+      if (nudgeAttempts.delete(id)) budgetDirty = true;
+      if (nudgeEpisode.delete(id)) budgetDirty = true;
+      if (lastNudge.delete(id)) budgetDirty = true;
+    }
+  }
   // A budget belongs to one continuous non-zero unread episode. New senders and
-  // partial drains cannot replenish it; only reaching zero (or the lane leaving
-  // the active set above) starts a fresh future episode.
+  // partial drains cannot replenish it; only reaching zero and the broker
+  // advancing unread_episode on a later refill starts a fresh future episode.
   for (const lane of lanes) {
     const attempts = nudgeAttemptCountAfterUnread(nudgeAttempts.get(lane.id), lane.unread);
     if (lane.unread <= 0) {
       nudgeAttempts.delete(lane.id);
       nudgeEpisode.delete(lane.id);
       lastNudge.delete(lane.id);
+      budgetDirty = true;
       continue;
     }
     if (!nudgeEpisode.has(lane.id)) {
       nudgeEpisode.set(lane.id, lane.unread_episode);
+      budgetDirty = true;
     } else if (unreadEpisodeRestartedBetweenTicks(
       nudgeEpisode.get(lane.id)!,
       lane.unread_episode,
@@ -1237,12 +1369,23 @@ export function tick(db: Database, snapOverride?: TickSnapshot, deps: TickDeps =
       nudgeAttempts.delete(lane.id);
       lastNudge.delete(lane.id);
       nudgeEpisode.set(lane.id, lane.unread_episode);
+      budgetDirty = true;
       continue;
     }
-    if (attempts === undefined) nudgeAttempts.delete(lane.id);
-    else nudgeAttempts.set(lane.id, attempts);
+    if (attempts === undefined) {
+      if (nudgeAttempts.delete(lane.id)) budgetDirty = true;
+    } else if (nudgeAttempts.get(lane.id) !== attempts) {
+      nudgeAttempts.set(lane.id, attempts);
+      budgetDirty = true;
+    }
   }
-  for (const id of lastNudge.keys()) if (!active.has(id)) lastNudge.delete(id);
+  if (!nudgeBudgetPersistencePath) {
+    for (const id of lastNudge.keys()) if (!active.has(id)) { lastNudge.delete(id); budgetDirty = true; }
+  }
+  // Persist pruning/episode transitions before any transport. If persistence is
+  // enabled but unavailable, fail closed for this tick rather than forgetting a
+  // budget and granting fresh attempts after the next restart.
+  if (budgetDirty && !persistNudgeBudgetState()) return;
   for (const id of unreadyCodexWakeWarned) if (!active.has(id)) unreadyCodexWakeWarned.delete(id);
   for (const id of legacyCodexWakeWarned) if (!active.has(id)) legacyCodexWakeWarned.delete(id);
   for (const id of paneCache.keys()) if (!active.has(id)) paneCache.delete(id);
@@ -1286,11 +1429,12 @@ export function tick(db: Database, snapOverride?: TickSnapshot, deps: TickDeps =
       }
       if ((nudgeAttempts.get(lane.id) ?? 0) >= MAX_NUDGE_ATTEMPTS) {
         // Drain hook likely broken — stop hammering. One warning, then silent
-        // until the lane's unread clears (which resets the counter via the prune
-        // above) or it drops out of the lane set.
+        // until the mailbox drains and the broker advances unread_episode on a
+        // later refill.
         if ((nudgeAttempts.get(lane.id) ?? 0) === MAX_NUDGE_ATTEMPTS) {
           log(`giving up on ${lane.name ?? lane.id}: ${MAX_NUDGE_ATTEMPTS} nudges, still ${lane.unread} unread (drain hook stuck?)`);
           nudgeAttempts.set(lane.id, MAX_NUDGE_ATTEMPTS + 1); // mark "warned", stop re-logging
+          if (!persistNudgeBudgetState()) return;
         }
         continue;
       }
@@ -1315,16 +1459,28 @@ export function tick(db: Database, snapOverride?: TickSnapshot, deps: TickDeps =
       // Busy vocabulary unknown for this client → require the pane to be unchanged
       // since last tick before typing into it.
       if (laneProfile.requiresQuiescence && !paneQuiescent(paneId)) continue;
+      const tag = `${lane.name ?? "?"}/${lane.id} pane=${paneId}`;
+      if (DRY_RUN) { log(`DRY_RUN would nudge ${tag} (${lane.unread} unread)`); continue; }
+      // A pane sitting in copy-mode (operator wheel-scrolled to read) treats
+      // every nudge character as a copy-mode command. It is a safety skip and
+      // therefore consumes no attempt.
+      if ((deps.paneIsInCopyMode ?? paneIsInCopyMode)(paneId)) {
+        log(`skip nudge ${tag} — pane in copy-mode (operator scrolled)`);
+        continue;
+      }
+
+      // Write-ahead reservation: record the attempt and cooldown before tmux.
+      // A service restart or crash after submission can never mint another five
+      // attempts for the same broker-authored unread episode.
+      const reservedAttempts = (nudgeAttempts.get(lane.id) ?? 0) + 1;
+      nudgeAttempts.set(lane.id, reservedAttempts);
+      lastNudge.set(lane.id, clock());
+      if (!persistNudgeBudgetState()) return;
       const result = (deps.nudgeLane ?? nudge)(lane, paneId);
-      if (result !== "skipped") {
-        lastNudge.set(lane.id, clock());
-        const attempts = nudgeAttemptCountAfterTransport(nudgeAttempts.get(lane.id), result);
-        nudgeAttempts.set(lane.id, attempts);
-        if (result === "submitted") {
-          log(`nudged ${lane.name ?? "?"}/${lane.id} pane=${paneId} (${lane.unread} unread, attempt ${attempts})`);
-        } else {
-          log(`wake submit unconfirmed for ${lane.name ?? "?"}/${lane.id} pane=${paneId} — attempt ${attempts} counted, mailbox remains queued`);
-        }
+      if (result === "submitted") {
+        log(`nudged ${lane.name ?? "?"}/${lane.id} pane=${paneId} (${lane.unread} unread, attempt ${reservedAttempts})`);
+      } else {
+        log(`wake submit unconfirmed for ${lane.name ?? "?"}/${lane.id} pane=${paneId} — attempt ${reservedAttempts} counted, mailbox remains queued`);
       }
       nudgedPanesThisTick.add(paneId);                           // A2: claim the pane for the rest of this tick
     } catch (e) {
@@ -1343,7 +1499,10 @@ export function tick(db: Database, snapOverride?: TickSnapshot, deps: TickDeps =
 let heartbeatWriteWarned = false;
 export function writeHeartbeat(): void {
   try {
-    require("node:fs").writeFileSync(HEARTBEAT_PATH, `${new Date().toISOString()}\n`);
+    require("node:fs").writeFileSync(
+      HEARTBEAT_PATH,
+      `${new Date().toISOString()}\nnudge_budget=${nudgeBudgetHealthStatus()}\n`,
+    );
   } catch (e) {
     if (!heartbeatWriteWarned) {
       heartbeatWriteWarned = true;
@@ -1379,6 +1538,7 @@ function main(): void {
     ? `nudge=${NUDGEABLE_CLIENTS.join(",")}`
     : "nudge=DISABLED (set NUDGE_CLIENTS to enable)";
   log(`starting: db=${DB_PATH} interval=${POLL_INTERVAL_MS}ms cooldown=${NUDGE_COOLDOWN_MS}ms ${nudgeState} heartbeat=${HEARTBEAT_PATH}${DRY_RUN ? " DRY_RUN" : ""}`);
+  loadNudgeBudgetState();
   // A stray unhandled rejection must NOT kill the process (which would strand the
   // watchdog with a dead poller that never writes its heartbeat — though the
   // watchdog would then restart it; logging here makes the cause visible).

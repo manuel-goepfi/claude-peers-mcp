@@ -468,9 +468,11 @@ describe("writeHeartbeat", () => {
       ?? `${process.env.HOME}/.claude-peers-autodrain.heartbeat`;
     expect(existsSync(path)).toBe(true);
     const body = readFileSync(path, "utf8").trim();
-    const ts = Date.parse(body);
+    const [timestamp, health] = body.split("\n");
+    const ts = Date.parse(timestamp!);
     expect(Number.isNaN(ts)).toBe(false);          // a valid timestamp
     expect(ts).toBeGreaterThanOrEqual(before - 1000); // freshly written
+    expect(health).toMatch(/^nudge_budget=(ready|degraded)$/);
   });
 });
 

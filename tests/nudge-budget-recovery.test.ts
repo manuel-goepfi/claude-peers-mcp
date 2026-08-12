@@ -4,12 +4,11 @@
  * Incoming mail must not replenish a lane that already exhausted its budget:
  * repeated senders can otherwise turn a bounded wake mechanism into an
  * unbounded stream of real user turns. The budget resets only after the inbox
- * reaches zero (or the lane leaves the active set entirely).
+ * reaches zero and the broker records a later refill as a new episode.
  */
 
 import { describe, expect, test } from "bun:test";
 import {
-  nudgeAttemptCountAfterTransport,
   nudgeAttemptCountAfterUnread,
   unreadEpisodeRestartedBetweenTicks,
 } from "../bin/codex-autodrain-poller.ts";
@@ -36,39 +35,6 @@ describe("nudge budget is bounded for one unread episode", () => {
 
   test("a lane first observed with unread mail has no fabricated attempts", () => {
     expect(nudgeAttemptCountAfterUnread(undefined, 7)).toBeUndefined();
-  });
-});
-
-describe("every transport attempt consumes nudge budget", () => {
-  test("an unconfirmed submission still consumes one bounded attempt", () => {
-    expect(nudgeAttemptCountAfterTransport(2, "submit-failed")).toBe(3);
-  });
-
-  test("a confirmed submission consumes exactly one attempt", () => {
-    expect(nudgeAttemptCountAfterTransport(2, "submitted")).toBe(3);
-  });
-
-  test("the first confirmed submission starts the budget at one", () => {
-    expect(nudgeAttemptCountAfterTransport(undefined, "submitted")).toBe(1);
-  });
-
-  test("a safety skip consumes no attempt", () => {
-    expect(nudgeAttemptCountAfterTransport(2, "skipped")).toBe(2);
-    expect(nudgeAttemptCountAfterTransport(undefined, "skipped")).toBeUndefined();
-  });
-
-  test("one complete episode exhausts, stays exhausted, then resets at zero", () => {
-    let attempts: number | undefined;
-    for (let count = 0; count < MAX; count++) {
-      attempts = nudgeAttemptCountAfterTransport(attempts, "submitted");
-    }
-    expect(attempts).toBe(MAX);
-    expect(nudgeAttemptCountAfterUnread(attempts, 9)).toBe(MAX);
-    expect(nudgeAttemptCountAfterUnread(attempts, 2)).toBe(MAX);
-
-    attempts = nudgeAttemptCountAfterUnread(attempts, 0);
-    expect(attempts).toBeUndefined();
-    expect(nudgeAttemptCountAfterTransport(attempts, "submitted")).toBe(1);
   });
 });
 

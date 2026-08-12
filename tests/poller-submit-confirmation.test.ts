@@ -21,13 +21,19 @@
 
 import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   __nudgeAttemptCountForTest,
   __resetNudgeBudgetStateForTest,
   composerStillHolds,
+  loadNudgeBudgetState,
+  nudgeBudgetHealthStatus,
   submissionProbe,
   submitWakeOnlyNudge,
   tick,
+  writeHeartbeat,
   type Lane,
   type TickSnapshot,
 } from "../bin/codex-autodrain-poller.ts";
@@ -322,6 +328,133 @@ describe("the shipped poller is wake-only", () => {
     db.close();
   });
 
+  test("the hard cap survives a poller process restart", () => {
+    __resetNudgeBudgetStateForTest();
+    const root = mkdtempSync(join(tmpdir(), "claude-peers-nudge-budget-"));
+    const budgetPath = join(root, "budget.json");
+    const db = new Database(":memory:");
+    db.run(`CREATE TABLE peers (
+      id TEXT PRIMARY KEY, name TEXT, pid INTEGER NOT NULL, client_type TEXT NOT NULL,
+      tmux_pane_id TEXT, thread_id TEXT, seat_key TEXT, receiver_mode TEXT,
+      last_hook_seen_at TEXT, last_drain_at TEXT, unread_episode INTEGER NOT NULL DEFAULT 0
+    )`);
+    db.run("CREATE TABLE messages (id INTEGER PRIMARY KEY, to_id TEXT NOT NULL, sent_at TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0, delivered_at TEXT)");
+    db.run("INSERT INTO peers VALUES ('restart-seat', 'infra.restart', ?, 'codex', '%62', 'thread-restart', 'pane:infra:%62', 'codex-hook', NULL, NULL, 7)", [process.pid]);
+    db.run("INSERT INTO messages VALUES (1, 'restart-seat', '2026-08-12T00:00:00.000Z', 0, NULL)");
+    const snap: TickSnapshot = {
+      procs: [{ pid: process.pid, ppid: 1, args: "codex resume" }],
+      paneByPid: new Map([["%62", process.pid]]),
+      paneMap: new Map([[process.pid, {
+        session: "infra", window_index: "1", window_name: "peers", pane_index: "14", pane_id: "%62",
+      }]]),
+    };
+    let now = 100_000;
+    let submissions = 0;
+    const runTick = () => {
+      now += 61_000;
+      tick(db, snap, {
+        nudgeableClients: ["codex"], isPidAlive: () => true, paneIsIdle: () => true,
+        now: () => now, nudgeLane: () => {
+          const onDisk = JSON.parse(readFileSync(budgetPath, "utf8"));
+          expect(onDisk.peers["restart-seat"].attempts).toBe(submissions + 1);
+          submissions++;
+          return "submitted";
+        },
+      });
+    };
+
+    try {
+      expect(loadNudgeBudgetState(budgetPath)).toBe(true);
+      for (let count = 0; count < 5; count++) runTick();
+      expect(submissions).toBe(5);
+      expect(statSync(budgetPath).mode & 0o777).toBe(0o600);
+
+      // Temporarily removing Codex from NUDGE_CLIENTS is not a mailbox drain.
+      // The durable ledger must survive that absence as well as a process exit.
+      tick(db, snap, {
+        nudgeableClients: ["claude"], isPidAlive: () => true, paneIsIdle: () => true,
+        now: () => now, nudgeLane: () => { submissions++; return "submitted"; },
+      });
+      expect(submissions).toBe(5);
+
+      // Simulate a new poller process: all in-memory maps disappear, then the
+      // daemon reloads the atomic ledger before its first tick.
+      __resetNudgeBudgetStateForTest();
+      expect(loadNudgeBudgetState(budgetPath)).toBe(true);
+      expect(__nudgeAttemptCountForTest("restart-seat")).toBe(5);
+      runTick();
+      expect(submissions).toBe(5);
+      expect(__nudgeAttemptCountForTest("restart-seat")).toBe(6);
+
+      db.run("UPDATE messages SET delivered = 1, delivered_at = '2026-08-12T00:01:00.000Z' WHERE id = 1");
+      db.run("DELETE FROM peers WHERE id = 'restart-seat'");
+      runTick();
+      expect(__nudgeAttemptCountForTest("restart-seat")).toBeUndefined();
+      __resetNudgeBudgetStateForTest();
+      expect(loadNudgeBudgetState(budgetPath)).toBe(true);
+      expect(__nudgeAttemptCountForTest("restart-seat")).toBeUndefined();
+    } finally {
+      __resetNudgeBudgetStateForTest();
+      db.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("an unreadable or unwritable durable ledger fails closed", () => {
+    const root = mkdtempSync(join(tmpdir(), "claude-peers-nudge-ledger-fail-"));
+    const corruptPath = join(root, "corrupt.json");
+    writeFileSync(corruptPath, "", { mode: 0o600 });
+    expect(loadNudgeBudgetState(corruptPath)).toBe(false);
+    expect(nudgeBudgetHealthStatus()).toBe("degraded");
+    writeHeartbeat();
+    const heartbeatPath = process.env.CLAUDE_PEERS_AUTODRAIN_HEARTBEAT
+      ?? `${process.env.HOME}/.claude-peers-autodrain.heartbeat`;
+    expect(readFileSync(heartbeatPath, "utf8")).toContain("nudge_budget=degraded");
+
+    const db = new Database(":memory:");
+    db.run(`CREATE TABLE peers (
+      id TEXT PRIMARY KEY, name TEXT, pid INTEGER NOT NULL, client_type TEXT NOT NULL,
+      tmux_pane_id TEXT, thread_id TEXT, seat_key TEXT, receiver_mode TEXT,
+      last_hook_seen_at TEXT, last_drain_at TEXT, unread_episode INTEGER NOT NULL DEFAULT 0
+    )`);
+    db.run("CREATE TABLE messages (id INTEGER PRIMARY KEY, to_id TEXT NOT NULL, sent_at TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0, delivered_at TEXT)");
+    db.run("INSERT INTO peers VALUES ('closed-seat', 'infra.closed', ?, 'codex', '%63', 'thread-closed', 'pane:infra:%63', 'codex-hook', NULL, NULL, 1)", [process.pid]);
+    db.run("INSERT INTO messages VALUES (1, 'closed-seat', '2026-08-12T00:00:00.000Z', 0, NULL)");
+    const snap: TickSnapshot = {
+      procs: [{ pid: process.pid, ppid: 1, args: "codex resume" }],
+      paneByPid: new Map([["%63", process.pid]]),
+      paneMap: new Map([[process.pid, {
+        session: "infra", window_index: "1", window_name: "peers", pane_index: "15", pane_id: "%63",
+      }]]),
+    };
+    let submissions = 0;
+    const deps = {
+      nudgeableClients: ["codex"], isPidAlive: () => true, paneIsIdle: () => true,
+      now: () => 200_000, nudgeLane: () => { submissions++; return "submitted" as const; },
+    };
+    try {
+      tick(db, snap, deps);
+      expect(submissions).toBe(0);
+
+      __resetNudgeBudgetStateForTest();
+      const freshPath = join(root, "fresh.json");
+      expect(loadNudgeBudgetState(freshPath)).toBe(true);
+      expect(existsSync(freshPath)).toBe(true);
+      expect(statSync(freshPath).mode & 0o777).toBe(0o600);
+      tick(db, snap, deps);
+      expect(submissions).toBe(1);
+
+      __resetNudgeBudgetStateForTest();
+      expect(loadNudgeBudgetState(join(root, "missing", "budget.json"))).toBe(false);
+      tick(db, snap, deps);
+      expect(submissions).toBe(1);
+    } finally {
+      __resetNudgeBudgetStateForTest();
+      db.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("failed wake transports receive cooldown and stop at the same hard cap", () => {
     __resetNudgeBudgetStateForTest();
     const db = new Database(":memory:");
@@ -360,7 +493,7 @@ describe("the shipped poller is wake-only", () => {
     db.close();
   });
 
-  test("skips are free, while failed and confirmed transport attempts share one budget", () => {
+  test("copy-mode safety skips are free, while failed and confirmed transports share one budget", () => {
     __resetNudgeBudgetStateForTest();
     const db = new Database(":memory:");
     db.run(`CREATE TABLE peers (
@@ -379,14 +512,15 @@ describe("the shipped poller is wake-only", () => {
       }]]),
     };
     let now = 100_000;
-    const outcomes = ["submit-failed", "skipped", "submitted"] as const;
+    const outcomes = ["submit-failed", "submitted"] as const;
     let calls = 0;
-    const runTick = () => {
+    const runTick = (copyMode = false) => {
       now += 61_000;
       tick(db, snap, {
         nudgeableClients: ["codex"],
         isPidAlive: () => true,
         paneIsIdle: () => true,
+        paneIsInCopyMode: () => copyMode,
         now: () => now,
         nudgeLane: () => outcomes[calls++]!,
       });
@@ -394,7 +528,7 @@ describe("the shipped poller is wake-only", () => {
 
     runTick();
     expect(__nudgeAttemptCountForTest("mixed-seat")).toBe(1);
-    runTick();
+    runTick(true);
     expect(__nudgeAttemptCountForTest("mixed-seat")).toBe(1);
     runTick();
     expect(__nudgeAttemptCountForTest("mixed-seat")).toBe(2);
@@ -402,7 +536,7 @@ describe("the shipped poller is wake-only", () => {
       nudgeableClients: ["codex"], isPidAlive: () => true, paneIsIdle: () => true,
       now: () => now, nudgeLane: () => { calls++; return "submitted"; },
     });
-    expect(calls).toBe(3);
+    expect(calls).toBe(2);
     expect(db.query("SELECT delivered FROM messages WHERE id = 1").get()).toEqual({ delivered: 0 });
     db.close();
   });
