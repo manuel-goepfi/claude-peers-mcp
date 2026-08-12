@@ -171,12 +171,14 @@ describe("codex-seat launcher", () => {
     );
   });
 
-  test("strips a bare --remote unix:// (shared default app-server) and warns, keeping explicit endpoints", () => {
-    // The bare form targets Codex's days-old shared app-server whose MCP state
-    // is typically dead — a lane attached there has no peers tools for its
-    // whole life ("Transport closed") and TUI restarts can never fix it. The
-    // launcher treats the bare form as "wants remote hosting" and provides the
-    // pane-local seat instead; a named endpoint remains a deliberate choice.
+  test("a bare --remote unix:// passes through with a trade-off warning, never a redirect", () => {
+    // The bare form is a DELIBERATE choice of the shared default app-server —
+    // it is how a terminal TUI and Codex Desktop attach to the same session,
+    // which a pane-local seat cannot provide. The wrapper's job is to name the
+    // trade (peers tools depend on that host's per-thread MCP health), not to
+    // override the operator's topology. An earlier revision silently
+    // redirected the bare form to the seat and broke the Desktop co-attach
+    // workflow; this test pins the passthrough contract.
     const { root, state, fakeCodex } = fixture();
     const bin = join(root, "bin");
     Bun.spawnSync(["mkdir", "-p", bin]);
@@ -193,21 +195,21 @@ describe("codex-seat launcher", () => {
       FAKE_CODEX_RECORD_ONLY: "1",
     };
 
-    // Bare form (both spellings) is stripped before dispatch: the noninteractive
-    // exec passes through WITHOUT the poisoned flag, and the operator is told.
+    // Bare form (both spellings): warn, then hand Codex the args VERBATIM.
     const bare = Bun.spawnSync([LAUNCHER, "--remote", "unix://", "exec", "--json"], { env, stdout: "pipe", stderr: "pipe" });
     expect(bare.exitCode).toBe(0);
-    expect(new TextDecoder().decode(bare.stderr)).toContain("stale-MCP footgun");
-    expect(readFileSync(join(state, "tui.args"), "utf8")).toBe("exec\n--json\n");
+    expect(new TextDecoder().decode(bare.stderr)).toContain("Desktop co-attach");
+    expect(readFileSync(join(state, "tui.args"), "utf8")).toBe("--remote\nunix://\nexec\n--json\n");
 
     const bareEq = Bun.spawnSync([LAUNCHER, "--remote=unix://", "exec", "--json"], { env, stdout: "pipe", stderr: "pipe" });
     expect(bareEq.exitCode).toBe(0);
-    expect(new TextDecoder().decode(bareEq.stderr)).toContain("stale-MCP footgun");
+    expect(new TextDecoder().decode(bareEq.stderr)).toContain("Desktop co-attach");
+    expect(readFileSync(join(state, "tui.args"), "utf8")).toBe("--remote=unix://\nexec\n--json\n");
 
-    // An explicit endpoint is a deliberate target: passthrough, no warning.
+    // An explicit endpoint stays a silent deliberate choice: no warning at all.
     const explicit = Bun.spawnSync([LAUNCHER, "--remote", "ws://127.0.0.1:41999", "exec", "--json"], { env, stdout: "pipe", stderr: "pipe" });
     expect(explicit.exitCode).toBe(0);
-    expect(new TextDecoder().decode(explicit.stderr)).not.toContain("stale-MCP footgun");
+    expect(new TextDecoder().decode(explicit.stderr)).not.toContain("Desktop co-attach");
     expect(readFileSync(join(state, "tui.args"), "utf8")).toBe("--remote\nws://127.0.0.1:41999\nexec\n--json\n");
   });
 

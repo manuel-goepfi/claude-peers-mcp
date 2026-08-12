@@ -91,36 +91,22 @@ passthrough_command=""
 seen_cd=0
 seen_remote=0
 unknown_option=0
-# Bare `--remote unix://` names Codex's DEFAULT shared app-server socket. That
-# host is typically days old and carries dead MCP state (a lane attached there
-# has NO peers tools — "Transport closed" — and restarting the TUI can never
-# fix it, because the MCP servers live in the shared host). Nobody who types
-# the bare form is choosing that host deliberately; they are asking for remote
-# hosting, which the pane-local seat below provides against a FRESH per-pane
-# app-server. So strip the bare form and take the seat. An explicit endpoint
-# (ws://host:port, wss://, unix://PATH) still passes through untouched, and
-# CLAUDE_PEERS_CODEX_SEAT=0 in the shell wrapper bypasses this script entirely.
-stripped=()
-skip_next=0
-stripped_bare_remote=0
+# Bare `--remote unix://` names Codex's DEFAULT shared app-server socket. The
+# operator chooses it DELIBERATELY: it is how a terminal TUI and Codex Desktop
+# attach to the SAME session (one thread, two screens) — a pane-local seat
+# cannot provide that. So the bare form passes through like any explicit
+# endpoint. The trade is peers-tool health: MCP servers live per-thread in
+# that shared host, a resumed thread whose MCP died stays mute, and no TUI
+# restart revives it — hook RECEIVE keeps working either way. Warn so a mute
+# lane is a known trade, never a mystery. (An earlier revision silently
+# redirected the bare form to the seat; that broke the Desktop co-attach
+# workflow and is exactly the kind of intent-override this wrapper must not do.)
 for token in "$@"; do
-  if (( skip_next )); then
-    skip_next=0
-    [[ "$token" == "unix://" ]] && { stripped_bare_remote=1; continue; }
-    stripped+=(--remote "$token")
-    continue
+  if [[ "$token" == "unix://" || "$token" == "--remote=unix://" ]]; then
+    printf 'codex-seat: attaching to the shared default app-server (Desktop co-attach). Peers TOOLS depend on that host'"'"'s per-thread MCP: fresh threads spawn fresh MCP; a resumed thread whose MCP died stays send-mute (hook receive still works). For a guaranteed-fresh seat, launch without --remote.\n' >&2
+    break
   fi
-  case "$token" in
-    --remote) skip_next=1; continue ;;
-    --remote=unix://) stripped_bare_remote=1; continue ;;
-  esac
-  stripped+=("$token")
 done
-if (( skip_next )); then stripped+=(--remote); fi   # trailing valueless flag: preserve for clap's own error
-if (( stripped_bare_remote )); then
-  printf 'codex-seat: bare --remote unix:// targets the shared default app-server (stale-MCP footgun); using a pane-local seat instead. Pass an explicit endpoint to override.\n' >&2
-  set -- ${stripped[@]+"${stripped[@]}"}
-fi
 
 arguments=("$@")
 argument_index=0
