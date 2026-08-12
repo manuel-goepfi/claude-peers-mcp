@@ -117,12 +117,9 @@ export function composeTmuxFromEnv(
   if (paneId && paneId.length > 0) {
     info.pane_id = paneId;
   }
-  // pane_index intentionally not forwarded — the cc bashrc wrapper exports
-  // PANE_ID (a stable %N identifier) rather than pane_index (an unstable
-  // display ordinal). Leaving pane_index undefined keeps the peer-name
-  // fallback in server.ts (envName ?? `${session}.${pane_index}`) honest:
-  // only the live tmux walk knows the per-window pane ordinal, so
-  // env-hint-only paths don't pretend to.
+  // pane_index intentionally not forwarded — the launcher exports PANE_ID (a
+  // stable %N identifier), while pane_index is an unstable display position.
+  // Seat identity and operator-label allocation must never depend on it.
   return info;
 }
 

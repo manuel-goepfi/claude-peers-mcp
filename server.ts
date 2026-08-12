@@ -987,7 +987,7 @@ async function ackClaimedInbox(batch: ClaimedInboxBatch, via: string): Promise<b
  *   1. CLAUDE_PEER_NAME env var (operator-set or wrapper-injected — bashrc
  *      cc/ccc/cccr wrappers pre-export this).
  *   2. Tmux operator label (`session.N`) read from @operator_label/@peer_label,
- *      or allocated from pane_index when the pane has no human label yet.
+ *      or allocated monotonically when the pane has no human label yet.
  *   3. Tmux pane-id fallback (`session.%N`) only when no human label can be
  *      resolved.
  *   4. observer-${pid} (PID-based final fallback — closes the spec §1.5
@@ -1084,13 +1084,23 @@ export function isHumanOperatorLabel(label: string | null, session: string): lab
 
 export function chooseOperatorLabel(
   session: string,
-  paneIndex: string | undefined,
+  _paneIndex: string | undefined,
   usedLabels: Iterable<string>,
   windowName?: string | null,
 ): string {
   const used = new Set<string>();
+  let highestOrdinal = 0;
   for (const label of usedLabels) {
-    if (isHumanOperatorLabel(label, session)) used.add(stripResolvedNameSuffix(label.trim()));
+    const base = stripResolvedNameSuffix(label.trim());
+    if (!base) continue;
+    used.add(base);
+    if (base.startsWith(`${session}.`)) {
+      const suffix = base.slice(session.length + 1);
+      const ordinal = /^[0-9]+$/.test(suffix) ? Number(suffix) : NaN;
+      if (Number.isSafeInteger(ordinal) && ordinal > 0 && ordinal < Number.MAX_SAFE_INTEGER) {
+        highestOrdinal = Math.max(highestOrdinal, ordinal);
+      }
+    }
   }
 
   // The operator's own window name wins when they chose one. It is the label on the
@@ -1102,15 +1112,29 @@ export function chooseOperatorLabel(
     if (!used.has(candidate)) return candidate;
   }
 
-  if (paneIndex && /^[0-9]+$/.test(paneIndex)) {
-    const paneIndexLabel = `${session}.${paneIndex}`;
-    if (!used.has(paneIndexLabel)) return paneIndexLabel;
-  }
+  // Pane indexes are display positions: splitting or closing panes renumbers
+  // them. Allocate after the highest live ordinal so a fresh pane never adopts
+  // a closed pane's identity or changes meaning when the layout is rearranged.
+  return `${session}.${highestOrdinal + 1}`;
+}
 
-  for (let n = 1; ; n++) {
-    const candidate = `${session}.${n}`;
-    if (!used.has(candidate)) return candidate;
-  }
+export function preservedTmuxOperatorLabel(
+  operatorLabel: string | null,
+  peerLabel: string | null,
+  session: string,
+): string | null {
+  // @operator_label is pane-scoped and explicitly sticky. Once present, keep it
+  // even if it predates today's session.N shape; re-deriving a non-empty label
+  // makes a surviving pane change identity when layouts or naming rules change.
+  const explicit = cleanTmuxOptionValue(operatorLabel);
+  if (explicit) return explicit;
+
+  // @peer_label is broker-owned legacy state, so retain only a recognized human
+  // label and remove the broker's numeric collision suffix before promoting it.
+  const legacy = cleanTmuxOptionValue(peerLabel);
+  return isHumanOperatorLabel(legacy, session)
+    ? stripResolvedNameSuffix(legacy.trim())
+    : null;
 }
 
 function runTmux(args: string[]): string | null {
@@ -1380,11 +1404,17 @@ function resolveTmuxOperatorLabel(tmuxInfo: TmuxPaneInfo | null): string | null 
   if (!tmuxInfo?.session || !tmuxInfo.pane_id) return null;
 
   const paneTarget = tmuxInfo.pane_id;
-  const existing =
-    cleanTmuxOptionValue(readTmuxPaneOption(paneTarget, "@operator_label")) ??
-    cleanTmuxOptionValue(readTmuxPaneOption(paneTarget, "@peer_label"));
-  if (isHumanOperatorLabel(existing, tmuxInfo.session)) {
-    return stripResolvedNameSuffix(existing.trim());
+  const operatorLabel = readTmuxPaneOption(paneTarget, "@operator_label");
+  const existing = preservedTmuxOperatorLabel(
+    operatorLabel,
+    readTmuxPaneOption(paneTarget, "@peer_label"),
+    tmuxInfo.session,
+  );
+  if (existing) {
+    if (!cleanTmuxOptionValue(operatorLabel)) {
+      setTmuxPaneOption(paneTarget, "@operator_label", existing);
+    }
+    return existing;
   }
 
   const label = chooseOperatorLabel(

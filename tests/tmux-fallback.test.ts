@@ -1,21 +1,18 @@
 /**
- * Regression test for the tmux-derived peer-name fallback.
+ * Regression test for tmux pane metadata used by the peer-name fallback.
  *
  * Bug: a Claude launched outside the bashrc cc/ccc/cccr wrappers gets no
- * CLAUDE_PEER_NAME env var and would register with name=null — unfindable
- * by name, only by id. Mirrors bashrc:162-168's #S.#P logic at the MCP
- * layer (server.ts main()) so the floor is consistent regardless of how
- * the session was started.
+ * CLAUDE_PEER_NAME env var and still needs a stable pane plus session-wide
+ * label allocation. pane_index remains available as display metadata, but it
+ * is never a stable seat identity because splits and closes renumber it.
  *
  * The wiring lives in two places:
  *   1. shared/tmux.ts parseTmuxPanes — accepts an optional 5th tab field
  *      (pane_index) without breaking 4-field callers.
- *   2. server.ts main() — composes peerName as envName ?? `${session}.${pane_index}`.
+ *   2. server.ts — ignores pane_index when allocating sticky operator labels.
  *
- * This file tests #1 directly. The server.ts composition path is too
- * heavy to spin up in a unit test (would import all of server.ts and
- * trigger main()'s side effects), so it's covered by manual E2E smoke
- * checks documented in the implementation plan.
+ * This file tests the parser contract; operator-label behavior is covered by
+ * operator-label-naming.test.ts.
  */
 
 import { describe, test, expect } from "bun:test";
@@ -67,15 +64,11 @@ describe("parseTmuxPanes — pane_index fallback support", () => {
     expect(info.pane_index).toBeUndefined();
   });
 
-  test("composed peer-name reflects #S.#P shape used by bashrc", () => {
-    // End-to-end shape check: simulate what server.ts main() does after
-    // detectTmuxPane resolves the ancestry. If this test ever fails, the
-    // operator's manzoopsinfra.1 / manzoopsinfra.2 addressing breaks.
-    const out = "12345\tmanzoopsinfra\t1\tclaude\t2";
+  test("retains pane index only as descriptive layout metadata", () => {
+    const out = "12345\tmanzoopsinfra\t1\tclaude\t2\t%42";
     const info = parseTmuxPanes(out).get(12345)!;
-    const composed =
-      info && info.pane_index ? `${info.session}.${info.pane_index}` : null;
-    expect(composed).toBe("manzoopsinfra.2");
+    expect(info.pane_index).toBe("2");
+    expect(info.pane_id).toBe("%42");
   });
 
   test("type contract: TmuxPaneInfo treats pane_index as optional", () => {

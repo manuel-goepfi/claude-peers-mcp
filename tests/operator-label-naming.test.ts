@@ -14,7 +14,12 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { chooseOperatorLabel, isHumanOperatorLabel, isOperatorChosenWindowName } from "../server.ts";
+import {
+  chooseOperatorLabel,
+  isHumanOperatorLabel,
+  isOperatorChosenWindowName,
+  preservedTmuxOperatorLabel,
+} from "../server.ts";
 
 describe("isOperatorChosenWindowName", () => {
   test("accepts labels the operator clearly chose", () => {
@@ -58,12 +63,38 @@ describe("chooseOperatorLabel", () => {
     expect(chooseOperatorLabel("C5_lanes", "1", used, "REVIEW-1996")).toBe("C5_lanes.3");
   });
 
+  test("allocates after the highest live ordinal instead of reusing a closed-pane gap", () => {
+    expect(chooseOperatorLabel("traffic", "1", ["traffic.2", "traffic.5"], "bash")).toBe("traffic.6");
+  });
+
+  test("pane index changes never rename the next seat", () => {
+    const used = ["traffic.2", "traffic.5"];
+    expect(chooseOperatorLabel("traffic", "1", used, "bash")).toBe("traffic.6");
+    expect(chooseOperatorLabel("traffic", "9", used, "bash")).toBe("traffic.6");
+  });
+
+  test("ignores unsafe numeric suffixes instead of emitting an imprecise ordinal", () => {
+    expect(chooseOperatorLabel("traffic", "1", ["traffic.9007199254740992"], "bash")).toBe("traffic.1");
+  });
+
   test("the collision that actually happened: seeing siblings prevents it", () => {
     // Each lane is pane_index 1 in its own window. Blind to siblings (the pre--s
     // behaviour) they all chose C5_lanes.1; seeing them, they separate.
     expect(chooseOperatorLabel("C5_lanes", "1", [], "claude")).toBe("C5_lanes.1");
     expect(chooseOperatorLabel("C5_lanes", "1", ["C5_lanes.1"], "claude")).toBe("C5_lanes.2");
     expect(chooseOperatorLabel("C5_lanes", "1", ["C5_lanes.1", "C5_lanes.2"], "claude")).toBe("C5_lanes.3");
+  });
+});
+
+describe("preservedTmuxOperatorLabel", () => {
+  test("keeps every non-empty pane-scoped operator label verbatim", () => {
+    expect(preservedTmuxOperatorLabel("traffic.1.3", "traffic.9", "traffic")).toBe("traffic.1.3");
+    expect(preservedTmuxOperatorLabel("human.pr", null, "traffic")).toBe("human.pr");
+  });
+
+  test("promotes only a recognized legacy peer label", () => {
+    expect(preservedTmuxOperatorLabel(null, "traffic.2#4", "traffic")).toBe("traffic.2");
+    expect(preservedTmuxOperatorLabel(null, "traffic.%24", "traffic")).toBeNull();
   });
 });
 

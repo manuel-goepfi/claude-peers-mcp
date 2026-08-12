@@ -338,16 +338,16 @@ describe("Operator-label fallback — human name first, pane_id metadata last", 
     expect(isHumanOperatorLabel("marketing.2", "infra")).toBe(false);
   });
 
-  test("operator-label allocation prefers pane_index when it is free", () => {
-    expect(chooseOperatorLabel("infra", "2", ["infra.1", "infra.3"])).toBe("infra.2");
+  test("operator-label allocation ignores pane_index and advances past the highest live ordinal", () => {
+    expect(chooseOperatorLabel("infra", "2", ["infra.1", "infra.3"])).toBe("infra.4");
   });
 
-  test("operator-label allocation falls back to the lowest free session.N", () => {
+  test("operator-label allocation advances monotonically when prior labels exist", () => {
     expect(chooseOperatorLabel("infra", "2", ["infra.1", "infra.2", "infra.2#4"])).toBe("infra.3");
   });
 
   test("operator-label allocation ignores pane-id-shaped broker fallbacks as human seats", () => {
-    expect(chooseOperatorLabel("infra", "2", ["infra.%19", "infra.%24"])).toBe("infra.2");
+    expect(chooseOperatorLabel("infra", "2", ["infra.%19", "infra.%24"])).toBe("infra.1");
   });
 
   test("resolved-name suffix stripping is limited to broker numeric suffixes", () => {
