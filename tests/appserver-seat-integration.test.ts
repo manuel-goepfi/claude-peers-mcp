@@ -158,7 +158,8 @@ const canUseTmux = Bun.spawnSync(["tmux", "list-sessions"], { stdout: "ignore", 
   try {
     const created = Bun.spawnSync([
       "tmux", "new-session", "-d", "-s", session, "-c", cwd,
-      "env", "CLAUDE_PEER_NAME=stale-launch-name", "bash", "-c", "exec -a codex sleep 60",
+      "bash", "-c",
+      'export CLAUDE_PEER_NAME=stale-launch-name CLAUDE_PEER_TMUX_PANE_ID="$TMUX_PANE"; unset TMUX_PANE; exec -a codex sleep 60',
     ], { stdout: "pipe", stderr: "pipe" });
     expect(created.exitCode).toBe(0);
 
@@ -181,7 +182,7 @@ const canUseTmux = Bun.spawnSync(["tmux", "list-sessions"], { stdout: "ignore", 
       await Bun.sleep(25);
     }
     expect(visibleCodexReady).toBe(true);
-    expect(await Bun.file(`/proc/${panePid}/environ`).text()).toContain(`TMUX_PANE=${paneId}\0`);
+    expect(await Bun.file(`/proc/${panePid}/environ`).text()).toContain(`CLAUDE_PEER_TMUX_PANE_ID=${paneId}\0`);
     expect(new TextDecoder().decode(Bun.spawnSync(["readlink", `/proc/${panePid}/cwd`]).stdout).trim()).toBe(cwd);
     expect(Bun.spawnSync([
       "tmux", "set-option", "-p", "-t", paneId!, "@operator_label", "infra.9",
