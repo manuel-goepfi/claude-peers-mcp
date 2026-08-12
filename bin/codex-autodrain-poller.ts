@@ -282,11 +282,6 @@ const legacyCodexWakeWarned = new Set<string>(); // compatibility metadata is vi
 // a process-lifetime cap rather than a per-window one).
 const bootstrapNudged = new Set<string>();
 
-// Last observed unread count per lane, so a RISING count can restore a lane's
-// nudge budget. Pruned with the other per-lane maps when a lane leaves the set.
-const lastUnreadSeen = new Map<string, number>();
-       // peer id -> already got its one bootstrap nudge
-
 // A1 nudge-storm guard (pure, exported for unit testing). A zero-mail lane is in
 // the nudge set only via the NULL-hook bootstrap path; once it has had its one
 // bootstrap nudge, block it (re-nudging a still-deaf lane just bombs the pane). A
@@ -1127,6 +1122,30 @@ function submitPaneText(paneId: string, text: string): boolean {
 
 export type WakeOnlyNudgeResult = "submitted" | "submit-failed";
 
+/** Keep one bounded attempt budget for the entire non-zero unread episode. */
+export function nudgeAttemptCountAfterUnread(
+  current: number | undefined,
+  unread: number,
+): number | undefined {
+  return unread <= 0 ? undefined : current;
+}
+
+/** Only an observed TUI submission consumes an attempt. */
+export function nudgeAttemptCountAfterSubmit(
+  current: number | undefined,
+  result: "submitted",
+): number;
+export function nudgeAttemptCountAfterSubmit(
+  current: number | undefined,
+  result: WakeOnlyNudgeResult,
+): number | undefined;
+export function nudgeAttemptCountAfterSubmit(
+  current: number | undefined,
+  result: WakeOnlyNudgeResult,
+): number | undefined {
+  return result === "submitted" ? (current ?? 0) + 1 : current;
+}
+
 export interface WakeOnlyNudgeDeps {
   submit?: (paneId: string, text: string) => boolean;
 }
@@ -1158,14 +1177,16 @@ function nudge(lane: Lane, paneId: string): void {
   // "check msgs" opens the "(goto line)" prompt over the operator's status bar
   // (recurring 2026-07-22). Skip; the next tick retries after they scroll out.
   if (paneIsInCopyMode(paneId)) { log(`skip nudge ${tag} — pane in copy-mode (operator scrolled)`); return; }
-  if (submitWakeOnlyNudge(lane, paneId) !== "submitted") {
+  const result = submitWakeOnlyNudge(lane, paneId);
+  if (result !== "submitted") {
     // An unobserved wake does not consume cooldown/attempt budget. The poller's
     // read-only mailbox relationship guarantees the queue remains intact.
     log(`wake submit unconfirmed for ${tag} — not counting; mailbox remains queued`);
     return;
   }
   lastNudge.set(lane.id, Date.now());
-  nudgeAttempts.set(lane.id, (nudgeAttempts.get(lane.id) ?? 0) + 1);
+  const attempts = nudgeAttemptCountAfterSubmit(nudgeAttempts.get(lane.id), result);
+  nudgeAttempts.set(lane.id, attempts);
   // A zero-mail nudge is a bootstrap (hook-wake) nudge — record it so the lane is
   // never bootstrap-nudged again (A1 lifetime cap). A real-mail nudge does NOT set
   // this, so a lane that later receives actual mail still nudges normally.
@@ -1203,36 +1224,14 @@ export function tick(db: Database, snapOverride?: TickSnapshot, deps: TickDeps =
   // to current lanes so they cannot grow unbounded over a multi-day run.
   const active = new Set(lanes.map((l) => l.id));
   for (const id of nudgeAttempts.keys()) if (!active.has(id)) nudgeAttempts.delete(id);
-  // A NULL-hook lane stays in the set even at 0 unread (the bootstrap clause),
-  // so leaving-the-set is NOT a reliable "mail cleared" signal for it: without
-  // this reset such a lane kept its attempt count forever and, once it hit
-  // MAX_NUDGE_ATTEMPTS, was never nudged again for FUTURE mail until a poller
-  // restart (observed on launch.4: "giving up ... still 0 unread").
-  for (const lane of lanes) if (lane.unread <= 0) nudgeAttempts.delete(lane.id);
-  // NEW MAIL ALSO RESTORES THE BUDGET — otherwise give-up is a one-way door for
-  // exactly the lanes that cannot rescue themselves.
-  //
-  // The reset above fires only when the queue reaches ZERO. A manual-drain lane
-  // clears its queue by being nudged, so once it hits MAX_NUDGE_ATTEMPTS with mail
-  // still queued it can never earn its way out: no nudge -> no drain -> unread
-  // never reaches 0 -> counter never resets -> no nudge. Permanently deaf until the
-  // poller process restarts. Live instance 2026-08-01: "giving up on orch.1: 5
-  // nudges, still 4 unread", after which the operator had to ask that lane to drain
-  // by hand.
-  //
-  // A rising unread count is proof the lane is still being talked to, and a fresh
-  // message deserves a fresh attempt budget. This does NOT re-open keystroke
-  // bombing: the cap still applies per batch, and a lane whose queue never grows
-  // stays given-up exactly as before.
+  // A budget belongs to one continuous non-zero unread episode. New senders and
+  // partial drains cannot replenish it; only reaching zero (or the lane leaving
+  // the active set above) starts a fresh future episode.
   for (const lane of lanes) {
-    const previous = lastUnreadSeen.get(lane.id);
-    if (previous !== undefined && lane.unread > previous && nudgeAttempts.has(lane.id)) {
-      log(`new mail for ${lane.name ?? lane.id} (${previous} -> ${lane.unread}) — restoring nudge budget`);
-      nudgeAttempts.delete(lane.id);
-    }
-    lastUnreadSeen.set(lane.id, lane.unread);
+    const attempts = nudgeAttemptCountAfterUnread(nudgeAttempts.get(lane.id), lane.unread);
+    if (attempts === undefined) nudgeAttempts.delete(lane.id);
+    else nudgeAttempts.set(lane.id, attempts);
   }
-  for (const id of lastUnreadSeen.keys()) if (!active.has(id)) lastUnreadSeen.delete(id);
   for (const id of lastNudge.keys()) if (!active.has(id)) lastNudge.delete(id);
   for (const id of unreadyCodexWakeWarned) if (!active.has(id)) unreadyCodexWakeWarned.delete(id);
   for (const id of legacyCodexWakeWarned) if (!active.has(id)) legacyCodexWakeWarned.delete(id);
