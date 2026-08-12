@@ -11,6 +11,7 @@ import {
   retentionPurgeSql,
   STORAGE_SCHEMA_VERSION,
   storageIndexes,
+  storageTriggers,
   storageSnapshot,
   storageUserVersion,
   unknownReceiverPurgeSql,
@@ -89,7 +90,58 @@ describe("versioned historical-message migration", () => {
     expect(result.backupPath).toBeUndefined();
     expect((db.query("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(STORAGE_SCHEMA_VERSION);
     expect(db.query("PRAGMA foreign_key_list(messages)").all()).toHaveLength(0);
+    expect(db.query("SELECT name FROM sqlite_master WHERE type='trigger' AND name=?").get(storageTriggers.unreadEpisode)).toEqual({ name: storageTriggers.unreadEpisode });
     expect(() => initializeStorage(db, { databasePath: dbPath })).not.toThrow();
+    db.close();
+  });
+
+  test("unread episodes distinguish same-millisecond overlap from drain and refill", () => {
+    const dir = root();
+    const dbPath = join(dir, "unread-episodes.db");
+    const db = new Database(dbPath);
+    initializeStorage(db, { databasePath: dbPath });
+    db.run(`INSERT INTO peers (id,pid,cwd,summary,registered_at,last_seen)
+      VALUES ('receiver',1,'/','','2026-08-12T00:00:00.000Z','2026-08-12T00:00:00.000Z')`);
+    const send = db.prepare(`INSERT INTO messages (from_id,to_id,text,sent_at,delivered)
+      VALUES ('sender','receiver',?,'2026-08-12T00:00:00.000Z',0)`);
+
+    send.run("first");
+    send.run("overlap-before-partial-ack");
+    expect(db.query("SELECT unread_episode FROM peers WHERE id='receiver'").get()).toEqual({ unread_episode: 1 });
+    db.run("UPDATE messages SET delivered=1 WHERE text='first'");
+    expect(db.query("SELECT unread_episode FROM peers WHERE id='receiver'").get()).toEqual({ unread_episode: 1 });
+
+    db.run("UPDATE messages SET delivered=1 WHERE to_id='receiver'");
+    send.run("refill-after-zero");
+    expect(db.query("SELECT unread_episode FROM peers WHERE id='receiver'").get()).toEqual({ unread_episode: 2 });
+    db.close();
+  });
+
+  test("current-version startup additively restores the episode column and trigger", () => {
+    const dir = root();
+    const dbPath = join(dir, "current-additive.db");
+    const db = new Database(dbPath);
+    initializeStorage(db, { databasePath: dbPath });
+    db.run(`DROP TRIGGER ${storageTriggers.unreadEpisode}`);
+    db.run("ALTER TABLE peers DROP COLUMN unread_episode");
+    expect(storageUserVersion(db)).toBe(STORAGE_SCHEMA_VERSION);
+
+    expect(initializeStorage(db, { databasePath: dbPath })).toMatchObject({
+      version: STORAGE_SCHEMA_VERSION,
+      migrated: false,
+    });
+    expect(db.query("PRAGMA table_info(peers)").all())
+      .toContainEqual(expect.objectContaining({ name: "unread_episode" }));
+    expect(db.query("SELECT name FROM sqlite_master WHERE type='trigger' AND name=?").get(storageTriggers.unreadEpisode))
+      .toEqual({ name: storageTriggers.unreadEpisode });
+
+    db.run(`INSERT INTO peers (id,pid,cwd,summary,registered_at,last_seen)
+      VALUES ('receiver',1,'/','','2026-08-12T00:00:00.000Z','2026-08-12T00:00:00.000Z')`);
+    db.run(`INSERT INTO messages (from_id,to_id,text,sent_at,delivered)
+      VALUES ('sender','receiver','first','2026-08-12T00:00:00.000Z',0)`);
+    db.run(`INSERT INTO messages (from_id,to_id,text,sent_at,delivered)
+      VALUES ('sender','receiver','overlap','2026-08-12T00:00:00.000Z',0)`);
+    expect(db.query("SELECT unread_episode FROM peers WHERE id='receiver'").get()).toEqual({ unread_episode: 1 });
     db.close();
   });
 

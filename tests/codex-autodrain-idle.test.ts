@@ -539,6 +539,11 @@ import {
   threadIdFromCodexPaneStatus,
   visibleCodexSeatsFromSnapshot,
 } from "../bin/codex-autodrain-poller.ts";
+import type {
+  ReconcilePaneThreadRequest,
+  ReconcilePaneThreadResponse,
+  RegisterResponse,
+} from "../shared/types.ts";
 
 function codexSeatSnap() {
   return {
@@ -665,13 +670,19 @@ describe("threadIdFromCodexPaneStatus", () => {
       "• Finished the previous turn",
       "",
       "› Implement {feature}",
-      `peerstestfix · ${thread} · gpt-5.6-sol xhigh · Context 88% used`,
+      `peerstestfix · ${thread} · gpt-5.6-sol xhigh · Context 12% left · Context 88% used`,
     ].join("\n"))).toBe(thread);
+  });
+
+  test("accepts the live untitled shape where thread-title equals thread-id", () => {
+    expect(threadIdFromCodexPaneStatus(
+      `${thread} · ${thread} · gpt-5.6-sol high fast · Context 100% left · Context 0% used · weekly 14% left`,
+    )).toBe(thread);
   });
 
   test("fails quiet when thread-id is not configured", () => {
     expect(threadIdFromCodexPaneStatus(
-      "› Implement {feature}\npeerstestfix · gpt-5.6-sol xhigh · Context 88% used\n",
+      "› Implement {feature}\npeerstestfix · gpt-5.6-sol xhigh · Context 12% left · Context 88% used\n",
     )).toBeNull();
   });
 
@@ -679,22 +690,26 @@ describe("threadIdFromCodexPaneStatus", () => {
     expect(threadIdFromCodexPaneStatus([
       `Log mentioned ${thread}`,
       "› Implement {feature}",
-      "peerstestfix · gpt-5.6-sol xhigh · Context 88% used",
+      "peerstestfix · gpt-5.6-sol xhigh · Context 12% left · Context 88% used",
     ].join("\n"))).toBeNull();
   });
 
   test("rejects ambiguous or non-segment UUIDs", () => {
     expect(threadIdFromCodexPaneStatus(
-      `peerstestfix · ${thread} · 11111111-2222-4333-8444-555555555555 · model`,
+      `peerstestfix · ${thread} · 11111111-2222-4333-8444-555555555555 · Context 12% left · Context 88% used`,
     )).toBeNull();
     expect(threadIdFromCodexPaneStatus(
-      `peerstestfix-${thread} · gpt-5.6-sol xhigh · Context 88% used`,
+      `peerstestfix-${thread} · gpt-5.6-sol xhigh · Context 12% left · Context 88% used`,
     )).toBeNull();
+    expect(threadIdFromCodexPaneStatus(thread)).toBeNull();
+    expect(threadIdFromCodexPaneStatus(`transcript text · ${thread}`)).toBeNull();
+    expect(threadIdFromCodexPaneStatus(`assistant · ${thread} · finished`)).toBeNull();
+    expect(threadIdFromCodexPaneStatus(`› attacker · ${thread} · payload`)).toBeNull();
   });
 
   test("strips terminal color escapes before parsing", () => {
     expect(threadIdFromCodexPaneStatus(
-      `\u001b[2mpeerstestfix · ${thread} · gpt-5.6-sol xhigh\u001b[0m`,
+      `\u001b[2mpeerstestfix · ${thread} · gpt-5.6-sol xhigh · Context 12% left · Context 88% used\u001b[0m`,
     )).toBe(thread);
   });
 });
@@ -745,9 +760,10 @@ function visibleSeat(name = "pr.1", pid = 200) {
   };
 }
 
-function registerResponse(name = "pr.1") {
+function registerResponse(name = "pr.1"): RegisterResponse {
   return {
     id: `peer-${name}`,
+    token: `token-${name}`,
     name,
     resolved_name: name,
     client_type: "codex",
@@ -800,7 +816,7 @@ describe("reconcileVisibleCodexSeats", () => {
 
   test("binds an exact pane status thread after registering the visible seat", async () => {
     __resetCodexSeatReconcileStateForTest();
-    const posts: Array<{ path: string; body: any }> = [];
+    const posts: Array<{ path: string; body: unknown; peerToken?: string }> = [];
     const thread = "019ff65b-9ea6-7751-898a-9c645d30b1e6";
 
     await reconcileVisibleCodexSeats(emptySeatSnap(), {
@@ -810,27 +826,29 @@ describe("reconcileVisibleCodexSeats", () => {
       gitValue: async () => null,
       threadIdForPane: () => thread,
       callerPid: 999,
-      postBroker: async (path, body) => {
-        posts.push({ path, body });
-        return path === "/register" ? registerResponse() as any : {
+      postBroker: async <T>(path: string, body: unknown, peerToken?: string): Promise<T> => {
+        posts.push({ path, body, peerToken });
+        const response: RegisterResponse | ReconcilePaneThreadResponse = path === "/register" ? registerResponse() : {
           ok: true,
           id: "peer-pr.1",
           thread_id: thread,
           folded: 0,
           migrated: 0,
-        } as any;
+        };
+        return response as T;
       },
       publishBrokerIdentityToTmux: () => ({ ok: true, target: null, failedOptions: [] }),
     });
 
     expect(posts.map((post) => post.path)).toEqual(["/register", "/reconcile-pane-thread"]);
-    expect(posts[1]!.body).toEqual({
+    expect(posts[1]!.body as ReconcilePaneThreadRequest).toEqual({
       id: "peer-pr.1",
       pid: 200,
       caller_pid: 999,
       tmux_pane_id: "%200",
       thread_id: thread,
     });
+    expect(posts[1]!.peerToken).toBe("token-pr.1");
   });
 
   test("does not call the thread endpoint when status parsing fails quiet", async () => {
@@ -851,6 +869,58 @@ describe("reconcileVisibleCodexSeats", () => {
     });
 
     expect(paths).toEqual(["/register"]);
+  });
+
+  test("does not reconcile a three-segment transcript line that contains a UUID", async () => {
+    __resetCodexSeatReconcileStateForTest();
+    const paths: string[] = [];
+    const thread = "019ff65b-9ea6-7751-898a-9c645d30b1e6";
+
+    await reconcileVisibleCodexSeats(emptySeatSnap(), {
+      now: () => 50_000,
+      intervalMs: 10_000,
+      visibleSeats: () => [visibleSeat()],
+      gitValue: async () => null,
+      threadIdForPane: () => threadIdFromCodexPaneStatus(`assistant · ${thread} · finished`),
+      postBroker: async (path) => {
+        paths.push(path);
+        return registerResponse() as any;
+      },
+      publishBrokerIdentityToTmux: () => ({ ok: true, target: null, failedOptions: [] }),
+    });
+
+    expect(paths).toEqual(["/register"]);
+  });
+
+  test("production broker transport puts the registration token only on reconciliation", async () => {
+    __resetCodexSeatReconcileStateForTest();
+    const thread = "019ff65b-9ea6-7751-898a-9c645d30b1e6";
+    const requests: Array<{ url: string; headers: Headers }> = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = Object.assign(async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      const url = String(input);
+      requests.push({ url, headers: new Headers(init?.headers) });
+      const payload = url.endsWith("/register")
+        ? registerResponse()
+        : { ok: true, id: "peer-pr.1", thread_id: thread, folded: 0, migrated: 0 };
+      return Response.json(payload);
+    }, { preconnect: originalFetch.preconnect });
+    try {
+      await reconcileVisibleCodexSeats(emptySeatSnap(), {
+        now: () => 50_000,
+        intervalMs: 10_000,
+        visibleSeats: () => [visibleSeat()],
+        gitValue: async () => null,
+        threadIdForPane: () => thread,
+        publishBrokerIdentityToTmux: () => ({ ok: true, target: null, failedOptions: [] }),
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+
+    expect(requests.map((request) => new URL(request.url).pathname)).toEqual(["/register", "/reconcile-pane-thread"]);
+    expect(requests[0]!.headers.has("X-Peer-Token")).toBe(false);
+    expect(requests[1]!.headers.get("X-Peer-Token")).toBe("token-pr.1");
   });
 
   test("dry-run discovers seats but posts and publishes nothing", async () => {

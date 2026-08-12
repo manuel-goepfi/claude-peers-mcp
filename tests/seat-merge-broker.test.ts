@@ -156,6 +156,73 @@ describe("seat-anchored registration", () => {
     expect(migrated.n).toBe(1);
   });
 
+  test("a rolled-back seat fold preserves the duplicate rate bucket until commit", async () => {
+    const survivorPid = spawnHolder();
+    const duplicatePid = spawnHolder();
+    const newcomerPid = spawnHolder();
+    const receiverPid = spawnHolder();
+    const survivor = await register(survivorPid, { tmux_pane_id: "%718" });
+    const receiver = await register(receiverPid, { tmux_pane_id: "%719", name: "rate.receiver" });
+    const duplicateId = "rate-fold-duplicate";
+    const duplicateToken = "rate-fold-duplicate-token";
+    const writable = new Database(broker.dbPath);
+    writable.run(`
+      INSERT INTO peers (
+        id, pid, cwd, git_root, tty, summary, registered_at, last_seen,
+        name, tmux_session, tmux_window_index, tmux_window_name, token,
+        tmux_pane_id, resolved_name, absolute_git_dir, client_type,
+        receiver_mode, seat_key, seat_pids
+      )
+      SELECT ?, ?, cwd, git_root, tty, summary,
+             '2000-01-01T00:00:00.000Z', '2000-01-01T00:00:00.000Z',
+             name, tmux_session, tmux_window_index, tmux_window_name, ?,
+             tmux_pane_id, resolved_name, absolute_git_dir, client_type,
+             receiver_mode, seat_key, ?
+      FROM peers WHERE id = ?
+    `, [duplicateId, duplicatePid, duplicateToken, JSON.stringify([duplicatePid]), survivor.id]);
+    writable.close();
+    tokens.set(duplicateId, duplicateToken);
+
+    const sendAsDuplicate = () => fetch(`${broker.url}/send-message`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Peer-Token": duplicateToken },
+      body: JSON.stringify({
+        id: duplicateId,
+        from_id: duplicateId,
+        to_id: receiver.id,
+        text: "rate bucket probe",
+      }),
+    });
+    for (let count = 0; count < 60; count++) {
+      expect((await sendAsDuplicate()).status).toBe(200);
+    }
+    expect((await sendAsDuplicate()).status).toBe(429);
+
+    const triggerDb = new Database(broker.dbPath);
+    triggerDb.run(`
+      CREATE TRIGGER fail_late_seat_registration
+      BEFORE UPDATE OF seat_key ON peers
+      WHEN OLD.id = '${survivor.id}'
+      BEGIN
+        SELECT RAISE(ABORT, 'planted late seat registration failure');
+      END
+    `);
+    const failed = await register(newcomerPid, { tmux_pane_id: "%718" }) as unknown as { error?: string };
+    expect(failed.error).toBe("registration persistence failed");
+    expect(triggerDb.query("SELECT COUNT(*) AS count FROM peers WHERE id = ?").get(duplicateId))
+      .toEqual({ count: 1 });
+    expect((await sendAsDuplicate()).status).toBe(429);
+
+    const metricsBefore = await call<{ rate_limit_buckets: number }>("/metrics", { id: survivor.id });
+    triggerDb.run("DROP TRIGGER fail_late_seat_registration");
+    triggerDb.close();
+    const merged = await register(newcomerPid, { tmux_pane_id: "%718" });
+    expect(merged.id).toBe(survivor.id);
+    const metricsAfter = await call<{ rate_limit_buckets: number }>("/metrics", { id: survivor.id });
+    expect(metricsAfter.rate_limit_buckets).toBe(metricsBefore.rate_limit_buckets - 1);
+    expect((await sendAsDuplicate()).status).toBe(401);
+  });
+
   test("a LIVE row's id survives ahead of a newer dead one", async () => {
     // The shape left behind by every seat that duplicated before this fix, and
     // the shape sitting in the production database right now: one row whose

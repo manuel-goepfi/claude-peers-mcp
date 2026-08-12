@@ -267,6 +267,7 @@ export function paneQuiescent(paneId: string): boolean {
 
 const lastNudge = new Map<string, number>();  // peer id -> epoch ms of last nudge
 const nudgeAttempts = new Map<string, number>(); // peer id -> consecutive nudge count
+const nudgeEpisode = new Map<string, number>(); // peer id -> broker-authored unread episode
 const unreadyCodexWakeWarned = new Set<string>(); // avoid logging the same bad identity every tick
 const legacyCodexWakeWarned = new Set<string>(); // compatibility metadata is visible once, without log spam
 // A lane selected purely by the NULL-hook bootstrap path (zero unread mail, hook
@@ -323,7 +324,8 @@ const THREAD_UUID_SEGMENT_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}
 /**
  * Parse only the final non-empty pane line, where Codex renders configured
  * status-line items. A UUID elsewhere in the transcript is never identity
- * evidence, and zero/multiple exact UUID segments fail quiet.
+ * evidence. The title may equal the UUID for an untitled thread; all UUID
+ * segments must therefore agree with the fixed thread-id slot.
  */
 export function threadIdFromCodexPaneStatus(capture: string): string | null {
   const finalLine = capture
@@ -333,11 +335,24 @@ export function threadIdFromCodexPaneStatus(capture: string): string | null {
     .filter(Boolean)
     .at(-1);
   if (!finalLine) return null;
-  const matches = finalLine
+  const segments = finalLine
     .split(" · ")
-    .map((segment) => segment.trim())
-    .filter((segment) => THREAD_UUID_SEGMENT_RE.test(segment));
-  return matches.length === 1 ? matches[0]!.toLowerCase() : null;
+    .map((segment) => segment.trim());
+  // The managed status-line order is thread-title, thread-id, optional fields,
+  // then both context gauges. Position alone is not enough: transcript prose can
+  // contain the same separator and a UUID. Require the fixed thread slot plus
+  // the adjacent Codex context-gauge signature. Optional items (for example a
+  // branch or a temporarily unavailable usage limit) may disappear, so locate
+  // the gauges without assuming a total segment count.
+  if (!THREAD_UUID_SEGMENT_RE.test(segments[1] ?? "")) return null;
+  const remainingIndex = segments.findIndex((segment) => /^Context \d+% left$/.test(segment));
+  if (remainingIndex < 3 || !/^Context \d+% used$/.test(segments[remainingIndex + 1] ?? "")) return null;
+  const matches = new Set(
+    segments
+      .filter((segment) => THREAD_UUID_SEGMENT_RE.test(segment))
+      .map((segment) => segment.toLowerCase()),
+  );
+  return matches.size === 1 ? segments[1]!.toLowerCase() : null;
 }
 
 function threadIdForPane(paneId: string): string | null {
@@ -403,6 +418,7 @@ export interface Lane {
   seat_key: string | null;
   receiver_mode: string;
   unread: number;
+  unread_episode: number;
   last_hook_seen_at: string | null;  // NULL = drain hook never attached (needs bootstrap nudge)
 }
 
@@ -479,7 +495,7 @@ function lanesWithUnread(db: Database, nudgeableClients: string[] = NUDGEABLE_CL
   //      caller, so a permanently-stuck seat is not keystroke-bombed forever.
   return db.query(`
     SELECT p.id, p.name, p.pid, p.client_type, p.tmux_pane_id, p.thread_id,
-           p.seat_key, p.receiver_mode, p.last_hook_seen_at,
+           p.seat_key, p.receiver_mode, p.last_hook_seen_at, p.unread_episode,
            COUNT(m.id) AS unread
     FROM peers p
     LEFT JOIN messages m ON m.to_id = p.id AND m.delivered = 0
@@ -808,10 +824,12 @@ export async function gitValue(
   }
 }
 
-async function postBroker<T>(path: string, body: unknown): Promise<T> {
+async function postBroker<T>(path: string, body: unknown, peerToken?: string): Promise<T> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (peerToken) headers["X-Peer-Token"] = peerToken;
   const res = await fetch(`${BROKER_URL}${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers,
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(3000),
   });
@@ -826,7 +844,7 @@ async function postBroker<T>(path: string, body: unknown): Promise<T> {
 let lastCodexSeatReconcileAt = 0;
 let codexSeatReconcileInFlight = false;
 
-type PostBrokerFn = <T>(path: string, body: unknown) => Promise<T>;
+type PostBrokerFn = typeof postBroker;
 type PublishIdentityFn = typeof publishBrokerIdentityToTmux;
 
 export interface ReconcileVisibleCodexSeatsDeps {
@@ -897,7 +915,7 @@ export async function reconcileVisibleCodexSeats(snap: TickSnapshot, deps: Recon
             caller_pid: deps.callerPid ?? process.pid,
             tmux_pane_id: paneId,
             thread_id: threadId,
-          });
+          }, reg.token);
         }
       } catch (e) {
         log(`codex seat reconcile failed for ${seat.name} pid=${seat.pid} pane=${seat.tmux.pane_id ?? "?"}: ${e instanceof Error ? e.message : String(e)}`);
@@ -1121,6 +1139,7 @@ function submitPaneText(paneId: string, text: string): boolean {
 }
 
 export type WakeOnlyNudgeResult = "submitted" | "submit-failed";
+export type NudgeLaneResult = WakeOnlyNudgeResult | "skipped";
 
 /** Keep one bounded attempt budget for the entire non-zero unread episode. */
 export function nudgeAttemptCountAfterUnread(
@@ -1130,20 +1149,28 @@ export function nudgeAttemptCountAfterUnread(
   return unread <= 0 ? undefined : current;
 }
 
-/** Only an observed TUI submission consumes an attempt. */
-export function nudgeAttemptCountAfterSubmit(
+/** Detect a broker-observed zero-to-nonzero boundary between poller ticks. */
+export function unreadEpisodeRestartedBetweenTicks(
+  observedEpisode: number,
+  currentEpisode: number,
+): boolean {
+  return currentEpisode !== observedEpisode;
+}
+
+/** Every real paste/Enter transport attempt is bounded; safety skips are free. */
+export function nudgeAttemptCountAfterTransport(
   current: number | undefined,
-  result: "submitted",
+  result: WakeOnlyNudgeResult,
 ): number;
-export function nudgeAttemptCountAfterSubmit(
+export function nudgeAttemptCountAfterTransport(
   current: number | undefined,
-  result: WakeOnlyNudgeResult,
+  result: NudgeLaneResult,
 ): number | undefined;
-export function nudgeAttemptCountAfterSubmit(
+export function nudgeAttemptCountAfterTransport(
   current: number | undefined,
-  result: WakeOnlyNudgeResult,
+  result: NudgeLaneResult,
 ): number | undefined {
-  return result === "submitted" ? (current ?? 0) + 1 : current;
+  return result === "skipped" ? current : (current ?? 0) + 1;
 }
 
 export interface WakeOnlyNudgeDeps {
@@ -1169,29 +1196,26 @@ export function submitWakeOnlyNudge(
   }
 }
 
-function nudge(lane: Lane, paneId: string): void {
+function nudge(lane: Lane, paneId: string): NudgeLaneResult {
   const tag = `${lane.name ?? "?"}/${lane.id} pane=${paneId}`;
-  if (DRY_RUN) { log(`DRY_RUN would nudge ${tag} (${lane.unread} unread)`); return; }
+  if (DRY_RUN) { log(`DRY_RUN would nudge ${tag} (${lane.unread} unread)`); return "skipped"; }
   // A pane sitting in copy-mode (operator wheel-scrolled to read) treats every
   // nudge character as a copy-mode COMMAND, not typed input — the 'g' in
   // "check msgs" opens the "(goto line)" prompt over the operator's status bar
   // (recurring 2026-07-22). Skip; the next tick retries after they scroll out.
-  if (paneIsInCopyMode(paneId)) { log(`skip nudge ${tag} — pane in copy-mode (operator scrolled)`); return; }
+  if (paneIsInCopyMode(paneId)) { log(`skip nudge ${tag} — pane in copy-mode (operator scrolled)`); return "skipped"; }
   const result = submitWakeOnlyNudge(lane, paneId);
-  if (result !== "submitted") {
-    // An unobserved wake does not consume cooldown/attempt budget. The poller's
-    // read-only mailbox relationship guarantees the queue remains intact.
-    log(`wake submit unconfirmed for ${tag} — not counting; mailbox remains queued`);
-    return;
-  }
-  lastNudge.set(lane.id, Date.now());
-  const attempts = nudgeAttemptCountAfterSubmit(nudgeAttempts.get(lane.id), result);
-  nudgeAttempts.set(lane.id, attempts);
-  // A zero-mail nudge is a bootstrap (hook-wake) nudge — record it so the lane is
-  // never bootstrap-nudged again (A1 lifetime cap). A real-mail nudge does NOT set
-  // this, so a lane that later receives actual mail still nudges normally.
-  if (lane.unread === 0) bootstrapNudged.add(lane.id);
-  log(`nudged ${tag} (${lane.unread} unread, attempt ${nudgeAttempts.get(lane.id)})`);
+  return result;
+}
+
+export function __resetNudgeBudgetStateForTest(): void {
+  nudgeAttempts.clear();
+  lastNudge.clear();
+  nudgeEpisode.clear();
+}
+
+export function __nudgeAttemptCountForTest(id: string): number | undefined {
+  return nudgeAttempts.get(id);
 }
 
 // A tick whose wall-time crosses this fraction of the poll interval is logged as
@@ -1205,11 +1229,13 @@ export interface TickDeps {
   nudgeableClients?: string[];
   isPidAlive?: (pid: number) => boolean;
   paneIsIdle?: (paneId: string, profile: IdleProfile) => boolean;
-  nudgeLane?: (lane: Lane, paneId: string) => void;
+  nudgeLane?: (lane: Lane, paneId: string) => NudgeLaneResult;
+  now?: () => number;
 }
 
 export function tick(db: Database, snapOverride?: TickSnapshot, deps: TickDeps = {}): void {
-  const tickStart = Date.now();
+  const clock = deps.now ?? Date.now;
+  const tickStart = clock();
   const nudgeableClients = deps.nudgeableClients ?? NUDGEABLE_CLIENTS;
   // Auto-nudge disabled (no opted-in client types) → do no work this tick. The loop
   // still runs (heartbeat keeps the watchdog happy) but never touches a pane. This
@@ -1224,11 +1250,29 @@ export function tick(db: Database, snapOverride?: TickSnapshot, deps: TickDeps =
   // to current lanes so they cannot grow unbounded over a multi-day run.
   const active = new Set(lanes.map((l) => l.id));
   for (const id of nudgeAttempts.keys()) if (!active.has(id)) nudgeAttempts.delete(id);
+  for (const id of nudgeEpisode.keys()) if (!active.has(id)) nudgeEpisode.delete(id);
   // A budget belongs to one continuous non-zero unread episode. New senders and
   // partial drains cannot replenish it; only reaching zero (or the lane leaving
   // the active set above) starts a fresh future episode.
   for (const lane of lanes) {
     const attempts = nudgeAttemptCountAfterUnread(nudgeAttempts.get(lane.id), lane.unread);
+    if (lane.unread <= 0) {
+      nudgeAttempts.delete(lane.id);
+      nudgeEpisode.delete(lane.id);
+      lastNudge.delete(lane.id);
+      continue;
+    }
+    if (!nudgeEpisode.has(lane.id)) {
+      nudgeEpisode.set(lane.id, lane.unread_episode);
+    } else if (unreadEpisodeRestartedBetweenTicks(
+      nudgeEpisode.get(lane.id)!,
+      lane.unread_episode,
+    )) {
+      nudgeAttempts.delete(lane.id);
+      lastNudge.delete(lane.id);
+      nudgeEpisode.set(lane.id, lane.unread_episode);
+      continue;
+    }
     if (attempts === undefined) nudgeAttempts.delete(lane.id);
     else nudgeAttempts.set(lane.id, attempts);
   }
@@ -1305,7 +1349,7 @@ export function tick(db: Database, snapOverride?: TickSnapshot, deps: TickDeps =
       // bootstrap only ever bought latency, never correctness.
       if (hasNothingToDeliver(lane.unread)) continue;
       if (bootstrapCapBlocks(lane.unread, bootstrapNudged.has(lane.id))) continue;
-      const since = Date.now() - (lastNudge.get(lane.id) ?? 0);
+      const since = clock() - (lastNudge.get(lane.id) ?? 0);
       if (since < NUDGE_COOLDOWN_MS) continue;                   // recently nudged — give it time to drain
       const { paneId, attachId } = resolveLanePane(lane, snap);
       if (!paneId) continue;                                     // bg lane not attached anywhere → unreachable, skip
@@ -1323,14 +1367,24 @@ export function tick(db: Database, snapOverride?: TickSnapshot, deps: TickDeps =
       // Busy vocabulary unknown for this client → require the pane to be unchanged
       // since last tick before typing into it.
       if (laneProfile.requiresQuiescence && !paneQuiescent(paneId)) continue;
-      (deps.nudgeLane ?? nudge)(lane, paneId);
+      const result = (deps.nudgeLane ?? nudge)(lane, paneId);
+      if (result !== "skipped") {
+        lastNudge.set(lane.id, clock());
+        const attempts = nudgeAttemptCountAfterTransport(nudgeAttempts.get(lane.id), result);
+        nudgeAttempts.set(lane.id, attempts);
+        if (result === "submitted") {
+          log(`nudged ${lane.name ?? "?"}/${lane.id} pane=${paneId} (${lane.unread} unread, attempt ${attempts})`);
+        } else {
+          log(`wake submit unconfirmed for ${lane.name ?? "?"}/${lane.id} pane=${paneId} — attempt ${attempts} counted, mailbox remains queued`);
+        }
+      }
       nudgedPanesThisTick.add(paneId);                           // A2: claim the pane for the rest of this tick
     } catch (e) {
       log(`tick: error handling lane ${lane.name ?? lane.id} — ${e instanceof Error ? e.message : String(e)} (continuing)`);
     }
   }
 
-  const elapsed = Date.now() - tickStart;
+  const elapsed = clock() - tickStart;
   if (elapsed > TICK_WARN_MS) {
     log(`SLOW TICK: ${elapsed}ms over ${lanes.length} lane(s) (warn>${TICK_WARN_MS}ms, interval=${POLL_INTERVAL_MS}ms) — lane width may exceed design envelope`);
   }

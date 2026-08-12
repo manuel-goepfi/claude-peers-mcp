@@ -9,8 +9,9 @@
 
 import { describe, expect, test } from "bun:test";
 import {
-  nudgeAttemptCountAfterSubmit,
+  nudgeAttemptCountAfterTransport,
   nudgeAttemptCountAfterUnread,
+  unreadEpisodeRestartedBetweenTicks,
 } from "../bin/codex-autodrain-poller.ts";
 
 const MAX = 5;
@@ -38,12 +39,45 @@ describe("nudge budget is bounded for one unread episode", () => {
   });
 });
 
-describe("only confirmed submissions consume nudge budget", () => {
-  test("an unconfirmed submission leaves the count unchanged", () => {
-    expect(nudgeAttemptCountAfterSubmit(2, "submit-failed")).toBe(2);
+describe("every transport attempt consumes nudge budget", () => {
+  test("an unconfirmed submission still consumes one bounded attempt", () => {
+    expect(nudgeAttemptCountAfterTransport(2, "submit-failed")).toBe(3);
   });
 
   test("a confirmed submission consumes exactly one attempt", () => {
-    expect(nudgeAttemptCountAfterSubmit(2, "submitted")).toBe(3);
+    expect(nudgeAttemptCountAfterTransport(2, "submitted")).toBe(3);
+  });
+
+  test("the first confirmed submission starts the budget at one", () => {
+    expect(nudgeAttemptCountAfterTransport(undefined, "submitted")).toBe(1);
+  });
+
+  test("a safety skip consumes no attempt", () => {
+    expect(nudgeAttemptCountAfterTransport(2, "skipped")).toBe(2);
+    expect(nudgeAttemptCountAfterTransport(undefined, "skipped")).toBeUndefined();
+  });
+
+  test("one complete episode exhausts, stays exhausted, then resets at zero", () => {
+    let attempts: number | undefined;
+    for (let count = 0; count < MAX; count++) {
+      attempts = nudgeAttemptCountAfterTransport(attempts, "submitted");
+    }
+    expect(attempts).toBe(MAX);
+    expect(nudgeAttemptCountAfterUnread(attempts, 9)).toBe(MAX);
+    expect(nudgeAttemptCountAfterUnread(attempts, 2)).toBe(MAX);
+
+    attempts = nudgeAttemptCountAfterUnread(attempts, 0);
+    expect(attempts).toBeUndefined();
+    expect(nudgeAttemptCountAfterTransport(attempts, "submitted")).toBe(1);
+  });
+});
+
+describe("unread episode boundaries between ticks", () => {
+  test("a broker-authored episode advance starts a new budget", () => {
+    expect(unreadEpisodeRestartedBetweenTicks(7, 8)).toBe(true);
+  });
+
+  test("overlapping mail and partial drains keep the same episode", () => {
+    expect(unreadEpisodeRestartedBetweenTicks(7, 7)).toBe(false);
   });
 });

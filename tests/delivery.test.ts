@@ -837,6 +837,7 @@ describe("Live broker delivery features", () => {
           claimByPid?: boolean;
           ackByPid?: boolean;
           hookHeartbeatByPid?: boolean;
+          reconcilePaneThread?: boolean;
         };
         delivery?: {
           states?: boolean;
@@ -854,6 +855,7 @@ describe("Live broker delivery features", () => {
     expect(body.capabilities?.hookDrain?.claimByPid).toBe(true);
     expect(body.capabilities?.hookDrain?.ackByPid).toBe(true);
     expect(body.capabilities?.hookDrain?.hookHeartbeatByPid).toBe(true);
+    expect(body.capabilities?.hookDrain?.reconcilePaneThread).toBe(true);
     expect(body.capabilities?.delivery?.states).toBe(true);
     expect(body.capabilities?.delivery?.vocabulary).toEqual(["queued", "claimed", "acknowledged", "unknown"]);
     expect(body.ready).toBe(true);
@@ -3499,15 +3501,42 @@ describe("Live broker delivery features", () => {
     await brokerFetch("/send-message", {
       from_id: s.id, to_id: a.id, text: "survive my death",
     });
+    const beforeDeath = new Database(TEST_DB, { readonly: true });
+    expect(beforeDeath.query("SELECT unread_episode FROM peers WHERE id = ?").get(a.id))
+      .toEqual({ unread_episode: 1 });
+    beforeDeath.close();
     dead.kill();
     await dead.exited;
 
     const fresh = spawnSleep();
-    await brokerFetch("/register", {
+    const replacement = {
       pid: fresh.pid, cwd: "/rehydrate-2", git_root: null, tty: null,
       name: "b-new", tmux_session: "rh2", tmux_window_index: "1",
       tmux_window_name: "claude", summary: "",
-    });
+    };
+    const failureDb = new Database(TEST_DB);
+    failureDb.run(`
+      CREATE TRIGGER fail_rehydrate_insert
+      BEFORE INSERT ON peers
+      WHEN NEW.id = '${a.id}'
+      BEGIN
+        SELECT RAISE(ABORT, 'planted rehydrate failure');
+      END
+    `);
+    const failedReplacement = await rawPost("/register", replacement);
+    expect(failedReplacement.status).toBe(500);
+    expect(failureDb.query("SELECT id, unread_episode FROM peers WHERE id = ?").get(a.id))
+      .toEqual({ id: a.id, unread_episode: 1 });
+    expect(failureDb.query("SELECT COUNT(*) AS count FROM messages WHERE to_id = ? AND delivered = 0").get(a.id))
+      .toEqual({ count: 1 });
+    failureDb.run("DROP TRIGGER fail_rehydrate_insert");
+    failureDb.close();
+
+    await brokerFetch("/register", replacement);
+    const afterRehydrate = new Database(TEST_DB, { readonly: true });
+    expect(afterRehydrate.query("SELECT unread_episode FROM peers WHERE id = ?").get(a.id))
+      .toEqual({ unread_episode: 1 });
+    afterRehydrate.close();
     // Drain via /poll-by-pid — should see the mail addressed to the
     // inherited ID (a.id), proving rehydration restored the inbox.
     const { json } = await rawPost("/poll-by-pid", {

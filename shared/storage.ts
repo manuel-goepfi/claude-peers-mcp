@@ -116,6 +116,10 @@ const peerColumns = [
   { name: "last_hook_seen_at", type: "TEXT" },
   { name: "last_drain_at", type: "TEXT" },
   { name: "last_drain_error", type: "TEXT" },
+  // Monotonic identity for a peer's zero-to-nonzero unread transitions. The
+  // autodrain poller uses this instead of timestamps, which cannot order an
+  // ack-to-zero and refill that occur in the same millisecond.
+  { name: "unread_episode", type: "INTEGER NOT NULL DEFAULT 0" },
   { name: "non_targetable", type: "INTEGER NOT NULL DEFAULT 0" },
   // Durable seat identity (shared/seat.ts). seat_key anchors the row to the
   // operator-visible seat (tmux pane / tty) instead of to whichever process
@@ -145,6 +149,10 @@ export const storageIndexes = {
   peerReceiverMode: "idx_peers_receiver_mode",
   peerSeatKey: "idx_peers_seat_key",
   peerThreadId: "idx_peers_thread_id",
+} as const;
+
+export const storageTriggers = {
+  unreadEpisode: "trg_messages_start_unread_episode",
 } as const;
 
 function tableExists(db: Database, table: string): boolean {
@@ -259,6 +267,7 @@ function createPeersTable(db: Database): void {
       last_hook_seen_at TEXT,
       last_drain_at TEXT,
       last_drain_error TEXT,
+      unread_episode INTEGER NOT NULL DEFAULT 0,
       summary TEXT NOT NULL DEFAULT '',
       registered_at TEXT NOT NULL,
       last_seen TEXT NOT NULL,
@@ -293,6 +302,7 @@ export function ensureAdditivePeerSchema(db: Database): void {
   db.run(`CREATE INDEX IF NOT EXISTS ${storageIndexes.peerThreadId} ON peers(thread_id)`);
   db.run(seatKeyBackfillSql());
   db.run(seatKeyPaneUpgradeSql());
+  createTriggers(db);
 }
 
 function createMessagesTable(db: Database, name = "messages"): void {
@@ -320,6 +330,23 @@ function createIndexes(db: Database): void {
   db.run(`CREATE INDEX ${storageIndexes.peerReceiverMode} ON peers(receiver_mode, id)`);
   db.run(`CREATE INDEX ${storageIndexes.peerSeatKey} ON peers(seat_key)`);
   db.run(`CREATE INDEX ${storageIndexes.peerThreadId} ON peers(thread_id)`);
+}
+
+function createTriggers(db: Database): void {
+  db.run(`
+    CREATE TRIGGER IF NOT EXISTS ${storageTriggers.unreadEpisode}
+    AFTER INSERT ON messages
+    WHEN NEW.delivered = 0
+      AND NOT EXISTS (
+        SELECT 1 FROM messages
+        WHERE to_id = NEW.to_id AND delivered = 0 AND id <> NEW.id
+      )
+    BEGIN
+      UPDATE peers
+      SET unread_episode = unread_episode + 1
+      WHERE id = NEW.to_id;
+    END
+  `);
 }
 
 function schemaObjectsExist(db: Database): boolean {
@@ -477,6 +504,7 @@ function migrateLegacy(
     db.run("DELETE FROM sqlite_sequence WHERE name='messages'");
     db.run("INSERT INTO sqlite_sequence(name, seq) VALUES('messages', ?)", [highWater]);
     createIndexes(db);
+    createTriggers(db);
     db.run(seatKeyBackfillSql());
     onCheckpoint?.("before-version");
     db.run(`PRAGMA user_version = ${STORAGE_SCHEMA_VERSION}`);
@@ -496,6 +524,7 @@ function createFresh(db: Database): void {
     createPeersTable(db);
     createMessagesTable(db);
     createIndexes(db);
+    createTriggers(db);
     db.run(`PRAGMA user_version = ${STORAGE_SCHEMA_VERSION}`);
     db.exec("COMMIT");
   } catch (error) {
@@ -510,10 +539,16 @@ function validateCurrentSchema(db: Database): void {
     if (!messageCols.has(column)) throw new Error(`storage v${STORAGE_SCHEMA_VERSION} is missing messages.${column}`);
   }
   const peerCols = storageTableColumns(db, "peers");
-  if (!peerCols.has("non_targetable")) throw new Error(`storage v${STORAGE_SCHEMA_VERSION} is missing peers.non_targetable`);
+  for (const column of ["non_targetable", "unread_episode"]) {
+    if (!peerCols.has(column)) throw new Error(`storage v${STORAGE_SCHEMA_VERSION} is missing peers.${column}`);
+  }
   const indexes = new Set((db.query("SELECT name FROM sqlite_master WHERE type='index'").all() as Array<{ name: string }>).map((row) => row.name));
   for (const name of Object.values(storageIndexes)) {
     if (!indexes.has(name)) throw new Error(`storage v${STORAGE_SCHEMA_VERSION} is missing index ${name}`);
+  }
+  const triggers = new Set((db.query("SELECT name FROM sqlite_master WHERE type='trigger'").all() as Array<{ name: string }>).map((row) => row.name));
+  for (const name of Object.values(storageTriggers)) {
+    if (!triggers.has(name)) throw new Error(`storage v${STORAGE_SCHEMA_VERSION} is missing trigger ${name}`);
   }
   const foreignKeys = db.query("PRAGMA foreign_key_list(messages)").all();
   if (foreignKeys.length !== 0) throw new Error("messages table must not retain peer foreign keys");

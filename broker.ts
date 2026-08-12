@@ -554,6 +554,16 @@ const selectPeersByThread = db.prepare(`
   ORDER BY last_seen DESC
 `);
 
+const updateReconciledReceiverState = db.prepare(`
+  UPDATE peers
+  SET receiver_mode = ?,
+      last_hook_seen_at = ?,
+      last_drain_at = ?,
+      last_drain_error = ?,
+      summary = ?
+  WHERE id = ?
+`);
+
 const updateLastSeen = db.prepare(`
   UPDATE peers SET last_seen = ? WHERE id = ?
 `);
@@ -615,6 +625,29 @@ const updateName = db.prepare(`
 const deletePeer = db.prepare(`
   DELETE FROM peers WHERE id = ?
 `);
+
+const countUnreadForPeer = db.prepare(`
+  SELECT COUNT(*) AS count FROM messages WHERE to_id = ? AND delivered = 0
+`);
+
+const bumpUnreadEpisode = db.prepare(`
+  UPDATE peers SET unread_episode = unread_episode + 1 WHERE id = ?
+`);
+
+function foldPeerRowInto(targetId: string, sourceId: string): number {
+  const targetUnreadBefore = Number((countUnreadForPeer.get(targetId) as { count: number }).count);
+  const moved = db.run(
+    "UPDATE messages SET to_id = ? WHERE to_id = ? AND delivered = 0",
+    [targetId, sourceId],
+  );
+  // UPDATE does not fire the INSERT trigger. Moving mail into an empty target
+  // is nevertheless a real zero-to-nonzero transition for that target and must
+  // advance its episode exactly once. Additional folds into the now-nonempty
+  // target remain in the same episode.
+  if (targetUnreadBefore === 0 && moved.changes > 0) bumpUnreadEpisode.run(targetId);
+  deletePeer.run(sourceId);
+  return moved.changes;
+}
 
 const selectAllPeers = db.prepare(`
   SELECT * FROM peers
@@ -727,7 +760,7 @@ const claimMessage = db.prepare(`
 // Excludes the caller's own PID: live same-PID refresh is handled by PID-dedup,
 // not rehydration.
 const selectRehydrateCandidatesByPane = db.prepare(`
-  SELECT id, pid, last_seen, git_root FROM peers
+  SELECT id, pid, last_seen, git_root, unread_episode FROM peers
   WHERE non_targetable = 0
     AND tmux_session = ?
     AND tmux_pane_id = ?
@@ -766,7 +799,7 @@ const selectSeatOccupants = db.prepare(`
 const updateSeatIdentity = db.prepare(`UPDATE peers SET seat_key = ?, seat_pids = ? WHERE id = ?`);
 
 const selectRehydrateCandidatesByWindow = db.prepare(`
-  SELECT id, pid, last_seen, git_root FROM peers
+  SELECT id, pid, last_seen, git_root, unread_episode FROM peers
   WHERE non_targetable = 0
     AND tmux_session = ?
     AND tmux_pane_id IS NULL
@@ -1269,6 +1302,8 @@ function handleRegister(body: RegisterRequest): RegisterResult {
   }
 
   let inheritedId: string | null = null;
+  let inheritedUnreadEpisode: number | null = null;
+  let legacyRehydrateId: string | null = null;
 
   // Seat merge — the durable-identity anchor. One seat is one row, however many
   // processes register for it.
@@ -1367,7 +1402,7 @@ function handleRegister(body: RegisterRequest): RegisterResult {
         body.pid,
         body.git_root,
         body.git_root
-      )) as { id: string; pid: number; last_seen: string; git_root: string | null }[];
+      )) as { id: string; pid: number; last_seen: string; git_root: string | null; unread_episode: number }[];
     for (const c of candidates) {
       const lastSeenMs = new Date(c.last_seen).getTime();
       if (!Number.isFinite(lastSeenMs)) continue;
@@ -1391,8 +1426,8 @@ function handleRegister(body: RegisterRequest): RegisterResult {
         // ESRCH / undefined → dead → inherit at any age (fall through)
       }
       inheritedId = c.id;
-      deletePeer.run(c.id);
-      buckets.delete(c.id);
+      inheritedUnreadEpisode = c.unread_episode;
+      legacyRehydrateId = c.id;
       if (c.git_root !== body.git_root) {
         console.error(`[broker] rehydrate: degraded git_root match old=${c.git_root ?? "(null)"} new=${body.git_root ?? "(null)"} id=${c.id}`);
       }
@@ -1522,17 +1557,19 @@ function handleRegister(body: RegisterRequest): RegisterResult {
     // peer). db.transaction() makes the delete + write all-or-nothing; the
     // buckets.delete (in-memory) runs only after the transaction commits.
     db.transaction(() => {
+      // Legacy rehydration recreates the same peer id with a new process/token.
+      // Delete inside this transaction: a failed replacement must leave the
+      // predecessor row and its recoverable inbox intact.
+      if (legacyRehydrateId) deletePeer.run(legacyRehydrateId);
       // Fold duplicate rows on this seat into the survivor BEFORE anything else,
       // migrating their undelivered mail instead of dropping it. Mail is keyed
       // on to_id (no foreign key), so re-pointing it is all that "delivering to
       // the seat rather than to a process" requires. Delivered rows are left
       // alone — they are the sender's audit trail against the id it used.
       for (const foldId of seatMerge.fromIds) {
-        const moved = db.run("UPDATE messages SET to_id = ? WHERE to_id = ? AND delivered = 0", [id, foldId]);
-        deletePeer.run(foldId);
-        buckets.delete(foldId);
-        if (moved.changes > 0) {
-          console.error(`[broker] seat-merge: migrated ${moved.changes} undelivered message(s) from ${foldId} to ${id}`);
+        const moved = foldPeerRowInto(id, foldId);
+        if (moved > 0) {
+          console.error(`[broker] seat-merge: migrated ${moved} undelivered message(s) from ${foldId} to ${id}`);
         }
       }
       // Existing PID-dedup: a live peer re-registering must replace its own row.
@@ -1567,7 +1604,15 @@ function handleRegister(body: RegisterRequest): RegisterResult {
       // Seat identity is written last so it lands on both the insert and update
       // paths without threading two more binds through each statement.
       updateSeatIdentity.run(seatKey, serializeSeatPids(mergeSeatPids(seatMerge.pids, body.pid, isPidAlive)), id);
+      // Legacy rehydration deletes and recreates the same peer id while its
+      // queued inbox survives. Preserve that continuous inbox's episode marker
+      // so process replacement cannot replenish an exhausted nudge budget.
+      if (inheritedUnreadEpisode !== null) {
+        db.run("UPDATE peers SET unread_episode = ? WHERE id = ?", [inheritedUnreadEpisode, id]);
+      }
     })();
+    if (legacyRehydrateId) buckets.delete(legacyRehydrateId);
+    for (const foldId of seatMerge.fromIds) buckets.delete(foldId);
     if (existing && existing.id !== id) {
       buckets.delete(existing.id);
     }
@@ -2412,6 +2457,31 @@ type ReconcilePaneThreadResult =
   | { ok: true; value: ReconcilePaneThreadResponse }
   | { ok: false; status: number; error: string };
 
+function latestIso(values: Array<string | null>): string | null {
+  const present = values.filter((value): value is string => Boolean(value));
+  return present.length > 0 ? present.sort().at(-1)! : null;
+}
+
+function reconciledReceiverState(target: Peer, duplicates: Peer[]): Pick<
+  Peer,
+  "last_hook_seen_at" | "last_drain_at" | "last_drain_error" | "summary"
+> & { receiver_mode: ReceiverMode } {
+  const rows = [target, ...duplicates];
+  const newestHealth = rows
+    .filter((peer) => peer.last_hook_seen_at)
+    .sort((a, b) => b.last_hook_seen_at!.localeCompare(a.last_hook_seen_at!))[0]
+    ?? target;
+  return {
+    receiver_mode: rows.some((peer) => peer.receiver_mode === "codex-hook")
+      ? "codex-hook"
+      : validReceiverMode(target.receiver_mode, "codex"),
+    last_hook_seen_at: newestHealth.last_hook_seen_at,
+    last_drain_at: latestIso(rows.map((peer) => peer.last_drain_at)),
+    last_drain_error: newestHealth.last_drain_error,
+    summary: rows.find((peer) => peer.summary)?.summary || "",
+  };
+}
+
 /**
  * Join the exact visible Codex pane identity to the exact thread UUID that its
  * status line renders. This is intentionally narrower than /register: it never
@@ -2455,25 +2525,31 @@ function handleReconcilePaneThread(body: ReconcilePaneThreadRequest): ReconcileP
     ) {
       return { ok: false, status: 404, error: "pane peer not found" };
     }
-    if (target.thread_id && target.thread_id.toLowerCase() !== normalizedThreadId) {
-      return { ok: false, status: 409, error: "pane already belongs to a different thread" };
-    }
-
     const duplicates = (selectPeersByThread.all(normalizedThreadId) as Peer[])
       .filter((peer) => peer.id !== target.id);
-    if (duplicates.some((peer) => peer.tmux_pane_id !== null || peer.seat_key !== null)) {
-      return { ok: false, status: 409, error: "thread is already bound to another pane" };
+    if (duplicates.some((peer) => peer.client_type !== "codex")) {
+      return { ok: false, status: 409, error: "thread is already bound to another client" };
+    }
+    if (duplicates.some((peer) =>
+      (peer.tmux_pane_id !== null || peer.seat_key !== null) && peerSeatAlive(peer)
+    )) {
+      return { ok: false, status: 409, error: "thread is already bound to another live pane" };
     }
 
+    const receiverState = reconciledReceiverState(target, duplicates);
+
     for (const duplicate of duplicates) {
-      const moved = db.run(
-        "UPDATE messages SET to_id = ? WHERE to_id = ? AND delivered = 0",
-        [target.id, duplicate.id],
-      );
-      migrated += moved.changes;
-      deletePeer.run(duplicate.id);
+      migrated += foldPeerRowInto(target.id, duplicate.id);
       foldedIds.push(duplicate.id);
     }
+    updateReconciledReceiverState.run(
+      receiverState.receiver_mode,
+      receiverState.last_hook_seen_at,
+      receiverState.last_drain_at,
+      receiverState.last_drain_error,
+      receiverState.summary,
+      target.id,
+    );
     db.run("UPDATE peers SET thread_id = ?, last_seen = ? WHERE id = ?", [
       normalizedThreadId,
       new Date().toISOString(),
@@ -3020,15 +3096,6 @@ requestHandler = async (req: Request) => {
         return Response.json(result.value);
       }
 
-      // Loopback + same-UID PID proof, with exact id/pid/pane matching. This is
-      // intentionally tokenless because the poller performs a preserve-token
-      // /register but never retains or impersonates the pane's bearer token.
-      if (path === "/reconcile-pane-thread") {
-        const result = handleReconcilePaneThread(body as unknown as ReconcilePaneThreadRequest);
-        if (!result.ok) return Response.json({ error: result.error }, { status: result.status });
-        return Response.json(result.value);
-      }
-
       // CLI callers receive a normal peer token but a permanently
       // non-targetable identity. This atomic route is intentionally separate
       // from session registration so no seat metadata, dedup, supersession, or
@@ -3139,6 +3206,20 @@ requestHandler = async (req: Request) => {
       }
 
       switch (path) {
+        case "/reconcile-pane-thread": {
+          // The poller has just registered this exact visible seat and therefore
+          // holds its broker-issued token. Require both token possession and the
+          // same-UID caller/target PID plus exact id/pid/pane checks in the
+          // handler; same-user process evidence alone must not authorize a
+          // mailbox/thread mutation.
+          const reconcileBody: ReconcilePaneThreadRequest = {
+            ...(body as unknown as ReconcilePaneThreadRequest),
+            id: auth.id,
+          };
+          const result = handleReconcilePaneThread(reconcileBody);
+          if (!result.ok) return Response.json({ error: result.error }, { status: result.status });
+          return Response.json(result.value);
+        }
         case "/heartbeat":
           {
             const heartbeat: HeartbeatRequest = { id: auth.id };

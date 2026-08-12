@@ -42,6 +42,9 @@ export interface Peer {
   last_hook_seen_at: string | null;
   last_drain_at: string | null;
   last_drain_error: string | null;
+  // Increments only when this peer's unread inbox crosses zero -> non-zero.
+  // Optional on public/read-compat shapes that intentionally omit internals.
+  unread_episode?: number;
   summary: string;
   registered_at: string; // ISO timestamp
   last_seen: string; // ISO timestamp

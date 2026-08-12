@@ -54,7 +54,8 @@ describe("send status hint for nudge-driven lanes", () => {
     // Evidence, not assumption: a prior drain proves a working path exists.
     const hint = sendStatusHint(target({ last_drain_at: "2026-08-01T08:00:00Z" }), false);
     expect(hint).toContain("has drained before");
-    expect(hint).toContain("without action from you");
+    expect(hint).toContain("bounded attempt budget");
+    expect(hint).toContain("check_messages if this handoff is urgent");
     // The specific phrasings that taught senders the mail was stranded.
     expect(hint).not.toContain("must use check_messages");
     expect(hint).not.toContain("no active hook");
@@ -67,6 +68,7 @@ describe("send status hint for nudge-driven lanes", () => {
       const hint = sendStatusHint(target({ client_type, last_drain_at: "2026-08-01T08:00:00Z" }), false);
       expect(hint).toContain("has drained before");
       expect(hint).not.toContain("must use check_messages");
+      expect(hint).toContain("if this handoff is urgent");
     }
   });
 

@@ -1491,12 +1491,14 @@ export function sendStatusHint(target: SendMessageResponse["target"] | undefined
   // it is worse than the pessimistic wording it replaced: a sender who is told
   // "no action required" stops looking.
   //
-  // A PRIOR SUCCESSFUL DRAIN is the one fact the broker actually holds. A lane that
-  // has drained before demonstrably has a working path — whatever that path is.
+  // A PRIOR SUCCESSFUL DRAIN is the one fact the broker actually holds. It proves
+  // that a path worked before, but not that the external poller is running now or
+  // that this unread episode still has attempt budget, so urgent sends retain an
+  // explicit receiver-side fallback.
   const hasDrainedBefore = Boolean(target.last_drain_at);
   const paneBacked = Boolean(target.tmux_pane_id) && target.client_type !== "unknown";
   if (paneBacked && hasDrainedBefore) {
-    return ` Still queued; ${target.client_type} receiver has drained before (last ${target.last_drain_at}) and has a pane the autodrain poller can nudge — it should arrive without action from you.`;
+    return ` Still queued; ${target.client_type} receiver has drained before (last ${target.last_drain_at}) and has a pane the autodrain poller can nudge. Current poller state and its bounded attempt budget are not visible here, so ask that lane to call check_messages if this handoff is urgent.`;
   }
   if (paneBacked) {
     // Pane present but no drain on record: probably nudgeable, not demonstrated.
