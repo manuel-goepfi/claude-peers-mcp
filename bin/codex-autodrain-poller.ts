@@ -319,7 +319,9 @@ function sh(cmd: string[]): { ok: boolean; out: string } {
 }
 
 const ANSI_ESCAPE_RE = /\u001b\[[0-?]*[ -/]*[@-~]/g;
-const THREAD_UUID_SEGMENT_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const THREAD_UUID_SOURCE = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+const THREAD_UUID_SEGMENT_RE = new RegExp(`^${THREAD_UUID_SOURCE}$`, "i");
+const TRUNCATED_UNTITLED_STATUS_RE = new RegExp(`^(${THREAD_UUID_SOURCE}) · \\1 ·\\s*…$`, "i");
 
 /**
  * Parse only the final non-empty pane line, where Codex renders configured
@@ -335,6 +337,12 @@ export function threadIdFromCodexPaneStatus(capture: string): string | null {
     .filter(Boolean)
     .at(-1);
   if (!finalLine) return null;
+  // At 80 columns Codex truncates the untitled status after its duplicated
+  // title/id pair: "<uuid> · <same uuid> ·…". The duplicate anchored at the
+  // start plus the renderer's terminal ellipsis remains exact identity proof;
+  // a single UUID or prefixed transcript prose still fails quiet.
+  const truncatedUntitled = finalLine.match(TRUNCATED_UNTITLED_STATUS_RE);
+  if (truncatedUntitled) return truncatedUntitled[1]!.toLowerCase();
   const segments = finalLine
     .split(" · ")
     .map((segment) => segment.trim());

@@ -680,6 +680,11 @@ describe("threadIdFromCodexPaneStatus", () => {
     )).toBe(thread);
   });
 
+  test("accepts the 80-column untitled status truncated after the duplicated UUID", () => {
+    expect(threadIdFromCodexPaneStatus(`${thread} · ${thread} ·…`)).toBe(thread);
+    expect(threadIdFromCodexPaneStatus(`${thread} · ${thread} · …`)).toBe(thread);
+  });
+
   test("fails quiet when thread-id is not configured", () => {
     expect(threadIdFromCodexPaneStatus(
       "› Implement {feature}\npeerstestfix · gpt-5.6-sol xhigh · Context 12% left · Context 88% used\n",
@@ -705,6 +710,8 @@ describe("threadIdFromCodexPaneStatus", () => {
     expect(threadIdFromCodexPaneStatus(`transcript text · ${thread}`)).toBeNull();
     expect(threadIdFromCodexPaneStatus(`assistant · ${thread} · finished`)).toBeNull();
     expect(threadIdFromCodexPaneStatus(`› attacker · ${thread} · payload`)).toBeNull();
+    expect(threadIdFromCodexPaneStatus(`${thread} · 11111111-2222-4333-8444-555555555555 ·…`)).toBeNull();
+    expect(threadIdFromCodexPaneStatus(`assistant · ${thread} · ${thread} ·…`)).toBeNull();
   });
 
   test("strips terminal color escapes before parsing", () => {
