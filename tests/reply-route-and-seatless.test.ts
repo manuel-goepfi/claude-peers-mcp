@@ -193,6 +193,19 @@ describe("codex nudge text", () => {
     expect(nudgeText(lane(3, "codex")).toLowerCase().startsWith("check ")).toBe(false);
   });
 
+  test("owns the toolless app-server lane: one off-bus reply, no retries, back to work", () => {
+    // codexd / shared-host lanes have no claude-peers MCP by design, so the
+    // wrapper's check_messages instruction is impossible there. Without this
+    // clause a lane was knocked repeatedly and burned a turn per knock
+    // re-stating "Still BLOCKED" (observed 2026-08-12). The wrapper must name
+    // the case and bound the lane's response.
+    const text = nudgeText(lane(1, "codex"));
+    expect(text).toContain("If check_messages is unavailable or fails with a closed transport");
+    expect(text).toContain("off the peers bus");
+    expect(text).toContain("do not retry");
+    expect(text).toContain("resume your prior work");
+  });
+
   test("pluralises and gives Claude the same observable-state fallback", () => {
     expect(nudgeText(lane(2, "codex"))).toContain("2 unread messages");
     expect(nudgeText(lane(1, "codex"))).toContain("1 unread message");
