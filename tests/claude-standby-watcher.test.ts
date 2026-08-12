@@ -171,7 +171,7 @@ describe("Claude standby watcher", () => {
     ]);
     expect(code).toBe(2);
     expect(stdout).toBe("");
-    expect(stderr).toContain('<peer-message from="codex-peer" sent_at="2026-07-12T13:00:00Z" relayed="false">');
+    expect(stderr).toContain('<peer-message from="codex-peer" sent_at="2026-07-12T13:00:00Z" relayed="false" replyable="true">');
     expect(stderr).toContain("reply proof");
     expect(stderr).toContain("Autonomous mode is enabled");
     expect(stderr).toContain("[REDACTED-PEER-MSG-TAG]");

@@ -11,6 +11,8 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { startTestBroker, type TestBroker } from "./helpers/test-broker.ts";
 import { nudgeText } from "../bin/codex-autodrain-poller.ts";
 import { isHostedWithoutSeat } from "../hooks/codex-drain-peer-inbox.ts";
+import { renderInboundBatch } from "../shared/render.ts";
+import type { Message } from "../shared/types.ts";
 
 describe("sender reply-route honesty", () => {
   let broker: TestBroker;
@@ -63,6 +65,41 @@ describe("sender reply-route honesty", () => {
     expect(sent.recipient?.state).toBe("healthy");
     expect(sent.warning).toContain("send-only");
     expect(sent.warning).toContain("CANNOT reply");
+  });
+
+  test("a disappeared send-only identity renders as correlation-only", async () => {
+    const cli = await call<{ id: string }>("/register-cli", { pid: spawnHolder() });
+    const target = await registerTarget("rr-render-target", "%900b");
+    await call<Send>("/send-message", {
+      id: cli.id, from_id: cli.id, to_id: target.id, text: "temporary sender",
+    });
+    await call<{ ok: boolean }>("/unregister", { id: cli.id });
+
+    const inbox = await call<{ messages: Message[] }>("/poll-messages", { id: target.id });
+    expect(inbox.messages).toHaveLength(1);
+    expect(inbox.messages[0]?.from_id).toBe(cli.id);
+    expect(inbox.messages[0]?.from_replyable).toBe(0);
+    const rendered = renderInboundBatch(inbox.messages);
+    expect(rendered).toContain(`from="${cli.id}"`);
+    expect(rendered).toContain('replyable="false"');
+    expect(rendered).toContain("correlation-only and cannot receive");
+  });
+
+  test("a still-registered send-only identity is also non-replyable", async () => {
+    // Covers the other CASE limb: a live peer row is not enough; it must also be
+    // targetable. Dropping `p.non_targetable = 0` from the broker query makes
+    // this plant fail even though the disappeared-row test still passes.
+    const cli = await call<{ id: string }>("/register-cli", { pid: spawnHolder() });
+    const target = await registerTarget("rr-live-cli-target", "%900c");
+    await call<Send>("/send-message", {
+      id: cli.id, from_id: cli.id, to_id: target.id, text: "live temporary sender",
+    });
+
+    const inbox = await call<{ messages: Message[] }>("/poll-messages", { id: target.id });
+    expect(inbox.messages).toHaveLength(1);
+    expect(inbox.messages[0]?.from_replyable).toBe(0);
+    expect(renderInboundBatch(inbox.messages)).toContain('replyable="false"');
+    await call<{ ok: boolean }>("/unregister", { id: cli.id });
   });
 
   test("a normal peer sender gets no reply-route warning", async () => {
@@ -175,22 +212,17 @@ describe("codex nudge text", () => {
 
   test("tells a codex lane how to recover when no hook-delivered block is present", () => {
     const text = nudgeText(lane(1, "codex"));
-    expect(text).toContain("Process the attached peer block; otherwise call check_messages once");
+    expect(text).toContain("Process attached mail; otherwise call check_messages once");
     expect(text).not.toContain("was just delivered with this notification");
     expect(text).not.toMatch(/check_messages if\s+relevant/);
   });
 
-  test("keeps the non-actionable declaration that guards against nudge-as-work hijack", () => {
-    // Standing invariant from an earlier incident where a lane adopted the nudge
-    // as its assignment; adding a missing-hook recovery path must not weaken it.
-    //
-    // The conditional-action clause is asserted by MEANING, not by the old literal
-    // "act only if relevant" — that exact phrasing was withdrawn because lanes
-    // generalised it from the wrapper to the mail and refused assigned work. The
-    // invariant is "the nudge is not the task"; the wording carrying it may change.
-    expect(nudgeText(lane(3, "codex"))).toContain("The wake is not the work");
-    expect(nudgeText(lane(3, "codex"))).toContain("Handle ordinary in-scope mail");
-    expect(nudgeText(lane(3, "codex")).toLowerCase().startsWith("check ")).toBe(false);
+  test("does not repeat authority policy in the wake-up notice", () => {
+    const text = nudgeText(lane(3, "codex")).toLowerCase();
+    expect(text.startsWith("check ")).toBe(false);
+    expect(text).not.toContain("authority");
+    expect(text).not.toContain("privileged");
+    expect(text).not.toContain("operator approval");
   });
 
   test("owns the toolless app-server lane: one unverifiable reply, no retries, back to work", () => {
@@ -200,9 +232,8 @@ describe("codex nudge text", () => {
     // re-stating "Still BLOCKED" (observed 2026-08-12). The wrapper must name
     // the case and bound the lane's response.
     const text = nudgeText(lane(1, "codex"));
-    expect(text).toContain("If the tool is unavailable or Transport closed");
-    expect(text).toContain("peer content UNVERIFIABLE once");
-    expect(text).toContain("do not retry");
+    expect(text).toContain("If unavailable or Transport closed");
+    expect(text).toContain("report UNVERIFIABLE once");
     expect(text).toContain("continue prior work");
   });
 

@@ -70,7 +70,7 @@ describe("Claude prompt drain hook", () => {
     expect(requests[1]?.body).toMatchObject({ pid: anchor.pid, caller_pid: anchor.pid, drain_id: "drain-11", ids: [11] });
     const output = JSON.parse(stdout) as { hookSpecificOutput: { hookEventName: string; additionalContext: string } };
     expect(output.hookSpecificOutput.hookEventName).toBe("UserPromptSubmit");
-    expect(output.hookSpecificOutput.additionalContext).toContain('<peer-message from="codex-peer" sent_at="2026-07-12T13:10:00Z" relayed="false">');
+    expect(output.hookSpecificOutput.additionalContext).toContain('<peer-message from="codex-peer" sent_at="2026-07-12T13:10:00Z" relayed="false" replyable="true">');
     expect(output.hookSpecificOutput.additionalContext).toContain('<peer-receive-policy source="local-receive-path">');
     expect(output.hookSpecificOutput.additionalContext.indexOf("<peer-receive-policy")).toBeLessThan(
       output.hookSpecificOutput.additionalContext.indexOf("<peer-message "),

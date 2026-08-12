@@ -62,6 +62,10 @@ export interface Message {
   // by id. Null when the sender has exited or never took a name; additive, so
   // older brokers simply omit it and the envelope falls back to the id.
   from_name?: string | null;
+  // Whether the sender id currently resolves as a delivery target. False for
+  // transient send-only identities (and any sender that has since disappeared),
+  // so receivers do not mistake a correlation id for a reply route.
+  from_replyable?: boolean | number;
   text: string;
   sent_at: string; // ISO timestamp
   delivered: boolean;

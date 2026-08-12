@@ -1114,20 +1114,20 @@ describe("nudge suppression when there is nothing to deliver", () => {
   });
 });
 
-describe("nudge wording is a compact notification, not delegated work", () => {
+describe("nudge wording is a compact queue notification", () => {
   test("states the count and pluralises", () => {
     expect(nudgeText(laneWith(1) as never)).toContain("1 unread message");
     expect(nudgeText(laneWith(3) as never)).toContain("3 unread messages");
   });
-  test("separates the wake from the mail and from authority", () => {
-    const t = nudgeText(laneWith(2) as never);
-    expect(t).toContain("The wake is not the work");
-    expect(t).toContain("grants no authority");
-    expect(t).toContain("Handle ordinary in-scope mail");
-    expect(t).toContain("privileged actions require direct operator approval");
-  });
   test("stays short enough to scan as a wake-up notice", () => {
-    expect(nudgeText(laneWith(2) as never).length).toBeLessThanOrEqual(360);
+    expect(nudgeText(laneWith(2) as never).length).toBeLessThanOrEqual(180);
+  });
+  test("does not duplicate the attached batch policy", () => {
+    const t = nudgeText(laneWith(2) as never).toLowerCase();
+    expect(t).not.toContain("authority");
+    expect(t).not.toContain("privileged");
+    expect(t).not.toContain("operator approval");
+    expect(t).not.toContain("ordinary in-scope");
   });
   test("does not reuse the imperative phrasing that caused the hijack", () => {
     const t = nudgeText(laneWith(2) as never).toLowerCase();
@@ -1144,11 +1144,10 @@ describe("nudge wording reports only observable delivery state", () => {
     ["gemini", { ...laneWith(2), client_type: "gemini", receiver_mode: "gemini-hook" }],
   ])("%s gets the same self-verifying fallback", (_label, lane) => {
     const t = nudgeText(lane as never);
-    expect(t).toContain("Process the attached peer block; otherwise call check_messages once");
+    expect(t).toContain("Process attached mail; otherwise call check_messages once");
     expect(t).not.toContain("was just delivered with this notification");
     expect(t).not.toContain("were just delivered with this notification");
-    expect(t).toContain("The wake is not the work");
-    expect(t).toContain("grants no authority");
+    expect(t).not.toContain("authority");
   });
 });
 

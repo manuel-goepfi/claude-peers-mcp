@@ -279,6 +279,7 @@ describe("two-phase drain: claim → render → emit → ack", () => {
         id: 72,
         from_id: "empty-peer",
         from_name: "",
+        from_replyable: 0,
         to_id: "selfrow",
         text: "",
         sent_at: "2026-08-04T08:00:01Z",
@@ -301,6 +302,7 @@ describe("two-phase drain: claim → render → emit → ack", () => {
     expect(ctx).not.toContain("\u0000");
     expect(ctx).not.toContain("\u0007");
     expect(ctx).not.toContain("\u007f");
+    expect(ctx).toContain('from="empty-peer" sent_at="2026-08-04T08:00:01Z" relayed="false" replyable="false"');
     expect(requests.map((q) => q.path)).toEqual(["/claim-by-pid", "/ack-by-pid"]);
   });
 

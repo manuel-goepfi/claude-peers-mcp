@@ -685,12 +685,12 @@ const insertMessage = db.prepare(`
   VALUES (?, ?, ?, ?, 0)
 `);
 
-// The join exists so the recipient can name the sender. Without it the envelope
-// carries only from_id, so a lane quoting its inbox writes "2o0dtmqx" — an id the
-// operator cannot map to a pane on sight. LEFT JOIN, not JOIN: a sender that has
-// since exited must still deliver its mail, it simply arrives unnamed.
+// The join gives the recipient both the sender label and the current reply-route
+// state. LEFT JOIN, not JOIN: a sender that has exited must still deliver its
+// mail, but its id is correlation-only and must not be presented as replyable.
 const selectUndelivered = db.prepare(`
-  SELECT m.*, p.name AS from_name
+  SELECT m.*, p.name AS from_name,
+    CASE WHEN p.id IS NOT NULL AND p.non_targetable = 0 THEN 1 ELSE 0 END AS from_replyable
   FROM messages m
   LEFT JOIN peers p ON p.id = m.from_id
   WHERE m.to_id = ? AND m.delivered = 0
