@@ -9,19 +9,17 @@
  *   -> the seat was permanently deaf+mute. Fix: liveness before age; a dead
  *   candidate is inheritable at any age.
  *
- *   Bug 3 — the autodrain poller's lane query skipped zero-mail seats
- *   (HAVING unread > 0), so a freshly-registered seat whose drain hook never
- *   attached (last_hook_seen_at IS NULL) and has no mail yet was never nudged ->
- *   its hook never attached (chicken-and-egg). Fix: also surface
- *   last_hook_seen_at IS NULL seats; MAX_NUDGE_ATTEMPTS bounds the bootstrap.
+ *   Nudge candidate invariant — only currently undelivered mail addressed to
+ *   the exact peer may put a lane in the poller's nudge set. Hook state, a pane,
+ *   or delivered history cannot synthesize work.
  *
- * Mirrors the inline-logic test pattern (in-memory DB + a copy of the prod
- * logic). If broker.ts / codex-autodrain-poller.ts diverge, update these copies.
+ * Uses in-memory DB fixtures. Poller selection/dedup assertions call exported
+ * production helpers; broker rehydration assertions mirror its transaction.
  */
 
 import { describe, test, expect, beforeEach } from "bun:test";
 import { Database } from "bun:sqlite";
-import { bootstrapCapBlocks, paneAlreadyNudgedThisTick } from "../bin/codex-autodrain-poller.ts";
+import { lanesWithUnread, paneAlreadyNudgedThisTick } from "../bin/codex-autodrain-poller.ts";
 import { retentionPurgeSql, storageIndexes, unknownReceiverPurgeSql } from "../shared/storage.ts";
 
 const REHYDRATE_WINDOW_MS = 3600_000; // 1h — mirror of broker.ts
@@ -149,126 +147,61 @@ describe("Bug 1 (full fix) — reaper decouples mail-reap from row-reap", () => 
   });
 });
 
-describe("Bug 3 — autodrain surfaces NULL-hook zero-mail seats", () => {
+describe("autodrain requires exact currently undelivered mail", () => {
   let db: Database;
 
   beforeEach(() => {
     db = new Database(":memory:");
     db.run(
-      "CREATE TABLE peers (id TEXT PRIMARY KEY, pid INTEGER, name TEXT, client_type TEXT, tmux_pane_id TEXT, last_hook_seen_at TEXT)",
+      `CREATE TABLE peers (
+        id TEXT PRIMARY KEY, pid INTEGER, name TEXT, client_type TEXT,
+        tmux_pane_id TEXT, thread_id TEXT, seat_key TEXT, receiver_mode TEXT,
+        last_hook_seen_at TEXT, unread_episode INTEGER NOT NULL DEFAULT 0
+      )`,
     );
     db.run(
       "CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, to_id TEXT, delivered INTEGER)",
     );
   });
 
-  // Mirror of codex-autodrain-poller.ts lanesWithUnread() — the fixed query.
-  function lanesWithUnread(): { id: string; unread: number; last_hook_seen_at: string | null }[] {
-    return db
-      .query(
-        `SELECT p.id, p.last_hook_seen_at, COUNT(m.id) AS unread
-         FROM peers p
-         LEFT JOIN messages m ON m.to_id = p.id AND m.delivered = 0
-         WHERE p.client_type IN ('codex','gemini','claude')
-         GROUP BY p.id
-         HAVING unread > 0 OR p.last_hook_seen_at IS NULL`,
-      )
-      .all() as { id: string; unread: number; last_hook_seen_at: string | null }[];
-  }
-
-  test("surfaces a fresh NULL-hook seat with ZERO mail (the bootstrap-nudge case)", () => {
+  test("does not surface a fresh NULL-hook seat with zero mail", () => {
     db.run(
       "INSERT INTO peers (id, pid, name, client_type, last_hook_seen_at) VALUES ('fresh', 100, 'infra.4', 'claude', NULL)",
     );
-    const lanes = lanesWithUnread();
-    const fresh = lanes.find((l) => l.id === "fresh");
-    expect(fresh).toBeDefined();
-    expect(fresh!.unread).toBe(0); // COUNT(m.id) over no rows = 0 (not 1 — would be wrong with COUNT(*))
+    expect(lanesWithUnread(db, ["claude"])).toEqual([]);
   });
 
-  test("surfaces a seat WITH unread mail (unchanged behavior)", () => {
+  test("does not surface delivered history as pending mail", () => {
+    db.run(
+      "INSERT INTO peers (id, pid, name, client_type, last_hook_seen_at) VALUES ('history', 101, 'coding.1', 'claude', NULL)",
+    );
+    db.run("INSERT INTO messages (to_id, delivered) VALUES ('history', 1)");
+    expect(lanesWithUnread(db, ["claude"])).toEqual([]);
+  });
+
+  test("surfaces and counts only undelivered mail for the exact peer", () => {
     db.run(
       "INSERT INTO peers (id, pid, name, client_type, last_hook_seen_at) VALUES ('hasmail', 101, 'coding.1', 'claude', '2026-06-17T05:00:00Z')",
     );
+    db.run(
+      "INSERT INTO peers (id, pid, name, client_type, last_hook_seen_at) VALUES ('other', 102, 'coding.2', 'claude', NULL)",
+    );
     db.run("INSERT INTO messages (to_id, delivered) VALUES ('hasmail', 0)");
-    const lanes = lanesWithUnread();
+    db.run("INSERT INTO messages (to_id, delivered) VALUES ('hasmail', 1)");
+    const lanes = lanesWithUnread(db, ["claude"]);
     const hasmail = lanes.find((l) => l.id === "hasmail");
     expect(hasmail).toBeDefined();
     expect(hasmail!.unread).toBe(1);
-  });
-
-  test("does NOT surface a hook-attached seat with zero mail (no needless nudge)", () => {
-    db.run(
-      "INSERT INTO peers (id, pid, name, client_type, last_hook_seen_at) VALUES ('healthy', 102, 'rag.1', 'claude', '2026-06-17T05:00:00Z')",
-    );
-    const lanes = lanesWithUnread();
-    expect(lanes.find((l) => l.id === "healthy")).toBeUndefined();
+    expect(lanes.find((l) => l.id === "other")).toBeUndefined();
   });
 });
 
-describe("Bug 4 — bootstrap-nudge storm guards (A1 lifetime cap + A2 per-pane dedup)", () => {
-  // Bug 4: the NULL-hook bootstrap path (Bug 3's fix) correctly SURFACES a
-  // zero-mail unattached lane, but had no termination for a lane whose hook never
-  // binds (a detached bg-Claude lane). Combined with multiple lanes resolving to
-  // ONE pane, an innocent foreground pane was nudged repeatedly per cycle. Two
-  // guards fix it, both now PURE EXPORTED functions in codex-autodrain-poller.ts
-  // that tick() calls directly (so these tests exercise the real prod decision, not
-  // an in-test copy):
-  //   A1 — bootstrapCapBlocks: a zero-mail (bootstrap) lane is nudged AT MOST ONCE.
-  //   A2 — paneAlreadyNudgedThisTick: one physical pane is nudged AT MOST ONCE/tick.
+describe("per-pane nudge dedup", () => {
+  // Multiple lanes can still resolve to one pane. The real exported guard keeps
+  // one physical pane to at most one nudge per tick.
   // Field captured live (2026-06-18): pane %433 carried 3 clause5.6 rows, 2 of them
   // NULL-hook+zero-mail, nudged interleaved every ~60s (attempts 1→3).
 
-  // recordBootstrap mirrors ONLY nudge()'s bookkeeping (a zero-mail nudge records
-  // the id, but only on a successful submit). The DECISION under test —
-  // bootstrapCapBlocks — is the real prod export, so a regression in tick()'s guard
-  // is caught here. submitOk defaults true (the happy path).
-  function recordBootstrap(unread: number, id: string, seen: Set<string>, submitOk = true): void {
-    if (!submitOk) return;                         // failed submit → no bookkeeping
-    if (unread === 0) seen.add(id);
-  }
-
-  test("a zero-mail NULL-hook lane is nudged ONCE, then never again (A1 lifetime cap)", () => {
-    const seen = new Set<string>();
-    // Tick 1: not blocked → nudge → record.
-    expect(bootstrapCapBlocks(0, seen.has("ghost"))).toBe(false);
-    recordBootstrap(0, "ghost", seen);
-    // Tick 2..N: same lane, still zero mail, still NULL-hook → now blocked.
-    expect(bootstrapCapBlocks(0, seen.has("ghost"))).toBe(true);
-    expect(bootstrapCapBlocks(0, seen.has("ghost"))).toBe(true);
-  });
-
-  test("a lane that later receives REAL mail bypasses the bootstrap cap (still nudges)", () => {
-    const seen = new Set<string>();
-    expect(bootstrapCapBlocks(0, seen.has("ghost"))).toBe(false);
-    recordBootstrap(0, "ghost", seen);             // bootstrap consumed
-    expect(bootstrapCapBlocks(0, seen.has("ghost"))).toBe(true); // capped while zero-mail
-    // Mail arrives → unread > 0 → the cap does not apply (real mail must deliver).
-    expect(bootstrapCapBlocks(2, seen.has("ghost"))).toBe(false);
-  });
-
-  test("PLANTED-WRONG guard: real export blocks a re-bootstrapped deaf seat", () => {
-    // bootstrapCapBlocks is the actual tick() guard. If a future edit weakens it so
-    // a recorded zero-mail lane is no longer blocked, this expectation flips —
-    // catching a real prod regression (not just an in-test copy).
-    const seen = new Set<string>();
-    recordBootstrap(0, "ghost", seen);
-    expect(bootstrapCapBlocks(0, seen.has("ghost"))).toBe(true);
-  });
-
-  test("a FAILED C-m submit does NOT consume the lifetime cap (lane stays eligible)", () => {
-    // The nudge typed text but the submit failed (pane vanished in the settle) — it
-    // never fired as a turn, so the one-shot cap must survive for a real retry.
-    const seen = new Set<string>();
-    recordBootstrap(0, "ghost", seen, /*submitOk*/ false);
-    expect(seen.has("ghost")).toBe(false);                       // cap NOT burned
-    expect(bootstrapCapBlocks(0, seen.has("ghost"))).toBe(false); // still nudgeable
-    // A subsequent successful submit then consumes the cap exactly once.
-    recordBootstrap(0, "ghost", seen, /*submitOk*/ true);
-    expect(bootstrapCapBlocks(0, seen.has("ghost"))).toBe(true);
-  });
-
-  // --- A2: drive the real paneAlreadyNudgedThisTick export ---
   // Replicate ONLY tick()'s loop scaffolding (claim-after-nudge); the DECISION
   // (paneAlreadyNudgedThisTick) is the real prod export under test.
   function nudgesThisTick(lanesByPane: { id: string; pane: string }[]): string[] {

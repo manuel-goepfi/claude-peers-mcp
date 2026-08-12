@@ -270,34 +270,11 @@ const nudgeAttempts = new Map<string, number>(); // peer id -> consecutive nudge
 const nudgeEpisode = new Map<string, number>(); // peer id -> broker-authored unread episode
 const unreadyCodexWakeWarned = new Set<string>(); // avoid logging the same bad identity every tick
 const legacyCodexWakeWarned = new Set<string>(); // compatibility metadata is visible once, without log spam
-// A lane selected purely by the NULL-hook bootstrap path (zero unread mail, hook
-// never attached) gets ONE bootstrap nudge for the LIFE OF THIS PROCESS — then
-// never again from the bootstrap path. This Set is in-memory, so the cap does NOT
-// survive a poller restart (a fresh process starts with an empty Set); the restart
-// backstops are MAX_NUDGE_ATTEMPTS + the systemd StartLimitBurst, not this Set.
-// Without this, a permanently-deaf seat (a registration row whose drain hook never
-// binds — e.g. a detached bg-Claude lane) is re-nudged every MAX_NUDGE_ATTEMPTS
-// window because nudgeAttempts resets when the lane briefly leaves the set. A
-// bootstrap nudge has no mail to deliver, so one attempt to wake the hook is all
-// that is ever useful. NOT pruned by the unread-clear sweep (that is what makes it
-// a process-lifetime cap rather than a per-window one).
-const bootstrapNudged = new Set<string>();
-
-// A1 nudge-storm guard (pure, exported for unit testing). A zero-mail lane is in
-// the nudge set only via the NULL-hook bootstrap path; once it has had its one
-// bootstrap nudge, block it (re-nudging a still-deaf lane just bombs the pane). A
-// lane carrying real mail (unread > 0) is never blocked by this — the bootstrap cap
-// applies only to the zero-mail bootstrap path. tick() calls this with the lane's
-// live unread count and `bootstrapNudged.has(lane.id)`.
 // A lane with no unread mail has nothing to receive, so a nudge could only ever
-// cost it a turn. Exported as a predicate (like bootstrapCapBlocks) so the rule
-// is assertable rather than buried in the tick loop.
+// cost it a turn. Exported so the final defensive check remains independently
+// assertable even though the candidate SQL also excludes empty inboxes.
 export function hasNothingToDeliver(unread: number): boolean {
   return unread <= 0;
-}
-
-export function bootstrapCapBlocks(unread: number, alreadyBootstrapNudged: boolean): boolean {
-  return unread === 0 && alreadyBootstrapNudged;
 }
 
 // A2 nudge-storm guard (pure, exported for unit testing). At most ONE nudge per
@@ -427,7 +404,7 @@ export interface Lane {
   receiver_mode: string;
   unread: number;
   unread_episode: number;
-  last_hook_seen_at: string | null;  // NULL = drain hook never attached (needs bootstrap nudge)
+  last_hook_seen_at: string | null;  // NULL = drain hook has not attached yet
 }
 
 export type CodexWakeBlockReason = "no-pane-id" | "no-seat-key" | "seat-pane-mismatch";
@@ -487,29 +464,24 @@ export function parseNudgeClients(raw: string | undefined = process.env.NUDGE_CL
   return [...new Set(picked)];
 }
 const NUDGEABLE_CLIENTS = parseNudgeClients();
-function lanesWithUnread(db: Database, nudgeableClients: string[] = NUDGEABLE_CLIENTS): Lane[] {
+export function lanesWithUnread(db: Database, nudgeableClients: string[] = NUDGEABLE_CLIENTS): Lane[] {
   // No nudgeable client types → nothing to nudge. Return empty WITHOUT building a
   // `WHERE ... IN ()` (invalid SQL in SQLite) — and the tick() caller short-circuits
   // before this on the same condition, so this is just a defensive second guard.
   if (nudgeableClients.length === 0) return [];
   const placeholders = nudgeableClients.map(() => "?").join(", ");
-  // LEFT JOIN (not JOIN) + the HAVING clause below surface two kinds of lane:
-  //   1. lanes with undelivered mail (unread > 0) — the normal case;
-  //   2. lanes whose drain hook has NEVER attached (last_hook_seen_at IS NULL)
-  //      even at unread=0. Without (2) a freshly-registered seat with a broken/
-  //      unattached hook and no mail yet is never nudged, so its hook never
-  //      attaches — the chicken-and-egg "deaf fresh seat" bug. One bootstrap
-  //      nudge lets the hook bind. Both are bounded by MAX_NUDGE_ATTEMPTS in the
-  //      caller, so a permanently-stuck seat is not keystroke-bombed forever.
+  // Candidate selection is fail-closed: only an exact peer/message join over a
+  // currently undelivered row can produce a lane. Hook state, pane visibility,
+  // and delivered history are never substitutes for real pending mail.
   return db.query(`
     SELECT p.id, p.name, p.pid, p.client_type, p.tmux_pane_id, p.thread_id,
            p.seat_key, p.receiver_mode, p.last_hook_seen_at, p.unread_episode,
            COUNT(m.id) AS unread
     FROM peers p
-    LEFT JOIN messages m ON m.to_id = p.id AND m.delivered = 0
+    JOIN messages m ON m.to_id = p.id AND m.delivered = 0
     WHERE p.client_type IN (${placeholders})
     GROUP BY p.id
-    HAVING unread > 0 OR p.last_hook_seen_at IS NULL
+    HAVING unread > 0
   `).all(...nudgeableClients) as Lane[];
 }
 
@@ -1288,12 +1260,6 @@ export function tick(db: Database, snapOverride?: TickSnapshot, deps: TickDeps =
   for (const id of unreadyCodexWakeWarned) if (!active.has(id)) unreadyCodexWakeWarned.delete(id);
   for (const id of legacyCodexWakeWarned) if (!active.has(id)) legacyCodexWakeWarned.delete(id);
   for (const id of paneCache.keys()) if (!active.has(id)) paneCache.delete(id);
-  // bootstrapNudged is pruned ONLY when the lane leaves the set entirely (session
-  // gone / hook finally attached → no longer NULL-hook). It is deliberately NOT
-  // pruned on the unread-clear path above — that retention is what enforces the A1
-  // lifetime cap. Pruning here keeps the Set bounded over a multi-day run.
-  for (const id of bootstrapNudged) if (!active.has(id)) bootstrapNudged.delete(id);
-
   if (lanes.length === 0) return;
 
   // A2: at most ONE nudge per physical pane per tick. Multiple lanes can resolve
@@ -1342,21 +1308,9 @@ export function tick(db: Database, snapOverride?: TickSnapshot, deps: TickDeps =
         }
         continue;
       }
-      // A1: a zero-mail lane is here only via the NULL-hook bootstrap path. Nudge
-      // it AT MOST ONCE in this process lifetime — one keystroke to try to wake an
-      // unattached drain hook is all that is ever useful (there is no mail to
-      // deliver). A lane that is still here after its bootstrap nudge has a hook
-      // that did not bind; re-nudging it just bombs the pane. (A lane that later
-      // gets real mail has unread > 0 and bypasses this guard entirely.)
-      // NEVER nudge a lane with nothing to deliver. This supersedes the old A1
-      // zero-mail bootstrap path (e0c515b), which nudged a NULL-hook seat once to
-      // make its drain hook bind. That cost is not payable: the nudge consumes a
-      // real turn, and on a fresh lane it consumes the FIRST turn -- the one that
-      // frames the whole session (observed 2026-07-20 on infra.3277756, 0 unread).
-      // An unbound hook binds on the lane's next natural turn anyway, so the
-      // bootstrap only ever bought latency, never correctness.
+      // Re-check at the last boundary before transport. The SQL already requires
+      // an undelivered row, but a stale or malformed Lane must still fail closed.
       if (hasNothingToDeliver(lane.unread)) continue;
-      if (bootstrapCapBlocks(lane.unread, bootstrapNudged.has(lane.id))) continue;
       const since = clock() - (lastNudge.get(lane.id) ?? 0);
       if (since < NUDGE_COOLDOWN_MS) continue;                   // recently nudged — give it time to drain
       const { paneId, attachId } = resolveLanePane(lane, snap);

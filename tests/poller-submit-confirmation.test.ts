@@ -195,6 +195,33 @@ describe("the shipped poller is wake-only", () => {
     db.close();
   });
 
+  test("the real tick never wakes zero-mail or delivered-only lanes", () => {
+    const db = new Database(":memory:");
+    db.run(`CREATE TABLE peers (
+      id TEXT PRIMARY KEY, name TEXT, pid INTEGER NOT NULL, client_type TEXT NOT NULL,
+      tmux_pane_id TEXT, thread_id TEXT, seat_key TEXT, receiver_mode TEXT,
+      last_hook_seen_at TEXT, last_drain_at TEXT, unread_episode INTEGER NOT NULL DEFAULT 0
+    )`);
+    db.run("CREATE TABLE messages (id INTEGER PRIMARY KEY, to_id TEXT NOT NULL, sent_at TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0, delivered_at TEXT)");
+    db.run("INSERT INTO peers VALUES ('empty-seat', 'infra.empty', ?, 'codex', '%43', 'thread-empty', 'pane:infra:%43', 'codex-hook', NULL, NULL, 0)", [process.pid]);
+    db.run("INSERT INTO peers VALUES ('history-seat', 'infra.history', ?, 'codex', '%44', 'thread-history', 'pane:infra:%44', 'codex-hook', NULL, NULL, 1)", [process.pid]);
+    db.run("INSERT INTO messages (id, to_id, sent_at, delivered, delivered_at) VALUES (2, 'history-seat', '2026-08-12T00:00:00.000Z', 1, '2026-08-12T00:00:01.000Z')");
+
+    const submissions: string[] = [];
+    tick(db, { procs: [], paneByPid: new Map(), paneMap: new Map() }, {
+      nudgeableClients: ["codex"],
+      isPidAlive: () => true,
+      paneIsIdle: () => true,
+      nudgeLane: (lane) => {
+        submissions.push(lane.id);
+        return "submitted";
+      },
+    });
+
+    expect(submissions).toEqual([]);
+    db.close();
+  });
+
   test("the real tick refuses a mismatched seat before the transport boundary", () => {
     const db = new Database(":memory:");
     db.run(`CREATE TABLE peers (
