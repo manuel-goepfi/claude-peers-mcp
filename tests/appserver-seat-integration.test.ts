@@ -20,10 +20,14 @@ const canUseTmux = Bun.spawnSync(["tmux", "list-sessions"], { stdout: "ignore", 
   const currentSession = `cp-appreg-current-${process.pid}-${Date.now()}`;
   let appServer: ReturnType<typeof Bun.spawn> | null = null;
   try {
-    for (const [session, name] of [[otherSession, "other-lane"], [currentSession, "stale-launch-name"]] as const) {
+    for (const session of [otherSession, currentSession]) {
       const created = Bun.spawnSync([
         "tmux", "new-session", "-d", "-s", session, "-c", cwd,
-        "env", `CLAUDE_PEER_NAME=${name}`, "bash", "-c", "exec -a codex sleep 60",
+        // The hook accepts the inherited pane hint, while the production poller
+        // deliberately watches only CLAUDE_PEER_NAME/TMUX_PANE. Keep this
+        // isolated-broker fixture invisible to that live daemon so it cannot
+        // register the fake client or rewrite the pane label mid-assertion.
+        "bash", "-c", 'export CLAUDE_PEER_TMUX_PANE_ID="$TMUX_PANE"; unset TMUX_PANE; exec -a codex sleep 60',
       ], { stdout: "pipe", stderr: "pipe" });
       expect(created.exitCode).toBe(0);
     }
