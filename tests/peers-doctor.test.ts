@@ -147,6 +147,10 @@ describe("schema-aware doctor", () => {
         live_registered_processes: 1,
         adapters_with_registered_client: 1,
         adapters_without_registered_client: 7,
+        // 'later-match' is a LIVE client whose seat records no live adapter
+        // process — exactly the "Transport closed" lane-state this counts.
+        // The two dead-pid rows are dead seats (reaper's domain), not counted.
+        peers_with_dead_adapter: 1,
       });
       expect(report.aggregates?.peers.active).toBe(2);
     } finally {

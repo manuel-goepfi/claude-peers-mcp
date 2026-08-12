@@ -125,6 +125,41 @@ export function seatPidsAlive(
   return seatPids.some(isPidAlive);
 }
 
+export type SeatAdapterLiveness = "alive" | "dead" | "unknown";
+
+/**
+ * Does a live MCP adapter still serve this seat?
+ *
+ * A seat's pids mix the session (TUI/hook registrants) with the per-session
+ * MCP adapter (server.ts). When the adapter dies while the session lives, the
+ * lane's peers TOOLS fail ("Transport closed") while its hook receive path
+ * keeps working — a split the lane itself discovers only mid-handoff, and a
+ * sender otherwise never learns at all.
+ *
+ * - "alive":   some live seat pid is an adapter process.
+ * - "dead":    a live pid is a RECOGNIZED CLIENT SESSION and no live pid is an
+ *              adapter — tool sends from that lane will fail until it restarts.
+ * - "unknown": no live pid at all (dead seat — the reaper's domain), or the
+ *              live pids are neither adapter nor recognizable session. "Dead"
+ *              is an accusation the sender acts on, so it requires an
+ *              affirmed session, not merely the absence of an adapter: a
+ *              registrant we cannot classify (a test fixture, an unrecognized
+ *              client) must fail QUIET, not page every sender.
+ */
+export function classifySeatAdapterLiveness(
+  seatPids: number[],
+  fallbackPid: number,
+  isPidAlive: (pid: number) => boolean,
+  isAdapterPid: (pid: number) => boolean,
+  isSessionPid: (pid: number) => boolean,
+): SeatAdapterLiveness {
+  const pids = seatPids.length > 0 ? seatPids : [fallbackPid];
+  const live = pids.filter(isPidAlive);
+  if (live.length === 0) return "unknown";
+  if (live.some(isAdapterPid)) return "alive";
+  return live.some(isSessionPid) ? "dead" : "unknown";
+}
+
 /**
  * SQL that backfills seat_key for rows written before this column existed.
  * Mirrors durableSeatKey() exactly; keep the two in step.

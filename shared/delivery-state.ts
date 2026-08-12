@@ -31,6 +31,14 @@ export interface RecipientDeliveryHealth {
   last_drain_at: string | null;
   /** Whether anything (poller nudge or client hook) can prompt a drain. */
   nudgeable: boolean;
+  /**
+   * Whether the recipient's per-session MCP adapter is running. Orthogonal to
+   * the drain state: a dead adapter does not block RECEIVING (hooks are
+   * separate processes) but every peers tool call in that lane fails with
+   * "Transport closed" — so a sender expecting a REPLY must know. Present
+   * only when the broker could classify the seat's processes.
+   */
+  mcp_transport?: "alive" | "dead" | "unknown";
   /** Human-readable sender warning; null when there is nothing to say. */
   warning: string | null;
 }
@@ -43,6 +51,8 @@ export interface RecipientDrainFacts {
   hasPane: boolean;
   /** Client drains itself via a prompt hook rather than needing a nudge. */
   hookDriven: boolean;
+  /** Seat-process classification of the recipient's MCP adapter, when known. */
+  mcpTransport?: "alive" | "dead" | "unknown";
   undrainedWarnMs?: number;
 }
 
@@ -70,28 +80,39 @@ export function recipientDeliveryHealth(facts: RecipientDrainFacts): RecipientDe
     oldest_pending_ms: facts.oldestPendingMs,
     last_drain_at: facts.lastDrainAt,
     nudgeable,
+    ...(facts.mcpTransport ? { mcp_transport: facts.mcpTransport } : {}),
+  };
+  // A dead adapter never changes the drain STATE — receipt still works via
+  // hooks — but the sender must hear it: a reply from that lane is impossible
+  // until its session restarts, and the lane discovers that only mid-handoff.
+  const finish = (health: RecipientDeliveryHealth): RecipientDeliveryHealth => {
+    if (facts.mcpTransport !== "dead") return health;
+    const note =
+      "Recipient's peers MCP adapter is not running: hook mail still delivers, " +
+      "but its own peers tools (send/find/reply) fail with a closed transport until its session restarts.";
+    return { ...health, warning: health.warning ? `${health.warning} ${note}` : note };
   };
 
   if (!nudgeable) {
-    return {
+    return finish({
       ...base,
       state: "no_drain_path",
       warning:
         `Recipient has no automatic drain path (no tmux pane, manual drain): ${facts.pending} message(s) queued. ` +
         "It will see them only when it calls check_messages itself.",
-    };
+    });
   }
 
   if (facts.oldestPendingMs !== null && facts.oldestPendingMs > warnMs) {
     const drained = facts.lastDrainAt ? `last drained ${facts.lastDrainAt}` : "has never drained";
-    return {
+    return finish({
       ...base,
       state: "undrained",
       warning:
         `Recipient has not drained for ${humanizeMs(facts.oldestPendingMs)} (${drained}): ` +
         `${facts.pending} message(s) queued. Treat this as undelivered, not received.`,
-    };
+    });
   }
 
-  return { ...base, state: "healthy", warning: null };
+  return finish({ ...base, state: "healthy", warning: null });
 }

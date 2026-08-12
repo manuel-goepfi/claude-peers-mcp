@@ -64,7 +64,8 @@ import {
   recipientDeliveryHealth,
   type RecipientDeliveryHealth,
 } from "./shared/delivery-state.ts";
-import { durableSeatKey, mergeSeatPids, parseSeatPids, seatPidsAlive, serializeSeatPids } from "./shared/seat.ts";
+import { classifySeatAdapterLiveness, durableSeatKey, mergeSeatPids, parseSeatPids, seatPidsAlive, serializeSeatPids } from "./shared/seat.ts";
+import { isClientProcess } from "./shared/client.ts";
 import { acquireBrokerOwnership, assertDatabaseIdentity, type BrokerLifecycleIdentity } from "./shared/broker-lifecycle.ts";
 import {
   OWNER_ONLY_UMASK,
@@ -1656,6 +1657,35 @@ function disambiguateName(rawName: string | null, selfId: string, windowName?: s
 // name would be reusable. Used by disambiguateName, the rehydrate path
 // (482-489), and cleanStalePeers (was bare-catch, hardened to use this
 // helper for symmetric EPERM handling across all liveness checks).
+// The per-session MCP adapter is identified by its argv carrying this repo's
+// server.ts. Same detection the doctor uses (isPeerAdapterProcess), inlined
+// against /proc because the broker classifies one seat's few pids at send
+// time, not a whole process table. cmdline is NUL-separated; the absolute
+// path contains no NULs, so a raw substring check is exact enough.
+const ADAPTER_SERVER_PATH = new URL("./server.ts", import.meta.url).pathname;
+function isAdapterServerPid(pid: number): boolean {
+  try {
+    return readFileSync(`/proc/${pid}/cmdline`, "utf8").includes(ADAPTER_SERVER_PATH);
+  } catch {
+    return false; // exited mid-check, or /proc unavailable — never "alive" on faith
+  }
+}
+
+// "Adapter dead" is only claimed against an AFFIRMED client session — a live
+// seat pid we cannot recognize as any supported client stays "unknown" and
+// warns nobody (fail-quiet; see classifySeatAdapterLiveness).
+const SESSION_CLIENT_TYPES = ["claude", "codex", "gemini", "cursor", "agy", "kimi"] as const;
+function isClientSessionPid(pid: number): boolean {
+  try {
+    const args = readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0").filter(Boolean).join(" ");
+    const comm = readFileSync(`/proc/${pid}/comm`, "utf8").trim();
+    const row = { pid, ppid: 0, comm, args };
+    return SESSION_CLIENT_TYPES.some((client) => isClientProcess(row, client));
+  } catch {
+    return false;
+  }
+}
+
 function isPidAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -1825,6 +1855,13 @@ function recipientHealthFor(peer: Peer): RecipientDeliveryHealth {
     hasPane: Boolean(peer.tmux_pane_id) && validClientType(peer.client_type) !== "unknown",
     // These modes drain on the client's own prompt/tool cycle.
     hookDriven: receiverMode === "claude-channel" || receiverMode === "codex-hook" || receiverMode === "gemini-hook",
+    // Adapter-vs-session split, read live at send time: a lane whose MCP
+    // adapter died keeps receiving via hooks but cannot send or reply
+    // ("Transport closed" on every peers tool). The sender is the only party
+    // positioned to route around that, so it is told here.
+    mcpTransport: classifySeatAdapterLiveness(
+      parseSeatPids(peer.seat_pids), peer.pid, isPidAlive, isAdapterServerPid, isClientSessionPid,
+    ),
   });
 }
 

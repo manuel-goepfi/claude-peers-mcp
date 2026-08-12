@@ -1567,6 +1567,30 @@ describe("Live broker delivery features", () => {
     expect(message).toEqual({ delivered: 0, claimed_by: null, claimed_at: null });
   }, 15_000);
 
+  test("a send to a live session with no adapter process reports mcp_transport dead", async () => {
+    // The "Transport closed" lane state: a recognizable CLIENT session lives
+    // (argv0 forged to "claude" — isClientProcess reads the cmdline), so the
+    // seat is alive and hook mail would deliver — but no adapter (server.ts)
+    // serves the seat, so every peers tool call from that lane fails. The
+    // sender is the only party who can route around that, and must be told
+    // at send time. A plain sleep pid would classify "unknown", not "dead":
+    // the accusation requires an affirmed session.
+    const child = Bun.spawn(["bash", "-c", "exec -a claude sleep 60"]);
+    childProcesses.add(child);
+    await Bun.sleep(150); // let exec replace the cmdline before the broker reads /proc
+    const peer = await brokerFetch<{ id: string }>("/register", {
+      pid: child.pid, cwd: "/adapter-dead-recipient", git_root: null, tty: null, name: "adapter-dead-recipient",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null,
+      client_type: "codex", receiver_mode: "codex-hook", summary: "",
+    });
+    const sent = await brokerFetch<{ recipient?: { mcp_transport?: string; warning?: string | null } }>("/send-message", {
+      from_id: peer.id, to_id: peer.id, text: "adapter-dead surfacing probe",
+    });
+    expect(sent.recipient?.mcp_transport).toBe("dead");
+    expect(sent.recipient?.warning ?? "").toContain("MCP adapter is not running");
+    expect(sent.recipient?.warning ?? "").toContain("hook mail still delivers");
+  });
+
   test("/ack-by-pid: wrong drain_id does not deliver and records a mismatch", async () => {
     const child = spawnSleep();
     const peer = await brokerFetch<{ id: string }>("/register", {

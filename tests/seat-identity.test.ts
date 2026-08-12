@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  classifySeatAdapterLiveness,
   durableSeatKey,
   mergeSeatPids,
   parseSeatPids,
@@ -199,5 +200,42 @@ describe("seatKeyBackfillSql", () => {
     expect((db.query("SELECT seat_key FROM peers WHERE id='x'").get() as { seat_key: string }).seat_key)
       .toBe("pane:pinned:%99");
     db.close();
+  });
+});
+
+describe("classifySeatAdapterLiveness", () => {
+  const aliveSet = (alive: number[]) => (pid: number) => alive.includes(pid);
+  const adapterSet = (adapters: number[]) => (pid: number) => adapters.includes(pid);
+  const sessionSet = (sessions: number[]) => (pid: number) => sessions.includes(pid);
+
+  test("a live adapter among the seat pids is alive", () => {
+    expect(classifySeatAdapterLiveness([100, 200], 100, aliveSet([100, 200]), adapterSet([200]), sessionSet([100]))).toBe("alive");
+  });
+
+  test("a live session with a dead adapter is dead — the Transport-closed lane state", () => {
+    // 200 (the adapter) exited; 100 (the TUI) lives. Tool sends from that
+    // lane fail while hook receipt keeps working.
+    expect(classifySeatAdapterLiveness([100, 200], 100, aliveSet([100]), adapterSet([200]), sessionSet([100]))).toBe("dead");
+  });
+
+  test("a live pid that is neither adapter nor recognizable session is unknown, not dead", () => {
+    // "Dead" is an accusation senders act on. A registrant we cannot classify
+    // (test fixture, unrecognized client) must fail quiet.
+    expect(classifySeatAdapterLiveness([100], 100, aliveSet([100]), adapterSet([]), sessionSet([]))).toBe("unknown");
+  });
+
+  test("no live pid at all is unknown — the reaper's domain, not a transport verdict", () => {
+    expect(classifySeatAdapterLiveness([100, 200], 100, aliveSet([]), adapterSet([200]), sessionSet([100]))).toBe("unknown");
+  });
+
+  test("legacy rows with no seat pids fall back to the row pid", () => {
+    expect(classifySeatAdapterLiveness([], 300, aliveSet([300]), adapterSet([300]), sessionSet([]))).toBe("alive");
+    expect(classifySeatAdapterLiveness([], 300, aliveSet([300]), adapterSet([]), sessionSet([300]))).toBe("dead");
+    expect(classifySeatAdapterLiveness([], 300, aliveSet([]), adapterSet([]), sessionSet([]))).toBe("unknown");
+  });
+
+  test("a dead adapter pid is never counted alive on cmdline alone", () => {
+    // isAdapterPid may match stale metadata; only LIVE pids are consulted.
+    expect(classifySeatAdapterLiveness([200], 200, aliveSet([]), adapterSet([200]), sessionSet([]))).toBe("unknown");
   });
 });

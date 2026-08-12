@@ -6,6 +6,7 @@ import { ownerProcessIsCurrent, readOwnerMetadata } from "./broker-lifecycle.ts"
 import { classifyClientHooks, type HookClassification, type HookClient } from "./hook-config.ts";
 import { STORAGE_SCHEMA_VERSION, storageTableColumns, storageUserVersion } from "./storage.ts";
 import { claimCutoffIso } from "./delivery-state.ts";
+import { classifySeatAdapterLiveness, parseSeatPids } from "./seat.ts";
 import type { ClientType } from "./types.ts";
 
 export type SurfaceState = "current" | "stale" | "missing" | "malformed" | "unsafe";
@@ -39,7 +40,7 @@ export interface DatabaseAggregates {
   receiver_modes: Record<string, number>;
   receiver_health: { observed: number; errors: number };
   queue: { queued: number; claimed: number; acknowledged: number; unknown: number; total: number };
-  correlation: { registered_processes: number; live_registered_processes: number; adapters_with_registered_client: number; adapters_without_registered_client: number };
+  correlation: { registered_processes: number; live_registered_processes: number; adapters_with_registered_client: number; adapters_without_registered_client: number; peers_with_dead_adapter: number };
 }
 
 export interface DatabaseReport {
@@ -304,11 +305,41 @@ function decodeDatabase(db: Database, version: number, processes: Map<number, Pr
   const health = peerColumns.has("last_hook_seen_at") && peerColumns.has("last_drain_error")
     ? db.query("SELECT SUM(last_hook_seen_at IS NOT NULL) AS observed, SUM(last_drain_error IS NOT NULL) AS errors FROM peers").get() as { observed: number; errors: number }
     : { observed: 0, errors: 0 };
-  const registeredPids = peerColumns.has("pid")
-    ? (db.query("SELECT pid FROM peers").all() as Array<{ pid: number }>).map((row) => Number(row.pid)).filter(Number.isInteger)
+  const peerRows = peerColumns.has("pid")
+    ? db.query(
+      `SELECT pid, ${peerColumns.has("seat_pids") ? "seat_pids" : "NULL AS seat_pids"}, ${peerColumns.has("non_targetable") ? "non_targetable" : "0 AS non_targetable"} FROM peers`,
+    ).all() as Array<{ pid: number; seat_pids: string | null; non_targetable: number }>
     : [];
-  const registeredSet = new Set(registeredPids);
+  const registeredPids = peerRows.map((row) => Number(row.pid)).filter(Number.isInteger);
+  // Correlate against EVERY pid serving a seat, not only the row's primary
+  // pid: seat merging records the TUI and the MCP adapter in seat_pids, and
+  // matching only `pid` reported matched-adapters=0 on a fleet of 27 healthy
+  // adapters — a correlation that could never say anything.
+  const registeredSet = new Set<number>(registeredPids);
+  for (const row of peerRows) for (const pid of parseSeatPids(row.seat_pids)) registeredSet.add(pid);
   const adapterPids = adapterClientPids(processes, repoRoot);
+  // A live session whose seat has NO live adapter process: that lane's peers
+  // tools fail with "Transport closed" while its hooks keep receiving — the
+  // dead-adapter state a lane discovers only mid-handoff. Non-targetable rows
+  // (CLI one-shots) never had an adapter and are skipped.
+  const expectedServer = resolve(repoRoot, "server.ts");
+  const peersWithDeadAdapter = peerRows.filter((row) => {
+    if (row.non_targetable) return false;
+    return classifySeatAdapterLiveness(
+      parseSeatPids(row.seat_pids),
+      Number(row.pid),
+      (pid) => processes.has(pid),
+      (pid) => {
+        const proc = processes.get(pid);
+        return proc !== undefined && isPeerAdapterProcess(proc, expectedServer);
+      },
+      (pid) => {
+        const proc = processes.get(pid);
+        return proc !== undefined && (["claude", "codex", "gemini", "cursor", "agy", "kimi"] as const)
+          .some((client) => isClientProcess(proc, client));
+      },
+    ) === "dead";
+  }).length;
   return {
     peers: { total: Number(peer.total ?? 0), targetable: Number(peer.targetable ?? 0), active: Number(peer.active ?? 0) },
     clients: peerColumns.has("client_type") ? grouped(db, "SELECT client_type, COUNT(*) AS count FROM peers GROUP BY client_type ORDER BY client_type", "client_type") : { unknown: Number(peer.total ?? 0) },
@@ -320,6 +351,7 @@ function decodeDatabase(db: Database, version: number, processes: Map<number, Pr
       live_registered_processes: registeredPids.filter((pid) => processes.has(pid)).length,
       adapters_with_registered_client: adapterPids.filter((pid) => pid !== null && registeredSet.has(pid)).length,
       adapters_without_registered_client: adapterPids.filter((pid) => pid === null || !registeredSet.has(pid)).length,
+      peers_with_dead_adapter: peersWithDeadAdapter,
     },
   };
 }
@@ -402,6 +434,9 @@ export async function buildDoctorReport(options: { port: number; dbPath: string;
   if (broker.schema_version !== null && database.schema_version !== null && broker.schema_version !== database.schema_version) errors++;
   if (database.state === "legacy" || database.state === "missing") warnings++;
   if (processes.orphaned_adapters > 0 || processes.spare_parented_adapters > 0) warnings++;
+  // Live sessions whose seats lost their MCP adapter: tool sends from those
+  // lanes fail ("Transport closed") while hook receipt keeps working.
+  if ((database.aggregates?.correlation.peers_with_dead_adapter ?? 0) > 0) warnings++;
   for (const client of Object.values(clients)) {
     if (client.duplicate_scope) warnings++;
     for (const state of [client.hooks.user.state, client.hooks.project.state, client.mcp.user.state, client.mcp.project.state]) {
@@ -430,7 +465,7 @@ export function renderDoctorHuman(report: DoctorReport): string {
     lines.push(`peers: total=${a.peers.total} active=${a.peers.active} targetable=${a.peers.targetable}`);
     lines.push(`queue: queued=${a.queue.queued} claimed=${a.queue.claimed} acknowledged=${a.queue.acknowledged} unknown=${a.queue.unknown} total=${a.queue.total}`);
     lines.push(`receiver-health: observed=${a.receiver_health.observed} errors=${a.receiver_health.errors}`);
-    lines.push(`correlation: registered=${a.correlation.registered_processes} live=${a.correlation.live_registered_processes} matched-adapters=${a.correlation.adapters_with_registered_client} unmatched-adapters=${a.correlation.adapters_without_registered_client}`);
+    lines.push(`correlation: registered=${a.correlation.registered_processes} live=${a.correlation.live_registered_processes} matched-adapters=${a.correlation.adapters_with_registered_client} unmatched-adapters=${a.correlation.adapters_without_registered_client} dead-adapter-peers=${a.correlation.peers_with_dead_adapter}`);
   }
   const adapterCount = Object.values(report.processes.adapters).reduce((sum, count) => sum + count, 0);
   lines.push(`processes: clients=${report.processes.client_roots.claude + report.processes.client_roots.codex + report.processes.client_roots.gemini} adapters=${adapterCount} orphaned=${report.processes.orphaned_adapters} spare=${report.processes.spare_parented_adapters}`);

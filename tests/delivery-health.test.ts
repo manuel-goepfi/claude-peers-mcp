@@ -115,6 +115,42 @@ describe("recipientDeliveryHealth", () => {
   });
 });
 
+describe("mcp_transport surfacing", () => {
+  test("absent facts leave the field off and warnings unchanged", () => {
+    const health = recipientDeliveryHealth(base);
+    expect("mcp_transport" in health).toBe(false);
+    expect(health.warning).toBeNull();
+  });
+
+  test("an alive adapter is reported without any warning", () => {
+    const health = recipientDeliveryHealth({ ...base, mcpTransport: "alive" });
+    expect(health.mcp_transport).toBe("alive");
+    expect(health.state).toBe("healthy");
+    expect(health.warning).toBeNull();
+  });
+
+  test("a dead adapter warns the sender even on an otherwise healthy seat", () => {
+    const health = recipientDeliveryHealth({ ...base, mcpTransport: "dead" });
+    expect(health.mcp_transport).toBe("dead");
+    // Drain state is unchanged — receipt still works via hooks.
+    expect(health.state).toBe("healthy");
+    expect(health.warning).toContain("MCP adapter is not running");
+    expect(health.warning).toContain("hook mail still delivers");
+  });
+
+  test("a dead adapter appends to an existing drain warning instead of replacing it", () => {
+    const health = recipientDeliveryHealth({
+      ...base,
+      mcpTransport: "dead",
+      oldestPendingMs: UNDRAINED_WARN_MS + 1,
+      pending: 3,
+    });
+    expect(health.state).toBe("undrained");
+    expect(health.warning).toContain("Treat this as undelivered");
+    expect(health.warning).toContain("MCP adapter is not running");
+  });
+});
+
 describe("deliveryWarningLine", () => {
   test("renders nothing when the recipient is healthy", () => {
     expect(deliveryWarningLine(recipientDeliveryHealth(base))).toBe("");
