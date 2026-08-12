@@ -41,3 +41,73 @@ Codex prints its THREAD ID in the pane status line. NudgeR already captures pane
 
 ## Key file map
 broker.ts (register ~1280-1560, recipientHealthFor ~1803) · hooks/register-peer-session.ts (metadata/app-server ~460-520, runRegistration ~564) · hooks/codex-drain-peer-inbox.ts (main ~594, thread-only mode) · bin/codex-autodrain-poller.ts (nudgeText ~89, seat reconcile) · shared/{seat,client,delivery-state,doctor}.ts · logs: ~/.claude-peers-broker.log, ~/.claude-peers-codex-autodrain.log, ~/.codex/logs/{register-peer-session,drain-peer-inbox}.log
+
+## Execution report — 2026-08-12
+
+**Core verdict: GO.** The split-brain repair, bounded unread-episode budget, exact thread-status reconciliation, and true-mail-only nudge gate are committed on `codex/claude-peers-reliability` through `ce0e8b2ff15041665906afca8206d646f854ee66`.
+
+### What shipped
+
+- The broker exposes an authenticated `/reconcile-pane-thread` route. It requires exact live PID/UID/pane proof, refuses live conflicting owners, folds dead duplicate rows transactionally, and preserves message/claim/ack state.
+- The poller extracts a Codex thread UUID only from a managed status-line shape. It accepts the live untitled duplicate-UUID shape (including its 80-column truncation), rejects conflicting/prefixed UUIDs, and fails quiet on drift.
+- `peers.unread_episode` is broker-authored by a SQLite zero-to-nonzero trigger. The poller budgets at most five transport attempts for one continuous unread episode; partial drains, rising counts, duplicate folds, rehydration, failed submits, and same-millisecond ordering do not mint a fresh budget.
+- Nudge candidate selection is now an exact inner join to `messages.to_id = peers.id AND messages.delivered = 0`. Empty lanes and delivered history cannot enter the loop. A second `unread <= 0` guard remains immediately before transport.
+- Send receipts describe observable delivery state without claiming that a tmux keystroke delivered or acknowledged mail.
+
+Logical commits after the handover base:
+
+```text
+ac7f957 fix: reconcile Codex pane and thread identity
+dcd5a3c fix: bound nudge retries per unread episode
+2e9c7a0 test: stabilize tmux quiescence fixture
+b96d661 test: isolate appserver pane fixture
+8be78b9 fix: harden reconciled peer delivery
+0c54699 fix: parse narrow Codex thread status
+8033db3 test: isolate inherited pane proof fixture
+ce0e8b2 fix: require pending mail before nudging
+```
+
+### Official hook and account audit
+
+The audit used the official [Claude Code hooks reference](https://code.claude.com/docs/en/hooks), [Claude directory/config reference](https://code.claude.com/docs/en/claude-directory), and [Codex hooks reference](https://learn.chatgpt.com/docs/hooks). Both products load matching hook entries; matching entries across applicable configuration scopes may all run.
+
+| Profile | Current state |
+|---|---|
+| Claude A (`~/.claude`) | Current managed `SessionStart` register/greeting, `UserPromptSubmit` inbox drain, and `Stop` standby hooks |
+| Claude B (`~/.claude-b`) | Reinstalled from this checkout; current managed hooks with backup `settings.json.bak-2026-08-12T16-49-56-407Z-2f884e82-d971-44b0-bd56-b22adbacc918` |
+| Codex A (`~/.codex`) | Current managed `SessionStart startup|resume` register+drain, `UserPromptSubmit` drain, and `Stop` drain; account-slot verifier retained |
+| Codex B (`~/.codex-b`) | Current managed register/drain hooks; no A-slot verifier, as designed |
+
+Both Codex profiles now render `thread-id` immediately after `thread-title` in the status line. The existing user-level safe drain wrapper, managed drain hook, and Clause5 project hook were retained: official layering means they can all execute, but claim/ack leases prevent duplicate message rendering. Scope consolidation is a separate operator choice, not part of this repair.
+
+`~/.mcp.json` is an intentional zero-byte, mode-0444 lockdown stub. `claude mcp list` may print a JSON parse diagnostic for it while still reporting `claude-peers: Connected`; it was not rewritten.
+
+The dotfiles launcher is exactly:
+
+```bash
+codexd() { codex --remote unix:// --cd "$PWD" "$@"; }
+```
+
+`codexd resume --help` reaches `codex resume`, preserves cwd filtering, and documents the shared-host trade-off. A fresh hosted thread spawns its MCP adapter; a resumed thread whose adapter already died cannot reconnect mid-session, but the disk-loaded prompt hooks continue to receive by exact thread identity.
+
+### Review and verification
+
+- Claude B, Opus 5, compound-engineering review session `5326e522-10c0-44d4-8941-358a65d37566`: terminal `completed`, PASS, no P0/P1/P2 findings.
+- Independent correctness, security, and testing passes: clean. Review-found unread-episode fold, same-millisecond, and rehydration cases were reproduced before repair and now have regression coverage.
+- Exact-head `bun run verify`: typecheck PASS; **1,105/1,105 tests**, **3,484 assertions**, 72 files; clean-install smoke PASS for Claude, Codex, and Gemini using `register-discover-send-ack`.
+- Scratch broker: pane-thread reconciliation and autodrain suites passed; doctor ready with zero errors.
+
+### Live acceptance
+
+- Broker and poller were rolled once at the lane-cycle boundary. Live schema now includes `peers.unread_episode` and `trg_messages_start_unread_episode`; health advertises pane/thread reconciliation.
+- Hosted `infra.4` row `mlk8uv95` was reconciled to its exact hook thread. It is one pane row in `codex-hook` mode with zero unread.
+- Fresh pane-local Codex `%2673` auto-stamped its live 80-column status UUID. Message `16965` caused one wake at `2026-08-12T17:30:07.242Z`, hook-acked at `17:30:07.408Z`, and produced reply `16966` (`TRUE-MAIL-ACK`), which this lane hook-acked at `17:31:17.741Z`.
+- A two-tick quiet window left both test lanes at zero unread and produced no second wake. Empty and delivered-only lanes are also covered through the shipped `tick()` integration test.
+- Two failed regression probes (`16961`, `16962`) were matched by id, target, state, and text prefix, then deleted. No unrelated mailbox was changed.
+- Doctor is ready with zero errors. Its degraded warning reflects real dead adapters, not broker failure.
+
+### Remaining topology facts
+
+- Old Codex TUIs started before `thread-id` was added will not render it until restart. Their genuinely undelivered mail remains nudgeable, but the hard five-attempt episode cap stops repeated knocks.
+- Claude B's peer-specific acceptance retry ended in provider HTTP 529 with zero model tokens; this did not change its connected MCP/config proof or the earlier completed Opus review.
+- Cursor's 3.5-day live agent cannot add an MCP child mid-session. A separate, read-only-verified wrapper/config repair will apply on the next Cursor launch; that work is outside this branch.
