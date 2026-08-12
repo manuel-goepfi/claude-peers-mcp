@@ -112,3 +112,44 @@ codexd() { codex --remote unix:// --cd "$PWD" "$@"; }
 - Claude B's peer-specific acceptance retry ended in provider HTTP 529 with zero model tokens; this did not change its connected MCP/config proof or the earlier completed Opus review.
 - Cursor's 3.5-day `traffic.1.1` agent cannot add an MCP child mid-session. The separate wrapper/config repair was read-only verified: it derives `session.window.pane` through process ancestry and will apply on the next Cursor launch; that work is outside this branch. Its stale broker row correctly refused a send.
 - Closure report `16967` was instead sent to live Cursor `traffic.1.3` on `%2732`; NudgeR produced one wake and the row acknowledged it at `2026-08-12T17:37:59.170Z`. No stale Claude row was deleted.
+
+## Final acceptance addendum — 2026-08-12
+
+The remaining account, layout, authority, and restart boundaries are closed on `codex/claude-peers-reliability` through `b5fd484885e37deab6920c0a3f0ee9c8e517f4b0`.
+
+Additional logical commits:
+
+```text
+f5a8ebf fix: harden peer wake identity and authority
+d09079a fix: keep pane labels stable across layout changes
+b5fd484 fix: persist nudge budgets across restarts
+```
+
+### Identity and lifecycle
+
+- Codex A (`~/.codex`) and B (`~/.codex-b`) now render `thread-id` first in the status line, before model/context fields. New and resumed TUIs load it; already-running TUIs still require restart.
+- A fresh hosted `codexd` test at width 58 registered, reconciled its exact thread, received message `16978`, hook-acked it, and replied with `CODEX-F5A8-ACK`. A width-65 test rendered the full thread id.
+- Pane numbering is no longer identity. The broker preserves a pane-scoped `@operator_label`; fallback ordinals allocate after the highest live ordinal instead of recycling a closed gap. In the live close/reopen test, `.2` remained `.2` after its pane index changed and the replacement became `.3`.
+- Every requested throwaway session was closed. The Claude B test PIDs exited and its broker row had zero unread mail.
+
+### Authority and wake semantics
+
+- The compact wake says what is observable: unread count, one `check_messages` attempt, no authority grant, privileged-action boundary, and the one-shot `Transport closed`/unverifiable fallback.
+- Orchestrators may coordinate ordinary in-scope work by default. They cannot delegate operator authority: a privileged action is valid only when the receiving lane already has direct operator authorization for that exact action in its own session.
+- Candidate selection remains an exact join to undelivered mail. Zero unread means zero wake. Copy-mode, busy input, missing ownership, dead processes, and unready Codex identity all fail closed before transport.
+
+### Claude B, Cursor, and durable NudgeR proof
+
+- The installed systemd poller now includes `claude` alongside `codex,gemini,cursor,agy,kimi`. Fresh Claude B message `16983` caused one hands-off wake at `18:31:47.838Z`, hook drain/ack at `18:31:49.642Z`, and `CLAUDE-B-HANDSOFF-ACK` without an operator prompt.
+- Claude B independently reviewed the final persistence diff. Its initial eight findings were re-tested; the final re-review was CLEAN with no P0/P1/P2 blocker.
+- Fresh Cursor lane `traffic.5` (`cdo210k7`, pane `%2794`) showed one transient first-call disconnect during MCP startup. In the same session, native `check_messages`, `whoami`, `send_message`, and `set_summary` then succeeded; a ping and ACK completed bidirectionally and the inbox drained to zero. This was a startup race, not pane-width or lane-name failure.
+- Nudge attempts now live in `~/.claude-peers-nudge-budget.json` (mode `0600`). Reservations and cooldown are fsynced before tmux submission; the parent directory is fsynced after atomic rename. Corrupt/unwritable state fails closed and appears as `nudge_budget=degraded` in the heartbeat.
+- A first installation explicitly creates an empty ledger. After rollout, a second systemd restart reloaded the existing ledger byte-for-byte: SHA-256 `63318be1370c127705b5031532a0b68d22e2772d33d3f5b2c15deb4f00ff0c54` was unchanged and no second bootstrap log appeared. Attempts made by the pre-ledger daemon cannot be reconstructed; durability applies from this rollout forward.
+- Deterministic regression coverage proves that five attempts remain exhausted across process restart and temporary client exclusion, write-ahead state is visible on disk before the transport callback, copy-mode consumes no attempt, drain/refill advances the broker episode, and drained/deleted seats are garbage-collected without losing a queued mailbox during rehydration.
+
+### Final gates
+
+- `bun run verify`: TypeScript PASS; **1,113/1,113 tests**, **3,524 assertions**, 72 files; clean-install smoke PASS for Claude, Codex, and Gemini using `register-discover-send-ack`.
+- Installed unit equals the tracked unit; one poller process is active; heartbeat is `nudge_budget=ready`.
+- `bun bin/peers-doctor.ts`: broker/database ready, receiver errors `0`, summary `degraded` with one warning because historical rows retain dead adapters. This is topology debt, not a receive-path failure.
+- Local HEAD and remote branch both resolve to `b5fd484885e37deab6920c0a3f0ee9c8e517f4b0` before this documentation-only addendum.
