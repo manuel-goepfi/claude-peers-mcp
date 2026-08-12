@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { findClientPidFromTable, findHookPeerPidsFromTable, findMcpPidFromTable } from "../hooks/codex-drain-peer-inbox.ts";
-import { codexHookRootDegradedReason, codexHookRootRefusalReason, codexHookSessionDiagnostic, peerName, publishBrokerIdentityToTmux, readPaneLabel, registrationTmuxPaneId, sessionIdFromHookInput, tmuxIdentityMirrorEnabled } from "../hooks/register-peer-session.ts";
+import { codexDrainRootDecision, codexHookRootDegradedReason, codexHookRootRefusalReason, codexHookSessionDiagnostic, peerName, publishBrokerIdentityToTmux, readPaneLabel, registrationTmuxPaneId, sessionIdFromHookInput, tmuxIdentityMirrorEnabled } from "../hooks/register-peer-session.ts";
 import { detectClientFromProcessChain, findBgSpareAncestor, initialReceiverMode, type ProcessInfo } from "../shared/client.ts";
 import { findNearestVisibleCodexProcessByStart, findVisibleCodexProcessByPaneId } from "../shared/visible-codex.ts";
 import { findCodexAppServerAncestor, findVisibleCodexSession, mcpThreadIdFromRequestMeta, registrationCwd, registrationCwdResult, registrationTtyPid, selectCodexManualDrainPid, selectInboxClaimIdentity, shouldUnregisterPeerOnShutdown, unresolvedAppServerToolDiagnostic } from "../server.ts";
@@ -536,6 +536,58 @@ describe("client detection", () => {
       hook_event_name: "SessionStart",
       transcript_path: rootTranscript,
     }, "SessionStart")).toBe("transcript-session-mismatch");
+    // A subagent turn carries the ROOT's session_id plus serialized
+    // agent_id/agent_type — the one imposter session/transcript comparison
+    // cannot catch, refused on the field Codex provides for it.
+    expect(codexHookRootRefusalReason({
+      session_id: rootThreadId,
+      hook_event_name: "UserPromptSubmit",
+      transcript_path: rootTranscript,
+      agent_id: "agent-1",
+      agent_type: "review",
+    }, "UserPromptSubmit")).toBe("subagent-context");
+  });
+
+  test("Codex drain decision routes a transcript-less root by exact thread join instead of refusing", () => {
+    const rootThreadId = "019fc273-a35b-78f0-9a70-f63b5905540f";
+    const rootTranscript = `/not-yet-created/rollout-${rootThreadId}.jsonl`;
+
+    // Codex omits transcript_path when the thread has no materialized rollout
+    // (persistence off / rollout IO pending) — measured on live root lanes.
+    // The drain must not refuse: the thread-routed claim is its proof.
+    expect(codexDrainRootDecision({
+      session_id: rootThreadId,
+      hook_event_name: "UserPromptSubmit",
+    }, "UserPromptSubmit")).toEqual({ action: "thread-only" });
+    expect(codexDrainRootDecision({
+      session_id: rootThreadId,
+      hook_event_name: "Stop",
+    }, "Stop")).toEqual({ action: "thread-only" });
+    // A matching transcript is still the strongest proof and keeps full recovery.
+    expect(codexDrainRootDecision({
+      session_id: rootThreadId,
+      hook_event_name: "UserPromptSubmit",
+      transcript_path: rootTranscript,
+    }, "UserPromptSubmit")).toEqual({ action: "proven", degraded: null });
+    // Positive evidence of another thread still refuses outright.
+    expect(codexDrainRootDecision({
+      session_id: "019fd84b-4556-7fd2-8e21-3fac2582d757",
+      hook_event_name: "UserPromptSubmit",
+      transcript_path: rootTranscript,
+    }, "UserPromptSubmit")).toEqual({ action: "refuse", reason: "transcript-session-mismatch" });
+    // Subagent context refuses even with the root's id and a matching transcript.
+    expect(codexDrainRootDecision({
+      session_id: rootThreadId,
+      hook_event_name: "UserPromptSubmit",
+      transcript_path: rootTranscript,
+      agent_type: "review",
+    }, "UserPromptSubmit")).toEqual({ action: "refuse", reason: "subagent-context" });
+    // An unparseable-but-present path stays fail-open, flagged degraded.
+    expect(codexDrainRootDecision({
+      session_id: rootThreadId,
+      hook_event_name: "UserPromptSubmit",
+      transcript_path: "/memory/rollout-not-a-uuid.jsonl",
+    }, "UserPromptSubmit")).toEqual({ action: "proven", degraded: "unparseable-transcript-path" });
   });
 
   test("an unresolved app-server seat names the blocked tool and the safe recovery boundary", () => {

@@ -106,6 +106,7 @@ export function codexHookSessionDiagnostic(value: unknown): CodexHookSessionDiag
 export type CodexHookRootRefusalReason =
   | "event-mismatch"
   | "missing-session-id"
+  | "subagent-context"
   | "missing-transcript-path"
   | "transcript-session-mismatch";
 
@@ -138,6 +139,12 @@ export function codexHookRootRefusalReason(
   )) return "event-mismatch";
   const sessionId = sessionIdFromHookInput(input);
   if (!sessionId) return "missing-session-id";
+  // Codex serializes subagent turn context as top-level agent_id/agent_type
+  // (schema.rs SubagentCommandInputFields, omitted for the root). A subagent
+  // turn carries the ROOT thread's session_id, so it would pass every
+  // session/transcript comparison — this is the one imposter the thread join
+  // cannot filter, and it must be refused on the field Codex provides for it.
+  if (codexHookSubagentContext(input)) return "subagent-context";
   if (typeof input.transcript_path !== "string" || !input.transcript_path.trim()) {
     return "missing-transcript-path";
   }
@@ -147,6 +154,44 @@ export function codexHookRootRefusalReason(
   // every root lane. Callers log the degraded proof and continue fail-open.
   if (!transcriptId) return null;
   return transcriptId === sessionId.toLowerCase() ? null : "transcript-session-mismatch";
+}
+
+/** True when the hook payload carries Codex's serialized subagent turn context. */
+function codexHookSubagentContext(input: Record<string, unknown>): boolean {
+  return [input.agent_id, input.agent_type].some(
+    (field) => typeof field === "string" && field.trim().length > 0,
+  );
+}
+
+export type CodexDrainRootDecision =
+  | { action: "refuse"; reason: CodexHookRootRefusalReason }
+  | { action: "thread-only" }
+  | { action: "proven"; degraded: CodexHookRootDegradedReason | null };
+
+/**
+ * Drain-side root decision. Registration keeps the strict transcript proof —
+ * it MINTS identity, and an internal session registering itself was the
+ * original observer-row bug. A drain only ever CLAIMS against an existing row,
+ * and the thread-routed claim (`/claim-by-thread`) resolves the broker row by
+ * exact thread id — Codex's hook session_id IS the ThreadId, and an internal
+ * session's own id matches no registered row (404, nothing drained).
+ *
+ * So a missing transcript_path must not refuse a drain: Codex omits it
+ * whenever the thread has no materialized rollout (session persistence off,
+ * or rollout IO pending — measured 326 refused drains on live root lanes),
+ * and the transcript was only load-bearing for the PID-routed fallback, where
+ * any same-process hook could reach the root's mailbox. The caller must
+ * honor "thread-only": exact thread join, no PID fallback, no
+ * self-registration (registration would refuse the same unproven payload).
+ */
+export function codexDrainRootDecision(
+  value: unknown,
+  expectedEventName: "SessionStart" | "UserPromptSubmit" | "Stop" | ReadonlyArray<"SessionStart" | "UserPromptSubmit" | "Stop">,
+): CodexDrainRootDecision {
+  const refusal = codexHookRootRefusalReason(value, expectedEventName);
+  if (refusal === "missing-transcript-path") return { action: "thread-only" };
+  if (refusal) return { action: "refuse", reason: refusal };
+  return { action: "proven", degraded: codexHookRootDegradedReason(value) };
 }
 
 export function codexHookRootDegradedReason(value: unknown): CodexHookRootDegradedReason | null {

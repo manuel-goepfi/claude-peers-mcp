@@ -1548,7 +1548,14 @@ describe("Live broker delivery features", () => {
     expect(code).toBe(0);
     expect(stdout).toBe("");
     expect(stderr).toContain("skipping unproven Codex registration reason=missing-transcript-path");
-    expect(stderr).toContain("skipping unproven Codex drain reason=missing-transcript-path");
+    // The drain no longer refuses a transcript-less payload — it claims by
+    // exact thread join, and the internal session's own thread id matches no
+    // registered row, so the broker answers 404 and the root's mail is
+    // untouched. Self-registration must not run: it would replay the same
+    // unproven payload into the strict registration proof.
+    expect(stderr).toContain("draining via exact thread join only");
+    expect(stderr).toContain("thread-routed claim found no registered row");
+    expect(stderr).not.toContain("attempting bounded self-registration");
 
     const db = new Database(TEST_DB, { readonly: true });
     const row = db.query("SELECT thread_id FROM peers WHERE id = ?").get(peer.id) as { thread_id: string };

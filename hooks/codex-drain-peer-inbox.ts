@@ -4,7 +4,7 @@ import { isClientProcess as sharedIsClientProcess, isCodexAppServerProcess as sh
 import { renderInboundBatch } from "../shared/render.ts";
 import type { ClientType, Message, ReceiverMode } from "../shared/types.ts";
 import { findSingleVisibleCodexProcess } from "../shared/visible-codex.ts";
-import { codexHookRefusalDiagnostic, codexHookRootDegradedReason, codexHookRootRefusalReason } from "./register-peer-session.ts";
+import { codexDrainRootDecision, codexHookRefusalDiagnostic } from "./register-peer-session.ts";
 
 const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
@@ -609,18 +609,26 @@ async function main(): Promise<void> {
     }
   }
 
+  let threadOnlyDrain = false;
   if (CLIENT_TYPE === "codex") {
-    const refusalReason = codexHookRootRefusalReason(
+    const decision = codexDrainRootDecision(
       hookInput,
       HOOK_EVENT_NAME as "SessionStart" | "UserPromptSubmit" | "Stop",
     );
-    if (refusalReason) {
-      log(`skipping unproven Codex drain ${codexHookRefusalDiagnostic(refusalReason)} event=${HOOK_EVENT_NAME}`);
+    if (decision.action === "refuse") {
+      log(`skipping unproven Codex drain ${codexHookRefusalDiagnostic(decision.reason)} event=${HOOK_EVENT_NAME}`);
       return;
     }
-    const degradedReason = codexHookRootDegradedReason(hookInput);
-    if (degradedReason) {
-      log(`Codex root proof degraded reason=${degradedReason}; continuing fail-open`);
+    if (decision.action === "thread-only") {
+      // Codex omits transcript_path whenever the thread has no materialized
+      // rollout (persistence off / rollout IO pending) — measured on live
+      // root lanes, not only internal sessions. The exact thread join is the
+      // proof here: session_id IS the ThreadId and /claim-by-thread resolves
+      // only the registered row. No PID fallback, no self-registration.
+      threadOnlyDrain = true;
+      log(`Codex root transcript absent; draining via exact thread join only event=${HOOK_EVENT_NAME}`);
+    } else if (decision.degraded) {
+      log(`Codex root proof degraded reason=${decision.degraded}; continuing fail-open`);
     }
   }
 
@@ -682,6 +690,14 @@ async function main(): Promise<void> {
         }
       }
     }
+  }
+  if (!claimed && sawMissingPeer && threadOnlyDrain) {
+    // Unproven root (or an internal session whose own thread id matches no
+    // row). Self-registration would replay the same transcript-less payload
+    // into the registration hook's strict proof and be refused — skip the
+    // 6-second timeout and leave mail queued for a proven registration.
+    log("thread-routed claim found no registered row; leaving mail queued for a proven registration");
+    return;
   }
   if (!claimed && sawMissingPeer) {
     log("peer row missing during drain; attempting bounded self-registration before one retry");

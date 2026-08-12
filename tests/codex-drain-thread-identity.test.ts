@@ -129,10 +129,12 @@ describe("the shipped drain wires it up", () => {
       session_id: "019fc273-a35b-78f0-9a70-f63b5905540f",
       transcript_path: "/tmp/rollout-019fc273-a35b-78f0-9a70-f63b5905540f.jsonl",
     }, "event-mismatch"],
-    ["internal SessionStart", {
+    ["subagent-context UserPromptSubmit", {
       hook_event_name: "SessionStart",
-      session_id: "019fd84b-4556-7fd2-8e21-3fac2582d757",
-    }, "missing-transcript-path"],
+      session_id: "019fc273-a35b-78f0-9a70-f63b5905540f",
+      transcript_path: "/tmp/rollout-019fc273-a35b-78f0-9a70-f63b5905540f.jsonl",
+      agent_type: "review",
+    }, "subagent-context"],
   ])("%s returns before process discovery, claim, or self-registration", (_label, payload, reason) => {
     const hookPath = new URL("../hooks/codex-drain-peer-inbox.ts", import.meta.url).pathname;
     const proc = Bun.spawnSync([process.execPath, hookPath], {
@@ -150,10 +152,42 @@ describe("the shipped drain wires it up", () => {
     expect(proc.exitCode).toBe(0);
     expect(new TextDecoder().decode(proc.stdout)).toBe("");
     expect(stderr).toContain(`skipping unproven Codex drain reason=${reason}`);
-    if (reason === "missing-transcript-path") {
-      expect(stderr).toContain("possible=internal-session-or-root-rollout-io correlate=codex-warning-log");
-    }
     expect(stderr).not.toContain("no codex ancestor found");
+  });
+
+  test("a transcript-less SessionStart drains by exact thread join only — no process discovery, no self-registration", () => {
+    // The old contract refused this payload outright as missing-transcript-path,
+    // which darkened every root lane whose rollout was not materialized
+    // (session persistence off / rollout IO pending) — 326 refused drains
+    // measured on live roots. The new contract routes it by exact thread join:
+    // an internal session's own thread id matches no registered row, so the
+    // broker answers 404 and nothing is claimed — the join is the proof.
+    const hookPath = new URL("../hooks/codex-drain-peer-inbox.ts", import.meta.url).pathname;
+    const proc = Bun.spawnSync([process.execPath, hookPath], {
+      env: {
+        CLAUDE_PEERS_CLIENT_TYPE: "codex",
+        CLAUDE_PEERS_HOOK_EVENT_NAME: "SessionStart",
+        // A closed port keeps the probe hermetic: the thread-routed claim is
+        // attempted (the contract under test) and fails on connection, which
+        // the drain logs and absorbs without touching pid discovery.
+        CLAUDE_PEERS_PORT: "1",
+        PATH: "/definitely-missing",
+      },
+      stdin: new TextEncoder().encode(JSON.stringify({
+        hook_event_name: "SessionStart",
+        session_id: "019fd84b-4556-7fd2-8e21-3fac2582d757",
+      })),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const stderr = new TextDecoder().decode(proc.stderr);
+
+    expect(proc.exitCode).toBe(0);
+    expect(new TextDecoder().decode(proc.stdout)).toBe("");
+    expect(stderr).toContain("draining via exact thread join only");
+    expect(stderr).not.toContain("skipping unproven Codex drain");
+    expect(stderr).not.toContain("no codex ancestor found");
+    expect(stderr).not.toContain("attempting bounded self-registration");
   });
 
   test("an unparseable transcript filename is logged and allowed through to thread routing", () => {
