@@ -438,6 +438,16 @@ describe("client detection", () => {
     }, "infra.3")).toBe("infra.2");
   });
 
+  test("Claude hook names ignore pane_index and keep a sticky pane label", () => {
+    const highIndex = { session: "c5-pstab", pane_id: "%3023", pane_index: "2", window_name: "bash" };
+    const afterRenumber = { session: "c5-pstab", pane_id: "%3023", pane_index: "1", window_name: "bash" };
+    expect(peerName("claude", 201, highIndex, {}, "stab.keep")).toBe("stab.keep");
+    expect(peerName("claude", 201, afterRenumber, {}, "stab.keep")).toBe("stab.keep");
+    expect(peerName("claude", 201, highIndex, {}, null, [])).toBe("c5-pstab.1");
+    expect(peerName("claude", 201, afterRenumber, {}, null, [])).toBe("c5-pstab.1");
+    expect(peerName("claude", 201, highIndex, {}, null, ["c5-pstab.1", "c5-pstab.3"])).toBe("c5-pstab.4");
+  });
+
   test("retries the pane label precedence chain before using a stale launch name", () => {
     let reads = 0;
     const label = readPaneLabel("%42", () => {

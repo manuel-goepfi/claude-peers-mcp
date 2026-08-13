@@ -3550,7 +3550,7 @@ describe("Live broker delivery features", () => {
     fresh.kill();
   });
 
-  test("rehydration: different tmux pane does NOT inherit", async () => {
+  test("rehydration: different legacy tmux window does NOT inherit", async () => {
     const dead = spawnSleep();
     const a = await brokerFetch<{ id: string }>("/register", {
       pid: dead.pid, cwd: "/rehydrate-3", git_root: null, tty: null,
@@ -3560,12 +3560,36 @@ describe("Live broker delivery features", () => {
     dead.kill();
     await dead.exited;
 
-    // Relaunch at a DIFFERENT pane index — should NOT inherit.
+    // Legacy rows without pane ids fall back to window identity. A different
+    // window must therefore mint a different peer id.
     const fresh = spawnSleep();
     const b = await brokerFetch<{ id: string }>("/register", {
       pid: fresh.pid, cwd: "/rehydrate-3", git_root: null, tty: null,
       name: "b-new", tmux_session: "rh3", tmux_window_index: "1",
       tmux_window_name: "claude", summary: "",
+    });
+    expect(b.id).not.toBe(a.id);
+    fresh.kill();
+  });
+
+  test("rehydration: different stable pane id does NOT inherit despite matching window metadata", async () => {
+    const dead = spawnSleep();
+    const a = await brokerFetch<{ id: string }>("/register", {
+      pid: dead.pid, cwd: "/rehydrate-distinct-pane", git_root: "/repo-distinct-pane", tty: null,
+      name: "a", tmux_session: "rh-distinct-pane", tmux_window_index: "0",
+      tmux_window_name: "claude", tmux_pane_id: "%780", summary: "",
+    });
+    dead.kill();
+    await dead.exited;
+
+    // Closing a pane and opening another may reproduce every human-visible
+    // field. The new %pane_id is the boundary that prevents it from adopting
+    // the closed pane's broker identity or recoverable inbox.
+    const fresh = spawnSleep();
+    const b = await brokerFetch<{ id: string }>("/register", {
+      pid: fresh.pid, cwd: "/rehydrate-distinct-pane", git_root: "/repo-distinct-pane", tty: null,
+      name: "b-new", tmux_session: "rh-distinct-pane", tmux_window_index: "0",
+      tmux_window_name: "claude", tmux_pane_id: "%781", summary: "",
     });
     expect(b.id).not.toBe(a.id);
     fresh.kill();

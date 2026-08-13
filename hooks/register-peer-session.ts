@@ -9,6 +9,11 @@ import {
 } from "../shared/tmux-identity.ts";
 import type { ClientType, ReceiverMode, RegisterResponse } from "../shared/types.ts";
 import { composeTmuxFromEnv, parsePsTree, parseTmuxPanes, type TmuxPaneInfo } from "../shared/tmux.ts";
+import {
+  chooseOperatorLabel,
+  cleanTmuxOptionValue,
+  isHumanOperatorLabel,
+} from "../shared/operator-label.ts";
 import { findSingleVisibleCodexProcess, findVisibleCodexProcessByPaneId } from "../shared/visible-codex.ts";
 import { brokerIsReady, openOwnerOnlyAppendLog, requestBroker } from "../shared/broker-client.ts";
 import { brokerServiceConfig, installedBrokerServiceIsCurrent } from "../shared/broker-service.ts";
@@ -447,11 +452,64 @@ export function readPaneLabel(
   return null;
 }
 
-export function peerName(clientType: HookClientType, pid: number, tmux: TmuxPaneInfo | null, env: Record<string, string | undefined>, paneLabel: string | null = readPaneLabel(tmux?.pane_id)): string {
+function readUsedOperatorLabels(session: string, currentPaneId: string): string[] {
+  try {
+    const result = Bun.spawnSync([
+      "tmux", "list-panes", "-s", "-t", session, "-F", "#{pane_id}\t#{@operator_label}\t#{@peer_label}",
+    ], { stdout: "pipe", stderr: "ignore" });
+    if (result.exitCode !== 0) return [];
+    const out = new TextDecoder().decode(result.stdout).trim();
+    if (!out) return [];
+    const labels: string[] = [];
+    for (const line of out.split("\n")) {
+      const [paneId, operatorLabel, peerLabel] = line.split("\t");
+      if (!paneId || paneId === currentPaneId) continue;
+      const label = cleanTmuxOptionValue(operatorLabel ?? null) ?? cleanTmuxOptionValue(peerLabel ?? null);
+      if (label) labels.push(label);
+    }
+    return labels;
+  } catch {
+    return [];
+  }
+}
+
+function stampOperatorLabelIfMissing(paneId: string, label: string): void {
+  try {
+    const existing = Bun.spawnSync(["tmux", "show-options", "-p", "-t", paneId, "-v", "@operator_label"], {
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+    if (cleanTmuxOptionValue(new TextDecoder().decode(existing.stdout))) return;
+    const stamped = Bun.spawnSync(["tmux", "set-option", "-p", "-t", paneId, "@operator_label", label], {
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    if (stamped.exitCode !== 0) {
+      log(`tmux operator-label stamp failed pane=${paneId}; registration name is not durable`);
+    }
+  } catch (e) {
+    // Pane options are best-effort; registration still proceeds with the
+    // computed name, but the loss of durability must be diagnosable.
+    log(`tmux operator-label stamp failed pane=${paneId}; registration name is not durable: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+export function peerName(
+  clientType: HookClientType,
+  pid: number,
+  tmux: TmuxPaneInfo | null,
+  env: Record<string, string | undefined>,
+  paneLabel: string | null = readPaneLabel(tmux?.pane_id),
+  usedLabels?: Iterable<string>,
+): string {
   if (clientType === "codex" && paneLabel) return paneLabel;
   const envName = env.CLAUDE_PEER_NAME?.trim();
   if (envName) return envName;
-  if (tmux?.session && tmux.pane_index) return `${tmux.session}.${tmux.pane_index}`;
+  if (paneLabel) return paneLabel;
+  if (tmux?.session && tmux.pane_id) {
+    const used = usedLabels ?? readUsedOperatorLabels(tmux.session, tmux.pane_id);
+    return chooseOperatorLabel(tmux.session, tmux.pane_index, used, tmux.window_name);
+  }
   if (tmux?.session && tmux.window_index) return `${tmux.session}.${tmux.window_index}`;
   return `${clientType}-${pid}`;
 }
@@ -509,13 +567,17 @@ async function metadata(threadId: string | null = null): Promise<RegisterMetadat
   }
   const cwd = cwdOf(pid) ?? process.cwd();
   const tmux = detectTmuxPane(pid, identityEnv);
+  const name = peerName(CLIENT_TYPE, pid, tmux, identityEnv);
+  if (tmux?.session && tmux.pane_id && isHumanOperatorLabel(name, tmux.session)) {
+    stampOperatorLabelIfMissing(tmux.pane_id, name);
+  }
   return {
     pid,
     cwd,
     git_root: await getGitRoot(cwd),
     absolute_git_dir: await getAbsoluteGitDir(cwd),
     tty: getTty(pid),
-    name: peerName(CLIENT_TYPE, pid, tmux, identityEnv),
+    name,
     tmux,
     identity_env: identityEnv,
   };
