@@ -76,6 +76,23 @@ describe("paneTextIsIdle", () => {
     expect(paneTextIsIdle(cursorFollowUp, profileFor("cursor"))).toBe(true);
   });
 
+  test("NUDGE (cursor): ordinary transcript prose containing 'Working' is not a busy state", () => {
+    const cursorIdle = [
+      "  Working tree not modified. No peer note sent.",
+      ` ${ESC}[2m→ Add a follow-up${ESC}[0m`,
+      "  Cursor Grok 4.6 Extra High",
+    ].join("\n");
+    expect(paneTextIsIdle(cursorIdle, profileFor("cursor"))).toBe(true);
+  });
+
+  test("SKIP (cursor): active Working timer remains a busy state", () => {
+    const cursorBusy = [
+      "  Working (7s · 120 tokens used)",
+      ` ${ESC}[2m→ Add a follow-up${ESC}[0m`,
+    ].join("\n");
+    expect(paneTextIsIdle(cursorBusy, profileFor("cursor"))).toBe(false);
+  });
+
   test("SKIP (cursor): real typed operator text after the → glyph", () => {
     const cursorTyped = [
       ` ${ESC}[2m→ ${ESC}[0mdeploy to production now`,

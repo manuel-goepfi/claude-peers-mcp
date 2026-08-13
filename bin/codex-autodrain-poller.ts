@@ -180,7 +180,13 @@ const CLAUDE_BUSY = [
 ];
 // Cursor busy markers are provisional (vocabulary not yet observed mid-turn on
 // this host): false-busy only delays a nudge, never misfires one.
-const CURSOR_BUSY = [/esc to interrupt/i, /esc to cancel/i, /\bGenerating\b/, /\bWorking\b/, /tokens used/i];
+const CURSOR_BUSY = [
+  /esc to interrupt/i,
+  /esc to cancel/i,
+  /\bGenerating\b/,
+  /\bWorking(?:…|\s*\(\d+s\b)/,
+  /tokens used/i,
+];
 const PROFILES: Record<string, IdleProfile> = {
   codex:  { prompt: /(^|\n)\s*›\s/, promptLine: /^\s*›/, strip: /^.*?›\s?/, busy: CODEX_BUSY },
   gemini: { prompt: /(^|\n)\s*›\s/, promptLine: /^\s*›/, strip: /^.*?›\s?/, busy: CODEX_BUSY },
