@@ -126,7 +126,7 @@ describe("schema-aware doctor", () => {
     ]);
     expect(summarizeProcesses(processes, repoRoot)).toEqual({
       client_roots: { claude: 2, codex: 1, gemini: 1 },
-      adapters: { claude: 2, codex: 1, gemini: 1, cursor: 1, agy: 1, kimi: 1, unknown: 1 },
+      adapters: { claude: 2, codex: 1, gemini: 1, cursor: 1, agy: 1, kimi: 1, grok: 0, unknown: 1 },
       orphaned_adapters: 1,
       spare_parented_adapters: 1,
     });

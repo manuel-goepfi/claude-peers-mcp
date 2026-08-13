@@ -99,7 +99,9 @@ export function isHookReceivePath(lane: Lane): boolean {
 }
 
 export function nudgeText(lane: Lane): string {
-  if (isHookReceivePath(lane)) {
+  const hookFresh = !lane.last_hook_seen_at
+    || Date.now() - Date.parse(lane.last_hook_seen_at) <= 2 * 60 * 1_000;
+  if (isHookReceivePath(lane) && hookFresh) {
     return "[peer-mail] Process the attached peer messages.";
   }
   const n = lane.unread;
@@ -223,6 +225,8 @@ const PROFILES: Record<string, IdleProfile> = {
   // their mail sat unread in real, live panes.
   kimi: { prompt: /(^|\n)\s*│\s*>/, promptLine: /^\s*│\s*>/, strip: /^.*?│\s*>\s?/,
           busy: [], requiresQuiescence: true },
+  grok: { prompt: /(^|\n)\s*[>$]\s/, promptLine: /^\s*[>$]/, strip: /^.*?[>$]\s?/,
+          busy: [/esc to (cancel|interrupt)/i], requiresQuiescence: true },
 };
 export function profileFor(clientType: string): IdleProfile {
   return PROFILES[clientType] ?? PROFILES.codex!;
@@ -570,7 +574,7 @@ export function codexLaneReadyForWake(lane: Lane): boolean {
 // dedup, case/space normalization) are unit-testable without mutating process.env.
 export function parseNudgeClients(raw: string | undefined = process.env.NUDGE_CLIENTS): string[] {
   if (!raw) return []; // DEFAULT: nudge nobody
-  const allowed = new Set(["codex", "gemini", "claude", "cursor", "agy", "kimi"]);
+  const allowed = new Set(["codex", "gemini", "claude", "cursor", "agy", "kimi", "grok"]);
   const picked = raw.split(",").map((s) => s.trim().toLowerCase()).filter((s) => allowed.has(s));
   return [...new Set(picked)];
 }

@@ -1102,7 +1102,7 @@ function reqStrict(s: unknown): string {
 // the right pid, and the row still read unknown/unknown.
 function validClientType(value: unknown): ClientType {
   return value === "claude" || value === "codex" || value === "gemini" || value === "cursor" || value === "agy"
-    || value === "kimi" || value === "unknown" ? value : "unknown";
+    || value === "kimi" || value === "grok" || value === "unknown" ? value : "unknown";
 }
 
 function validReceiverMode(value: unknown, clientType: ClientType): ReceiverMode {
@@ -1118,6 +1118,7 @@ function validReceiverMode(value: unknown, clientType: ClientType): ReceiverMode
   // kimi has no drain hook — it reads its inbox by calling check_messages after a
   // nudge. Leaving it "unknown" would make every send to it report no_drain_path.
   if (clientType === "kimi") return "manual-drain";
+  if (clientType === "grok") return "manual-drain";
   return "unknown";
 }
 
@@ -1755,7 +1756,7 @@ function isAdapterServerPid(pid: number): boolean {
 // "Adapter dead" is only claimed against an AFFIRMED client session — a live
 // seat pid we cannot recognize as any supported client stays "unknown" and
 // warns nobody (fail-quiet; see classifySeatAdapterLiveness).
-const SESSION_CLIENT_TYPES = ["claude", "codex", "gemini", "cursor", "agy", "kimi"] as const;
+const SESSION_CLIENT_TYPES = ["claude", "codex", "gemini", "cursor", "agy", "kimi", "grok"] as const;
 function isClientSessionPid(pid: number): boolean {
   try {
     const args = readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0").filter(Boolean).join(" ");

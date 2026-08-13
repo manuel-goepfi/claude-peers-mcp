@@ -257,6 +257,7 @@ export function shouldDisableBackgroundPolling(clientType: ClientType, receiverM
   // connection open per process. check_messages still polls the broker directly.
   return clientType === "claude" || clientType === "codex" || clientType === "gemini" || clientType === "cursor" || clientType === "agy"
     || clientType === "kimi"
+    || clientType === "grok"
     || clientType === "unknown"
     || receiverMode === "codex-hook" || receiverMode === "gemini-hook";
 }

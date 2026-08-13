@@ -232,6 +232,7 @@ export function summarizeProcesses(processes: Map<number, ProcessInfo>, repoRoot
     cursor: 0,
     agy: 0,
     kimi: 0,
+    grok: 0,
     unknown: 0,
   };
   let orphaned = 0;

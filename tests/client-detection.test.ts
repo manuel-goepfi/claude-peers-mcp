@@ -81,6 +81,16 @@ describe("client detection", () => {
     expect(initialReceiverMode("agy")).toBe("manual-drain");
   });
 
+  test("detects Grok CLI and assigns manual-drain delivery", () => {
+    const processes = table([
+      { pid: 30, ppid: 20, comm: "bun", args: "bun /home/manzo/claude-peers-mcp/server.ts" },
+      { pid: 20, ppid: 10, comm: "grok", args: "grok" },
+      { pid: 10, ppid: 1, comm: "bash", args: "bash" },
+    ]);
+    expect(detectClientFromProcessChain(30, processes, {})).toBe("grok");
+    expect(initialReceiverMode("grok")).toBe("manual-drain");
+  });
+
   test("a bare 'agent' binary without the cursor-agent path is NOT Cursor", () => {
     const processes = table([
       { pid: 20, ppid: 10, comm: "agent", args: "/usr/local/bin/agent --serve" },

@@ -1182,6 +1182,17 @@ describe("nudge wording branches by receive path", () => {
     expect(t).not.toContain("Transport closed");
     expect(t).not.toContain("UNVERIFIABLE");
   });
+
+  test("stale hook evidence falls back to manual-drain wording", () => {
+    const lane = { ...laneWith(2), last_hook_seen_at: "2020-01-01T00:00:00.000Z" };
+    const t = nudgeText(lane as never);
+    expect(t).toContain("Call check_messages once");
+    expect(t).not.toContain("attached peer messages");
+  });
+
+  test("Grok is explicitly allowlisted as a manual-drain client", () => {
+    expect(parseNudgeClients("grok")).toEqual(["grok"]);
+  });
 });
 
 describe("Codex wake-only delivery", () => {
