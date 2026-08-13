@@ -208,40 +208,43 @@ describe("sender reply-route honesty", () => {
 });
 
 describe("codex nudge text", () => {
-  const lane = (n: number, client: string) => ({ unread: n, client_type: client } as never);
+  const hook = (client: string, mode: string) => (
+    { unread: 1, client_type: client, receiver_mode: mode } as never
+  );
+  const manual = (n: number, client: string) => (
+    { unread: n, client_type: client, receiver_mode: "manual-drain" } as never
+  );
 
-  test("tells a codex lane how to recover when no hook-delivered block is present", () => {
-    const text = nudgeText(lane(1, "codex"));
-    expect(text).toContain("Process attached mail; otherwise call check_messages once");
-    expect(text).not.toContain("was just delivered with this notification");
-    expect(text).not.toMatch(/check_messages if\s+relevant/);
+  test("hook lanes are told only to process the attached body", () => {
+    for (const text of [
+      nudgeText(hook("codex", "codex-hook")),
+      nudgeText(hook("claude", "claude-channel")),
+      nudgeText(hook("gemini", "gemini-hook")),
+    ]) {
+      expect(text).toBe("[peer-mail] Process the attached peer messages.");
+      expect(text).not.toContain("check_messages");
+      expect(text).not.toContain("Transport closed");
+      expect(text).not.toContain("UNVERIFIABLE");
+      expect(text).not.toContain("<peer-message");
+    }
+  });
+
+  test("manual-drain lanes are told to call check_messages once", () => {
+    expect(nudgeText(manual(1, "cursor"))).toBe(
+      "[peer-mail] 1 unread peer message. Call check_messages once.",
+    );
+    expect(nudgeText(manual(2, "kimi"))).toBe(
+      "[peer-mail] 2 unread peer messages. Call check_messages once.",
+    );
+    expect(nudgeText(manual(1, "codex"))).toContain("Call check_messages once");
   });
 
   test("does not repeat authority policy in the wake-up notice", () => {
-    const text = nudgeText(lane(3, "codex")).toLowerCase();
+    const text = nudgeText(hook("codex", "codex-hook")).toLowerCase();
     expect(text.startsWith("check ")).toBe(false);
     expect(text).not.toContain("authority");
     expect(text).not.toContain("privileged");
     expect(text).not.toContain("operator approval");
-  });
-
-  test("owns the toolless app-server lane: one unverifiable reply, no retries, back to work", () => {
-    // codexd / shared-host lanes have no claude-peers MCP by design, so the
-    // wrapper's check_messages instruction is impossible there. Without this
-    // clause a lane was knocked repeatedly and burned a turn per knock
-    // re-stating "Still BLOCKED" (observed 2026-08-12). The wrapper must name
-    // the case and bound the lane's response.
-    const text = nudgeText(lane(1, "codex"));
-    expect(text).toContain("If unavailable or Transport closed");
-    expect(text).toContain("report UNVERIFIABLE once");
-    expect(text).toContain("continue prior work");
-  });
-
-  test("pluralises and gives Claude the same observable-state fallback", () => {
-    expect(nudgeText(lane(2, "codex"))).toContain("2 unread messages");
-    expect(nudgeText(lane(1, "codex"))).toContain("1 unread message");
-    expect(nudgeText(lane(1, "claude"))).toContain("otherwise call check_messages");
-    expect(nudgeText(lane(1, "claude"))).not.toContain("was just delivered");
   });
 });
 

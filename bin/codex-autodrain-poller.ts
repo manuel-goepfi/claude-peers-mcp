@@ -11,10 +11,9 @@
  * shows the prompt, not active work), it uses that pane's verified visible PID.
  *
  * The poller is wake-only. It submits a small notification to an exact idle
- * pane; the lane's own hook or explicit check_messages call then claims and
- * acknowledges mail using its session identity. The poller never reads, claims,
- * renders, or acknowledges message payloads, so a missed Enter cannot remove
- * mail from the queue.
+ * pane. Hook-backed lanes process the attached body; manual-drain lanes call
+ * check_messages. The poller never reads, claims, renders, or acknowledges
+ * message payloads, so a missed Enter cannot remove mail from the queue.
  *
  * Safety:
  *   - Reconciles visible Codex seats by exact pane registration and, when the
@@ -90,17 +89,22 @@ const RECONCILE_CODEX_SEATS = process.env.RECONCILE_CODEX_SEATS !== "0";
 // fails the freshness check. mtime is the signal; the body is human-readable.
 const HEARTBEAT_PATH = process.env.CLAUDE_PEERS_AUTODRAIN_HEARTBEAT ?? `${homedir()}/.claude-peers-autodrain.heartbeat`;
 const NUDGE_BUDGET_PATH = process.env.CLAUDE_PEERS_NUDGE_BUDGET_FILE ?? `${homedir()}/.claude-peers-nudge-budget.json`;
-// The nudge is typed into the pane as a real user turn. Keep it to observable
-// queue state plus one bounded recovery instruction; the attached batch policy
-// carries work and authority rules without repeating them here.
+// The nudge is typed into the pane as a real user turn. Branch by receive
+// path: hook lanes already have the body in-turn; manual-drain lanes must
+// fetch it. Recovery belongs in poller logs, not in this prompt.
+const HOOK_RECEIVE_MODES = new Set(["claude-channel", "codex-hook", "gemini-hook"]);
+
+export function isHookReceivePath(lane: Lane): boolean {
+  return HOOK_RECEIVE_MODES.has(lane.receiver_mode);
+}
+
 export function nudgeText(lane: Lane): string {
+  if (isHookReceivePath(lane)) {
+    return "[peer-mail] Process the attached peer messages.";
+  }
   const n = lane.unread;
   const noun = n === 1 ? "message" : "messages";
-  // The wrapper reports only queued mail. The locally rendered receive policy,
-  // not this wake, governs the body and its authority.
-  return `[peer-mail] ${n} unread ${noun}. Process attached mail; `
-    + `otherwise call check_messages once. If unavailable or Transport closed, `
-    + `report UNVERIFIABLE once and continue prior work.`;
+  return `[peer-mail] ${n} unread peer ${noun}. Call check_messages once.`;
 }
 // Give up nudging a lane after this many consecutive attempts with mail still
 // unread — a lane whose drain hook is broken must NOT be keystroke-bombed

@@ -1117,6 +1117,11 @@ const laneWith = (unread: number) => ({
   tmux_pane_id: "%1", thread_id: "thread-1", seat_key: "pane:infra:%1",
   receiver_mode: "codex-hook", unread, last_hook_seen_at: null,
 });
+const cursorLane = (unread: number) => ({
+  ...laneWith(unread),
+  name: "cursor.1", client_type: "cursor", receiver_mode: "manual-drain",
+  thread_id: null,
+});
 
 describe("nudge suppression when there is nothing to deliver", () => {
   test("zero unread is never nudged (the infra.3277756 case)", () => {
@@ -1132,12 +1137,13 @@ describe("nudge suppression when there is nothing to deliver", () => {
 });
 
 describe("nudge wording is a compact queue notification", () => {
-  test("states the count and pluralises", () => {
-    expect(nudgeText(laneWith(1) as never)).toContain("1 unread message");
-    expect(nudgeText(laneWith(3) as never)).toContain("3 unread messages");
+  test("manual-drain states the count and pluralises", () => {
+    expect(nudgeText(cursorLane(1) as never)).toContain("1 unread peer message");
+    expect(nudgeText(cursorLane(3) as never)).toContain("3 unread peer messages");
   });
   test("stays short enough to scan as a wake-up notice", () => {
     expect(nudgeText(laneWith(2) as never).length).toBeLessThanOrEqual(180);
+    expect(nudgeText(cursorLane(2) as never).length).toBeLessThanOrEqual(180);
   });
   test("does not duplicate the attached batch policy", () => {
     const t = nudgeText(laneWith(2) as never).toLowerCase();
@@ -1153,18 +1159,28 @@ describe("nudge wording is a compact queue notification", () => {
   });
 });
 
-describe("nudge wording reports only observable delivery state", () => {
+describe("nudge wording branches by receive path", () => {
   test.each([
-    ["claude", { ...laneWith(2), client_type: "claude" }],
+    ["claude", { ...laneWith(2), client_type: "claude", receiver_mode: "claude-channel" }],
     ["hook-backed codex", laneWith(2)],
-    ["manual codex", { ...laneWith(2), thread_id: null, receiver_mode: "manual-drain" }],
     ["gemini", { ...laneWith(2), client_type: "gemini", receiver_mode: "gemini-hook" }],
-  ])("%s gets the same self-verifying fallback", (_label, lane) => {
+  ])("%s hook wake names the attached body only", (_label, lane) => {
     const t = nudgeText(lane as never);
-    expect(t).toContain("Process attached mail; otherwise call check_messages once");
-    expect(t).not.toContain("was just delivered with this notification");
-    expect(t).not.toContain("were just delivered with this notification");
+    expect(t).toBe("[peer-mail] Process the attached peer messages.");
+    expect(t).not.toContain("check_messages");
     expect(t).not.toContain("authority");
+  });
+
+  test.each([
+    ["manual codex", { ...laneWith(2), thread_id: null, receiver_mode: "manual-drain" }],
+    ["cursor", cursorLane(2)],
+    ["kimi", { ...cursorLane(1), client_type: "kimi" }],
+  ])("%s manual-drain wake asks for one check_messages", (_label, lane) => {
+    const t = nudgeText(lane as never);
+    expect(t).toContain("Call check_messages once");
+    expect(t).not.toContain("Process the attached");
+    expect(t).not.toContain("Transport closed");
+    expect(t).not.toContain("UNVERIFIABLE");
   });
 });
 
@@ -1196,8 +1212,9 @@ describe("Codex wake-only delivery", () => {
 
     expect(result).toBe("submitted");
     expect(submissions).toEqual([{ paneId: "%42", text: nudgeText(lane as never) }]);
-    expect(submissions[0]!.text).toContain("otherwise call check_messages");
-    expect(submissions[0]!.text).not.toContain("<peer-message");
+    expect(submissions[0]!.text).toBe("[peer-mail] Process the attached peer messages.");
+    expect(submissions[0]!.text).not.toContain("check_messages");
+    expect(submissions[0]!.text).not.toMatch(/<peer-message\s/);
   });
 
   test("reports an unconfirmed submit without any broker mutation seam", () => {
