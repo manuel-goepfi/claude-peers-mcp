@@ -79,6 +79,58 @@ export function isVisibleCodexArgs(args: string): boolean {
   return !/\bapp-server\b/.test(args);
 }
 
+interface VisibleCodexCandidate {
+  row: ProcessInfo;
+  visible: VisibleCodexProcess;
+}
+
+const NONINTERACTIVE_CODEX_SUBCOMMANDS = new Set([
+  "exec", "e", "review", "login", "logout", "mcp", "plugin", "mcp-server",
+  "app-server", "remote-control", "completion", "update", "doctor", "sandbox",
+  "debug", "apply", "a", "archive", "delete", "unarchive", "cloud",
+  "exec-server", "features", "help",
+]);
+
+function isInteractiveNativeCodex(row: ProcessInfo): boolean {
+  const tokens = row.args.trim().split(/\s+/).slice(1).map((token) =>
+    token.replace(/^['"]|['"]$/g, "").toLowerCase()
+  );
+  return !tokens.some((token) => NONINTERACTIVE_CODEX_SUBCOMMANDS.has(token));
+}
+
+/**
+ * Codex installed through npm has two client processes for one TUI: the Node
+ * launcher and its native Codex child. They carry the same pane/TTY identity,
+ * so counting both as separate sessions creates a false ambiguity. Collapse
+ * only that exact direct pair; a nested Codex command is a separate candidate
+ * and must keep the lookup ambiguous.
+ */
+function singleLogicalVisibleCodex(
+  candidates: VisibleCodexCandidate[],
+): VisibleCodexProcess | null {
+  if (candidates.length === 1) return candidates[0]!.visible;
+  if (candidates.length !== 2) return null;
+
+  const [first, second] = candidates;
+  const launcher = second!.row.ppid === first!.row.pid ? first
+    : first!.row.ppid === second!.row.pid ? second
+      : null;
+  const native = launcher === first ? second : launcher === second ? first : null;
+  if (!launcher || !native) return null;
+
+  const launcherCommand = commandName(launcher.row.comm);
+  const launcherArg = commandName(launcher.row.args);
+  if (![launcherCommand, launcherArg].some((value) => value === "node" || value === "bun")) return null;
+  const nativeCommand = commandName(native.row.comm);
+  if (nativeCommand !== "codex" && !nativeCommand.startsWith("codex-")) return null;
+  if (!isInteractiveNativeCodex(native.row)) return null;
+  if (launcher.visible.cwd !== native.visible.cwd || launcher.visible.tty !== native.visible.tty) return null;
+
+  const identityKeys = ["TMUX_PANE", "CLAUDE_PEER_TMUX_PANE_ID", "CLAUDE_PEER_NAME"] as const;
+  if (identityKeys.some((key) => launcher.visible.env[key] !== native.visible.env[key])) return null;
+  return native.visible;
+}
+
 export function findSingleVisibleCodexProcess(
   processes: Map<number, ProcessInfo> | Iterable<ProcessInfo>,
   cwdHint: string,
@@ -89,7 +141,7 @@ export function findSingleVisibleCodexProcess(
   const cwdReader = readers.cwdOf ?? defaultCwdOf;
   const envReader = readers.environOf ?? defaultEnvironOf;
   const rows = processes instanceof Map ? processes.values() : processes;
-  const candidates: VisibleCodexProcess[] = [];
+  const candidates: VisibleCodexCandidate[] = [];
 
   for (const row of rows) {
     if (!isVisibleCodexProcess(row)) continue;
@@ -99,10 +151,10 @@ export function findSingleVisibleCodexProcess(
     if (!cwd || cwd !== cwdHint) continue;
     const env = envReader(row.pid);
     if (requireIdentityEnv && !hasVisibleCodexIdentityEnv(env)) continue;
-    candidates.push({ pid: row.pid, cwd, tty, env });
+    candidates.push({ row, visible: { pid: row.pid, cwd, tty, env } });
   }
 
-  return candidates.length === 1 ? candidates[0]! : null;
+  return singleLogicalVisibleCodex(candidates);
 }
 
 export function findVisibleCodexProcessByPaneId(
@@ -115,7 +167,7 @@ export function findVisibleCodexProcessByPaneId(
   const cwdReader = readers.cwdOf ?? defaultCwdOf;
   const envReader = readers.environOf ?? defaultEnvironOf;
   const rows = processes instanceof Map ? processes.values() : processes;
-  const candidates: VisibleCodexProcess[] = [];
+  const candidates: VisibleCodexCandidate[] = [];
 
   for (const row of rows) {
     if (!isVisibleCodexProcess(row)) continue;
@@ -125,10 +177,10 @@ export function findVisibleCodexProcessByPaneId(
     if (!cwd || (cwdHint !== null && cwd !== cwdHint)) continue;
     const env = envReader(row.pid);
     if (env.TMUX_PANE !== paneId && env.CLAUDE_PEER_TMUX_PANE_ID !== paneId) continue;
-    candidates.push({ pid: row.pid, cwd, tty, env });
+    candidates.push({ row, visible: { pid: row.pid, cwd, tty, env } });
   }
 
-  return candidates.length === 1 ? candidates[0]! : null;
+  return singleLogicalVisibleCodex(candidates);
 }
 
 export function findNearestVisibleCodexProcessByStart(

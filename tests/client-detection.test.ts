@@ -298,6 +298,137 @@ describe("client detection", () => {
       .toBeNull();
   });
 
+  test("collapses a Node launcher and its native Codex child into one pane-local session", () => {
+    const processes = new Map<number, ProcessInfo>([
+      [200, {
+        pid: 200,
+        ppid: 50,
+        comm: "node",
+        args: "node /opt/codex/bin/codex --remote ws://127.0.0.1:42916 --cd /home/manzo/Clause5",
+      }],
+      [201, {
+        pid: 201,
+        ppid: 200,
+        comm: "codex",
+        args: "/opt/codex/vendor/codex --remote ws://127.0.0.1:42916 --cd /home/manzo/Clause5",
+      }],
+    ]);
+    const readers = {
+      getTty: () => "pts/9",
+      cwdOf: () => "/home/manzo/Clause5",
+      environOf: () => ({ CLAUDE_PEER_NAME: "orch.17", TMUX_PANE: "%2916" }),
+    };
+
+    expect(findVisibleCodexProcessByPaneId(processes, null, "%2916", readers))
+      .toMatchObject({ pid: 201, env: { CLAUDE_PEER_NAME: "orch.17", TMUX_PANE: "%2916" } });
+    expect(findVisibleCodexSession(processes, "/home/manzo/Clause5", readers))
+      .toMatchObject({ pid: 201 });
+  });
+
+  test("collapses a Bun launcher and its native Codex child", () => {
+    const processes = new Map<number, ProcessInfo>([
+      [200, { pid: 200, ppid: 50, comm: "bun", args: "bun /opt/codex/bin/codex --remote unix://" }],
+      [201, { pid: 201, ppid: 200, comm: "codex", args: "/opt/codex/vendor/codex --remote unix://" }],
+    ]);
+    const readers = {
+      getTty: () => "pts/9",
+      cwdOf: () => "/home/manzo/Clause5",
+      environOf: () => ({ CLAUDE_PEER_NAME: "orch.17", TMUX_PANE: "%2916" }),
+    };
+
+    expect(findVisibleCodexProcessByPaneId(processes, null, "%2916", readers))
+      .toMatchObject({ pid: 201 });
+  });
+
+  test("keeps distinct Codex sessions in one pane ambiguous", () => {
+    const processes = new Map<number, ProcessInfo>([
+      [200, { pid: 200, ppid: 50, comm: "codex", args: "codex --remote ws://127.0.0.1:42916" }],
+      [201, { pid: 201, ppid: 51, comm: "codex", args: "codex --remote ws://127.0.0.1:42917" }],
+    ]);
+    const readers = {
+      getTty: () => "pts/9",
+      cwdOf: () => "/home/manzo/Clause5",
+      environOf: () => ({ CLAUDE_PEER_NAME: "orch.17", TMUX_PANE: "%2916" }),
+    };
+
+    expect(findVisibleCodexProcessByPaneId(processes, null, "%2916", readers)).toBeNull();
+  });
+
+  test("does not collapse a direct noninteractive Codex child when no TUI candidate exists", () => {
+    const processes = new Map<number, ProcessInfo>([
+      [200, { pid: 200, ppid: 50, comm: "node", args: "node /opt/codex/bin/codex exec review" }],
+      [201, { pid: 201, ppid: 200, comm: "codex", args: "/opt/codex/vendor/codex exec review" }],
+    ]);
+    const readers = {
+      getTty: () => "pts/9",
+      cwdOf: () => "/home/manzo/Clause5",
+      environOf: () => ({ CLAUDE_PEER_NAME: "orch.17", TMUX_PANE: "%2916" }),
+    };
+
+    expect(findVisibleCodexProcessByPaneId(processes, null, "%2916", readers)).toBeNull();
+    expect(findVisibleCodexSession(processes, "/home/manzo/Clause5", readers)).toBeNull();
+  });
+
+  test("keeps a launcher, TUI, and nested Codex command ambiguous", () => {
+    const processes = new Map<number, ProcessInfo>([
+      [200, { pid: 200, ppid: 50, comm: "node", args: "node /opt/codex/bin/codex --remote unix://" }],
+      [201, { pid: 201, ppid: 200, comm: "codex", args: "/opt/codex/vendor/codex --remote unix://" }],
+      [202, { pid: 202, ppid: 201, comm: "codex", args: "/opt/codex/vendor/codex exec review" }],
+    ]);
+    const readers = {
+      getTty: () => "pts/9",
+      cwdOf: () => "/home/manzo/Clause5",
+      environOf: () => ({ CLAUDE_PEER_NAME: "orch.17", TMUX_PANE: "%2916" }),
+    };
+
+    expect(findVisibleCodexProcessByPaneId(processes, null, "%2916", readers)).toBeNull();
+  });
+
+  test("refuses launcher pairs whose visible seat evidence disagrees", () => {
+    const processes = new Map<number, ProcessInfo>([
+      [200, { pid: 200, ppid: 50, comm: "node", args: "node /opt/codex/bin/codex --remote unix://" }],
+      [201, { pid: 201, ppid: 200, comm: "codex", args: "/opt/codex/vendor/codex --remote unix://" }],
+    ]);
+    const base = {
+      getTty: () => "pts/9",
+      cwdOf: () => "/home/manzo/Clause5",
+      environOf: () => ({ CLAUDE_PEER_NAME: "orch.17", TMUX_PANE: "%2916" }),
+    };
+
+    expect(findVisibleCodexProcessByPaneId(processes, null, "%2916", {
+      ...base,
+      getTty: (pid) => pid === 200 ? "pts/8" : "pts/9",
+    })).toBeNull();
+    expect(findVisibleCodexProcessByPaneId(processes, null, "%2916", {
+      ...base,
+      cwdOf: (pid) => pid === 200 ? "/home/manzo/Other" : "/home/manzo/Clause5",
+    })).toBeNull();
+    expect(findVisibleCodexProcessByPaneId(processes, null, "%2916", {
+      ...base,
+      environOf: (pid) => ({ CLAUDE_PEER_NAME: pid === 200 ? "orch.16" : "orch.17", TMUX_PANE: "%2916" }),
+    })).toBeNull();
+    expect(findVisibleCodexProcessByPaneId(processes, null, "%2916", {
+      ...base,
+      environOf: (pid) => pid === 200
+        ? { CLAUDE_PEER_NAME: "orch.17", TMUX_PANE: "%2916" }
+        : { CLAUDE_PEER_NAME: "orch.17", CLAUDE_PEER_TMUX_PANE_ID: "%2916" },
+    })).toBeNull();
+  });
+
+  test("does not collapse a nested native Codex subprocess into its parent session", () => {
+    const processes = new Map<number, ProcessInfo>([
+      [200, { pid: 200, ppid: 50, comm: "codex", args: "codex --remote ws://127.0.0.1:42916" }],
+      [201, { pid: 201, ppid: 200, comm: "codex", args: "codex exec review" }],
+    ]);
+    const readers = {
+      getTty: () => "pts/9",
+      cwdOf: () => "/home/manzo/Clause5",
+      environOf: () => ({ CLAUDE_PEER_NAME: "orch.17", TMUX_PANE: "%2916" }),
+    };
+
+    expect(findVisibleCodexProcessByPaneId(processes, null, "%2916", readers)).toBeNull();
+  });
+
   test("uses the visible pane-border label as the authoritative Codex name", () => {
     expect(peerName("codex", 201, { session: "orch", pane_id: "%2432" }, {
       CLAUDE_PEER_NAME: "stale-launch-name",
