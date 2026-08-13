@@ -570,7 +570,13 @@ fi
 
       launcher.kill("SIGKILL");
       await launcher.exited;
-      expect(await waitFor(() => [appPid, appChildPid, tuiPid, tuiChildPid, watchdogPid].every((pid) => !isAlive(pid)))).toBe(true);
+      // The watchdog has two bounded 1s TERM grace loops; leave scheduler
+      // headroom when the full suite is competing for CPU without weakening
+      // the assertion that every descendant is gone.
+      expect(await waitFor(
+        () => [appPid, appChildPid, tuiPid, tuiChildPid, watchdogPid].every((pid) => !isAlive(pid)),
+        8_000,
+      )).toBe(true);
     } finally {
       launcher.kill("SIGKILL");
       try {
