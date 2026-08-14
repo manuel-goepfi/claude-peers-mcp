@@ -101,6 +101,31 @@ describe("paneTextIsIdle", () => {
     expect(paneTextIsIdle(cursorTyped, profileFor("cursor"))).toBe(false);
   });
 
+  test("NUDGE (Grok 4.6): empty boxed ❯ prompt captured from the live TUI", () => {
+    const grokIdle = [
+      "  Worked for 31s                                      stop  [hooks: 3]",
+      `  ${ESC}[38;2;80;80;88m│${ESC}[38;2;225;225;225m ${ESC}[38;2;200;200;200m❯ ${" ".repeat(30)}${ESC}[38;2;80;80;88m│${ESC}[39m`,
+      "  Grok 4.6 (xhigh) · always-approve",
+    ].join("\n");
+    expect(paneTextIsIdle(grokIdle, profileFor("grok"))).toBe(true);
+  });
+
+  test("SKIP (Grok 4.6): real typed text inside the boxed prompt", () => {
+    const grokTyped = [
+      `  ${ESC}[38;2;80;80;88m│${ESC}[38;2;225;225;225m ${ESC}[38;2;200;200;200m❯ deploy now ${ESC}[38;2;80;80;88m│${ESC}[39m`,
+      "  Grok 4.6 (xhigh) · always-approve",
+    ].join("\n");
+    expect(paneTextIsIdle(grokTyped, profileFor("grok"))).toBe(false);
+  });
+
+  test("SKIP (Grok 4.6): boxed prompt remains non-nudgeable during a busy turn", () => {
+    const grokBusy = [
+      "  Thinking… 3.1s  [Esc:cancel]",
+      `  │ ❯ ${" ".repeat(30)}│`,
+    ].join("\n");
+    expect(paneTextIsIdle(grokBusy, profileFor("grok"))).toBe(false);
+  });
+
   test("NUDGE (agy): empty column-0 '>' prompt with indented output above", () => {
     const agyIdle = [
       "  ● [09:51:27] find /home/manzo running",

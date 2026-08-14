@@ -144,6 +144,7 @@ export interface IdleProfile {
   prompt: RegExp;        // matches the line-leading input prompt glyph
   promptLine: RegExp;    // matches a single captured line that IS the prompt line
   strip: RegExp;         // strips up to & incl the glyph (+1 optional space); keeps SGR
+  stripTail?: RegExp;    // strips client-owned input-box chrome after the typed text
   busy: RegExp[];        // any match => mid-turn => never nudge
   // Optional literal-placeholder escape hatch: some TUIs (Cursor) render the
   // terminal cursor as a reverse-video block ON the placeholder's first char,
@@ -225,8 +226,14 @@ const PROFILES: Record<string, IdleProfile> = {
   // their mail sat unread in real, live panes.
   kimi: { prompt: /(^|\n)\s*│\s*>/, promptLine: /^\s*│\s*>/, strip: /^.*?│\s*>\s?/,
           busy: [], requiresQuiescence: true },
-  grok: { prompt: /(^|\n)\s*[>$]\s/, promptLine: /^\s*[>$]/, strip: /^.*?[>$]\s?/,
-          busy: [/esc to (cancel|interrupt)/i], requiresQuiescence: true },
+  // Grok 4.6 draws its input as "│ ❯ ... │". Keep the older bare >/$ forms
+  // for compatibility, but strip the box's right border before deciding whether
+  // the input is empty. Real typed text remains and therefore still blocks a wake.
+  grok: { prompt: /(^|\n)(?:\s*│\s*❯\s|\s*[>$]\s)/,
+          promptLine: /^(?:\s*│\s*❯|\s*[>$])/,
+          strip: /^(?:.*?❯\s?|.*?[>$]\s?)/,
+          stripTail: /(?:\x1b\[[0-9;]*m|\s)*│(?:\x1b\[[0-9;]*m|\s)*$/,
+          busy: [/esc(?::|\s+to\s+)(cancel|interrupt)/i], requiresQuiescence: true },
 };
 export function profileFor(clientType: string): IdleProfile {
   return PROFILES[clientType] ?? PROFILES.codex!;
@@ -729,7 +736,9 @@ export function paneTextIsIdle(captureWithAnsi: string, profile: IdleProfile = P
   if (!promptLine) return false;
   // Strip everything up to and including the client's glyph (and one optional
   // space), keeping SGR codes after it so the dim/bright check below is exact.
-  const afterGlyph = promptLine.replace(profile.strip, "");  // keep SGR codes
+  const afterGlyph = promptLine
+    .replace(profile.strip, "")
+    .replace(profile.stripTail ?? /$^/, "");  // keep SGR codes around actual input
   const afterPlain = stripAnsi(afterGlyph).trim();
   if (afterPlain === "") return true;                          // empty input — nudge
   // Known literal placeholder (see IdleProfile.placeholderText) — empty input.
