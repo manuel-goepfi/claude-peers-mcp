@@ -56,6 +56,7 @@ export function chooseOperatorLabel(
   _paneIndex: string | undefined,
   usedLabels: Iterable<string>,
   windowName?: string | null,
+  windowPanes?: number | null,
 ): string {
   const used = new Set<string>();
   let highestOrdinal = 0;
@@ -76,7 +77,7 @@ export function chooseOperatorLabel(
   // border, the thing they say out loud, and the thing already meaningful to them —
   // "REVIEW-1996" rather than "C5_lanes.7", which they would still have to map back
   // to a task. Falls through when the name is taken or generic.
-  if (isOperatorChosenWindowName(windowName, session)) {
+  if (windowPanes === 1 && isOperatorChosenWindowName(windowName, session)) {
     const candidate = windowName!.trim();
     if (!used.has(candidate)) return candidate;
   }

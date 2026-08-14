@@ -675,7 +675,7 @@ async function detectTmuxPane(startPid = process.ppid): Promise<TmuxPaneInfo | n
       // pane_index appended as 5th field for the CLAUDE_PEER_NAME tmux-fallback
       // path. parseTmuxPanes treats it as optional, so older callers parsing
       // 4-field output continue to work.
-      ["tmux", "list-panes", "-a", "-F", "#{pane_pid}\t#{session_name}\t#{window_index}\t#{window_name}\t#{pane_index}\t#{pane_id}"],
+      ["tmux", "list-panes", "-a", "-F", "#{pane_pid}\t#{session_name}\t#{window_index}\t#{window_name}\t#{pane_index}\t#{pane_id}\t#{window_panes}"],
       { stdout: "pipe", stderr: "ignore" }
     );
     const listText = await new Response(listProc.stdout).text();
@@ -1330,6 +1330,7 @@ function resolveTmuxOperatorLabel(tmuxInfo: TmuxPaneInfo | null): string | null 
     tmuxInfo.pane_index,
     readUsedOperatorLabels(tmuxInfo.session, tmuxInfo.pane_id),
     tmuxInfo.window_name,
+    tmuxInfo.window_panes,
   );
   setTmuxPaneOption(paneTarget, "@operator_label", label);
   setTmuxPaneOption(paneTarget, "@peer_label", label);

@@ -71,6 +71,7 @@ describe("Codex hook installer", () => {
         hooks: {
           SessionStart: Array<{ matcher?: string; hooks: Array<{ command: string; name?: string; timeout?: number }> }>;
           UserPromptSubmit: Array<{ hooks: Array<{ command: string; name?: string; timeout?: number }> }>;
+          PostToolUse: Array<{ hooks: Array<{ command: string; name?: string; timeout?: number }> }>;
         };
       };
       const hooks = doc.hooks.UserPromptSubmit.flatMap((bucket) => bucket.hooks);
@@ -96,6 +97,11 @@ describe("Codex hook installer", () => {
       const stopHooks = stopBuckets.flatMap((bucket) => bucket.hooks);
       expect(stopHooks.filter((hook) => hook.command === expectedStopDrain)).toHaveLength(1);
       expect(stopHooks.find((hook) => hook.command === expectedStopDrain)?.name).toBe("claude-peers-codex-stop-drain");
+      const expectedPostToolDrain = `CLAUDE_PEERS_HOOK_EVENT_NAME=PostToolUse ${expectedDrainCommand}`;
+      const postToolHooks = doc.hooks.PostToolUse.flatMap((bucket) => bucket.hooks);
+      expect(postToolHooks.filter((hook) => hook.command === expectedPostToolDrain)).toHaveLength(1);
+      expect(postToolHooks.find((hook) => hook.command === expectedPostToolDrain)?.name).toBe("claude-peers-codex-post-tool-drain");
+      expect(postToolHooks.find((hook) => hook.command === expectedPostToolDrain)?.timeout).toBe(10);
       // The plain UserPromptSubmit drain must not have been duplicated or
       // captured by the new env-prefixed predicates.
       expect(commands.filter((command) => command.includes("CLAUDE_PEERS_HOOK_EVENT_NAME="))).toHaveLength(0);

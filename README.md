@@ -92,8 +92,10 @@ CODEX_HOME="$HOME/.codex-b" bun bin/install-codex-hook.ts install
 CODEX_HOME="$HOME/.codex-b" bun bin/install-codex-hook.ts --check
 ```
 
-- Claude: `SessionStart` registration, `UserPromptSubmit` drain, and a `Stop` `asyncRewake` standby watcher. The watcher polls every 10 seconds for the first hour after activity, then every 60 seconds while the Claude process remains alive; later Stop events refresh the fast window without spawning duplicate watchers.
-- Codex: proven root-session hooks register and drain at `SessionStart`, drain at `UserPromptSubmit`, and drain at `Stop`. The hook proves the root by matching `session_id` to the rollout transcript filename. Unproven internal or child hooks leave mail queued for `check_messages` or the next proven root hook.
+- Claude: `SessionStart` registration, `UserPromptSubmit` drain, `PostToolBatch` drain between tool batches, and a `Stop` `asyncRewake` standby watcher. The watcher polls every 10 seconds for the first hour after activity, then every 60 seconds while the Claude process remains alive; later Stop events refresh the fast window without spawning duplicate watchers.
+- Codex: proven root-session hooks register and drain at `SessionStart`, drain at `UserPromptSubmit`, drain after each local `PostToolUse`, and drain at `Stop`. The hook proves the root by matching `session_id` to the rollout transcript filename; transcript-less drains use only the exact thread join and never mint identity. Unproven internal or child hooks leave mail queued for `check_messages` or the next proven root hook.
+
+The post-tool hooks are the supported mid-turn receive path. They inject queued mail before the next model request without typing into a busy pane. A tool-free model call cannot be interrupted and receives mail at its next supported hook boundary.
 - Gemini: `SessionStart` registration and `BeforeAgent` drain. The installer also renders its supported `mcpServers` entry.
 
 Project scope is explicit:
@@ -123,7 +125,7 @@ bun run smoke:install
 
 The doctor performs one `GET /health`, then uses same-user read-only process, config, and SQLite evidence. It never polls, claims, acknowledges, heartbeats, sends, or otherwise changes broker state. While the broker reports `starting` or `migrating`, schema queries are skipped. If health is unreachable while a live or ambiguous database owner exists, schema reads are refused.
 
-In JSON output, `processes.adapters` always contains the complete diagnostic key set: `claude`, `codex`, `gemini`, `cursor`, `agy`, `kimi`, and `unknown`. Cursor, agy, and Kimi process detection does not expand the supported installer or release-smoke boundary above.
+In JSON output, `processes.adapters` always contains the complete diagnostic key set: `claude`, `codex`, `gemini`, `cursor`, `agy`, `kimi`, `grok`, and `unknown`. Cursor, agy, Kimi, and Grok process detection does not expand the supported installer or release-smoke boundary above.
 
 Start two client sessions and ask one to call `list_peers`, then send with `send_to_peer` or `send_message`.
 
@@ -172,7 +174,7 @@ Queue insertion is not receipt, so every send also returns the recipient's live 
 | Client | Receiver mode | Receipt path |
 | --- | --- | --- |
 | Claude Code | `claude/claude-channel` | Prompt-time hook claim and acknowledgement plus a refreshable idle `asyncRewake` watcher; explicit `check_messages` remains the safety net. |
-| Codex with current hooks | `codex/codex-hook` | Prompt/start/turn-end hook claim and acknowledgement. |
+| Codex with current hooks | `codex/codex-hook` | Prompt/start/post-tool/turn-end hook claim and acknowledgement. |
 | Gemini with current hooks | `gemini/gemini-hook` | `BeforeAgent` hook claim and acknowledgement. |
 | Codex or Gemini without a proven hook | `*/manual-drain` | `check_messages` until the hook registers and heartbeats successfully. |
 | Unknown/send-only | `unknown/unknown` | Not a normal automatic receiver; bounded retention applies. |

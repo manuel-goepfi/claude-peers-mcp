@@ -46,7 +46,16 @@ describe("isOperatorChosenWindowName", () => {
 
 describe("chooseOperatorLabel", () => {
   test("prefers the operator's window name over an ordinal", () => {
-    expect(chooseOperatorLabel("C5_lanes", "1", [], "REVIEW-1996")).toBe("REVIEW-1996");
+    expect(chooseOperatorLabel("C5_lanes", "1", [], "REVIEW-1996", 1)).toBe("REVIEW-1996");
+  });
+
+  test("does not donate one shared window name to one of several panes", () => {
+    expect(chooseOperatorLabel("traffic", "0", [], "peers", 2)).toBe("traffic.1");
+    expect(chooseOperatorLabel("traffic", "1", ["traffic.1"], "peers", 2)).toBe("traffic.2");
+  });
+
+  test("unknown pane count fails safe to a stable ordinal", () => {
+    expect(chooseOperatorLabel("traffic", "0", [], "peers")).toBe("traffic.1");
   });
 
   test("falls back to the ordinal when the window name is generic", () => {
@@ -55,12 +64,12 @@ describe("chooseOperatorLabel", () => {
   });
 
   test("never hands out a window name another lane already holds", () => {
-    expect(chooseOperatorLabel("C5_lanes", "1", ["REVIEW-1996"], "REVIEW-1996")).toBe("C5_lanes.1");
+    expect(chooseOperatorLabel("C5_lanes", "1", ["REVIEW-1996"], "REVIEW-1996", 1)).toBe("C5_lanes.1");
   });
 
   test("walks ordinals when both the window name and low ordinals are taken", () => {
     const used = ["REVIEW-1996", "C5_lanes.1", "C5_lanes.2"];
-    expect(chooseOperatorLabel("C5_lanes", "1", used, "REVIEW-1996")).toBe("C5_lanes.3");
+    expect(chooseOperatorLabel("C5_lanes", "1", used, "REVIEW-1996", 1)).toBe("C5_lanes.3");
   });
 
   test("allocates after the highest live ordinal instead of reusing a closed-pane gap", () => {

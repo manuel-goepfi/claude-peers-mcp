@@ -125,4 +125,5 @@ describe("Codex/Gemini drain hook claim error routing", () => {
     expect(source).toContain("stdout emit failed before ack");
     expect(source).toContain("ack failed after stdout emit");
   });
+
 });

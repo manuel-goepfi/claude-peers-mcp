@@ -128,19 +128,26 @@ describe("the shipped drain wires it up", () => {
       hook_event_name: "SubagentStart",
       session_id: "019fc273-a35b-78f0-9a70-f63b5905540f",
       transcript_path: "/tmp/rollout-019fc273-a35b-78f0-9a70-f63b5905540f.jsonl",
-    }, "event-mismatch"],
+    }, "event-mismatch", "SessionStart"],
     ["subagent-context UserPromptSubmit", {
       hook_event_name: "SessionStart",
       session_id: "019fc273-a35b-78f0-9a70-f63b5905540f",
       transcript_path: "/tmp/rollout-019fc273-a35b-78f0-9a70-f63b5905540f.jsonl",
       agent_type: "review",
-    }, "subagent-context"],
-  ])("%s returns before process discovery, claim, or self-registration", (_label, payload, reason) => {
+    }, "subagent-context", "SessionStart"],
+    ["subagent-context PostToolUse", {
+      hook_event_name: "PostToolUse",
+      session_id: "019fc273-a35b-78f0-9a70-f63b5905540f",
+      transcript_path: "/tmp/rollout-019fc273-a35b-78f0-9a70-f63b5905540f.jsonl",
+      agent_type: "review",
+      tool_name: "functions.exec",
+    }, "subagent-context", "PostToolUse"],
+  ])("%s returns before process discovery, claim, or self-registration", (_label, payload, reason, configuredEvent) => {
     const hookPath = new URL("../hooks/codex-drain-peer-inbox.ts", import.meta.url).pathname;
     const proc = Bun.spawnSync([process.execPath, hookPath], {
       env: {
         CLAUDE_PEERS_CLIENT_TYPE: "codex",
-        CLAUDE_PEERS_HOOK_EVENT_NAME: "SessionStart",
+        CLAUDE_PEERS_HOOK_EVENT_NAME: configuredEvent,
         PATH: "/definitely-missing",
       },
       stdin: new TextEncoder().encode(JSON.stringify(payload)),

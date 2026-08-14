@@ -21,7 +21,7 @@ const HOOK_EVENT_NAME = process.env.CLAUDE_PEERS_HOOK_EVENT_NAME ??
  * Codex root-thread identity — the exact join, and the fix for
  * "no codex ancestor found".
  *
- * Root SessionStart, UserPromptSubmit and Stop inputs carry the same session_id
+ * Root SessionStart, UserPromptSubmit, PostToolUse and Stop inputs carry the same session_id
  * that Codex stamps into `_meta.threadId` on the root thread's MCP calls. Codex
  * also runs lifecycle hooks for child/internal sessions, so main() first proves
  * that the hook transcript filename carries that same UUID. Only then is the
@@ -613,7 +613,7 @@ async function main(): Promise<void> {
   if (CLIENT_TYPE === "codex") {
     const decision = codexDrainRootDecision(
       hookInput,
-      HOOK_EVENT_NAME as "SessionStart" | "UserPromptSubmit" | "Stop",
+      HOOK_EVENT_NAME as "SessionStart" | "UserPromptSubmit" | "PostToolUse" | "Stop",
     );
     if (decision.action === "refuse") {
       log(`skipping unproven Codex drain ${codexHookRefusalDiagnostic(decision.reason)} event=${HOOK_EVENT_NAME}`);
@@ -726,7 +726,11 @@ async function main(): Promise<void> {
 
   const messages = claimed.messages ?? [];
   if (messages.length === 0 || !claimed.drain_id) {
-    await heartbeat(pid, "ok", 0);
+    // The claim endpoint already records the same successful hook freshness.
+    // Preserve the older lifecycle-event heartbeat contract, but avoid a
+    // second authenticated request and SQLite update after every empty tool
+    // boundary — the new high-frequency PostToolUse path.
+    if (HOOK_EVENT_NAME !== "PostToolUse") await heartbeat(pid, "ok", 0);
     return;
   }
 

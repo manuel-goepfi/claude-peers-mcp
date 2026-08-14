@@ -1823,6 +1823,10 @@ function isHookBackedClientPeer(peer: Pick<Peer, "client_type" | "receiver_mode"
     // agy (Google's agent CLI) registers the visible TUI pid too — same
     // pid-liveness routability reasoning as cursor.
     peer.client_type === "agy" ||
+    // Grok is also a visible manual-drain TUI. Its MCP adapter may be quiet
+    // between check_messages calls, but a live pane/pid remains routable by
+    // the autodrain poller's quiescent nudge path.
+    peer.client_type === "grok" ||
     // Claude rows: the SessionStart register hook binds pid to the visible
     // claude TUI process, but last_seen freshness rides on the session's MCP
     // server, which the client kills at every compact/resume and does not

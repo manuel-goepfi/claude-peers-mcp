@@ -19,6 +19,10 @@ import { describe, test, expect } from "bun:test";
 import { parseTmuxPanes, type TmuxPaneInfo } from "../shared/tmux.ts";
 
 describe("parseTmuxPanes — pane_index fallback support", () => {
+  test("captures the number of panes sharing the window", () => {
+    const pane = parseTmuxPanes("12345\tinfra\t5\tpeers\t1\t%42\t3\n").get(12345)!;
+    expect(pane.window_panes).toBe(3);
+  });
   test("populates pane_index when 5-field format is used", () => {
     const out =
       "12345\tmysess\t1\twindow-name\t2\n" +

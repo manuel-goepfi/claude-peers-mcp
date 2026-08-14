@@ -1,13 +1,28 @@
 #!/usr/bin/env bash
-# UserPromptSubmit hook: surface pending claude-peers mail before Claude handles
-# the user's prompt. Every failure is a soft failure so peer delivery can never
-# block normal Claude usage.
+# UserPromptSubmit/PostToolBatch hook: surface pending claude-peers mail before
+# Claude's next model request. Every failure is a soft failure so peer delivery
+# can never block normal Claude usage.
 
 set -u
 trap 'exit 0' ERR
 
-cat >/dev/null
+HOOK_EVENT_NAME="${CLAUDE_PEERS_HOOK_EVENT_NAME:-UserPromptSubmit}"
+case "$HOOK_EVENT_NAME" in
+  UserPromptSubmit|PostToolBatch) ;;
+  *) HOOK_EVENT_NAME="UserPromptSubmit" ;;
+esac
 command -v jq >/dev/null 2>&1 || exit 0
+
+# Claude runs tool hooks inside subagents too. Official hook input identifies
+# those calls with agent_id; agent_type alone is insufficient because a root
+# session started with `claude --agent` also carries it. Never let a subagent
+# claim the root seat's inbox.
+if [[ "$HOOK_EVENT_NAME" == "PostToolBatch" ]]; then
+  AGENT_ID=$(jq -r 'if (.agent_id | type) == "string" then .agent_id else "" end' 2>/dev/null)
+  [[ -n "$AGENT_ID" ]] && exit 0
+else
+  cat >/dev/null
+fi
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
@@ -119,9 +134,9 @@ BLOCKS=$(printf '%s' "$RESP" | bun "$SCRIPT_DIR/claude-render-peer-messages.ts" 
 
 CONTEXT="${COUNT} pending peer message(s) drained before this prompt:
 ${BLOCKS}"
-OUTPUT=$(jq -n --arg ctx "$CONTEXT" '{
+OUTPUT=$(jq -n --arg ctx "$CONTEXT" --arg event "$HOOK_EVENT_NAME" '{
   hookSpecificOutput: {
-    hookEventName: "UserPromptSubmit",
+    hookEventName: $event,
     additionalContext: $ctx
   }
 }' 2>/dev/null) || exit 0

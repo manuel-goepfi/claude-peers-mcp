@@ -73,9 +73,9 @@ The audit used the official [Claude Code hooks reference](https://code.claude.co
 
 | Profile | Current state |
 |---|---|
-| Claude A (`~/.claude`) | Current managed `SessionStart` register/greeting, `UserPromptSubmit` inbox drain, and `Stop` standby hooks |
-| Claude B (`~/.claude-b`) | Reinstalled from this checkout; current managed hooks with backup `settings.json.bak-2026-08-12T16-49-56-407Z-2f884e82-d971-44b0-bd56-b22adbacc918` |
-| Codex A (`~/.codex`) | Current managed `SessionStart startup|resume` register+drain, `UserPromptSubmit` drain, and `Stop` drain; account-slot verifier retained |
+| Claude A (`~/.claude`) | Current managed `SessionStart` register/greeting, `UserPromptSubmit` inbox drain, `PostToolBatch` mid-turn drain, and `Stop` standby hooks |
+| Claude B (`~/.claude-b`) | Reinstalled from this checkout with the same managed receive hooks, including `PostToolBatch` |
+| Codex A (`~/.codex`) | Current managed `SessionStart startup|resume` register+drain, `UserPromptSubmit` drain, `PostToolUse` mid-turn drain, and `Stop` drain; account-slot verifier retained |
 | Codex B (`~/.codex-b`) | Current managed register/drain hooks; no A-slot verifier, as designed |
 
 Both Codex profiles now render `thread-id` immediately after `thread-title` in the status line. The existing user-level safe drain wrapper, managed drain hook, and Clause5 project hook were retained: official layering means they can all execute, but claim/ack leases prevent duplicate message rendering. Scope consolidation is a separate operator choice, not part of this repair.

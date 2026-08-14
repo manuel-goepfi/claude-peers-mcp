@@ -19,7 +19,7 @@ const toolNames = [
   "whoami",
 ] as const;
 
-const doctorAdapterKeys = ["claude", "codex", "gemini", "cursor", "agy", "kimi", "unknown"] as const;
+const doctorAdapterKeys = ["claude", "codex", "gemini", "cursor", "agy", "kimi", "grok", "unknown"] as const;
 
 const publicVariables = [
   "CLAUDE_PEERS_PORT",

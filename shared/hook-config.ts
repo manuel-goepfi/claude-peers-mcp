@@ -36,6 +36,10 @@ export function canonicalHooks(client: HookClient, repoRoot: string): CanonicalH
         entry: { name: "claude-peers-codex-inbox", type: "command", command: drain, timeout: 10, statusMessage: "Checking peer inbox" },
       },
       {
+        event: "PostToolUse", scriptMarker: "CLAUDE_PEERS_HOOK_EVENT_NAME=PostToolUse",
+        entry: { name: "claude-peers-codex-post-tool-drain", type: "command", command: `CLAUDE_PEERS_HOOK_EVENT_NAME=PostToolUse ${drain}`, timeout: 10, statusMessage: "Checking peer inbox between tools" },
+      },
+      {
         event: "Stop", scriptMarker: "CLAUDE_PEERS_HOOK_EVENT_NAME=Stop",
         entry: { name: "claude-peers-codex-stop-drain", type: "command", command: `CLAUDE_PEERS_HOOK_EVENT_NAME=Stop ${drain}`, timeout: 10, statusMessage: "Checking peer inbox before stop" },
       },
@@ -66,6 +70,10 @@ export function canonicalHooks(client: HookClient, repoRoot: string): CanonicalH
     {
       event: "UserPromptSubmit", scriptMarker: "claude-drain-peer-inbox.sh", legacyMarkers: [".claude/hooks/drain-peer-inbox.sh"],
       entry: { name: "claude-peers-claude-inbox", type: "command", command: drain, timeout: 10, statusMessage: "Checking peer inbox" },
+    },
+    {
+      event: "PostToolBatch", scriptMarker: "CLAUDE_PEERS_HOOK_EVENT_NAME=PostToolBatch",
+      entry: { name: "claude-peers-claude-post-tool-drain", type: "command", command: `CLAUDE_PEERS_HOOK_EVENT_NAME=PostToolBatch ${drain}`, timeout: 10, statusMessage: "Checking peer inbox between tool batches" },
     },
     {
       event: "Stop", scriptMarker: "claude-standby-watcher.sh", legacyMarkers: ["claude-peers-standby-watcher.sh"],

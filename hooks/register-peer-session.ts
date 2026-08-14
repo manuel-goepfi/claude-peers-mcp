@@ -116,6 +116,7 @@ export type CodexHookRootRefusalReason =
   | "transcript-session-mismatch";
 
 export type CodexHookRootDegradedReason = "unparseable-transcript-path";
+export type CodexDrainHookEvent = "SessionStart" | "UserPromptSubmit" | "PostToolUse" | "Stop";
 
 export function codexHookRefusalDiagnostic(reason: CodexHookRootRefusalReason): string {
   if (reason === "missing-transcript-path") {
@@ -133,14 +134,14 @@ export function codexHookRefusalDiagnostic(reason: CodexHookRootRefusalReason): 
  */
 export function codexHookRootRefusalReason(
   value: unknown,
-  expectedEventName: "SessionStart" | "UserPromptSubmit" | "Stop" | ReadonlyArray<"SessionStart" | "UserPromptSubmit" | "Stop">,
+  expectedEventName: CodexDrainHookEvent | ReadonlyArray<CodexDrainHookEvent>,
 ): CodexHookRootRefusalReason | null {
   const input = value && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown>
     : {};
   const allowedEvents = Array.isArray(expectedEventName) ? expectedEventName : [expectedEventName];
   if (typeof input.hook_event_name !== "string" || !allowedEvents.includes(
-    input.hook_event_name as "SessionStart" | "UserPromptSubmit" | "Stop",
+    input.hook_event_name as CodexDrainHookEvent,
   )) return "event-mismatch";
   const sessionId = sessionIdFromHookInput(input);
   if (!sessionId) return "missing-session-id";
@@ -191,7 +192,7 @@ export type CodexDrainRootDecision =
  */
 export function codexDrainRootDecision(
   value: unknown,
-  expectedEventName: "SessionStart" | "UserPromptSubmit" | "Stop" | ReadonlyArray<"SessionStart" | "UserPromptSubmit" | "Stop">,
+  expectedEventName: CodexDrainHookEvent | ReadonlyArray<CodexDrainHookEvent>,
 ): CodexDrainRootDecision {
   const refusal = codexHookRootRefusalReason(value, expectedEventName);
   if (refusal === "missing-transcript-path") return { action: "thread-only" };
@@ -336,7 +337,7 @@ function detectTmuxPane(pid: number, env: Record<string, string | undefined> = p
       "list-panes",
       "-a",
       "-F",
-      "#{pane_pid}\t#{session_name}\t#{window_index}\t#{window_name}\t#{pane_index}\t#{pane_id}",
+      "#{pane_pid}\t#{session_name}\t#{window_index}\t#{window_name}\t#{pane_index}\t#{pane_id}\t#{window_panes}",
     ]);
     if (listProc.exitCode !== 0) return composeTmuxFromEnv(env);
     const paneMap = parseTmuxPanes(new TextDecoder().decode(listProc.stdout));
@@ -508,7 +509,7 @@ export function peerName(
   if (paneLabel) return paneLabel;
   if (tmux?.session && tmux.pane_id) {
     const used = usedLabels ?? readUsedOperatorLabels(tmux.session, tmux.pane_id);
-    return chooseOperatorLabel(tmux.session, tmux.pane_index, used, tmux.window_name);
+    return chooseOperatorLabel(tmux.session, tmux.pane_index, used, tmux.window_name, tmux.window_panes);
   }
   if (tmux?.session && tmux.window_index) return `${tmux.session}.${tmux.window_index}`;
   return `${clientType}-${pid}`;

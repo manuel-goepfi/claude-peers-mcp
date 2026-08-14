@@ -23,7 +23,7 @@ Treat the readiness state literally:
 
 Use the JSON report for automation. Gate on its exit status and `status`; do not parse human prose. The report contains counts and classifications, not message content, tokens, captured panes, arbitrary filesystem paths, or broker-log text.
 
-The `processes.adapters` object is a stable, complete diagnostic map with `claude`, `codex`, `gemini`, `cursor`, `agy`, `kimi`, and `unknown` keys. Cursor, agy, and Kimi are process-classification entries; the supported install and release-smoke workflow remains Claude, Codex, and Gemini.
+The `processes.adapters` object is a stable, complete diagnostic map with `claude`, `codex`, `gemini`, `cursor`, `agy`, `kimi`, `grok`, and `unknown` keys. Cursor, agy, Kimi, and Grok are process-classification entries; the supported install and release-smoke workflow remains Claude, Codex, and Gemini.
 
 ## Ownership modes
 

@@ -219,7 +219,8 @@ if [[ -n "$PANE_ID" ]]; then
   CLAUDE_PEER_TMUX_SESSION="$(tmux display-message -p -t "$PANE_ID" '#S' 2>/dev/null || true)"
   CLAUDE_PEER_TMUX_WINDOW_INDEX="$(tmux display-message -p -t "$PANE_ID" '#I' 2>/dev/null || true)"
   CLAUDE_PEER_TMUX_WINDOW_NAME="$(tmux display-message -p -t "$PANE_ID" '#W' 2>/dev/null || true)"
-  export CLAUDE_PEER_TMUX_SESSION CLAUDE_PEER_TMUX_WINDOW_INDEX CLAUDE_PEER_TMUX_WINDOW_NAME
+  CLAUDE_PEER_TMUX_WINDOW_PANES="$(tmux display-message -p -t "$PANE_ID" '#{window_panes}' 2>/dev/null || true)"
+  export CLAUDE_PEER_TMUX_SESSION CLAUDE_PEER_TMUX_WINDOW_INDEX CLAUDE_PEER_TMUX_WINDOW_NAME CLAUDE_PEER_TMUX_WINDOW_PANES
 fi
 
 if [[ -n "${CLAUDE_PEERS_CODEX_SEAT_PORT:-}" ]]; then

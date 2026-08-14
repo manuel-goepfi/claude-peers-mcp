@@ -25,15 +25,18 @@ export interface TmuxPaneInfo {
   // legacy 4-field input so old tests / callers don't break.
   pane_index?: string;
   pane_id?: string;
+  // Number of panes in this pane's window. A window name is safe to donate as
+  // a seat label only when this is exactly 1; missing/invalid counts fail safe.
+  window_panes?: number;
 }
 
 /**
- * Parse output of `tmux list-panes -a -F "#{pane_pid}\t#{session_name}\t#{window_index}\t#{window_name}[\t#{pane_index}\t#{pane_id}]"`.
+ * Parse output of `tmux list-panes -a -F "#{pane_pid}\t#{session_name}\t#{window_index}\t#{window_name}[\t#{pane_index}\t#{pane_id}\t#{window_panes}]"`.
  * Returns a Map keyed by pane_pid for O(1) ancestry lookups.
  *
  * Tab-delimited (NOT space-delimited) so session names and window names with
  * spaces are preserved. Skips malformed lines and lines with non-numeric pids.
- * The 5th and 6th fields (pane_index, pane_id) are optional and populated only when the upstream
+ * The 5th through 7th fields (pane_index, pane_id, window_panes) are optional and populated only when the upstream
  * format string requested it — used by the tmux-derived peer-name fallback in
  * server.ts when CLAUDE_PEER_NAME isn't set.
  */
@@ -54,6 +57,10 @@ export function parseTmuxPanes(output: string): Map<number, TmuxPaneInfo> {
         }
         if (parts.length >= 6 && parts[5]!.length > 0) {
           info.pane_id = parts[5]!;
+        }
+        if (parts.length >= 7 && /^\d+$/.test(parts[6]!)) {
+          const windowPanes = Number(parts[6]);
+          if (Number.isSafeInteger(windowPanes) && windowPanes > 0) info.window_panes = windowPanes;
         }
         paneMap.set(pid, info);
       }
@@ -106,6 +113,7 @@ export function composeTmuxFromEnv(
   const windowIndex = env.CLAUDE_PEER_TMUX_WINDOW_INDEX;
   const windowName = env.CLAUDE_PEER_TMUX_WINDOW_NAME;
   const paneId = env.CLAUDE_PEER_TMUX_PANE_ID;
+  const rawWindowPanes = env.CLAUDE_PEER_TMUX_WINDOW_PANES;
 
   const info: TmuxPaneInfo = { session };
   if (windowIndex && windowIndex.length > 0) {
@@ -116,6 +124,10 @@ export function composeTmuxFromEnv(
   }
   if (paneId && paneId.length > 0) {
     info.pane_id = paneId;
+  }
+  if (rawWindowPanes && /^\d+$/.test(rawWindowPanes)) {
+    const windowPanes = Number(rawWindowPanes);
+    if (Number.isSafeInteger(windowPanes) && windowPanes > 0) info.window_panes = windowPanes;
   }
   // pane_index intentionally not forwarded — the launcher exports PANE_ID (a
   // stable %N identifier), while pane_index is an unstable display position.

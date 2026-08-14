@@ -2010,8 +2010,11 @@ describe("Live broker delivery features", () => {
     childT.kill();
   });
 
-  test("stale-but-alive Cursor seat survives a reap pass with its queued mail and keeps its id on re-register", async () => {
-    // Cursor cycles its MCP servers: heartbeats stop for minutes while the
+  test.each([
+    ["Cursor", "cursor"],
+    ["Grok", "grok"],
+  ])("stale-but-alive %s seat survives a reap pass with its queued mail and keeps its id on re-register", async (_label, clientType) => {
+    // Manual-drain TUIs can leave heartbeats quiet for minutes while the
     // visible agent (the registered pid) stays alive. Regression under test:
     // the stale row used to hit shouldPermanentlyReapPeer's alive-pid branch,
     // which deleted row + queued mail immediately — no recoverable-inbox
@@ -2021,18 +2024,18 @@ describe("Live broker delivery features", () => {
     const childS = spawnSleep();
     const childT = spawnSleep();
     const sender = await brokerFetch<{ id: string }>("/register", {
-      pid: childS.pid, cwd: "/cursor-cycle-s", git_root: null, tty: null, name: "cursor-cycle-s",
+      pid: childS.pid, cwd: `/${clientType}-cycle-s`, git_root: null, tty: null, name: `${clientType}-cycle-s`,
       tmux_session: null, tmux_window_index: null, tmux_window_name: null, summary: "",
     });
     const target = await brokerFetch<{ id: string }>("/register", {
-      pid: childT.pid, cwd: "/cursor-cycle-t", git_root: null, tty: null, name: "cursor-cycle-target",
-      tmux_session: "cur", tmux_window_index: "1", tmux_window_name: "agent", tmux_pane_id: "%333",
-      client_type: "cursor", receiver_mode: "manual-drain", summary: "",
+      pid: childT.pid, cwd: `/${clientType}-cycle-t`, git_root: null, tty: null, name: `${clientType}-cycle-target`,
+      tmux_session: clientType.slice(0, 3), tmux_window_index: "1", tmux_window_name: "agent", tmux_pane_id: "%333",
+      client_type: clientType, receiver_mode: "manual-drain", summary: "",
     });
     const send = await brokerFetch<{ ok: boolean; id?: number }>("/send-to-peer", {
       from_id: sender.id,
-      selector: { name: "cursor-cycle-target" },
-      text: "queued across a cursor server cycle",
+      selector: { name: `${clientType}-cycle-target` },
+      text: `queued across a ${clientType} server cycle`,
     });
     expect(send.ok).toBe(true);
 
@@ -2043,7 +2046,7 @@ describe("Live broker delivery features", () => {
     rw.close();
 
     // A list_peers call runs the liveAndFreshPeers reap pass. With the
-    // visible-seat exemption a stale-but-alive Cursor row is NOT reapable at
+    // visible-seat exemption a stale-but-alive manual-drain row is NOT reapable at
     // all — it stays LISTED and routable through the inter-generation gap
     // (mail delivers on the next nudge), exactly like stale hook-backed
     // codex/gemini seats.
@@ -2063,9 +2066,9 @@ describe("Live broker delivery features", () => {
     // The next server generation registers with the SAME visible pid →
     // samePidRefresh keeps the id, so the queued mail still addresses this seat.
     const reReg = await brokerFetch<{ id: string }>("/register", {
-      pid: childT.pid, cwd: "/cursor-cycle-t", git_root: null, tty: null, name: "cursor-cycle-target",
-      tmux_session: "cur", tmux_window_index: "1", tmux_window_name: "agent", tmux_pane_id: "%333",
-      client_type: "cursor", receiver_mode: "manual-drain", summary: "",
+      pid: childT.pid, cwd: `/${clientType}-cycle-t`, git_root: null, tty: null, name: `${clientType}-cycle-target`,
+      tmux_session: clientType.slice(0, 3), tmux_window_index: "1", tmux_window_name: "agent", tmux_pane_id: "%333",
+      client_type: clientType, receiver_mode: "manual-drain", summary: "",
     });
     expect(reReg.id).toBe(target.id);
     childS.kill();
@@ -2552,6 +2555,66 @@ describe("Live broker delivery features", () => {
     expect(status.statuses[0]!.delivered).toBe(true);
     expect(typeof status.statuses[0]!.delivered_at).toBe("string");
     child.kill();
+  });
+
+  test("empty Codex PostToolUse claim does not send a duplicate heartbeat", async () => {
+    const child = spawnSleep();
+    const threadId = crypto.randomUUID();
+    await brokerFetch<{ id: string }>("/register", {
+      pid: child.pid, cwd: "/codex-post-tool-empty", git_root: null, tty: null, name: "codex-post-tool-empty",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null,
+      thread_id: threadId, client_type: "codex", receiver_mode: "codex-hook", summary: "",
+    });
+    const observedPaths: string[] = [];
+    const proxy = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      async fetch(request) {
+        const incoming = new URL(request.url);
+        observedPaths.push(incoming.pathname);
+        return fetch(`${brokerUrl}${incoming.pathname}${incoming.search}`, {
+          method: request.method,
+          headers: request.headers,
+          body: request.method === "GET" || request.method === "HEAD" ? undefined : await request.text(),
+        });
+      },
+    });
+
+    try {
+      const hook = Bun.spawn(["bun", new URL("../hooks/codex-drain-peer-inbox.ts", import.meta.url).pathname], {
+        cwd: new URL("..", import.meta.url).pathname,
+        env: {
+          ...process.env,
+          CODEX_HOME: `${broker.root}/.codex`,
+          CLAUDE_PEERS_PORT: String(proxy.port),
+          CLAUDE_PEERS_MCP_PID: String(child.pid),
+          CLAUDE_PEERS_HOOK_EVENT_NAME: "PostToolUse",
+        },
+        stdin: "pipe",
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      hook.stdin.write(JSON.stringify({
+        hook_event_name: "PostToolUse",
+        session_id: threadId,
+        transcript_path: `/not-yet-created/rollout-${threadId}.jsonl`,
+        tool_name: "functions.exec",
+      }));
+      hook.stdin.end();
+      const [stdout, stderr, code] = await Promise.all([
+        new Response(hook.stdout).text(),
+        new Response(hook.stderr).text(),
+        hook.exited,
+      ]);
+
+      expect(code).toBe(0);
+      expect(stdout).toBe("");
+      expect(stderr).toBe("");
+      expect(observedPaths).toEqual(["/claim-by-thread"]);
+    } finally {
+      proxy.stop(true);
+      child.kill();
+    }
   });
 
   test("Codex Stop-event hook emits decision:block with reason and ACKs", async () => {

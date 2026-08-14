@@ -715,6 +715,10 @@ describe("client detection", () => {
       session_id: rootThreadId,
       hook_event_name: "Stop",
     }, "Stop")).toEqual({ action: "thread-only" });
+    expect(codexDrainRootDecision({
+      session_id: rootThreadId,
+      hook_event_name: "PostToolUse",
+    }, "PostToolUse")).toEqual({ action: "thread-only" });
     // A matching transcript is still the strongest proof and keeps full recovery.
     expect(codexDrainRootDecision({
       session_id: rootThreadId,

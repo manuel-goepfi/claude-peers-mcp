@@ -797,7 +797,7 @@ export interface TickSnapshot {
 }
 export function takeSnapshot(): TickSnapshot | null {
   const psOut = sh(["ps", "-eo", "pid=,ppid=,args="]);
-  const paneOut = sh(["tmux", "list-panes", "-a", "-F", "#{pane_pid}\t#{session_name}\t#{window_index}\t#{window_name}\t#{pane_index}\t#{pane_id}"]);
+  const paneOut = sh(["tmux", "list-panes", "-a", "-F", "#{pane_pid}\t#{session_name}\t#{window_index}\t#{window_name}\t#{pane_index}\t#{pane_id}\t#{window_panes}"]);
   if (!psOut.ok || !paneOut.ok) return null;
   const procs: ProcLike[] = [];
   for (const line of psOut.out.split("\n")) {

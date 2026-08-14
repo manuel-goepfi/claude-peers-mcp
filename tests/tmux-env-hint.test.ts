@@ -43,22 +43,36 @@ describe("composeTmuxFromEnv — CLAUDE_PEER_TMUX_* env hint fallback", () => {
     expect(result).toBeNull();
   });
 
-  test("returns full TmuxPaneInfo when all four env vars are populated", () => {
+  test("returns full TmuxPaneInfo when all launcher env vars are populated", () => {
     // The happy path: cc/ccc/cccr/cc2 wrapper inside a healthy tmux pane.
     const result = composeTmuxFromEnv({
       CLAUDE_PEER_TMUX_SESSION: "visionsuitespike",
       CLAUDE_PEER_TMUX_WINDOW_INDEX: "1",
       CLAUDE_PEER_TMUX_WINDOW_NAME: "claude",
       CLAUDE_PEER_TMUX_PANE_ID: "%42",
+      CLAUDE_PEER_TMUX_WINDOW_PANES: "2",
     });
     expect(result).not.toBeNull();
     expect(result!.session).toBe("visionsuitespike");
     expect(result!.window_index).toBe("1");
     expect(result!.window_name).toBe("claude");
     expect(result!.pane_id).toBe("%42");
+    expect(result!.window_panes).toBe(2);
     // Intentionally undefined — env hint can't supply per-window pane ordinal.
     expect(result!.pane_index).toBeUndefined();
   });
+
+  test.each(["", "0", "-1", "1.5", "many", "9007199254740992"])(
+    "ignores invalid window pane count %p",
+    (windowPanes) => {
+      const result = composeTmuxFromEnv({
+        CLAUDE_PEER_TMUX_SESSION: "infra",
+        CLAUDE_PEER_TMUX_WINDOW_PANES: windowPanes,
+      });
+      expect(result).not.toBeNull();
+      expect(result!.window_panes).toBeUndefined();
+    },
+  );
 
   test("session-only env leaves window_index/window_name/pane_id UNDEFINED (not empty string)", () => {
     // Critical schema-shape contract (Fix B v1.1 after reviewer-found drift):

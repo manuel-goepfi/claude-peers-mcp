@@ -62,9 +62,9 @@ describe("send status hint for nudge-driven lanes", () => {
   });
 
   test("every nudgeable client type gets the automatic wording, not just codex", () => {
-    // cursor / agy / kimi have no hook API at all, so manual-drain is their ONLY
+    // cursor / agy / kimi / grok have no hook API at all, so manual-drain is their ONLY
     // mode. If the wording implied breakage they would look permanently broken.
-    for (const client_type of ["codex", "cursor", "agy", "kimi"] as const) {
+    for (const client_type of ["codex", "cursor", "agy", "kimi", "grok"] as const) {
       const hint = sendStatusHint(target({ client_type, last_drain_at: "2026-08-01T08:00:00Z" }), false);
       expect(hint).toContain("has drained before");
       expect(hint).not.toContain("must use check_messages");
