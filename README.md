@@ -134,7 +134,7 @@ Start two client sessions and ask one to call `list_peers`, then send with `send
 | `list_peers` | List targetable peers by `machine`, exact `directory`, or worktree-aware `repo` scope; optional tmux filter. |
 | `send_message` | Send to one live broker ID. Stale IDs fail and return replacement candidates; no guessing. |
 | `send_to_peer` | Resolve one exact selector: ID, name, resolved name, seat key, visible tmux target, or tmux session plus pane ID. Ambiguity returns candidates and sends nothing. |
-| `inspect_peer_pane` | Explicitly capture 1–200 lines from a peer pane, read-only, capped at 8 KiB. |
+| `inspect_peer_pane` | Explicitly capture 1–200 lines from a peer pane, read-only, capped at 8 KiB. Does not claim or ack the caller's inbox. |
 | `broadcast_message` | Fan out to a bounded tmux/repo/name scope. At least one filter is required and filters combine with AND. |
 | `set_summary` | Set an explicit operator/agent summary visible to peers. There is no LLM or API-key auto-summary dependency. |
 | `set_name` | Set or clear the human-facing seat name; broker resolution remains unique. |

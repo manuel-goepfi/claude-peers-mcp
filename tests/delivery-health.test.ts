@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import {
   recipientDeliveryHealth,
+  adapterLivenessForSender,
+  ADAPTER_CONTACT_FRESH_MS,
   UNDRAINED_WARN_MS,
   type RecipientDrainFacts,
 } from "../shared/delivery-state.ts";
@@ -148,6 +150,36 @@ describe("mcp_transport surfacing", () => {
     expect(health.state).toBe("undrained");
     expect(health.warning).toContain("Treat this as undelivered");
     expect(health.warning).toContain("MCP adapter is not running");
+  });
+});
+
+describe("adapterLivenessForSender", () => {
+  const now = Date.parse("2026-08-14T04:50:00.000Z");
+  const freshSeen = new Date(now - 5_000).toISOString();
+  const olderHook = new Date(now - 60_000).toISOString();
+
+  test("leaves alive and unknown untouched", () => {
+    expect(adapterLivenessForSender("alive", freshSeen, olderHook, now)).toBe("alive");
+    expect(adapterLivenessForSender("unknown", freshSeen, olderHook, now)).toBe("unknown");
+  });
+
+  test("keeps PID-dead when there is no hook stamp (registration-only Transport-closed)", () => {
+    expect(adapterLivenessForSender("dead", freshSeen, null, now)).toBe("dead");
+    expect(adapterLivenessForSender("dead", freshSeen, undefined, now)).toBe("dead");
+  });
+
+  test("keeps PID-dead when last_seen is not newer than last_hook (hook-only drain)", () => {
+    expect(adapterLivenessForSender("dead", olderHook, olderHook, now)).toBe("dead");
+    expect(adapterLivenessForSender("dead", olderHook, freshSeen, now)).toBe("dead");
+  });
+
+  test("keeps PID-dead when MCP contact is older than the freshness window", () => {
+    const staleSeen = new Date(now - ADAPTER_CONTACT_FRESH_MS - 1).toISOString();
+    expect(adapterLivenessForSender("dead", staleSeen, olderHook, now)).toBe("dead");
+  });
+
+  test("promotes PID-dead to alive when a fresh last_seen is strictly after last_hook", () => {
+    expect(adapterLivenessForSender("dead", freshSeen, olderHook, now)).toBe("alive");
   });
 });
 

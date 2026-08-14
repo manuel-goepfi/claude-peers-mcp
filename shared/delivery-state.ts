@@ -1,3 +1,5 @@
+import type { SeatAdapterLiveness } from "./seat.ts";
+
 export const CLAIM_TTL_MS = 30_000;
 
 export function claimCutoffIso(nowMs = Date.now()): string {
@@ -13,6 +15,39 @@ export function claimCutoffIso(nowMs = Date.now()): string {
  * who is waiting on a reply.
  */
 export const UNDRAINED_WARN_MS = 10 * 60_000;
+
+/**
+ * Recent MCP broker contact (heartbeat or tool call) that is strictly newer
+ * than the last hook drain. Used to override a PID-scan "dead" when the
+ * adapter is live but not listed in seat_pids (Codex app-server / TUI-only rows).
+ */
+export const ADAPTER_CONTACT_FRESH_MS = 120_000;
+
+/**
+ * Sender-facing adapter liveness.
+ *
+ * PID classification is the floor: a live adapter process is always alive, and
+ * unknown stays unknown. "Dead" is overridden to alive only when last_seen is
+ * fresh AND strictly after last_hook_seen_at — that pattern is MCP heartbeat
+ * or tool traffic, not a hook-only drain (which writes both timestamps in one
+ * statement). Registration-only rows (no hook stamp) stay dead, which is the
+ * Transport-closed fixture.
+ */
+export function adapterLivenessForSender(
+  pidClass: SeatAdapterLiveness,
+  lastSeenAt: string | null | undefined,
+  lastHookSeenAt: string | null | undefined,
+  nowMs = Date.now(),
+): SeatAdapterLiveness {
+  if (pidClass !== "dead") return pidClass;
+  if (!lastSeenAt || !lastHookSeenAt) return "dead";
+  const seen = Date.parse(lastSeenAt);
+  const hook = Date.parse(lastHookSeenAt);
+  if (!Number.isFinite(seen) || !Number.isFinite(hook)) return "dead";
+  if (seen <= hook) return "dead";
+  if (nowMs - seen > ADAPTER_CONTACT_FRESH_MS) return "dead";
+  return "alive";
+}
 
 export type RecipientDrainState =
   /** Draining normally, or the queue is too young to judge. */

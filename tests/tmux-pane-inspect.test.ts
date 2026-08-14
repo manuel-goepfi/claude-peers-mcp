@@ -48,4 +48,16 @@ describe("tmux pane inspection helpers", () => {
     expect(source).toContain('"capture-pane"');
     expect(source).not.toContain('"send-keys"');
   });
+
+  test("inspect_peer_pane does not claim or ack the caller inbox", () => {
+    const source = readFileSync(new URL("../server.ts", import.meta.url), "utf8");
+    const start = source.indexOf('case "inspect_peer_pane"');
+    expect(start).toBeGreaterThan(-1);
+    const next = source.indexOf("\n    case ", start + 1);
+    const body = source.slice(start, next === -1 ? source.length : next);
+    expect(body).toContain("inspectPeerPane(");
+    expect(body).not.toContain("drainPendingMessages(");
+    expect(body).not.toContain("claimCurrentInbox(");
+    expect(body).not.toContain("ackClaimedInbox(");
+  });
 });

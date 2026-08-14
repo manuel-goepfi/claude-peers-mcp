@@ -64,6 +64,7 @@ import {
   CLAIM_TTL_MS,
   claimCutoffIso,
   recipientDeliveryHealth,
+  adapterLivenessForSender,
   type RecipientDeliveryHealth,
 } from "./shared/delivery-state.ts";
 import { classifySeatAdapterLiveness, durableSeatKey, mergeSeatPids, parseSeatPids, seatPidsAlive, serializeSeatPids } from "./shared/seat.ts";
@@ -1941,8 +1942,12 @@ function recipientHealthFor(peer: Peer): RecipientDeliveryHealth {
     // adapter died keeps receiving via hooks but cannot send or reply
     // ("Transport closed" on every peers tool). The sender is the only party
     // positioned to route around that, so it is told here.
-    mcpTransport: classifySeatAdapterLiveness(
-      parseSeatPids(peer.seat_pids), peer.pid, isPidAlive, isAdapterServerPid, isClientSessionPid,
+    mcpTransport: adapterLivenessForSender(
+      classifySeatAdapterLiveness(
+        parseSeatPids(peer.seat_pids), peer.pid, isPidAlive, isAdapterServerPid, isClientSessionPid,
+      ),
+      peer.last_seen,
+      peer.last_hook_seen_at,
     ),
   });
 }

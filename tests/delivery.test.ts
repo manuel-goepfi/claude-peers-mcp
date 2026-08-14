@@ -1634,6 +1634,29 @@ describe("Live broker delivery features", () => {
     expect(sent.recipient?.warning ?? "").toContain("hook mail still delivers");
   });
 
+  test("a PID-dead seat with fresher MCP last_seen than last_hook is not advertised dead", async () => {
+    const child = Bun.spawn(["bash", "-c", "exec -a claude sleep 60"]);
+    childProcesses.add(child);
+    await Bun.sleep(150);
+    const peer = await brokerFetch<{ id: string }>("/register", {
+      pid: child.pid, cwd: "/adapter-live-contact", git_root: null, tty: null, name: "adapter-live-contact",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null,
+      client_type: "codex", receiver_mode: "codex-hook", summary: "",
+    });
+    const now = Date.now();
+    const rw = new Database(TEST_DB);
+    rw.run(
+      "UPDATE peers SET last_hook_seen_at = ?, last_seen = ? WHERE id = ?",
+      [new Date(now - 60_000).toISOString(), new Date(now - 1_000).toISOString(), peer.id],
+    );
+    rw.close();
+    const sent = await brokerFetch<{ recipient?: { mcp_transport?: string; warning?: string | null } }>("/send-message", {
+      from_id: peer.id, to_id: peer.id, text: "adapter-live-contact surfacing probe",
+    });
+    expect(sent.recipient?.mcp_transport).toBe("alive");
+    expect(sent.recipient?.warning ?? "").not.toContain("MCP adapter is not running");
+  });
+
   test("/ack-by-pid: wrong drain_id does not deliver and records a mismatch", async () => {
     const child = spawnSleep();
     const peer = await brokerFetch<{ id: string }>("/register", {

@@ -1673,7 +1673,7 @@ const TOOLS = [
   {
     name: "inspect_peer_pane",
     description:
-      "Read the last lines from a peer's tmux pane. Read-only: uses tmux capture-pane, never send-keys, and never writes to the target pane.",
+      "Read the last lines from a peer's tmux pane. Read-only: uses tmux capture-pane, never send-keys, never writes to the target pane, and never claims or acknowledges the caller's inbox. Pending mail is delivered only by check_messages or the prompt hook.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -2047,10 +2047,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         };
       }
       try {
+        // Capture only. Claiming the caller inbox here made inspect look like
+        // receipt while send_message still said queued.
         const snapshot = await inspectPeerPane(peer_id, clampTmuxLineCount(line_count));
-        const pending = await drainPendingMessages();
         return {
-          content: [{ type: "text" as const, text: `${formatTmuxSnapshot(snapshot)}${pending ?? ""}` }],
+          content: [{ type: "text" as const, text: formatTmuxSnapshot(snapshot) }],
           isError: !snapshot.ok,
         };
       } catch (e) {

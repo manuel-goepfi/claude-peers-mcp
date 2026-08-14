@@ -53,7 +53,7 @@ legacy/manual-drain lanes retain their receive path. The standalone binary still
 defaults to no clients unless `NUDGE_CLIENTS` is set:
 
 ```
-Environment=NUDGE_CLIENTS=codex,gemini,claude,cursor,agy,kimi
+Environment=NUDGE_CLIENTS=codex,gemini,claude,cursor,agy,kimi,grok
 ```
 
 The poller logs its state at startup (`nudge=DISABLED` or `nudge=codex,...`), so

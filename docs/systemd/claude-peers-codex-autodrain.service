@@ -45,7 +45,7 @@ Environment=TMUX_TMPDIR=/tmp
 # Wake-only scope. The poller submits a notification but never claims or
 # acknowledges mailbox rows. Preserve every supported hook/manual client: a
 # legacy lane may depend on this wake to run its own check_messages path.
-Environment=NUDGE_CLIENTS=codex,gemini,claude,cursor,agy,kimi
+Environment=NUDGE_CLIENTS=codex,gemini,claude,cursor,agy,kimi,grok
 # Tunables (defaults shown; override here if needed):
 # Environment=POLL_INTERVAL_MS=15000
 # Environment=NUDGE_COOLDOWN_MS=60000
