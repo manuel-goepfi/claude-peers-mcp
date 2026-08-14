@@ -1190,7 +1190,11 @@ export function composerStillHolds(capture: string, probe: string): boolean {
   const lines = capture.split("\n");
   let marker = -1;
   for (let i = lines.length - 1; i >= 0; i--) {
-    if (/^\s*[›>]\s/.test(lines[i] ?? "")) { marker = i; break; }
+    // Match every managed TUI's actual composer, not only Codex/Gemini. A
+    // missed marker is a false submit confirmation: the wake can remain typed
+    // while the poller records a successful nudge and spends its attempt budget.
+    // Modern Grok and Kimi put the prompt inside a left box border.
+    if (/^\s*(?:│\s*[>❯]|[›>→❯$])(?:\s|$)/.test(lines[i] ?? "")) { marker = i; break; }
   }
   if (marker === -1) return false; // no composer visible — cannot claim it is held
   const composer = lines.slice(marker).join(" ").replace(/\s+/g, " ");

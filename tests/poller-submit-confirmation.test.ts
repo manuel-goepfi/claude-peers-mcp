@@ -81,6 +81,17 @@ describe("composerStillHolds distinguishes UNSENT from SENT", () => {
     expect(composerStillHolds(capture, probe)).toBe(true);
   });
 
+  test.each([
+    ["Cursor", `→ ${probe}`, "→ Add a follow-up"],
+    ["Claude", `❯ ${probe}`, "❯ "],
+    ["Grok 4.6 boxed", `│ ❯ ${probe} │`, "│ ❯                                      │"],
+    ["Kimi boxed", `│ > ${probe}`, "│ > "],
+    ["legacy Grok", `$ ${probe}`, "$ "],
+  ])("%s composer reports held before Enter and released after submit", (_client, held, empty) => {
+    expect(composerStillHolds(`earlier output\n${held}`, probe)).toBe(true);
+    expect(composerStillHolds(`${probe}\nWorking\n${empty}`, probe)).toBe(false);
+  });
+
   test("a capture with no visible composer never claims the text is held", () => {
     // Fail toward "submitted" here: with no prompt marker we have no evidence of
     // holding, and inventing one would block delivery on every unusual pane.
