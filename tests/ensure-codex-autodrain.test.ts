@@ -49,6 +49,8 @@ async function runWatchdog(opts: RunOpts = {}) {
   mkdirSync(shim);
   const pkillLog = join(root, "pkill.log");
   const systemctlLog = join(root, "systemctl.log");
+  const labelHookLog = join(root, "tmux-label-hook.log");
+  const labelHookInstaller = join(root, "install-tmux-label-hooks");
   const pgrepExit = opts.pollerRunning ? 0 : 1;
   const pgrepOut = opts.pollerRunning ? "echo 99999" : ":";
   const systemd = opts.systemd ?? { managerAvailable: false };
@@ -69,9 +71,11 @@ case "$2" in
   *) exit 1 ;;
 esac
 `);
+  writeFileSync(labelHookInstaller, `#!/bin/bash\necho called >> '${labelHookLog}'\nexit 0\n`);
   chmodSync(join(shim, "pgrep"), 0o755);
   chmodSync(join(shim, "pkill"), 0o755);
   chmodSync(join(shim, "systemctl"), 0o755);
+  chmodSync(labelHookInstaller, 0o755);
   const nudgeFile = join(root, "nudge-clients");
   if (opts.file !== null && opts.file !== undefined) writeFileSync(nudgeFile, opts.file);
   const log = join(root, "watchdog.log");
@@ -87,6 +91,7 @@ esac
       NUDGE_CLIENTS_FILE: nudgeFile,
       AUTODRAIN_LOG: log,
       AUTODRAIN_HEARTBEAT: heartbeat,
+      TMUX_LABEL_HOOK_INSTALLER: labelHookInstaller,
       TMUX_TMPDIR: tmuxTmp,
       ...(opts.env ?? {}),
     },
@@ -100,6 +105,7 @@ esac
     log: existsSync(log) ? readFileSync(log, "utf8") : "",
     pkills: existsSync(pkillLog) ? readFileSync(pkillLog, "utf8") : "",
     systemctl: existsSync(systemctlLog) ? readFileSync(systemctlLog, "utf8") : "",
+    labelHookInstalls: existsSync(labelHookLog) ? readFileSync(labelHookLog, "utf8") : "",
   };
 }
 
@@ -118,6 +124,7 @@ describe("systemd supervision takes precedence over the tmux fallback", () => {
     expect(r.systemctl).toContain(`XDG_RUNTIME_DIR=/run/user/${uid}`);
     expect(r.systemctl).toContain(`DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${uid}/bus`);
     expect(r.systemctl).not.toContain("restart");
+    expect(r.labelHookInstalls).toBe("called\n");
   });
 
   test("inactive reachable unit is restarted without falling through to tmux", async () => {

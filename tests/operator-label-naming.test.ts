@@ -60,6 +60,7 @@ describe("chooseOperatorLabel", () => {
 
   test("falls back to the ordinal when the window name is generic", () => {
     expect(chooseOperatorLabel("C5_lanes", "1", [], "claude")).toBe("C5_lanes.1");
+    expect(chooseOperatorLabel("infra", "4", [], "grok", 1)).toBe("infra.1");
     expect(chooseOperatorLabel("C5_lanes", "1", [], undefined)).toBe("C5_lanes.1");
   });
 

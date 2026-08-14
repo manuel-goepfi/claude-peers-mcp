@@ -1,0 +1,60 @@
+#!/bin/bash
+# Install pane-birth labels independently of agent/MCP startup. Grok does not
+# create a session or launch MCP servers until its first prompt, so registration
+# alone cannot label a zero-turn pane.
+set -eu
+
+HOOK_SLOT=90
+LABELER="${CLAUDE_PEERS_TMUX_LABELER:-/home/manzo/claude-peers-mcp/bin/tmux-label-pane.ts}"
+TMUX_BIN="${CLAUDE_PEERS_TMUX_BIN:-/usr/local/bin/tmux}"
+[ -x "$TMUX_BIN" ] || TMUX_BIN="$(command -v tmux 2>/dev/null || true)"
+BUN_BIN="${CLAUDE_PEERS_BUN_BIN:-/home/manzo/.bun/bin/bun}"
+[ -x "$BUN_BIN" ] || BUN_BIN="$(command -v bun 2>/dev/null || true)"
+FLOCK_BIN="${CLAUDE_PEERS_FLOCK_BIN:-$(command -v flock 2>/dev/null || true)}"
+LABEL_LOCK="${CLAUDE_PEERS_TMUX_LABEL_LOCK:-$HOME/.claude-peers-tmux-label.lock}"
+
+if [ -n "${CLAUDE_PEERS_TMUX_SOCKET:-}" ]; then
+  TMUX_SOCKET="$CLAUDE_PEERS_TMUX_SOCKET"
+elif [ -n "${TMUX:-}" ]; then
+  TMUX_SOCKET="${TMUX%%,*}"
+else
+  TMUX_SOCKET="${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/default"
+fi
+
+tmux_cmd() { "$TMUX_BIN" -S "$TMUX_SOCKET" "$@"; }
+
+# No server yet is normal during login. ~/.tmux.conf invokes the watchdog again
+# when the server starts, and its call to this installer will then succeed.
+if [ -z "$TMUX_BIN" ] || ! tmux_cmd list-sessions >/dev/null 2>&1; then
+  exit 0
+fi
+
+HOOK_NAMES="after-new-session after-new-window after-split-window"
+if [ "${1:-}" = "--uninstall" ]; then
+  for hook in $HOOK_NAMES; do
+    tmux_cmd set-hook -gu "${hook}[${HOOK_SLOT}]" 2>/dev/null || true
+  done
+  exit 0
+fi
+if [ "$#" -ne 0 ]; then
+  echo "usage: install-tmux-label-hooks [--uninstall]" >&2
+  exit 2
+fi
+if [ -z "$BUN_BIN" ] || [ -z "$FLOCK_BIN" ] || [ ! -r "$LABELER" ]; then
+  echo "tmux label hook prerequisites missing" >&2
+  exit 1
+fi
+
+# tmux hook arrays use numeric slots. Slot 90 is claude-peers-owned: replacing
+# it is idempotent and leaves every operator/plugin hook in other slots intact.
+# run-shell intentionally stays synchronous. Combined with flock this makes the
+# read-used -> choose -> set transaction serial across simultaneous pane births.
+HOOK_COMMAND="run-shell \"env CLAUDE_PEERS_TMUX_SOCKET='$TMUX_SOCKET' CLAUDE_PEERS_TMUX_BIN='$TMUX_BIN' '$FLOCK_BIN' -x '$LABEL_LOCK' '$BUN_BIN' '$LABELER' '#{pane_id}'\""
+for hook in $HOOK_NAMES; do
+  tmux_cmd set-hook -g "${hook}[${HOOK_SLOT}]" "$HOOK_COMMAND"
+done
+
+# Creation hooks cannot repair panes that predate installation (including the
+# zero-turn pane that exposed this gap), so run the same locked allocator once.
+env CLAUDE_PEERS_TMUX_SOCKET="$TMUX_SOCKET" CLAUDE_PEERS_TMUX_BIN="$TMUX_BIN" \
+  "$FLOCK_BIN" -x "$LABEL_LOCK" "$BUN_BIN" "$LABELER" --all

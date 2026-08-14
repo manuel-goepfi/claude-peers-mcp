@@ -44,6 +44,17 @@ LOG="${AUTODRAIN_LOG:-/home/manzo/.claude-peers-codex-autodrain.log}"
 HEARTBEAT="${AUTODRAIN_HEARTBEAT:-/home/manzo/.claude-peers-autodrain.heartbeat}"
 SYSTEMD_UNIT="${AUTODRAIN_SYSTEMD_UNIT:-claude-peers-codex-autodrain.service}"
 
+# Pane names must exist before an agent registers. In particular, a zero-turn
+# Grok pane launches no MCP adapter, so registration cannot stamp its label.
+# This installer is independent of the poller opt-in and runs before the
+# systemd-owner early return. It is idempotent and preserves other tmux hooks.
+TMUX_LABEL_HOOK_INSTALLER="${TMUX_LABEL_HOOK_INSTALLER:-/home/manzo/claude-peers-mcp/bin/install-tmux-label-hooks}"
+if [ -r "$TMUX_LABEL_HOOK_INSTALLER" ]; then
+  if ! bash "$TMUX_LABEL_HOOK_INSTALLER" >/dev/null 2>&1; then
+    echo "$(date -Iseconds) watchdog: tmux pane-label hook install failed" >> "$LOG"
+  fi
+fi
+
 # The user service is the single primary poller owner. Check whether its unit
 # can be resolved before examining the fallback opt-in: an active unit is a
 # clean no-op; an inactive but resolvable unit is restarted. Do NOT start the

@@ -1173,6 +1173,27 @@ function pasteIntoPane(paneId: string, text: string): boolean {
   }
 }
 
+export type WakeInputTransport = "literal" | "bracketed-paste";
+
+/**
+ * Pick the input event the target TUI actually consumes.
+ *
+ * Grok 4.6 ignores tmux's bracketed `paste-buffer -p` event entirely: the
+ * command exits zero, but its composer remains empty. Wake notifications are
+ * deliberately short, so literal keys avoid that incompatibility without
+ * reviving the historical multi-kilobyte key-burst race on other clients.
+ */
+export function wakeInputTransport(clientType: string): WakeInputTransport {
+  return clientType === "grok" ? "literal" : "bracketed-paste";
+}
+
+function enterWakeText(paneId: string, text: string, clientType: string): boolean {
+  if (wakeInputTransport(clientType) === "literal") {
+    return sh(["tmux", "send-keys", "-t", paneId, "-l", "--", text]).ok;
+  }
+  return pasteIntoPane(paneId, text);
+}
+
 export function submissionProbe(text: string): string {
   return text.replace(/\s+/g, " ").trim().slice(0, 48);
 }
@@ -1185,8 +1206,33 @@ export function submissionProbe(text: string): string {
  * still appears in the capture; only its presence BELOW the marker means it is
  * unsent. Checking mere presence would report every successful submit as failed.
  */
-export function composerStillHolds(capture: string, probe: string): boolean {
-  if (!probe) return false;
+export type ComposerSubmissionEvidence = "held" | "submitted" | "unknown";
+
+function regionContainsSubmissionProbe(region: string, probe: string): boolean {
+  // `capture-pane` preserves visual wrapping. In a very narrow pane Grok can
+  // render one character per line, so whitespace-preserving substring checks
+  // cannot recognise the turn. Compare a bounded compact form instead.
+  const compactRegion = region.replace(/\s+/g, "");
+  const compactHead = probe.slice(0, 24).replace(/\s+/g, "");
+  if (!compactHead) return false;
+  if (compactRegion.includes(compactHead)) return true;
+  // Grok's prompt cell can visually consume the opening `[` at extreme widths.
+  // The remaining `peer-mail]...` prefix is still specific to this wake.
+  return compactHead.startsWith("[")
+    && compactHead.length > 12
+    && compactRegion.includes(compactHead.slice(1));
+}
+
+/**
+ * Classify what the pane positively proves about one attempted submission.
+ *
+ * Absence is UNKNOWN, never success: Grok can clear a pasted wake without
+ * starting a turn, leaving neither composer text nor a transcript echo. The
+ * old boolean check treated that disappearance as submission and spent the
+ * retry budget on five fictional successes while mail stayed queued.
+ */
+export function composerSubmissionEvidence(capture: string, probe: string): ComposerSubmissionEvidence {
+  if (!probe) return "unknown";
   const lines = capture.split("\n");
   let marker = -1;
   for (let i = lines.length - 1; i >= 0; i--) {
@@ -1196,11 +1242,19 @@ export function composerStillHolds(capture: string, probe: string): boolean {
     // Modern Grok and Kimi put the prompt inside a left box border.
     if (/^\s*(?:│\s*[>❯]|[›>→❯$])(?:\s|$)/.test(lines[i] ?? "")) { marker = i; break; }
   }
-  if (marker === -1) return false; // no composer visible — cannot claim it is held
-  const composer = lines.slice(marker).join(" ").replace(/\s+/g, " ");
   // Compare on a shortened head: the composer may truncate or re-wrap the tail.
-  const head = probe.slice(0, 24);
-  return head.length > 0 && composer.includes(head);
+  if (!probe.trim()) return "unknown";
+  if (marker === -1) {
+    return regionContainsSubmissionProbe(lines.join("\n"), probe) ? "submitted" : "unknown";
+  }
+  const composer = lines.slice(marker).join("\n");
+  if (regionContainsSubmissionProbe(composer, probe)) return "held";
+  const transcript = lines.slice(0, marker).join("\n");
+  return regionContainsSubmissionProbe(transcript, probe) ? "submitted" : "unknown";
+}
+
+export function composerStillHolds(capture: string, probe: string): boolean {
+  return composerSubmissionEvidence(capture, probe) === "held";
 }
 
 /**
@@ -1219,7 +1273,7 @@ export function composerStillHolds(capture: string, probe: string): boolean {
  * false and do not count the wake. Mail remains untouched in the broker because
  * this poller has no claim or acknowledgement capability.
  */
-function submitPaneText(paneId: string, text: string): boolean {
+function submitPaneText(paneId: string, text: string, clientType: string): boolean {
   const probe = submissionProbe(text);
 
   // Do NOT re-type if a previous attempt is still sitting in the composer.
@@ -1228,7 +1282,7 @@ function submitPaneText(paneId: string, text: string): boolean {
   // is already failing to submit. Re-Enter the text that is already there.
   const before = sh(["tmux", "capture-pane", "-p", "-t", paneId]);
   const alreadyHeld = before.ok && composerStillHolds(before.out, probe);
-  if (!alreadyHeld && !pasteIntoPane(paneId, text)) return false;
+  if (!alreadyHeld && !enterWakeText(paneId, text, clientType)) return false;
 
   // Settle longer than the TUI's paste-burst window before submitting.
   Bun.spawnSync(["sleep", SUBMIT_SETTLE_S]);
@@ -1240,9 +1294,9 @@ function submitPaneText(paneId: string, text: string): boolean {
     Bun.spawnSync(["sleep", SUBMIT_CONFIRM_INTERVAL_S]);
     const capture = sh(["tmux", "capture-pane", "-p", "-t", paneId]);
     if (!capture.ok) return false; // pane vanished — cannot claim delivery
-    if (!composerStillHolds(capture.out, probe)) return true;
+    if (composerSubmissionEvidence(capture.out, probe) === "submitted") return true;
   }
-  log(`wake submit unconfirmed for ${paneId} — text still in composer; mailbox remains queued`);
+  log(`wake submit unconfirmed for ${paneId} — no positive transcript evidence; mailbox remains queued`);
   return false;
 }
 
@@ -1279,7 +1333,11 @@ export function submitWakeOnlyNudge(
   deps: WakeOnlyNudgeDeps = {},
 ): WakeOnlyNudgeResult {
   try {
-    return (deps.submit ?? submitPaneText)(paneId, nudgeText(lane))
+    const text = nudgeText(lane);
+    const submitted = deps.submit
+      ? deps.submit(paneId, text)
+      : submitPaneText(paneId, text, lane.client_type);
+    return submitted
       ? "submitted"
       : "submit-failed";
   } catch {

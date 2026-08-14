@@ -27,12 +27,14 @@ import { join } from "node:path";
 import {
   __nudgeAttemptCountForTest,
   __resetNudgeBudgetStateForTest,
+  composerSubmissionEvidence,
   composerStillHolds,
   loadNudgeBudgetState,
   nudgeBudgetHealthStatus,
   submissionProbe,
   submitWakeOnlyNudge,
   tick,
+  wakeInputTransport,
   writeHeartbeat,
   type Lane,
   type TickSnapshot,
@@ -118,6 +120,54 @@ describe("composerStillHolds distinguishes UNSENT from SENT", () => {
     ].join("\n");
     expect(composerStillHolds(capture, probe)).toBe(false);
   });
+});
+
+describe("composerSubmissionEvidence requires positive submit evidence", () => {
+  const probe = submissionProbe("[peer-mail] 1 unread peer message. Call check_messages once.");
+
+  test("Grok dropping the pasted wake and returning to its empty placeholder is UNKNOWN, not submitted", () => {
+    const capture = [
+      "earlier transcript without the wake",
+      "  │ ❯ Build anything                                      │",
+      "  Grok 4.6 (low) · always-approve",
+    ].join("\n");
+    expect(composerSubmissionEvidence(capture, probe)).toBe("unknown");
+  });
+
+  test("wake text still below the last Grok prompt is HELD", () => {
+    expect(composerSubmissionEvidence(`│ ❯ ${probe} │`, probe)).toBe("held");
+  });
+
+  test("wake text above a later empty Grok prompt is SUBMITTED", () => {
+    const capture = [probe, "◆ Thinking…", "│ ❯ Build anything │"].join("\n");
+    expect(composerSubmissionEvidence(capture, probe)).toBe("submitted");
+  });
+
+  test("a very narrow Grok pane can wrap the submitted probe one character per line", () => {
+    // Live infra.3 at 20 columns: the leading `[` shares the prompt cell and is
+    // absent from capture-pane, while every later character occupies a line.
+    const verticallyWrapped = probe.slice(1, 25).split("").join("\n");
+    const capture = [`❯ ${verticallyWrapped}`, "◆ user_prompt_submit", "│ ❯ Build anything │"].join("\n");
+    expect(composerSubmissionEvidence(capture, probe)).toBe("submitted");
+  });
+
+  test("the same narrow wrapping remains HELD when there is no later composer", () => {
+    const verticallyWrapped = probe.slice(1, 25).split("").join("\n");
+    expect(composerSubmissionEvidence(`│ ❯ ${verticallyWrapped}`, probe)).toBe("held");
+  });
+});
+
+describe("wakeInputTransport matches each TUI's accepted input path", () => {
+  test("Grok receives a short wake as literal keys because it ignores bracketed tmux paste", () => {
+    expect(wakeInputTransport("grok")).toBe("literal");
+  });
+
+  test.each(["codex", "claude", "cursor", "gemini", "agy", "kimi", "unknown"])(
+    "%s retains bracketed paste protection",
+    (clientType) => {
+      expect(wakeInputTransport(clientType)).toBe("bracketed-paste");
+    },
+  );
 });
 
 describe("the shipped poller is wake-only", () => {
