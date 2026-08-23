@@ -48,14 +48,16 @@ async function runInstaller(serverAlive = true, ...args: string[]) {
 }
 
 describe("tmux label hook installation", () => {
-  test("installs synchronous indexed hooks without clobbering other hook slots", async () => {
+  test("installs background indexed hooks without clobbering other hook slots", async () => {
     const result = await runInstaller();
     expect(result.code).toBe(0);
     expect(result.tmux).toContain("set-hook -g after-split-window[90]");
     expect(result.tmux).toContain("set-hook -g after-new-window[90]");
     expect(result.tmux).toContain("set-hook -g after-new-session[90]");
     expect(result.tmux).not.toContain("set-hook -ag");
-    expect(result.tmux).not.toContain("run-shell -b");
+    expect(result.tmux).toContain("run-shell -b");
+    expect(result.tmux).toContain(".claude-peers-tmux-label.log");
+    expect(result.tmux).toContain("2>&1 || :");
     expect(result.tmux).toContain("#{pane_id}");
     expect(result.flock).toContain("--all");
     expect(result.flock).not.toContain(" -- ");

@@ -12,6 +12,7 @@ BUN_BIN="${CLAUDE_PEERS_BUN_BIN:-/home/manzo/.bun/bin/bun}"
 [ -x "$BUN_BIN" ] || BUN_BIN="$(command -v bun 2>/dev/null || true)"
 FLOCK_BIN="${CLAUDE_PEERS_FLOCK_BIN:-$(command -v flock 2>/dev/null || true)}"
 LABEL_LOCK="${CLAUDE_PEERS_TMUX_LABEL_LOCK:-$HOME/.claude-peers-tmux-label.lock}"
+LABEL_LOG="${CLAUDE_PEERS_TMUX_LABEL_LOG:-$HOME/.claude-peers-tmux-label.log}"
 
 if [ -n "${CLAUDE_PEERS_TMUX_SOCKET:-}" ]; then
   TMUX_SOCKET="$CLAUDE_PEERS_TMUX_SOCKET"
@@ -40,21 +41,44 @@ if [ "$#" -ne 0 ]; then
   echo "usage: install-tmux-label-hooks [--uninstall]" >&2
   exit 2
 fi
+
+# These paths cross tmux command/format expansion and the shell's quoted argv.
+# Reject bytes that could terminate or expand in any of those layers.
+for hook_value in "$TMUX_SOCKET" "$TMUX_BIN" "$FLOCK_BIN" "$LABEL_LOCK" "$BUN_BIN" "$LABELER" "$LABEL_LOG"; do
+  case "$hook_value" in
+    *"'"*|*'"'*|*\\*|*'$'*|*'#'*|*$'\n'*|*$'\r'*)
+      echo "tmux label hook path contains unsupported quoting characters" >&2
+      exit 1
+      ;;
+  esac
+done
 if [ -z "$BUN_BIN" ] || [ -z "$FLOCK_BIN" ] || [ ! -r "$LABELER" ]; then
   echo "tmux label hook prerequisites missing" >&2
+  exit 1
+fi
+if ! (umask 077; : >> "$LABEL_LOG") 2>/dev/null; then
+  echo "tmux label log is not appendable: $LABEL_LOG" >&2
   exit 1
 fi
 
 # tmux hook arrays use numeric slots. Slot 90 is claude-peers-owned: replacing
 # it is idempotent and leaves every operator/plugin hook in other slots intact.
-# run-shell intentionally stays synchronous. Combined with flock this makes the
-# read-used -> choose -> set transaction serial across simultaneous pane births.
-HOOK_COMMAND="run-shell \"env CLAUDE_PEERS_TMUX_SOCKET='$TMUX_SOCKET' CLAUDE_PEERS_TMUX_BIN='$TMUX_BIN' '$FLOCK_BIN' -x '$LABEL_LOCK' '$BUN_BIN' '$LABELER' '#{pane_id}'\""
+# flock keeps the read-used -> choose -> set transaction serial across pane births.
+# run-shell -b alone is not sufficient: its completion callback can still print
+# job output or a nonzero-exit diagnostic to a dead one-shot client. Suppress both
+# output paths and normalize the status so the callback has nothing to print.
+HOOK_COMMAND="run-shell -b \"( env CLAUDE_PEERS_TMUX_SOCKET='$TMUX_SOCKET' CLAUDE_PEERS_TMUX_BIN='$TMUX_BIN' '$FLOCK_BIN' -x '$LABEL_LOCK' '$BUN_BIN' '$LABELER' '#{pane_id}' >>'$LABEL_LOG' 2>&1 || : ) >/dev/null 2>&1\""
 for hook in $HOOK_NAMES; do
   tmux_cmd set-hook -g "${hook}[${HOOK_SLOT}]" "$HOOK_COMMAND"
 done
 
 # Creation hooks cannot repair panes that predate installation (including the
 # zero-turn pane that exposed this gap), so run the same locked allocator once.
-env CLAUDE_PEERS_TMUX_SOCKET="$TMUX_SOCKET" CLAUDE_PEERS_TMUX_BIN="$TMUX_BIN" \
-  "$FLOCK_BIN" -x "$LABEL_LOCK" "$BUN_BIN" "$LABELER" --all
+if env CLAUDE_PEERS_TMUX_SOCKET="$TMUX_SOCKET" CLAUDE_PEERS_TMUX_BIN="$TMUX_BIN" \
+  "$FLOCK_BIN" -x "$LABEL_LOCK" "$BUN_BIN" "$LABELER" --all >>"$LABEL_LOG" 2>&1; then
+  :
+else
+  backfill_status=$?
+  echo "tmux pane-label backfill failed; see $LABEL_LOG" >&2
+  exit "$backfill_status"
+fi

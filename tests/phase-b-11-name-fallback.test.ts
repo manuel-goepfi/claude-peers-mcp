@@ -187,6 +187,19 @@ describe("Codex Desktop app-server identity guard", () => {
     expect(isCodexAppServerProcess(interactive)).toBe(false);
     expect(findClientPidFromProcessChain(200, table, "codex")).toBe(200);
   });
+
+  test("does not mistake the shared relay socket name for the app-server subcommand", () => {
+    const interactive: ProcessInfo = {
+      pid: 201,
+      ppid: 99,
+      comm: "codex",
+      args: "/opt/codex --remote unix:///run/user/1000/claude-peers/app-server.sock --cd /repo resume 01a003d3-bbfd-79d1-8818-40120eda0b65",
+    };
+    const table = new Map<number, ProcessInfo>([[201, interactive]]);
+
+    expect(isCodexAppServerProcess(interactive)).toBe(false);
+    expect(findClientPidFromProcessChain(201, table, "codex")).toBe(201);
+  });
 });
 
 describe("#11 — R6.1 Task-subagent suffix overlay (preserved from R6.1)", () => {

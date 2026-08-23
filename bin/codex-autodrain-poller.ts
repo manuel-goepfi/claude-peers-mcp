@@ -49,7 +49,7 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { publishBrokerIdentityToTmux } from "../shared/tmux-identity.ts";
 import type { ReconcilePaneThreadResponse, RegisterResponse } from "../shared/types.ts";
-import { isVisibleCodexArgs } from "../shared/visible-codex.ts";
+import { isVisibleCodexArgs, singleInteractiveCodexProcess } from "../shared/visible-codex.ts";
 import {
   parseTmuxPanes,
   bgSessionIdFromPtyHostArgs,
@@ -209,14 +209,24 @@ const PROFILES: Record<string, IdleProfile> = {
   // fails to match is the dangerous direction (it nudges INTO a working agent),
   // and no amount of guessing fixes that. Quiescence needs no vocabulary at all.
   cursor: { prompt: /(^|\n)\s*→\s/, promptLine: /^\s*→/, strip: /^.*?→\s?/, busy: CURSOR_BUSY,
-            placeholderText: /^(Plan, search, build anything|Add a follow-up)/,
+            placeholderText: /^(?:Plan, search, build anything|Add a follow-up)$/,
             requiresQuiescence: true },
-  // agy (Google's agent CLI): bare ASCII `>` input prompt, but COLUMN-0
-  // anchored — all agy transcript/output lines are indented ≥1 space, so the
-  // usual ASCII-'>' ambiguity (blockquotes, diff context) does not apply as
-  // long as the regexes forbid leading whitespace. Do NOT add \s* here.
-  agy: { prompt: /(^|\n)>(\s|$)/, promptLine: /^>(\s|$)/, strip: /^>\s?/,
-         busy: [/esc to (cancel|interrupt)/i, /\bGenerating\b/i, /\bThinking\b/i] },
+  // agy / Antigravity CLI: bare ASCII `>` input prompt, but COLUMN-0 anchored.
+  // Version 1.1.13 renders an empty composer as the literal mode placeholder
+  // `> Accept-edits mode: file edits auto-approved (shift+tab to cycle)`.
+  // Completed transcript counters contain the word "thinking", so matching it
+  // across the whole capture permanently false-busies an idle lane. Require
+  // quiescence instead; typed text remains non-placeholder and still blocks.
+  agy: { prompt: /(^|\n)>(\s|$)/, promptLine: /^>(\s|$)/,
+         // Agy 1.1.19 emits the prompt colour SGR before the glyph. Match only
+         // leading SGR sequences plus the already-validated column-zero `>`;
+         // preserve every sequence after the glyph for placeholder dim/colour
+         // analysis. Without this, the raw-line strip leaves `>` behind and an
+         // empty mode placeholder is misclassified as typed operator input.
+         strip: /^(?:\x1b\[[0-9;]*m)*>\s?/,
+         busy: [/esc to (cancel|interrupt)/i],
+         placeholderText: /^Accept-edits mode: file edits auto-approved \(shift\+tab to cycle\)$/i,
+         requiresQuiescence: true },
   // kimi (Moonshot's CLI): input is drawn in a rounded box, prompt line is
   // U+2502 + ">" ("│ >"). The busy vocabulary has NOT been observed mid-turn on
   // this host and could not be recovered from the binary, so this profile carries
@@ -242,6 +252,14 @@ export function profileFor(clientType: string): IdleProfile {
 // Pane content from the previous tick, for the quiescence gate. Keyed by pane id.
 const paneQuiescenceCache = new Map<string, string>();
 
+/** Remove only known idle-only repaint counters before comparing pane snapshots. */
+export function quiescenceFingerprint(capture: string): string {
+  return capture.replace(
+    /^(\s*Goal active \()(?:\d+d )?(?:\d+h )?(?:\d+m )?\d+s(\)\s*)$/gm,
+    "$1<elapsed>$2",
+  );
+}
+
 /**
  * True when this pane looks the same as it did last tick.
  *
@@ -258,9 +276,10 @@ const paneQuiescenceCache = new Map<string, string>();
 export function paneQuiescent(paneId: string): boolean {
   const { ok, out } = sh(["tmux", "capture-pane", "-p", "-t", paneId, "-S", "-15"]);
   if (!ok) return false;
+  const fingerprint = quiescenceFingerprint(out);
   const previous = paneQuiescenceCache.get(paneId);
-  paneQuiescenceCache.set(paneId, out);
-  return previous !== undefined && previous === out;
+  paneQuiescenceCache.set(paneId, fingerprint);
+  return previous !== undefined && previous === fingerprint;
 }
 
 const lastNudge = new Map<string, number>();  // peer id -> epoch ms of last nudge
@@ -462,11 +481,6 @@ export function threadIdFromIdleCodexPaneCapture(capture: string): string | null
   return threadIdFromCodexPaneStatus(capture);
 }
 
-function threadIdForPane(paneId: string): string | null {
-  const capture = sh(["tmux", "capture-pane", "-p", "-e", "-t", paneId, "-S", "-12"]);
-  return capture.ok ? threadIdFromIdleCodexPaneCapture(capture.out) : null;
-}
-
 function cwdOfPid(pid: number): string | null {
   try {
     return readlinkSync(`/proc/${pid}/cwd`);
@@ -529,14 +543,15 @@ export interface Lane {
   last_hook_seen_at: string | null;  // NULL = drain hook has not attached yet
 }
 
-export type CodexWakeBlockReason = "no-pane-id" | "no-seat-key" | "seat-pane-mismatch";
+export type CodexWakeBlockReason = "no-pane-id" | "no-seat-key" | "seat-pane-mismatch" | "no-thread-id";
 
 /**
  * Why a Codex row cannot safely receive a pane wake. The poller never claims or
- * acknowledges mail, so thread/hook metadata is not part of the safety proof:
- * a legacy row can be woken and let its own prompt hook self-register, or call
- * check_messages explicitly. Typing into the wrong pane is the irreversible
- * boundary, so exact pane-seat ownership remains mandatory.
+ * acknowledges mail. Exact pane-seat ownership prevents typing into the wrong
+ * terminal, while a broker-bound thread prevents submitting a turn whose MCP
+ * adapter cannot resolve that pane. Unbound Codex rows remain visible but are
+ * never nudged; the app-server relay must first publish a successful root
+ * thread/start or thread/resume lifecycle response.
  */
 export function codexWakeBlockReason(lane: Lane): CodexWakeBlockReason | null {
   if (lane.client_type !== "codex") return null;
@@ -545,13 +560,13 @@ export function codexWakeBlockReason(lane: Lane): CodexWakeBlockReason | null {
   if (!paneId) return "no-pane-id";
   if (!seatKey) return "no-seat-key";
   if (seatKey !== `pane:${paneId}` && !seatKey.endsWith(`:${paneId}`)) return "seat-pane-mismatch";
+  if (!lane.thread_id?.trim()) return "no-thread-id";
   return null;
 }
 
 export function codexWakeCompatibilityReasons(lane: Lane): string[] {
   if (lane.client_type !== "codex") return [];
   const reasons: string[] = [];
-  if (!lane.thread_id?.trim()) reasons.push("no-thread-id");
   if (lane.receiver_mode !== "codex-hook") reasons.push(`receiver-mode=${lane.receiver_mode || "unknown"}`);
   return reasons;
 }
@@ -605,6 +620,23 @@ export function lanesWithUnread(db: Database, nudgeableClients: string[] = NUDGE
     GROUP BY p.id
     HAVING unread > 0
   `).all(...nudgeableClients) as Lane[];
+}
+
+/**
+ * Re-read the exact recipient mailbox at the final transport boundary.
+ *
+ * Candidate discovery and pane validation take long enough for a native client
+ * hook to drain the mailbox in between. The initial Lane count is therefore
+ * evidence for scheduling only; it must never authorize a later keystroke.
+ */
+export function pendingUnreadForPeer(db: Database, peerId: string): number {
+  const row = db.query(`
+    SELECT COUNT(*) AS unread
+    FROM messages
+    WHERE to_id = ? AND delivered = 0
+  `).get(peerId) as { unread?: number } | null;
+  const unread = Number(row?.unread ?? 0);
+  return Number.isFinite(unread) && unread > 0 ? unread : 0;
 }
 
 // Confirm the pane still belongs to the lane (not a recycled/reused pane), so we
@@ -741,8 +773,11 @@ export function paneTextIsIdle(captureWithAnsi: string, profile: IdleProfile = P
     .replace(profile.stripTail ?? /$^/, "");  // keep SGR codes around actual input
   const afterPlain = stripAnsi(afterGlyph).trim();
   if (afterPlain === "") return true;                          // empty input — nudge
-  // Known literal placeholder (see IdleProfile.placeholderText) — empty input.
-  if (profile.placeholderText?.test(afterPlain)) return true;
+  // Clients with a known literal placeholder are fail-closed: only that exact
+  // vendor text counts as empty. Cursor can render the previous submitted
+  // prompt dim in its composer; falling through to the generic all-dim rule
+  // would append a wake to that retained prompt and resubmit both together.
+  if (profile.placeholderText) return profile.placeholderText.test(afterPlain);
   // Non-empty: it is a placeholder (safe to nudge) ONLY if the ENTIRE visible
   // text is rendered dim. Merely CONTAINING a dim span is not enough — real
   // bright operator input with a dim ghost-autocomplete suffix or a dim inline
@@ -833,6 +868,15 @@ export interface VisibleCodexSeatReaders {
   ttyOf?: (pid: number) => string | null;
 }
 
+interface VisibleCodexSeatCandidate {
+  proc: ProcLike;
+  seat: VisibleCodexSeat;
+}
+
+function processCommandName(args: string): string {
+  return args.trim().split(/\s+/)[0]?.replace(/^.*\//, "") ?? "";
+}
+
 export function tmuxInfoByPaneId(snap: TickSnapshot, paneId: string): TmuxPaneInfo | null {
   for (const info of snap.paneMap.values()) {
     if (info.pane_id === paneId) return info;
@@ -847,10 +891,10 @@ export function visibleCodexSeatsFromSnapshot(
   const envReader = readers.environOf ?? environOfPid;
   const cwdReader = readers.cwdOf ?? cwdOfPid;
   const ttyReader = readers.ttyOf ?? ttyOfPid;
-  const grouped = new Map<string, VisibleCodexSeat[]>();
+  const grouped = new Map<string, VisibleCodexSeatCandidate[]>();
 
   for (const proc of snap.procs) {
-    if (!isVisibleCodexArgs(proc.args)) continue;
+    if (!isVisibleCodexArgs(proc.args, proc.pid)) continue;
 
     const env = envReader(proc.pid);
     const name = env.CLAUDE_PEER_NAME?.trim();
@@ -873,13 +917,24 @@ export function visibleCodexSeatsFromSnapshot(
     };
     const key = tmux.pane_id ?? paneId;
     const existing = grouped.get(key);
-    if (existing) existing.push(seat);
-    else grouped.set(key, [seat]);
+    const candidate = { proc, seat };
+    if (existing) existing.push(candidate);
+    else grouped.set(key, [candidate]);
   }
 
   const seats: VisibleCodexSeat[] = [];
   for (const group of grouped.values()) {
-    if (group.length === 1) seats.push(group[0]!);
+    const selected = singleInteractiveCodexProcess(group.map(({ proc }) => ({
+      ...proc,
+      comm: processCommandName(proc.args),
+    })));
+    if (!selected) continue;
+    const candidate = group.find(({ proc }) => proc.pid === selected.pid);
+    if (!candidate) continue;
+    if (group.some(({ seat }) =>
+      seat.name !== candidate.seat.name || seat.cwd !== candidate.seat.cwd || seat.tty !== candidate.seat.tty
+    )) continue;
+    seats.push(candidate.seat);
   }
   return seats.sort((a, b) => a.pid - b.pid);
 }
@@ -983,7 +1038,10 @@ export async function reconcileVisibleCodexSeats(snap: TickSnapshot, deps: Recon
     const git = deps.gitValue ?? gitValue;
     const post = deps.postBroker ?? postBroker;
     const publish = deps.publishBrokerIdentityToTmux ?? publishBrokerIdentityToTmux;
-    const readThreadId = deps.threadIdForPane ?? threadIdForPane;
+    // Production identity never comes from rendered terminal pixels. Tests may
+    // inject a reader to exercise the legacy reconciliation seam, but live
+    // thread ownership is authored only by the app-server lifecycle relay.
+    const readThreadId = deps.threadIdForPane ?? (() => null);
     for (const seat of seats) {
       try {
         if (deps.dryRun ?? DRY_RUN) {
@@ -1516,8 +1574,9 @@ export function tick(db: Database, snapOverride?: TickSnapshot, deps: TickDeps =
         }
         continue;
       }
-      // Re-check at the last boundary before transport. The SQL already requires
-      // an undelivered row, but a stale or malformed Lane must still fail closed.
+      // The candidate count is a snapshot. Reject malformed/stale candidates
+      // before doing any pane work, then re-read SQLite immediately before the
+      // irreversible tmux transport below.
       if (hasNothingToDeliver(lane.unread)) continue;
       const since = clock() - (lastNudge.get(lane.id) ?? 0);
       if (since < NUDGE_COOLDOWN_MS) continue;                   // recently nudged — give it time to drain
@@ -1547,6 +1606,14 @@ export function tick(db: Database, snapOverride?: TickSnapshot, deps: TickDeps =
         continue;
       }
 
+      // A native UserPromptSubmit/PostToolBatch/Stop hook may have drained the
+      // inbox while this tick was resolving ownership and idle state. Never
+      // press Enter from the stale discovery snapshot. Use the fresh count in
+      // the notification too, so the visible wake cannot overstate the queue.
+      const currentUnread = pendingUnreadForPeer(db, lane.id);
+      if (hasNothingToDeliver(currentUnread)) continue;
+      const currentLane = currentUnread === lane.unread ? lane : { ...lane, unread: currentUnread };
+
       // Write-ahead reservation: record the attempt and cooldown before tmux.
       // A service restart or crash after submission can never mint another five
       // attempts for the same broker-authored unread episode.
@@ -1554,9 +1621,9 @@ export function tick(db: Database, snapOverride?: TickSnapshot, deps: TickDeps =
       nudgeAttempts.set(lane.id, reservedAttempts);
       lastNudge.set(lane.id, clock());
       if (!persistNudgeBudgetState()) return;
-      const result = (deps.nudgeLane ?? nudge)(lane, paneId);
+      const result = (deps.nudgeLane ?? nudge)(currentLane, paneId);
       if (result === "submitted") {
-        log(`nudged ${lane.name ?? "?"}/${lane.id} pane=${paneId} (${lane.unread} unread, attempt ${reservedAttempts})`);
+        log(`nudged ${lane.name ?? "?"}/${lane.id} pane=${paneId} (${currentUnread} unread, attempt ${reservedAttempts})`);
       } else {
         log(`wake submit unconfirmed for ${lane.name ?? "?"}/${lane.id} pane=${paneId} — attempt ${reservedAttempts} counted, mailbox remains queued`);
       }

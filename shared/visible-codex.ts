@@ -1,5 +1,11 @@
 import { readFileSync, readlinkSync } from "node:fs";
-import { isClientProcess, isCodexAppServerProcess, type ProcessInfo } from "./client.ts";
+import {
+  codexProcessArgv,
+  isClientProcess,
+  isCodexAppServerProcess,
+  isInteractiveCodexArgv,
+  type ProcessInfo,
+} from "./client.ts";
 
 export interface VisibleCodexProcess {
   pid: number;
@@ -73,10 +79,15 @@ export function isVisibleCodexProcess(row: ProcessInfo): boolean {
   return isClientProcess(row, "codex") && !isCodexAppServerProcess(row);
 }
 
-export function isVisibleCodexArgs(args: string): boolean {
+export function isVisibleCodexArgs(args: string, pid?: number): boolean {
   const first = commandName(args);
-  if (first !== "codex" && !first.startsWith("codex-")) return false;
-  return !/\bapp-server\b/.test(args);
+  const tokens = args.trim().split(/\s+/).filter(Boolean).map((token) => token.replace(/^['"]|['"]$/g, ""));
+  if (first !== "codex" && !first.startsWith("codex-") && first !== "node" && first !== "bun") return false;
+  const exact = pid ? codexProcessArgv(pid) : null;
+  // Tests and stale ps snapshots can carry a PID that has already been reused.
+  // Trust /proc only while its executable still matches the snapshotted argv.
+  const argv = exact && commandName(exact[0] ?? "") === first ? exact : tokens;
+  return isInteractiveCodexArgv(argv);
 }
 
 interface VisibleCodexCandidate {
@@ -84,18 +95,33 @@ interface VisibleCodexCandidate {
   visible: VisibleCodexProcess;
 }
 
-const NONINTERACTIVE_CODEX_SUBCOMMANDS = new Set([
-  "exec", "e", "review", "login", "logout", "mcp", "plugin", "mcp-server",
-  "app-server", "remote-control", "completion", "update", "doctor", "sandbox",
-  "debug", "apply", "a", "archive", "delete", "unarchive", "cloud",
-  "exec-server", "features", "help",
-]);
+export { isInteractiveCodexArgv };
 
-function isInteractiveNativeCodex(row: ProcessInfo): boolean {
-  const tokens = row.args.trim().split(/\s+/).slice(1).map((token) =>
-    token.replace(/^['"]|['"]$/g, "").toLowerCase()
+export function isInteractiveNativeCodex(row: ProcessInfo, exactArgv = codexProcessArgv(row.pid)): boolean {
+  if (exactArgv) return isInteractiveCodexArgv(exactArgv);
+  const flattened = row.args.trim().split(/\s+/).filter(Boolean).map((token) =>
+    token.replace(/^['"]|['"]$/g, "")
   );
-  return !tokens.some((token) => NONINTERACTIVE_CODEX_SUBCOMMANDS.has(token));
+  return isInteractiveCodexArgv(flattened.length > 0 ? flattened : [row.comm]);
+}
+
+/** Select one logical TUI, accepting a sole Node/Bun shim or its native child. */
+export function singleInteractiveCodexProcess(rows: ProcessInfo[]): ProcessInfo | null {
+  const candidates = rows.filter((row) =>
+    isClientProcess(row, "codex") && !isCodexAppServerProcess(row) && isInteractiveNativeCodex(row)
+  );
+  if (candidates.length === 1) return candidates[0]!;
+  if (candidates.length !== 2) return null;
+  const [first, second] = candidates;
+  const launcher = second!.ppid === first!.pid ? first : first!.ppid === second!.pid ? second : null;
+  const native = launcher === first ? second : launcher === second ? first : null;
+  if (!launcher || !native) return null;
+  const launcherCommand = commandName(launcher.comm);
+  const launcherArg = commandName(launcher.args);
+  const nativeCommand = commandName(native.comm);
+  if (![launcherCommand, launcherArg].some((value) => value === "node" || value === "bun")) return null;
+  if (nativeCommand !== "codex" && !nativeCommand.startsWith("codex-")) return null;
+  return native;
 }
 
 /**

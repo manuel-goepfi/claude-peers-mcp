@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# Attach an interactive Codex TUI to the shared Desktop app-server through a
+# pane-local observation relay. The relay does not rewrite protocol messages;
+# it only publishes successful thread/start and thread/resume identities to the
+# local broker using the exact tmux pane that launched this process.
+
+set -euo pipefail
+umask 077
+
+SELF="$(readlink -f "$0")"
+ROOT="$(cd -- "$(dirname -- "$SELF")/.." && pwd -P)"
+REAL_CODEX="${CLAUDE_PEERS_REAL_CODEX:-$(type -P codex || true)}"
+RELAY="${CLAUDE_PEERS_CODEX_RELAY:-$ROOT/bin/codex-appserver-relay.ts}"
+PANE_ID="${TMUX_PANE:-}"
+
+if [[ -z "$REAL_CODEX" || ! -x "$REAL_CODEX" ]]; then
+  printf 'codex-shared-seat: set CLAUDE_PEERS_REAL_CODEX to the real Codex executable\n' >&2
+  exit 127
+fi
+CODEX_STATE_HOME="${CODEX_HOME:-${HOME:-/tmp}/.codex}"
+UPSTREAM_SOCKET="${CLAUDE_PEERS_CODEX_APP_SERVER_SOCKET:-$CODEX_STATE_HOME/app-server-control/app-server-control.sock}"
+if [[ ! -S "$UPSTREAM_SOCKET" ]]; then
+  printf 'codex-shared-seat: account app-server socket is unavailable: %s\n' "$UPSTREAM_SOCKET" >&2
+  printf 'codex-shared-seat: codexd attaches to an already-running Desktop app-server; start that account app-server or use its pane-local launcher (for Codex B: codex2)\n' >&2
+  exit 1
+fi
+if [[ ! "$PANE_ID" =~ ^%[0-9]+$ ]]; then
+  printf 'codex-shared-seat: no verified tmux pane; using the shared app-server without pane binding\n' >&2
+  exec "$REAL_CODEX" --remote unix:// --cd "$PWD" "$@"
+fi
+if [[ ! -f "$RELAY" ]]; then
+  printf 'codex-shared-seat: relay missing: %s\n' "$RELAY" >&2
+  exit 127
+fi
+
+BROKER_PORT="${CLAUDE_PEERS_PORT:-7899}"
+RUNTIME_BASE="${XDG_RUNTIME_DIR:-/tmp}"
+RELAY_DIR="$(mktemp -d "$RUNTIME_BASE/claude-peers-codex-relay.XXXXXX")"
+RELAY_SOCKET="$RELAY_DIR/app-server.sock"
+READY_FILE="$RELAY_DIR/ready"
+LOG_DIR="$CODEX_STATE_HOME/logs"
+SAFE_PANE="${PANE_ID#%}"
+RELAY_LOG="$LOG_DIR/codex-shared-relay-$SAFE_PANE.log"
+mkdir -p "$LOG_DIR"
+if ! chmod 700 "$RELAY_DIR" "$LOG_DIR"; then
+  printf 'codex-shared-seat: failed to secure relay directories\n' >&2
+  exit 1
+fi
+
+RELAY_PID=""
+TUI_PID=""
+cleanup() {
+  local rc=$?
+  trap - EXIT HUP INT TERM
+  [[ -n "$TUI_PID" ]] && kill -TERM "$TUI_PID" 2>/dev/null || true
+  [[ -n "$RELAY_PID" ]] && kill -TERM "$RELAY_PID" 2>/dev/null || true
+  [[ -n "$TUI_PID" ]] && wait "$TUI_PID" 2>/dev/null || true
+  [[ -n "$RELAY_PID" ]] && wait "$RELAY_PID" 2>/dev/null || true
+  rm -f -- "$RELAY_SOCKET" "$READY_FILE"
+  rmdir -- "$RELAY_DIR" 2>/dev/null || true
+  exit "$rc"
+}
+trap cleanup EXIT HUP INT TERM
+
+node --experimental-strip-types "$RELAY" \
+  --pane "$PANE_ID" \
+  --socket "$RELAY_SOCKET" \
+  --upstream "$UPSTREAM_SOCKET" \
+  --ready "$READY_FILE" \
+  --broker-port "$BROKER_PORT" >>"$RELAY_LOG" 2>&1 &
+RELAY_PID=$!
+
+for _ in {1..100}; do
+  [[ -s "$READY_FILE" && -S "$RELAY_SOCKET" ]] && break
+  kill -0 "$RELAY_PID" 2>/dev/null || break
+  sleep 0.05
+done
+if [[ ! -s "$READY_FILE" || ! -S "$RELAY_SOCKET" ]] || ! kill -0 "$RELAY_PID" 2>/dev/null; then
+  printf 'codex-shared-seat: relay failed to start; see %s\n' "$RELAY_LOG" >&2
+  exit 1
+fi
+
+"$REAL_CODEX" --remote "unix://$RELAY_SOCKET" --cd "$PWD" "$@" <&0 &
+TUI_PID=$!
+set +e
+wait "$TUI_PID"
+tui_status=$?
+set -e
+TUI_PID=""
+exit "$tui_status"

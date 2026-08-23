@@ -67,6 +67,7 @@ describe("broker user-service installer", () => {
     expect(unit).toContain(`CLAUDE_PEERS_PORT=${config.port}`);
     expect(unit).toContain("StandardOutput=append:");
     expect(unit).toContain("\\x20");
+    expect(unit).not.toContain("After=default.target");
 
     const dropIn = readFileSync(config.dropInPath, "utf8");
     for (const path of [config.databasePath, config.bridgeTokenPath, config.backupPath, config.logPath]) {

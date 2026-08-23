@@ -130,6 +130,18 @@ export interface ReconcilePaneThreadResponse {
   migrated: number;
 }
 
+// Width-independent bridge used by the codexd app-server relay. The relay
+// observes a successful thread/start or thread/resume response, while the
+// broker independently proves that the caller belongs to the named tmux pane
+// before creating/folding any seat state.
+export interface BindCodexPaneThreadRequest {
+  caller_pid: number;
+  tmux_pane_id: string;
+  thread_id: string;
+}
+
+export type BindCodexPaneThreadResponse = ReconcilePaneThreadResponse;
+
 // Read-only, PID-authenticated proof that a visible client process already owns
 // a broker seat. Deliberately excludes the peer token: callers use this only to
 // verify process/pane identity before performing a normal /register handshake.

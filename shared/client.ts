@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import type { ClientType, ReceiverMode } from "./types.ts";
 
 export interface ProcessInfo {
@@ -27,6 +28,69 @@ function commandName(value: string): string {
 
 function argTokens(value: string): string[] {
   return value.trim().split(/\s+/).filter(Boolean);
+}
+
+const NONINTERACTIVE_CODEX_SUBCOMMANDS = new Set([
+  "exec", "e", "review", "login", "logout", "mcp", "plugin", "mcp-server",
+  "app-server", "remote-control", "completion", "update", "doctor", "sandbox",
+  "debug", "apply", "a", "archive", "delete", "unarchive", "cloud",
+  "exec-server", "features", "help",
+]);
+
+const CODEX_OPTIONS_WITH_VALUE = new Set([
+  "-c", "--config", "--enable", "--disable", "--remote",
+  "--remote-auth-token-env", "-i", "--image", "-m", "--model",
+  "--local-provider", "-p", "--profile", "-s", "--sandbox",
+  "--cd", "--add-dir", "-a", "--ask-for-approval",
+]);
+
+const NONINTERACTIVE_CODEX_FLAGS = new Set(["-h", "--help", "-v", "--version"]);
+
+export function codexProcessArgv(pid: number): string[] | null {
+  try {
+    const argv = readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0").filter(Boolean);
+    return argv.length > 0 ? argv : null;
+  } catch {
+    return null;
+  }
+}
+
+function codexArgumentStart(argv: string[]): number | null {
+  const executable = commandName(argv[0] ?? "");
+  if (executable === "codex-code-mode-host") return null;
+  if (executable === "codex" || executable.startsWith("codex-")) return 1;
+  if ((executable === "node" || executable === "bun") && commandName(argv[1] ?? "") === "codex") return 2;
+  return null;
+}
+
+/** Return Codex's actual first positional argument, never a later prompt word. */
+export function codexFirstPositionalArg(argv: string[]): string | null {
+  const start = codexArgumentStart(argv);
+  if (start === null) return null;
+  for (let index = start; index < argv.length;) {
+    const raw = argv[index] ?? "";
+    const token = raw.toLowerCase();
+    if (token === "--") return null;
+    if (NONINTERACTIVE_CODEX_FLAGS.has(token)) return token;
+    if (token.startsWith("-")) {
+      const option = token.split("=", 1)[0]!;
+      index += CODEX_OPTIONS_WITH_VALUE.has(option) && !token.includes("=") ? 2 : 1;
+      continue;
+    }
+    return token;
+  }
+  return null;
+}
+
+/**
+ * Classify only Codex's actual subcommand argument. `/proc/<pid>/cmdline`
+ * preserves an initial prompt as one argv item, so a prompt that mentions
+ * `app-server`, `review`, or the `a` alias cannot become a false subcommand.
+ */
+export function isInteractiveCodexArgv(argv: string[]): boolean {
+  if (codexArgumentStart(argv) === null) return false;
+  const positional = codexFirstPositionalArg(argv);
+  return positional === null || !NONINTERACTIVE_CODEX_FLAGS.has(positional) && !NONINTERACTIVE_CODEX_SUBCOMMANDS.has(positional);
 }
 
 function hasGeminiCliLauncher(args: string): boolean {
@@ -83,11 +147,13 @@ export function isClientProcess(row: ProcessInfo, clientType: Exclude<ClientType
   return clientType === "gemini" && (comm === "node" || comm === "bun" || comm === "npx") && hasGeminiCliLauncher(row.args);
 }
 
-export function isCodexAppServerProcess(row: ProcessInfo): boolean {
-  const comm = commandName(row.comm);
-  const firstArg = commandName(row.args);
-  if (comm !== "codex" && firstArg !== "codex") return false;
-  return /\bapp-server\b/.test(row.args);
+export function isCodexAppServerProcess(
+  row: ProcessInfo,
+  exactArgv = codexProcessArgv(row.pid),
+): boolean {
+  if (!isClientProcess(row, "codex")) return false;
+  const flattened = argTokens(row.args).map((token) => token.replace(/^['"]|['"]$/g, ""));
+  return codexFirstPositionalArg(exactArgv ?? flattened) === "app-server";
 }
 
 export function findClientPidFromProcessChain(

@@ -140,11 +140,13 @@ describe("public distribution contract", () => {
     expect(publicDocs).not.toContain("/home/manzo");
   });
 
-  test("managed auto-wake preserves every supported legacy/manual client", () => {
+  test("managed auto-wake covers post-idle Codex mail", () => {
     const unit = read("docs/systemd/claude-peers-codex-autodrain.service");
     const readme = read("README.md");
     expect(unit).toContain("Environment=NUDGE_CLIENTS=codex,gemini,claude,cursor,agy,kimi,grok");
-    expect(readme).toContain("opts every supported hook/manual client");
-    expect(readme).not.toContain("opts only verified Codex and Claude");
+    expect(readme).toContain("opts every supported client");
+    expect(readme).toContain("mail arriving after the turn is already idle");
+    expect(unit).toContain("After=claude-peers-broker.service");
+    expect(unit).not.toContain("After=default.target");
   });
 });

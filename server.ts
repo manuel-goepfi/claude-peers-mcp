@@ -47,7 +47,7 @@ import type {
 import { durableSeatKey } from "./shared/seat.ts";
 import { detectClientFromProcessChain, findBgSpareAncestor, findClientPidFromProcessChain, initialReceiverMode, isClientProcess, isCodexAppServerProcess, type ProcessInfo } from "./shared/client.ts";
 import { findSingleVisibleCodexProcess } from "./shared/visible-codex.ts";
-import { verifyCodexAppServerSeatProof } from "./shared/appserver-seat-proof.ts";
+import { waitForCodexAppServerSeatProof } from "./shared/appserver-seat-proof.ts";
 import {
   brokerIdentityPaneTarget as sharedBrokerIdentityPaneTarget,
   publishBrokerIdentityToTmux as sharedPublishBrokerIdentityToTmux,
@@ -262,7 +262,12 @@ export function shouldDisableBackgroundPolling(clientType: ClientType, receiverM
     || receiverMode === "codex-hook" || receiverMode === "gemini-hook";
 }
 
-async function brokerFetch<T>(path: string, body: unknown, _retry = false): Promise<T> {
+async function brokerFetch<T>(
+  path: string,
+  body: unknown,
+  _retry = false,
+  signal?: AbortSignal,
+): Promise<T> {
   const attemptPeerId = myId;
   const attemptToken = myToken;
   const headers: Record<string, string> = { "Content-Type": "application/json" };
@@ -271,6 +276,7 @@ async function brokerFetch<T>(path: string, body: unknown, _retry = false): Prom
     method: "POST",
     headers,
     body: JSON.stringify(body),
+    signal,
   });
   if (res.status === 401 && path !== "/register" && !_retry && !shuttingDown) {
     // S2 recovery: broker was restarted (or our token was rotated). Re-register
@@ -295,7 +301,7 @@ async function brokerFetch<T>(path: string, body: unknown, _retry = false): Prom
     } catch (e) {
       throw new Error(`Broker auth recovery failed during ${path}: ${e instanceof Error ? e.message : String(e)} (original request was rejected with 401)`);
     }
-    return brokerFetch<T>(path, rewriteAuthBodyForPeer(path, body, attemptPeerId, myId), true);
+    return brokerFetch<T>(path, rewriteAuthBodyForPeer(path, body, attemptPeerId, myId), true, signal);
   }
   // Orphan self-reap (record only — NEVER exit here). A 401 that reaches this
   // point is one the recovery path could NOT fix (the retried call also 401'd, or
@@ -782,7 +788,39 @@ export function unresolvedAppServerToolDiagnostic(toolName: string, reason: stri
 export function mcpThreadIdFromRequestMeta(meta: unknown): string | null {
   if (!meta || typeof meta !== "object" || Array.isArray(meta)) return null;
   const threadId = (meta as { threadId?: unknown }).threadId;
-  return typeof threadId === "string" && threadId.length > 0 ? threadId : null;
+  return typeof threadId === "string" && threadId.length > 0 ? threadId.toLowerCase() : null;
+}
+
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function tmuxPaneAlive(paneId: string | undefined): boolean {
+  if (!paneId) return false;
+  try {
+    return Bun.spawnSync(["tmux", "display-message", "-p", "-t", paneId, "#{pane_id}"], {
+      stdout: "ignore",
+      stderr: "ignore",
+    }).exitCode === 0;
+  } catch {
+    return false;
+  }
+}
+
+export function priorCodexPaneSeatReleased(
+  pid: number,
+  paneId: string | undefined,
+  deps: {
+    processAlive?: (pid: number) => boolean;
+    tmuxPaneAlive?: (paneId: string | undefined) => boolean;
+  } = {},
+): boolean {
+  return !(deps.processAlive ?? processAlive)(pid) || !(deps.tmuxPaneAlive ?? tmuxPaneAlive)(paneId);
 }
 
 export function shouldUnregisterPeerOnShutdown(peerId: PeerId | null, identityOwnedByHook: boolean): boolean {
@@ -2555,22 +2593,58 @@ async function main() {
       return { ok: false, reason: `connection is already bound to a different Codex thread` };
     }
 
-    let proof: ThreadIdentityProofResponse;
-    try {
-      proof = await brokerFetch<ThreadIdentityProofResponse>("/identity-by-thread", {
-        thread_id: threadId,
-        caller_pid: process.pid,
+    // The relay publishes immediately after the lifecycle response. SessionStart
+    // may first create a live thread-only row, after which the relay upserts and
+    // folds the exact pane row. Wait through only those bounded transitional
+    // states; every non-transient mismatch still fails immediately.
+    const waited = await waitForCodexAppServerSeatProof(threadId, (signal) =>
+      brokerFetch<ThreadIdentityProofResponse>("/identity-by-thread", {
+          thread_id: threadId,
+          caller_pid: process.pid,
+      }, false, signal), {
+        boundThreadId: () => appServerBoundThreadId,
       });
-    } catch (error) {
-      return { ok: false, reason: `hook-owned seat proof unavailable: ${errMsg(error)}` };
-    }
-    const verdict = verifyCodexAppServerSeatProof(threadId, proof, appServerBoundThreadId);
-    if (!verdict.ok) return { ok: false, reason: verdict.reason };
+    if (!waited.ok) return { ok: false, reason: `hook-owned seat proof unavailable: ${waited.reason}` };
+    const proof = waited.proof;
 
     if (appServerBoundThreadId) {
       if (proof.pid !== myRegisterPid || (myId !== null && proof.id !== myId)) {
-        return { ok: false, reason: "hook-owned seat changed while this MCP connection was active" };
+        if (!priorCodexPaneSeatReleased(myRegisterPid, myTmuxInfo?.pane_id)) {
+          return { ok: false, reason: "hook-owned seat changed while the previous Codex pane is still live" };
+        }
+        const oldPane = myTmuxInfo?.pane_id ?? "(none)";
+        myId = null;
+        myToken = null;
+        myRegisterPid = proof.pid;
+        myCwd = proof.cwd;
+        myGitRoot = proof.git_root;
+        myAbsoluteGitDir = proof.absolute_git_dir;
+        tty = proof.tty;
+        tmuxInfo = proof.tmux_session ? {
+          session: proof.tmux_session,
+          window_index: proof.tmux_window_index ?? undefined,
+          window_name: proof.tmux_window_name ?? undefined,
+          pane_id: proof.tmux_pane_id ?? undefined,
+        } : null;
+        myTmuxInfo = tmuxInfo;
+        peerName = proof.name ?? resolvePeerName(
+          null,
+          proof.tmux_session && proof.tmux_pane_id ? `${proof.tmux_session}.${proof.tmux_pane_id}` : null,
+          isSubagent,
+          proof.pid,
+        );
+        myClientType = proof.client_type;
+        myReceiverMode = proof.receiver_mode;
+        appServerIdentityOwnedByHook = true;
+        await reregisterPeer();
+        log(`app-server identity migrated for thread=${threadId} old_pane=${oldPane} new_pane=${proof.tmux_pane_id}`);
       }
+      // Hook registration/heartbeat may have upgraded a relay-created manual
+      // row after this adapter cached its initial proof. Refresh capability
+      // metadata on every same-seat proof so later claims cannot publish stale
+      // manual-drain state back over codex-hook.
+      myClientType = proof.client_type;
+      myReceiverMode = proof.receiver_mode;
       return { ok: true };
     }
 

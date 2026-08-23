@@ -19,6 +19,8 @@ import type {
   RegisterResponse,
   ReconcilePaneThreadRequest,
   ReconcilePaneThreadResponse,
+  BindCodexPaneThreadRequest,
+  BindCodexPaneThreadResponse,
   RegisterCliRequest,
   RegisterCliResponse,
   HeartbeatRequest,
@@ -68,7 +70,9 @@ import {
   type RecipientDeliveryHealth,
 } from "./shared/delivery-state.ts";
 import { classifySeatAdapterLiveness, durableSeatKey, mergeSeatPids, parseSeatPids, seatPidsAlive, serializeSeatPids } from "./shared/seat.ts";
-import { isClientProcess } from "./shared/client.ts";
+import { isClientProcess, isCodexAppServerProcess, type ProcessInfo } from "./shared/client.ts";
+import { singleInteractiveCodexProcess } from "./shared/visible-codex.ts";
+import { publishBrokerIdentityToTmux } from "./shared/tmux-identity.ts";
 import { acquireBrokerOwnership, assertDatabaseIdentity, type BrokerLifecycleIdentity } from "./shared/broker-lifecycle.ts";
 import {
   OWNER_ONLY_UMASK,
@@ -240,6 +244,7 @@ const BROKER_CAPABILITIES = {
 // Loopback-only bind means filesystem ACLs (chmod 0600) are the auth boundary.
 const BRIDGE_TOKEN_FILE = process.env.CLAUDE_PEERS_BRIDGE_TOKEN_FILE ?? `${process.env.HOME}/.claude-peers-bridge.token`;
 const BRIDGE_RATE_KEY = "__bridge__";  // dedicated rate-limit bucket
+const CODEX_BIND_RATE_KEY = "__codex_pane_bind__"; // bounded unauthenticated process-proof route
 
 // --- Rehydration: when a peer dies and re-launches in the same tmux pane,
 // inherit its ID so orphaned mail (addressed to the old ID) surfaces. Window
@@ -589,7 +594,11 @@ const updateReceiverHealth = db.prepare(`
   UPDATE peers
   SET last_seen = ?,
       client_type = ?,
-      receiver_mode = ?,
+      receiver_mode = CASE
+        WHEN receiver_mode = 'codex-hook' AND ? = 'manual-drain' THEN receiver_mode
+        WHEN receiver_mode = 'gemini-hook' AND ? = 'manual-drain' THEN receiver_mode
+        ELSE ?
+      END,
       last_hook_seen_at = ?,
       last_drain_at = COALESCE(?, last_drain_at),
       last_drain_error = ?
@@ -742,7 +751,7 @@ const selectIdentityProofByThread = db.prepare(`
          tmux_session, tmux_window_index, tmux_window_name, tmux_pane_id,
          thread_id, seat_key, seat_pids, client_type, receiver_mode
   FROM peers
-  WHERE non_targetable = 0 AND thread_id = ?
+  WHERE non_targetable = 0 AND lower(thread_id) = ?
   ORDER BY last_seen DESC
 `);
 
@@ -774,14 +783,14 @@ const selectRehydrateCandidatesByPane = db.prepare(`
 
 // Seat occupants: every row already anchored to this durable seat.
 //
-// The identity guards are deliberately the SAME ones rehydration applies, because
-// this is rehydration extended to live co-registrants — a seat is only "the same
-// seat" when the work happening there is the same work. cwd keeps a pane reused
-// by a different project from inheriting the previous occupant's mail; the
-// git_root clause lets a stored null upgrade to a known repo but never lets an
-// incoming null steal a concrete one; the window clause rejects a pane whose
-// window metadata contradicts the registrant. Dropping any of them would deliver
-// one project's mail into another's session.
+// This is rehydration extended to live co-registrants. The exact tmux pane id is
+// the durable location anchor; cwd keeps a pane reused by a different project
+// from inheriting the previous occupant's mail, and the git_root clause lets a
+// stored null upgrade to a known repo but never lets an incoming null steal a
+// concrete one. Window index/name are deliberately descriptive only: tmux can
+// renumber a window or auto-rename it from `claude` to `node` while the same
+// pane and same session remain alive. Treating those fields as identity stranded
+// the pane's old id and queued inbox on every such rename.
 //
 // Ordered exact-repo-first, then newest: the surviving id is the one most
 // recently advertised to the fleet, so the fewest senders hold a stale reference.
@@ -791,8 +800,6 @@ const selectSeatOccupants = db.prepare(`
     AND seat_key = ?1
     AND cwd = ?2
     AND (git_root = ?3 OR git_root IS NULL)
-    AND ((?4 IS NULL OR ?5 IS NULL) OR tmux_window_index IS NULL OR tmux_window_name IS NULL
-         OR (tmux_window_index = ?4 AND tmux_window_name = ?5))
   ORDER BY CASE WHEN (?3 IS NOT NULL AND git_root = ?3) THEN 0 ELSE 1 END, last_seen DESC
   LIMIT 8
 `);
@@ -1330,13 +1337,53 @@ function handleRegister(body: RegisterRequest): RegisterResult {
   const requestedClientType = validClientType(body.client_type);
   const seatKey = durableSeatKey(body);
   const seatMerge: { fromIds: string[]; pids: number[]; token: string | null } = { fromIds: [], pids: [], token: null };
+  type ThreadBoundCodexSeat = Peer & { token: string; seat_key: string | null; seat_pids: string | null };
+  let adoptedThreadSeat: ThreadBoundCodexSeat | null = null;
+
+  // The shared Codex app-server can deliver SessionStart after the pane-local
+  // relay has already bound this exact thread. That hook is intentionally
+  // headless: its process belongs to the shared host, not to any one pane. If
+  // registration considered only PID/seat, it would mint a second live row for
+  // the same thread and make every exact-thread tool call fail as ambiguous.
+  //
+  // Adopt only one LIVE, concrete pane binding for the exact Codex thread. Two
+  // live panes are a real conflict and must remain fail-closed. Headless exact-
+  // thread duplicates are safe to fold into the proven pane row; different
+  // threads on the same shared-host PID remain completely independent.
+  if (!seatKey && requestedClientType === "codex" && body.thread_id) {
+    const exactThreadRows = (selectPeersByThread.all(body.thread_id.toLowerCase()) as ThreadBoundCodexSeat[])
+      .filter((row) => {
+        const rowType = validClientType(row.client_type);
+        return rowType === "codex" || rowType === "unknown";
+      });
+    const livePaneRows = exactThreadRows.filter((row) =>
+      Boolean(row.tmux_pane_id) && Boolean(durableSeatKey(row)) && peerSeatAlive(row),
+    );
+    const livePaneSeatKeys = new Set(livePaneRows.map((row) => durableSeatKey(row)!));
+    if (livePaneSeatKeys.size > 1) {
+      return { ok: false, status: 409, error: "thread is bound to multiple live Codex panes" };
+    }
+    if (livePaneRows.length > 0) {
+      const survivor = livePaneRows[0]!;
+      adoptedThreadSeat = survivor;
+      inheritedId = survivor.id;
+      seatMerge.fromIds = exactThreadRows.filter((row) => row.id !== survivor.id).map((row) => row.id);
+      // The shared host PID serves many threads and must never keep a concrete
+      // pane alive after its native TUI exits. Exact hook routes authenticate
+      // by thread, so preserve only the pane row's existing seat processes.
+      seatMerge.pids = exactThreadRows.flatMap((row) => [row.pid, ...parseSeatPids(row.seat_pids)]);
+      seatMerge.token = survivor.token;
+      console.error(
+        `[broker] thread-seat-adopt: pid=${body.pid} adopts id=${survivor.id} for thread=${body.thread_id}` +
+        (seatMerge.fromIds.length > 0 ? ` (folding ${seatMerge.fromIds.length} exact-thread duplicate row(s))` : ""),
+      );
+    }
+  }
   if (seatKey) {
     const occupants = (selectSeatOccupants.all(
       seatKey,
       body.cwd,
       body.git_root,
-      body.tmux_window_index ?? null,
-      body.tmux_window_name ?? null,
     ) as Array<{
       id: string; pid: number; seat_pids: string | null; token: string | null; client_type: ClientType | null; last_seen: string;
     }>)
@@ -1516,8 +1563,10 @@ function handleRegister(body: RegisterRequest): RegisterResult {
 
   // Runtime-name de-dupe: keep the operator-facing name unchanged, but assign
   // a broker-unique resolved_name for diagnostics and exact process identity.
-  const requestedName = body.name ?? null;
-  const finalName = disambiguateName(requestedName, id, body.tmux_window_name);
+  const requestedName = adoptedThreadSeat ? adoptedThreadSeat.name : (body.name ?? null);
+  const finalName = adoptedThreadSeat
+    ? adoptedThreadSeat.resolved_name
+    : disambiguateName(requestedName, id, body.tmux_window_name);
   let receiverMode = initialReceiverModeFromRegistration(body.receiver_mode, clientType);
   if (existing?.id === id && receiverMode === "manual-drain") {
     const currentMode = validReceiverMode(existing.receiver_mode, clientType);
@@ -1543,9 +1592,23 @@ function handleRegister(body: RegisterRequest): RegisterResult {
   const ttyValue = body.tty ?? null;
   const summaryValue = body.summary ?? "";
   const preserveKnownSamePidMetadata = samePidRefresh && existing?.id === id;
-  const gitRootValue = preserveKnownSamePidMetadata ? (body.git_root ?? existing.git_root) : body.git_root;
-  const absoluteGitDirValue = preserveKnownSamePidMetadata ? (body.absolute_git_dir ?? existing.absolute_git_dir) : (body.absolute_git_dir ?? null);
-  const ttyWriteValue = preserveKnownSamePidMetadata ? (ttyValue ?? existing.tty) : ttyValue;
+  const pidWriteValue = adoptedThreadSeat?.pid ?? body.pid;
+  const cwdWriteValue = adoptedThreadSeat?.cwd ?? body.cwd;
+  const gitRootValue = adoptedThreadSeat
+    ? adoptedThreadSeat.git_root
+    : (preserveKnownSamePidMetadata ? (body.git_root ?? existing.git_root) : body.git_root);
+  const absoluteGitDirValue = adoptedThreadSeat
+    ? adoptedThreadSeat.absolute_git_dir
+    : (preserveKnownSamePidMetadata ? (body.absolute_git_dir ?? existing.absolute_git_dir) : (body.absolute_git_dir ?? null));
+  const ttyWriteValue = adoptedThreadSeat
+    ? adoptedThreadSeat.tty
+    : (preserveKnownSamePidMetadata ? (ttyValue ?? existing.tty) : ttyValue);
+  const tmuxSessionValue = adoptedThreadSeat?.tmux_session ?? body.tmux_session ?? null;
+  const tmuxWindowIndexValue = adoptedThreadSeat?.tmux_window_index ?? body.tmux_window_index ?? null;
+  const tmuxWindowNameValue = adoptedThreadSeat?.tmux_window_name ?? body.tmux_window_name ?? null;
+  const tmuxPaneIdValue = adoptedThreadSeat?.tmux_pane_id ?? body.tmux_pane_id ?? null;
+  const threadIdWriteValue = adoptedThreadSeat?.thread_id ?? body.thread_id ?? null;
+  const effectiveSeatKey = seatKey ?? adoptedThreadSeat?.seat_key ?? null;
   // ENC-08 (no silent failure): a DB write that throws here would otherwise
   // fall through to the route-level generic 500 ("internal error") with no
   // signal to the registering peer about WHY it failed — which is exactly how
@@ -1599,13 +1662,13 @@ function handleRegister(body: RegisterRequest): RegisterResult {
       // delivery-health warnings read.
       const rowExists = Boolean(db.query("SELECT 1 FROM peers WHERE id = ?").get(id));
       if (rowExists) {
-        updatePeerRegistration.run(body.pid, body.cwd, gitRootValue, absoluteGitDirValue, ttyWriteValue, requestedName, finalName, body.tmux_session ?? null, body.tmux_window_index ?? null, body.tmux_window_name ?? null, body.tmux_pane_id ?? null, body.thread_id ?? null, clientType, receiverMode, summaryValue, now, issuedToken, id);
+        updatePeerRegistration.run(pidWriteValue, cwdWriteValue, gitRootValue, absoluteGitDirValue, ttyWriteValue, requestedName, finalName, tmuxSessionValue, tmuxWindowIndexValue, tmuxWindowNameValue, tmuxPaneIdValue, threadIdWriteValue, clientType, receiverMode, summaryValue, now, issuedToken, id);
       } else {
-        insertPeer.run(id, body.pid, body.cwd, gitRootValue, absoluteGitDirValue, ttyWriteValue, requestedName, finalName, body.tmux_session ?? null, body.tmux_window_index ?? null, body.tmux_window_name ?? null, body.tmux_pane_id ?? null, body.thread_id ?? null, clientType, receiverMode, summaryValue, now, now, issuedToken);
+        insertPeer.run(id, pidWriteValue, cwdWriteValue, gitRootValue, absoluteGitDirValue, ttyWriteValue, requestedName, finalName, tmuxSessionValue, tmuxWindowIndexValue, tmuxWindowNameValue, tmuxPaneIdValue, threadIdWriteValue, clientType, receiverMode, summaryValue, now, now, issuedToken);
       }
       // Seat identity is written last so it lands on both the insert and update
       // paths without threading two more binds through each statement.
-      updateSeatIdentity.run(seatKey, serializeSeatPids(mergeSeatPids(seatMerge.pids, body.pid, isPidAlive)), id);
+      updateSeatIdentity.run(effectiveSeatKey, serializeSeatPids(mergeSeatPids(seatMerge.pids, pidWriteValue, isPidAlive)), id);
       // Legacy rehydration deletes and recreates the same peer id while its
       // queued inbox survives. Preserve that continuous inbox's episode marker
       // so process replacement cannot replenish an exhausted nudge budget.
@@ -2467,6 +2530,10 @@ type ReconcilePaneThreadResult =
   | { ok: true; value: ReconcilePaneThreadResponse }
   | { ok: false; status: number; error: string };
 
+type BindCodexPaneThreadResult =
+  | { ok: true; value: BindCodexPaneThreadResponse }
+  | { ok: false; status: number; error: string };
+
 function latestIso(values: Array<string | null>): string | null {
   const present = values.filter((value): value is string => Boolean(value));
   return present.length > 0 ? present.sort().at(-1)! : null;
@@ -2493,10 +2560,12 @@ function reconciledReceiverState(target: Peer, duplicates: Peer[]): Pick<
 }
 
 /**
- * Join the exact visible Codex pane identity to the exact thread UUID that its
- * status line renders. This is intentionally narrower than /register: it never
- * infers by cwd/name, never moves a concrete pane identity, and never adds the
- * shared app-server PID to the visible seat's liveness set.
+ * Join an exact visible Codex pane identity to an exact thread UUID. The caller
+ * is responsible for proving the join source (the public relay route below
+ * derives it from a successful app-server lifecycle response). This remains
+ * narrower than /register: it never infers by cwd/name, never moves a live
+ * concrete pane identity, and never adds the shared app-server PID to the
+ * visible seat's liveness set.
  */
 function handleReconcilePaneThread(body: ReconcilePaneThreadRequest): ReconcilePaneThreadResult {
   if (typeof body.id !== "string" || body.id.length === 0) {
@@ -2582,6 +2651,220 @@ function handleReconcilePaneThread(body: ReconcilePaneThreadRequest): ReconcileP
   };
 }
 
+interface TmuxPaneBindProof {
+  pane_id: string;
+  pane_pid: number;
+  pane_tty: string;
+  pane_current_path: string;
+  session: string;
+  window_index: string;
+  window_name: string;
+  operator_label: string | null;
+}
+
+function processTty(pid: number): string | null {
+  try {
+    const result = Bun.spawnSync(["ps", "-o", "tty=", "-p", String(pid)], {
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+    if (result.exitCode !== 0) return null;
+    return normalizedTtyForIdentity(new TextDecoder().decode(result.stdout));
+  } catch {
+    return null;
+  }
+}
+
+function tmuxPaneBindProof(paneId: string): TmuxPaneBindProof | null {
+  try {
+    const format = [
+      "#{pane_id}", "#{pane_pid}", "#{pane_tty}", "#{pane_current_path}", "#{session_name}",
+      "#{window_index}", "#{window_name}", "#{@operator_label}", "#{@peer_label}",
+    ].join("\t");
+    const result = Bun.spawnSync(["tmux", "display-message", "-p", "-t", paneId, format], {
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+    if (result.exitCode !== 0) return null;
+    const [actualPane, rawPanePid, rawTty, paneCurrentPath, session, windowIndex, windowName, operatorLabel, peerLabel] =
+      new TextDecoder().decode(result.stdout).trimEnd().split("\t");
+    const panePid = Number(rawPanePid);
+    const paneTty = normalizedTtyForIdentity(rawTty);
+    if (
+      actualPane !== paneId || !Number.isInteger(panePid) || panePid <= 1 || !paneTty || !session ||
+      !paneCurrentPath?.startsWith("/") || !statSync(paneCurrentPath).isDirectory()
+    ) return null;
+    const label = operatorLabel?.trim() || peerLabel?.trim() || null;
+    return {
+      pane_id: paneId,
+      pane_pid: panePid,
+      pane_tty: paneTty,
+      pane_current_path: paneCurrentPath,
+      session,
+      window_index: windowIndex ?? "",
+      window_name: windowName ?? "",
+      operator_label: label,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function processTableRowsOnTty(tty: string): ProcessInfo[] {
+  try {
+    const result = Bun.spawnSync(["ps", "-t", tty, "-o", "pid=,ppid=,comm=,args="], {
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+    if (result.exitCode !== 0) return [];
+    const rows: ProcessInfo[] = [];
+    for (const line of new TextDecoder().decode(result.stdout).split("\n")) {
+      const match = line.trim().match(/^(\d+)\s+(\d+)\s+(\S+)\s*(.*)$/);
+      if (!match) continue;
+      rows.push({
+        pid: Number(match[1]),
+        ppid: Number(match[2]),
+        comm: match[3]!,
+        args: match[4] ?? "",
+      });
+    }
+    return rows;
+  } catch {
+    return [];
+  }
+}
+
+function nativeInteractiveCodexOnTty(tty: string): ProcessInfo | null {
+  return singleInteractiveCodexProcess(processTableRowsOnTty(tty));
+}
+
+function gitValue(cwd: string, args: string[]): string | null {
+  try {
+    const result = Bun.spawnSync(["git", "-C", cwd, ...args], { stdout: "pipe", stderr: "ignore" });
+    if (result.exitCode !== 0) return null;
+    return new TextDecoder().decode(result.stdout).trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+function codexPaneThreadBindConflict(threadId: string, paneId: string): ReconcilePaneThreadResult | null {
+  const rows = selectPeersByThread.all(threadId.toLowerCase()) as Peer[];
+  if (rows.some((peer) => peer.client_type !== "codex")) {
+    return { ok: false, status: 409, error: "thread is already bound to another client" };
+  }
+  if (rows.some((peer) =>
+    peer.tmux_pane_id !== paneId &&
+    (peer.tmux_pane_id !== null || peer.seat_key !== null) &&
+    peerSeatAlive(peer)
+  )) {
+    return { ok: false, status: 409, error: "thread is already bound to another live pane" };
+  }
+  return null;
+}
+
+/**
+ * Width-independent Codex pane/thread publication. The relay is a child of the
+ * pane shell and keeps that pane's controlling TTY; the broker re-derives both
+ * facts, locates the single native interactive Codex TUI on the same TTY, then
+ * performs the existing authenticated fold internally. No screen text, cwd
+ * uniqueness, caller-supplied peer id, or caller-supplied target pid is trusted.
+ */
+function handleBindCodexPaneThread(body: BindCodexPaneThreadRequest): BindCodexPaneThreadResult {
+  if (!Number.isInteger(body.caller_pid) || body.caller_pid <= 1) {
+    return { ok: false, status: 400, error: "invalid caller_pid" };
+  }
+  if (typeof body.tmux_pane_id !== "string" || !/^%\d+$/.test(body.tmux_pane_id)) {
+    return { ok: false, status: 400, error: "invalid tmux_pane_id" };
+  }
+  if (typeof body.thread_id !== "string" || !THREAD_UUID_RE.test(body.thread_id)) {
+    return { ok: false, status: 400, error: "invalid thread_id" };
+  }
+  const callerErr = verifyPidUid(body.caller_pid);
+  if (callerErr) return { ok: false, status: 403, error: `caller rejected: ${callerErr}` };
+  const limited = rateCheck(CODEX_BIND_RATE_KEY, false);
+  if (limited) return { ok: false, status: 429, error: limited };
+  const pane = tmuxPaneBindProof(body.tmux_pane_id);
+  if (!pane) return { ok: false, status: 404, error: "tmux pane not found" };
+  if (processTty(body.caller_pid) !== pane.pane_tty) {
+    return { ok: false, status: 403, error: "relay controlling TTY does not match pane" };
+  }
+  if (!pidWithAncestors(body.caller_pid, 24).includes(pane.pane_pid)) {
+    return { ok: false, status: 403, error: "relay is not descended from pane shell" };
+  }
+  const tui = nativeInteractiveCodexOnTty(pane.pane_tty);
+  if (!tui) return { ok: false, status: 409, error: "pane does not contain exactly one interactive native Codex TUI" };
+  const targetErr = verifyPidUid(tui.pid);
+  if (targetErr) return { ok: false, status: 403, error: `target rejected: ${targetErr}` };
+  // Registration refreshes a pane row with thread_id=NULL before reconciliation
+  // writes the lifecycle thread. Preflight every reconciliation conflict while
+  // the old row is still intact. handleBindCodexPaneThread is synchronous, so
+  // no other request can interleave before the later registration/reconcile.
+  const conflict = codexPaneThreadBindConflict(body.thread_id, pane.pane_id);
+  if (conflict) return conflict;
+  // The broker runs with systemd mount-namespace hardening. Linux denies its
+  // readlink(/proc/<external-tui>/cwd) even for the same UID, so use tmux's
+  // pane-local cwd proof gathered above. Cwd is registration metadata only;
+  // identity still requires the exact pane, controlling TTY, shell ancestry,
+  // and a single native interactive Codex process on that TTY.
+  const cwd = pane.pane_current_path;
+  const gitRoot = gitValue(cwd, ["rev-parse", "--show-toplevel"]);
+  const absoluteGitDir = gitValue(cwd, ["rev-parse", "--absolute-git-dir"]);
+  const name = pane.operator_label ?? `${pane.session}.${pane.window_index}`;
+
+  const registration = handleRegister({
+    pid: tui.pid,
+    cwd,
+    git_root: gitRoot,
+    absolute_git_dir: absoluteGitDir,
+    tty: pane.pane_tty,
+    name,
+    tmux_session: pane.session,
+    tmux_window_index: pane.window_index,
+    tmux_window_name: pane.window_name,
+    tmux_pane_id: pane.pane_id,
+    thread_id: null,
+    client_type: "codex",
+    receiver_mode: "manual-drain",
+    preserve_token: true,
+    summary: "",
+  });
+  if (!registration.ok) return registration;
+
+  const reconciled = handleReconcilePaneThread({
+    id: registration.value.id,
+    pid: tui.pid,
+    caller_pid: body.caller_pid,
+    tmux_pane_id: pane.pane_id,
+    thread_id: body.thread_id,
+  });
+  if (!reconciled.ok) return reconciled;
+
+  // This route can be the first and only exact pane registrar: shared app-server
+  // hooks are headless, so waiting for one of them to mirror the row leaves a
+  // stale @peer_id on every resumed pane. Publish only broker-owned fields; the
+  // operator label remains sticky and is never rewritten here.
+  const peer = selectPeerById.get(reconciled.value.id) as Peer | null;
+  if (peer) {
+    const mirrored = publishBrokerIdentityToTmux({
+      id: peer.id,
+      name: peer.name,
+      resolved_name: peer.resolved_name,
+      client_type: validClientType(peer.client_type),
+      receiver_mode: validReceiverMode(peer.receiver_mode, "codex"),
+    }, {
+      session: pane.session,
+      window_index: pane.window_index,
+      window_name: pane.window_name,
+      pane_id: pane.pane_id,
+    }, { writeOperatorLabel: false });
+    if (!mirrored.ok) {
+      console.error(`[broker] codex pane bind identity mirror partially failed pane=${pane.pane_id} options=${mirrored.failedOptions.join(",")}`);
+    }
+  }
+  return reconciled;
+}
+
 type ThreadIdentityProofResult =
   | { ok: true; value: ThreadIdentityProofResponse }
   | { ok: false; status: number; error: string };
@@ -2599,7 +2882,8 @@ function resolveLiveThreadIdentity(threadId: string):
     return { ok: false, status: 400, error: "invalid thread_id" };
   }
 
-  const matches = (selectIdentityProofByThread.all(threadId) as ThreadIdentityRow[])
+  const normalizedThreadId = threadId.toLowerCase();
+  const matches = (selectIdentityProofByThread.all(normalizedThreadId) as ThreadIdentityRow[])
     .filter((row) => seatPidsAlive(parseSeatPids(row.seat_pids), row.pid, isPidAlive));
   if (matches.length === 0) return { ok: false, status: 404, error: "peer not found" };
   if (matches.length !== 1) return { ok: false, status: 409, error: "ambiguous live thread identity" };
@@ -2823,6 +3107,8 @@ function handleHookHeartbeatWithAuth(body: Omit<HookHeartbeatByPidRequest, "pid"
     now,
     clientType,
     receiverMode,
+    receiverMode,
+    receiverMode,
     now,
     typeof body.drained === "number" && body.drained > 0 ? now : null,
     status === "error" ? String(body.error ?? "unknown hook error").slice(0, 512) : null,
@@ -2881,7 +3167,17 @@ function handleClaimWithAuth(body: Omit<ClaimByPidRequest, "pid">, auth: { ok: t
     }
   })();
 
-  updateReceiverHealth.run(now, clientType, receiverMode, now, null, null, auth.id);
+  updateReceiverHealth.run(
+    now,
+    clientType,
+    receiverMode,
+    receiverMode,
+    receiverMode,
+    now,
+    null,
+    null,
+    auth.id,
+  );
   return {
     ok: true,
     peer_id: auth.id,
@@ -2932,7 +3228,17 @@ function handleAckWithAuth(body: Omit<AckByPidRequest, "pid">, auth: { ok: true;
   const drainError = ids.length > 0 && acked !== ids.length
     ? `ack mismatch: requested ${ids.length}, acked ${acked}`
     : null;
-  updateReceiverHealth.run(nowIso, clientType, receiverMode, nowIso, acked > 0 ? nowIso : null, drainError, auth.id);
+  updateReceiverHealth.run(
+    nowIso,
+    clientType,
+    receiverMode,
+    receiverMode,
+    receiverMode,
+    nowIso,
+    acked > 0 ? nowIso : null,
+    drainError,
+    auth.id,
+  );
   return { ok: true, peer_id: auth.id, acked, ...(acked > 0 ? { state: "acknowledged" as const } : {}) };
 }
 
@@ -3138,6 +3444,21 @@ requestHandler = async (req: Request) => {
         const res = handleIdentityByThread({
           thread_id: typeof body.thread_id === "string" ? body.thread_id : "",
           caller_pid: Number(body.caller_pid),
+        });
+        if (!res.ok) return Response.json({ error: res.error }, { status: res.status });
+        return Response.json(res.value);
+      }
+
+      // Observation-only codexd relay publication. This deliberately runs
+      // before peer-token auth because the broker re-proves the caller's
+      // same-UID process, controlling TTY, tmux pane-shell ancestry, and the
+      // unique native Codex TUI itself. No caller-supplied peer id or pid is
+      // accepted as the target.
+      if (path === "/bind-codex-pane-thread") {
+        const res = handleBindCodexPaneThread({
+          caller_pid: Number(body.caller_pid),
+          tmux_pane_id: typeof body.tmux_pane_id === "string" ? body.tmux_pane_id : "",
+          thread_id: typeof body.thread_id === "string" ? body.thread_id : "",
         });
         if (!res.ok) return Response.json({ error: res.error }, { status: res.status });
         return Response.json(res.value);

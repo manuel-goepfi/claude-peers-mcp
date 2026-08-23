@@ -702,8 +702,13 @@ export async function runRegistration(): Promise<void> {
       summary: "",
     });
     publishBrokerIdentityToTmux(reg, meta.tmux, meta.identity_env);
-    await post("/hook-heartbeat-by-pid", {
-      pid: meta.pid,
+    const heartbeatPath = CLIENT_TYPE === "codex" && threadId
+      ? "/hook-heartbeat-by-thread"
+      : "/hook-heartbeat-by-pid";
+    await post(heartbeatPath, {
+      ...(heartbeatPath === "/hook-heartbeat-by-thread"
+        ? { thread_id: threadId }
+        : { pid: meta.pid }),
       caller_pid: process.pid,
       client_type: CLIENT_TYPE,
       receiver_mode: RECEIVER_MODE,

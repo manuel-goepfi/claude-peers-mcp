@@ -1,11 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
-import { isClientProcess } from "../shared/client.ts";
+import { isClientProcess, isCodexAppServerProcess } from "../shared/client.ts";
 import { findClientPidFromTable, findHookPeerPidsFromTable, findMcpPidFromTable } from "../hooks/codex-drain-peer-inbox.ts";
 import { codexDrainRootDecision, codexHookRootDegradedReason, codexHookRootRefusalReason, codexHookSessionDiagnostic, peerName, publishBrokerIdentityToTmux, readPaneLabel, registrationTmuxPaneId, sessionIdFromHookInput, tmuxIdentityMirrorEnabled } from "../hooks/register-peer-session.ts";
 import { detectClientFromProcessChain, findBgSpareAncestor, initialReceiverMode, type ProcessInfo } from "../shared/client.ts";
-import { findNearestVisibleCodexProcessByStart, findVisibleCodexProcessByPaneId } from "../shared/visible-codex.ts";
-import { findCodexAppServerAncestor, findVisibleCodexSession, mcpThreadIdFromRequestMeta, registrationCwd, registrationCwdResult, registrationTtyPid, selectCodexManualDrainPid, selectInboxClaimIdentity, shouldUnregisterPeerOnShutdown, unresolvedAppServerToolDiagnostic } from "../server.ts";
+import { findNearestVisibleCodexProcessByStart, findVisibleCodexProcessByPaneId, isInteractiveNativeCodex, singleInteractiveCodexProcess } from "../shared/visible-codex.ts";
+import { findCodexAppServerAncestor, findVisibleCodexSession, mcpThreadIdFromRequestMeta, priorCodexPaneSeatReleased, registrationCwd, registrationCwdResult, registrationTtyPid, selectCodexManualDrainPid, selectInboxClaimIdentity, shouldUnregisterPeerOnShutdown, unresolvedAppServerToolDiagnostic } from "../server.ts";
 
 function table(rows: ProcessInfo[]): Map<number, ProcessInfo> {
   return new Map(rows.map((row) => [row.pid, row]));
@@ -379,6 +379,22 @@ describe("client detection", () => {
     expect(findVisibleCodexSession(processes, "/home/manzo/Clause5", readers)).toBeNull();
   });
 
+  test("does not mistake words inside an interactive initial prompt for Codex subcommands", () => {
+    const row = { pid: 999_991, ppid: 50, comm: "codex", args: "codex --remote unix:// flattened prompt" };
+    expect(isInteractiveNativeCodex(row, [
+      "/opt/codex/vendor/codex",
+      "--remote", "unix:///run/user/1000/relay.sock",
+      "--cd", "/home/manzo/Clause5",
+      "This is a harmless probe that may say review or apply",
+    ])).toBe(true);
+    expect(isInteractiveNativeCodex(row, [
+      "/opt/codex/vendor/codex",
+      "--remote", "unix:///run/user/1000/relay.sock",
+      "--cd", "/home/manzo/Clause5",
+      "exec", "review",
+    ])).toBe(false);
+  });
+
   test("keeps a launcher, TUI, and nested Codex command ambiguous", () => {
     const processes = new Map<number, ProcessInfo>([
       [200, { pid: 200, ppid: 50, comm: "node", args: "node /opt/codex/bin/codex --remote unix://" }],
@@ -610,10 +626,30 @@ describe("client detection", () => {
     expect(sessionIdFromHookInput({ session_id: threadId, hook_event_name: "SessionStart" })).toBe(threadId);
     expect(sessionIdFromHookInput({ session_id: threadId, hook_event_name: "Stop" })).toBe(threadId);
     expect(mcpThreadIdFromRequestMeta({ threadId })).toBe(threadId);
+    expect(mcpThreadIdFromRequestMeta({ threadId: threadId.toUpperCase() })).toBe(threadId);
     expect(sessionIdFromHookInput({ session_id: "" })).toBeNull();
     expect(sessionIdFromHookInput({ session_id: "   " })).toBeNull();
     expect(sessionIdFromHookInput({ session_id: `  ${threadId}  ` })).toBe(threadId);
     expect(mcpThreadIdFromRequestMeta({})).toBeNull();
+  });
+
+  test("shared app-server identity migrates only after the prior process or pane is released", () => {
+    const verdict = (processIsAlive: boolean, paneIsAlive: boolean) => priorCodexPaneSeatReleased(
+      200,
+      "%42",
+      { processAlive: () => processIsAlive, tmuxPaneAlive: () => paneIsAlive },
+    );
+    expect(verdict(true, true)).toBe(false);
+    expect(verdict(false, true)).toBe(true);
+    expect(verdict(true, false)).toBe(true);
+
+    const src = readFileSync(new URL("../server.ts", import.meta.url), "utf8");
+    const gate = src.indexOf("if (!priorCodexPaneSeatReleased(myRegisterPid, myTmuxInfo?.pane_id))");
+    const migration = src.slice(gate, gate + 2_500);
+    expect(gate).toBeGreaterThan(0);
+    expect(migration).toContain("myId = null");
+    expect(migration).toContain("myToken = null");
+    expect(migration).toContain("await reregisterPeer()");
   });
 
   test("Codex hook diagnostics match a durable root transcript without touching the filesystem", () => {
@@ -1118,5 +1154,29 @@ describe("node-shim codex TUI detection", () => {
     expect(isClientProcess({ pid: 2, ppid: 0, comm: "node", args: "node /srv/app/server.js" }, "codex")).toBe(false);
     // And the shim never leaks into other client types.
     expect(isClientProcess(row, "claude")).toBe(false);
+  });
+
+  test("classifies only the actual app-server subcommand", () => {
+    const prompt = { pid: 99, ppid: 1, comm: "codex", args: "codex --remote unix:///tmp/app-server.sock --cd /repo Investigate the app-server bind" };
+    expect(isCodexAppServerProcess(prompt, [
+      "codex", "--remote", "unix:///tmp/app-server.sock", "--cd", "/repo",
+      "Investigate the app-server bind",
+    ])).toBe(false);
+    expect(isCodexAppServerProcess({
+      ...prompt,
+      args: "codex --config model=test app-server --listen unix:///tmp/control.sock",
+    }, ["codex", "--config", "model=test", "app-server", "--listen", "unix:///tmp/control.sock"])).toBe(true);
+  });
+
+  test("selects a sole Node shim and collapses an exact shim/native pair", () => {
+    const shim = {
+      pid: 200,
+      ppid: 100,
+      comm: "node",
+      args: "node /opt/codex/bin/codex --remote unix:///tmp/relay.sock --cd /repo resume thread",
+    };
+    expect(singleInteractiveCodexProcess([shim])).toEqual(shim);
+    const native = { pid: 201, ppid: 200, comm: "codex", args: "codex --remote unix:///tmp/relay.sock" };
+    expect(singleInteractiveCodexProcess([shim, native])).toEqual(native);
   });
 });

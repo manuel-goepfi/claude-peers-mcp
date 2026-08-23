@@ -414,6 +414,33 @@ describe("Live broker delivery features", () => {
     expect(claim.json.error).toBe("ambiguous live thread identity");
   });
 
+  test("thread identity proof normalizes UUID case", async () => {
+    const child = spawnSleep();
+    const threadId = "019FC273-A35B-78F0-9A70-F63B5905540F";
+    await brokerFetch("/register", {
+      pid: child.pid,
+      cwd: "/case-normalized-thread",
+      git_root: null,
+      tty: "/dev/pts/90",
+      name: "case-normalized-thread",
+      tmux_session: "infra",
+      tmux_window_index: "1",
+      tmux_window_name: "peers",
+      tmux_pane_id: "%2590",
+      thread_id: threadId,
+      client_type: "codex",
+      receiver_mode: "codex-hook",
+      summary: "",
+    });
+
+    const response = await fetch(`${brokerUrl}/identity-by-thread`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ thread_id: threadId.toLowerCase(), caller_pid: process.pid }),
+    });
+    expect(response.status).toBe(200);
+  });
+
   test("register-cli creates an authenticated identity that is globally non-targetable", async () => {
     const targetProcess = spawnSleep();
     const ordinary = await brokerFetch<{ id: string }>("/register", {
@@ -1608,6 +1635,104 @@ describe("Live broker delivery features", () => {
     expect((rightBody.messages ?? []).map((m) => m.id)).toContain(sent.id);
     const wrongBody = wrongThread.json as { messages?: Array<{ id: number }> };
     expect((wrongBody.messages ?? []).map((m) => m.id)).not.toContain(sent.id);
+  });
+
+  test("shared-host hooks adopt pane threads without joining pane liveness or crossing health", async () => {
+    const host = spawnSleep();
+    const tuiA = spawnSleep();
+    const tuiB = spawnSleep();
+    const threadA = "019fcccc-1111-7000-8000-000000000001";
+    const threadB = "019fdddd-2222-7000-8000-000000000002";
+    try {
+      const paneRegistration = (pid: number, pane: string, name: string, threadId: string) => brokerFetch<{ id: string }>("/register", {
+        pid,
+        cwd: "/shared-host-pane-adopt",
+        git_root: null,
+        tty: `/dev/pts/${pid}`,
+        name,
+        tmux_session: "shared-host-test",
+        tmux_window_index: pane.slice(1),
+        tmux_window_name: name,
+        tmux_pane_id: pane,
+        thread_id: threadId,
+        client_type: "codex",
+        receiver_mode: "manual-drain",
+        summary: "",
+      });
+      const paneA = await paneRegistration(tuiA.pid, "%8101", "shared.1", threadA);
+      const paneB = await paneRegistration(tuiB.pid, "%8102", "shared.2", threadB);
+
+      const headless = {
+        pid: host.pid,
+        cwd: "/shared-host-pane-adopt",
+        git_root: null,
+        tty: null,
+        tmux_session: null,
+        tmux_window_index: null,
+        tmux_window_name: null,
+        tmux_pane_id: null,
+        client_type: "codex" as const,
+        receiver_mode: "codex-hook" as const,
+        preserve_token: true,
+        summary: "",
+      };
+      const adoptedA = await brokerFetch<{ id: string }>("/register", {
+        ...headless,
+        name: `codex-t${threadA.slice(-8)}`,
+        thread_id: threadA,
+      });
+      const adoptedB = await brokerFetch<{ id: string }>("/register", {
+        ...headless,
+        name: `codex-t${threadB.slice(-8)}`,
+        thread_id: threadB,
+      });
+      expect(adoptedA.id).toBe(paneA.id);
+      expect(adoptedB.id).toBe(paneB.id);
+
+      const heartbeatA = await rawPost("/hook-heartbeat-by-thread", {
+        thread_id: threadA,
+        caller_pid: process.pid,
+        status: "ok",
+        drained: 0,
+        client_type: "codex",
+        receiver_mode: "codex-hook",
+      });
+      expect(heartbeatA.status).toBe(200);
+      const ambiguousPidHeartbeat = await rawPost("/hook-heartbeat-by-pid", {
+        pid: host.pid,
+        caller_pid: process.pid,
+        status: "ok",
+        drained: 0,
+        client_type: "codex",
+        receiver_mode: "codex-hook",
+      });
+      expect(ambiguousPidHeartbeat.status).toBe(404);
+
+      const ro = new Database(TEST_DB, { readonly: true });
+      const rows = ro.query(
+        "SELECT id, pid, seat_pids, last_hook_seen_at FROM peers WHERE lower(thread_id) IN (?, ?) ORDER BY lower(thread_id)",
+      ).all(threadA, threadB) as Array<{
+        id: string;
+        pid: number;
+        seat_pids: string;
+        last_hook_seen_at: string | null;
+      }>;
+      ro.close();
+      expect(rows).toHaveLength(2);
+      const rowA = rows.find((row) => row.id === paneA.id)!;
+      const rowB = rows.find((row) => row.id === paneB.id)!;
+      expect(rowA.pid).toBe(tuiA.pid);
+      expect(rowB.pid).toBe(tuiB.pid);
+      expect(JSON.parse(rowA.seat_pids)).toEqual([tuiA.pid]);
+      expect(JSON.parse(rowB.seat_pids)).toEqual([tuiB.pid]);
+      expect(typeof rowA.last_hook_seen_at).toBe("string");
+      expect(rowB.last_hook_seen_at).toBeNull();
+    } finally {
+      host.kill();
+      tuiA.kill();
+      tuiB.kill();
+      await Promise.all([host.exited, tuiA.exited, tuiB.exited]);
+    }
   });
 
   test("a send to a live session with no adapter process reports mcp_transport dead", async () => {
@@ -3880,12 +4005,17 @@ describe("Live broker delivery features", () => {
     fresh.kill();
   });
 
-  test("rehydration: pane id with conflicting window metadata does NOT inherit", async () => {
+  test("rehydration: exact pane id survives tmux window renumber and auto-rename", async () => {
     const dead = spawnSleep();
     const a = await brokerFetch<{ id: string }>("/register", {
       pid: dead.pid, cwd: "/rehydrate-window-conflict", git_root: "/repo-window-conflict", tty: null,
       name: "a", tmux_session: "rh-window-conflict", tmux_window_index: "0",
       tmux_window_name: "old-window", tmux_pane_id: "%604", summary: "",
+    });
+    await brokerFetch("/send-message", {
+      from_id: a.id,
+      to_id: a.id,
+      text: "survives dead-seat window rename",
     });
     dead.kill();
     await dead.exited;
@@ -3896,7 +4026,9 @@ describe("Live broker delivery features", () => {
       name: "fresh", tmux_session: "rh-window-conflict", tmux_window_index: "1",
       tmux_window_name: "new-window", tmux_pane_id: "%604", summary: "",
     });
-    expect(b.id).not.toBe(a.id);
+    expect(b.id).toBe(a.id);
+    const poll = await brokerFetch<{ messages: { text: string }[] }>("/poll-messages", { id: b.id });
+    expect(poll.messages.map((message) => message.text)).toContain("survives dead-seat window rename");
     fresh.kill();
   });
 

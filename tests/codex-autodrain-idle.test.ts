@@ -101,6 +101,26 @@ describe("paneTextIsIdle", () => {
     expect(paneTextIsIdle(cursorTyped, profileFor("cursor"))).toBe(false);
   });
 
+  test("SKIP (cursor): dim retained previous prompt is not an empty placeholder", () => {
+    // Cursor 2026.08.11 can leave the just-submitted prompt rendered dim in the
+    // composer. A live nudge appended `[peer-mail]` to this text and resubmitted
+    // the combined prompt, so Cursor must accept only its two exact placeholders.
+    const cursorRetained = [
+      "  CURSOR-FRESH-MCP-OK",
+      ` ${ESC}[2m→ Call claude-peers whoami and check_messages.${ESC}[0m`,
+      "  Cursor Grok 4.6 Extra High",
+    ].join("\n");
+    expect(paneTextIsIdle(cursorRetained, profileFor("cursor"))).toBe(false);
+  });
+
+  test("SKIP (cursor): placeholder prefix plus typed text is not empty", () => {
+    const cursorTypedAfterPlaceholder = [
+      ` ${ESC}[2m→ Add a follow-up then deploy${ESC}[0m`,
+      "  Cursor Grok 4.6 Extra High",
+    ].join("\n");
+    expect(paneTextIsIdle(cursorTypedAfterPlaceholder, profileFor("cursor"))).toBe(false);
+  });
+
   test("NUDGE (Grok 4.6): empty boxed ❯ prompt captured from the live TUI", () => {
     const grokIdle = [
       "  Worked for 31s                                      stop  [hooks: 3]",
@@ -131,6 +151,25 @@ describe("paneTextIsIdle", () => {
       "  ● [09:51:27] find /home/manzo running",
       "> ",
       "  ? for shortcuts           Gemini 3.6 Flash",
+    ].join("\n");
+    expect(paneTextIsIdle(agyIdle, profileFor("agy"))).toBe(true);
+  });
+
+  test("NUDGE (agy 1.1.13): mode label is the empty composer, not typed input", () => {
+    const agyIdle = [
+      "18.1k in | 2.5k out | 384 thinking",
+      "  Completed output above remains in the transcript.",
+      "> Accept-edits mode: file edits auto-approved (shift+tab to cycle)",
+      "? for shortcuts          accept-edits · Gemini 3.7 Flash · medium",
+    ].join("\n");
+    expect(paneTextIsIdle(agyIdle, profileFor("agy"))).toBe(true);
+  });
+
+  test("NUDGE (agy 1.1.19): colour SGR before the prompt glyph remains empty", () => {
+    const agyIdle = [
+      `${ESC}[38;2;7;54;66m────────────────────────${ESC}[39m`,
+      `${ESC}[38;2;38;139;210m>${ESC}[39m ${ESC}[38;2;131;148;150mAccept-edits mode: file edits auto-approved (shift+tab to cycle)${ESC}[39m`,
+      `${ESC}[38;2;131;148;150m? for shortcuts${ESC}[39m`,
     ].join("\n");
     expect(paneTextIsIdle(agyIdle, profileFor("agy"))).toBe(true);
   });
@@ -638,6 +677,27 @@ describe("visibleCodexSeatsFromSnapshot", () => {
     expect(seats).toEqual([]);
   });
 
+  test("keeps a shared-seat TUI whose socket path and prompt mention app-server", () => {
+    const snap = {
+      procs: [
+        { pid: 100, ppid: 1, args: "-bash" },
+        {
+          pid: 200,
+          ppid: 100,
+          args: "codex --remote unix:///tmp/claude-peers-relay/app-server.sock --cd /repo Investigate the app-server bind",
+        },
+      ],
+      paneByPid: new Map([["%125", 100]]),
+      paneMap: new Map([[100, { session: "infra", window_index: "3", window_name: "3", pane_id: "%125" }]]),
+    } as any;
+    const seats = visibleCodexSeatsFromSnapshot(snap, {
+      environOf: () => ({ CLAUDE_PEER_NAME: "infra.3", TMUX_PANE: "%125", PWD: "/repo" }),
+      ttyOf: () => "/dev/pts/27",
+      cwdOf: () => "/repo",
+    });
+    expect(seats.map((seat) => seat.name)).toEqual(["infra.3"]);
+  });
+
   test("rejects a process whose env claims a pane it does not occupy", () => {
     const snap = {
       procs: [
@@ -677,7 +737,7 @@ describe("visibleCodexSeatsFromSnapshot", () => {
     expect(seats).toEqual([]);
   });
 
-  test("fails closed when same-pane Codex candidates have different inherited names", () => {
+  test("ignores a same-pane noninteractive Codex child with inherited metadata", () => {
     const snap = {
       procs: [
         { pid: 100, ppid: 1, args: "-bash" },
@@ -698,7 +758,64 @@ describe("visibleCodexSeatsFromSnapshot", () => {
       cwdOf: () => "/home/manzo/Clause5",
     });
 
+    expect(seats.map((seat) => ({ pid: seat.pid, name: seat.name }))).toEqual([
+      { pid: 200, name: "pr.1" },
+    ]);
+  });
+
+  test("ignores a same-pane Bun MCP server child with inherited metadata", () => {
+    const snap = {
+      procs: [
+        { pid: 100, ppid: 1, args: "-bash" },
+        { pid: 200, ppid: 100, args: "cursor-agent" },
+        { pid: 201, ppid: 200, args: "bun /home/manzo/claude-peers-mcp/server.ts" },
+      ],
+      paneByPid: new Map([["%125", 100]]),
+      paneMap: new Map([[100, { session: "infra", window_index: "4", window_name: "cursor-agent", pane_id: "%125" }]]),
+    } as any;
+
+    const seats = visibleCodexSeatsFromSnapshot(snap, {
+      environOf: () => ({ CLAUDE_PEER_NAME: "infra.4", TMUX_PANE: "%125", PWD: "/home/manzo/Clause5" }),
+      ttyOf: () => "/dev/pts/27",
+      cwdOf: () => "/home/manzo/Clause5",
+    });
+
     expect(seats).toEqual([]);
+  });
+
+  test("collapses a same-pane Codex Node shim and native child while ignoring the code-mode host", () => {
+    const snap = {
+      procs: [
+        { pid: 100, ppid: 1, args: "-bash" },
+        {
+          pid: 200,
+          ppid: 100,
+          args: "node /opt/codex/bin/codex --remote unix:///tmp/app-server.sock --cd /repo resume thread",
+        },
+        {
+          pid: 201,
+          ppid: 200,
+          args: "/opt/codex/vendor/codex --remote unix:///tmp/app-server.sock --cd /repo resume thread",
+        },
+        {
+          pid: 202,
+          ppid: 201,
+          args: "/opt/codex/vendor/codex-code-mode-host",
+        },
+      ],
+      paneByPid: new Map([["%125", 100]]),
+      paneMap: new Map([[100, { session: "infra", window_index: "5", window_name: "codex", pane_id: "%125" }]]),
+    } as any;
+
+    const seats = visibleCodexSeatsFromSnapshot(snap, {
+      environOf: () => ({ CLAUDE_PEER_NAME: "infra.5", TMUX_PANE: "%125", PWD: "/repo" }),
+      ttyOf: () => "/dev/pts/27",
+      cwdOf: () => "/repo",
+    });
+
+    expect(seats.map((seat) => ({ pid: seat.pid, name: seat.name }))).toEqual([
+      { pid: 201, name: "infra.5" },
+    ]);
   });
 
   test("parses NUL-separated environ text for hook identity fields", () => {
@@ -896,7 +1013,7 @@ describe("reconcileVisibleCodexSeats", () => {
     expect(posts.map((p) => p.path).some((path) => /claim|ack/i.test(path))).toBe(false);
   });
 
-  test("binds an exact pane status thread after registering the visible seat", async () => {
+  test("allows an explicit trusted thread reader after registering the visible seat", async () => {
     __resetCodexSeatReconcileStateForTest();
     const posts: Array<{ path: string; body: unknown; peerToken?: string }> = [];
     const thread = "019ff65b-9ea6-7751-898a-9c645d30b1e6";
@@ -933,7 +1050,7 @@ describe("reconcileVisibleCodexSeats", () => {
     expect(posts[1]!.peerToken).toBe("token-pr.1");
   });
 
-  test("does not call the thread endpoint when status parsing fails quiet", async () => {
+  test("does not call the thread endpoint when the optional reader has no identity", async () => {
     __resetCodexSeatReconcileStateForTest();
     const paths: string[] = [];
 
@@ -1221,10 +1338,10 @@ describe("nudge wording branches by receive path", () => {
 });
 
 describe("Codex wake-only delivery", () => {
-  test("requires exact pane-seat ownership without darkening legacy receive rows", () => {
+  test("requires exact pane-seat ownership and a broker-bound thread", () => {
     expect(codexLaneReadyForWake(laneWith(1) as never)).toBe(true);
     expect(codexLaneReadyForWake({ ...laneWith(1), seat_key: null } as never)).toBe(false);
-    expect(codexLaneReadyForWake({ ...laneWith(1), thread_id: null } as never)).toBe(true);
+    expect(codexLaneReadyForWake({ ...laneWith(1), thread_id: null } as never)).toBe(false);
     expect(codexLaneReadyForWake({ ...laneWith(1), tmux_pane_id: null } as never)).toBe(false);
     expect(codexLaneReadyForWake({ ...laneWith(1), receiver_mode: "manual-drain" } as never)).toBe(true);
   });
@@ -1233,10 +1350,11 @@ describe("Codex wake-only delivery", () => {
     expect(codexWakeBlockReason({ ...laneWith(1), tmux_pane_id: null } as never)).toBe("no-pane-id");
     expect(codexWakeBlockReason({ ...laneWith(1), seat_key: null } as never)).toBe("no-seat-key");
     expect(codexWakeBlockReason({ ...laneWith(1), seat_key: "pane:infra:%99" } as never)).toBe("seat-pane-mismatch");
+    expect(codexWakeBlockReason({ ...laneWith(1), thread_id: null } as never)).toBe("no-thread-id");
     expect(codexWakeBlockReason(laneWith(1) as never)).toBeNull();
     expect(codexWakeCompatibilityReasons({
       ...laneWith(1), thread_id: null, receiver_mode: "manual-drain",
-    } as never)).toEqual(["no-thread-id", "receiver-mode=manual-drain"]);
+    } as never)).toEqual(["receiver-mode=manual-drain"]);
   });
 
   test("submits only the notification that tells the hook-backed lane to drain", () => {

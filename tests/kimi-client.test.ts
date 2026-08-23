@@ -10,7 +10,13 @@
 
 import { describe, expect, test } from "bun:test";
 import { isClientProcess, detectClientFromProcessChain, initialReceiverMode, type ProcessInfo } from "../shared/client.ts";
-import { profileFor, parseNudgeClients, paneQuiescent, paneFromPidAncestry } from "../bin/codex-autodrain-poller.ts";
+import {
+  profileFor,
+  parseNudgeClients,
+  paneQuiescent,
+  paneFromPidAncestry,
+  quiescenceFingerprint,
+} from "../bin/codex-autodrain-poller.ts";
 import { shouldDisableBackgroundPolling } from "../server.ts";
 
 const row = (comm: string, args: string, pid = 10, ppid = 1): ProcessInfo => ({ pid, ppid, comm, args });
@@ -115,6 +121,18 @@ describe("quiescence gate (real tmux)", () => {
     } finally {
       Bun.spawnSync(["tmux", "kill-session", "-t", session], { stdout: "ignore", stderr: "ignore" });
     }
+  });
+});
+
+describe("quiescence fingerprint", () => {
+  test("ignores Cursor's idle goal timer but preserves real pane changes", () => {
+    const before = "finished\n  Goal active (2h 11m 39s)\n  → Add a follow-up\n";
+    const after = "finished\n  Goal active (2h 11m 41s)\n  → Add a follow-up\n";
+    expect(quiescenceFingerprint(before)).toBe(quiescenceFingerprint(after));
+    expect(quiescenceFingerprint(after.replace("2h", "1d 2h")))
+      .toBe(quiescenceFingerprint(after));
+    expect(quiescenceFingerprint(after.replace("finished", "new output")))
+      .not.toBe(quiescenceFingerprint(after));
   });
 });
 

@@ -10,6 +10,11 @@ const SERVER_SCRIPT = new URL("../server.ts", import.meta.url).pathname;
 const REGISTER_SCRIPT = new URL("../hooks/register-peer-session.ts", import.meta.url).pathname;
 const APP_SERVER_FIXTURE = new URL("./fixtures/codex-app-server-parent.ts", import.meta.url).pathname;
 const APP_SERVER_HOOK_FIXTURE = new URL("./fixtures/codex-app-server-hook-parent.ts", import.meta.url).pathname;
+const APP_SERVER_FIXTURE_DIR = new URL("./fixtures/", import.meta.url).pathname;
+
+function appServerFixtureCommand(targetScript: string): string {
+  return `cd ${JSON.stringify(APP_SERVER_FIXTURE_DIR)} && exec -a codex bun app-server ${JSON.stringify(targetScript)}`;
+}
 
 const canUseTmux = Bun.spawnSync(["tmux", "list-sessions"], { stdout: "ignore", stderr: "ignore" }).exitCode === 0;
 
@@ -50,7 +55,7 @@ const canUseTmux = Bun.spawnSync(["tmux", "list-sessions"], { stdout: "ignore", 
     ]).exitCode).toBe(0);
 
     const threadId = crypto.randomUUID();
-    const command = `exec -a codex bun ${JSON.stringify(APP_SERVER_HOOK_FIXTURE)} ${JSON.stringify(REGISTER_SCRIPT)} app-server`;
+    const command = appServerFixtureCommand(REGISTER_SCRIPT);
     appServer = Bun.spawn(["bash", "-c", command], {
       cwd,
       env: {
@@ -62,6 +67,8 @@ const canUseTmux = Bun.spawnSync(["tmux", "list-sessions"], { stdout: "ignore", 
         CLAUDE_PEERS_DB: broker.dbPath,
         CLAUDE_PEERS_BRIDGE_TOKEN_FILE: broker.tokenPath,
         CLAUDE_PEERS_TMUX_IDENTITY_MIRROR: "0",
+        CLAUDE_PEERS_TEST_APP_SERVER_MODULE: APP_SERVER_HOOK_FIXTURE,
+        CLAUDE_PEERS_TEST_APP_SERVER_CHILD_CWD: cwd,
         HOOK_PROBE_SESSION_ID: threadId,
       },
       stdin: "ignore",
@@ -115,6 +122,8 @@ const canUseTmux = Bun.spawnSync(["tmux", "list-sessions"], { stdout: "ignore", 
         CLAUDE_PEERS_DB: broker.dbPath,
         CLAUDE_PEERS_BRIDGE_TOKEN_FILE: broker.tokenPath,
         CLAUDE_PEERS_TMUX_IDENTITY_MIRROR: "0",
+        CLAUDE_PEERS_TEST_APP_SERVER_MODULE: APP_SERVER_HOOK_FIXTURE,
+        CLAUDE_PEERS_TEST_APP_SERVER_CHILD_CWD: cwd,
         HOOK_PROBE_SESSION_ID: mismatchThreadId,
       },
       stdin: "ignore",
@@ -290,7 +299,7 @@ const canUseTmux = Bun.spawnSync(["tmux", "list-sessions"], { stdout: "ignore", 
     // (~3 second) window but must still resolve through the exact ThreadId.
     await Bun.sleep(3_500);
 
-    const appServerCommand = `exec -a codex bun ${JSON.stringify(APP_SERVER_FIXTURE)} ${JSON.stringify(SERVER_SCRIPT)} app-server`;
+    const appServerCommand = appServerFixtureCommand(SERVER_SCRIPT);
     appServer = Bun.spawn(["bash", "-c", appServerCommand], {
       cwd,
       env: {
@@ -302,6 +311,8 @@ const canUseTmux = Bun.spawnSync(["tmux", "list-sessions"], { stdout: "ignore", 
         CLAUDE_PEERS_DB: broker.dbPath,
         CLAUDE_PEERS_BRIDGE_TOKEN_FILE: broker.tokenPath,
         CLAUDE_PEERS_TMUX_IDENTITY_MIRROR: "0",
+        CLAUDE_PEERS_TEST_APP_SERVER_MODULE: APP_SERVER_FIXTURE,
+        CLAUDE_PEERS_TEST_APP_SERVER_CHILD_CWD: cwd,
         MCP_PROBE_THREAD_ID: threadId,
       },
       stdin: "ignore",
@@ -354,7 +365,7 @@ const canUseTmux = Bun.spawnSync(["tmux", "list-sessions"], { stdout: "ignore", 
     ], { stdout: "pipe", stderr: "pipe" });
     expect(created.exitCode).toBe(0);
 
-    const appServerCommand = `exec -a codex bun ${JSON.stringify(APP_SERVER_FIXTURE)} ${JSON.stringify(SERVER_SCRIPT)} app-server`;
+    const appServerCommand = appServerFixtureCommand(SERVER_SCRIPT);
     appServer = Bun.spawn(["bash", "-c", appServerCommand], {
       cwd,
       env: {
@@ -366,6 +377,8 @@ const canUseTmux = Bun.spawnSync(["tmux", "list-sessions"], { stdout: "ignore", 
         CLAUDE_PEERS_DB: broker.dbPath,
         CLAUDE_PEERS_BRIDGE_TOKEN_FILE: broker.tokenPath,
         CLAUDE_PEERS_TMUX_IDENTITY_MIRROR: "0",
+        CLAUDE_PEERS_TEST_APP_SERVER_MODULE: APP_SERVER_FIXTURE,
+        CLAUDE_PEERS_TEST_APP_SERVER_CHILD_CWD: cwd,
         MCP_PROBE_THREAD_ID: "019fc273-unbound-thread",
       },
       stdin: "ignore",

@@ -99,6 +99,36 @@ describe("seat-anchored registration", () => {
     expect(second.token).toBe(first.token);
   });
 
+  test("tmux auto-renaming the same exact pane preserves its id and queued inbox", async () => {
+    const oldPid = spawnHolder();
+    const newPid = spawnHolder();
+    const first = await register(oldPid, {
+      tmux_pane_id: "%720",
+      tmux_window_index: "1",
+      tmux_window_name: "claude",
+      client_type: "codex",
+      receiver_mode: "manual-drain",
+    });
+    await call("/send-message", {
+      id: first.id,
+      from_id: first.id,
+      to_id: first.id,
+      text: "survives tmux auto-rename",
+    });
+
+    const resumed = await register(newPid, {
+      tmux_pane_id: "%720",
+      tmux_window_index: "4",
+      tmux_window_name: "node",
+      client_type: "codex",
+      receiver_mode: "manual-drain",
+    });
+
+    expect(resumed.id).toBe(first.id);
+    const pending = await call<{ messages: Array<{ text: string }> }>("/poll-messages", { id: resumed.id });
+    expect(pending.messages.map((message) => message.text)).toContain("survives tmux auto-rename");
+  });
+
   test("mail queued on either registration reaches the one seat", async () => {
     const serverPid = spawnHolder();
     const tuiPid = spawnHolder();

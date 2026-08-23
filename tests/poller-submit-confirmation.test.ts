@@ -31,6 +31,7 @@ import {
   composerStillHolds,
   loadNudgeBudgetState,
   nudgeBudgetHealthStatus,
+  pendingUnreadForPeer,
   submissionProbe,
   submitWakeOnlyNudge,
   tick,
@@ -286,6 +287,44 @@ describe("the shipped poller is wake-only", () => {
     });
 
     expect(submissions).toEqual([]);
+    db.close();
+  });
+
+  test("a native hook draining after discovery suppresses the stale pane wake", () => {
+    __resetNudgeBudgetStateForTest();
+    const db = new Database(":memory:");
+    db.run(`CREATE TABLE peers (
+      id TEXT PRIMARY KEY, name TEXT, pid INTEGER NOT NULL, client_type TEXT NOT NULL,
+      tmux_pane_id TEXT, thread_id TEXT, seat_key TEXT, receiver_mode TEXT,
+      last_hook_seen_at TEXT, last_drain_at TEXT, unread_episode INTEGER NOT NULL DEFAULT 0
+    )`);
+    db.run("CREATE TABLE messages (id INTEGER PRIMARY KEY, to_id TEXT NOT NULL, sent_at TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0, delivered_at TEXT)");
+    db.run("INSERT INTO peers VALUES ('claude-seat', 'orch.4', ?, 'claude', '%45', NULL, 'pane:orch:%45', 'claude-channel', NULL, NULL, 1)", [process.pid]);
+    db.run("INSERT INTO messages VALUES (1, 'claude-seat', '2026-08-22T10:00:00.000Z', 0, NULL)");
+    const snap: TickSnapshot = {
+      procs: [{ pid: process.pid, ppid: 1, args: "claude" }],
+      paneByPid: new Map([["%45", process.pid]]),
+      paneMap: new Map([[process.pid, {
+        session: "orch", window_index: "1", window_name: "orch.4", pane_index: "4", pane_id: "%45",
+      }]]),
+    };
+    let submissions = 0;
+
+    tick(db, snap, {
+      nudgeableClients: ["claude"],
+      isPidAlive: () => true,
+      paneIsIdle: () => {
+        // Exact race: discovery saw one row, then Claude's native hook claimed
+        // and acknowledged it before the poller reached tmux transport.
+        db.run("UPDATE messages SET delivered = 1, delivered_at = '2026-08-22T10:00:01.000Z' WHERE id = 1");
+        return true;
+      },
+      nudgeLane: () => { submissions++; return "submitted"; },
+    });
+
+    expect(pendingUnreadForPeer(db, "claude-seat")).toBe(0);
+    expect(submissions).toBe(0);
+    expect(__nudgeAttemptCountForTest("claude-seat")).toBeUndefined();
     db.close();
   });
 

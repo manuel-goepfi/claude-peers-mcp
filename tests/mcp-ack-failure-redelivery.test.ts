@@ -6,7 +6,12 @@ import { startTestBroker, type TestBroker } from "./helpers/test-broker.ts";
 
 const SERVER_SCRIPT = new URL("../server.ts", import.meta.url).pathname;
 const APP_SERVER_FIXTURE = new URL("./fixtures/codex-app-server-parent.ts", import.meta.url).pathname;
+const APP_SERVER_FIXTURE_DIR = new URL("./fixtures/", import.meta.url).pathname;
 const REPO_ROOT = new URL("..", import.meta.url).pathname;
+
+function appServerFixtureCommand(targetScript: string): string {
+  return `cd ${JSON.stringify(APP_SERVER_FIXTURE_DIR)} && exec -a codex bun app-server ${JSON.stringify(targetScript)}`;
+}
 const canUseTmux = Bun.spawnSync(["tmux", "-V"], {
   stdout: "ignore",
   stderr: "ignore",
@@ -254,12 +259,14 @@ test("check_messages returns a claimed body when ACK fails and the lease can be 
       CLAUDE_PEERS_BRIDGE_TOKEN_FILE: broker.tokenPath,
       CLAUDE_PEERS_CLIENT_TYPE: "codex",
       CLAUDE_PEERS_TMUX_IDENTITY_MIRROR: "0",
+      CLAUDE_PEERS_TEST_APP_SERVER_MODULE: APP_SERVER_FIXTURE,
+      CLAUDE_PEERS_TEST_APP_SERVER_CHILD_CWD: REPO_ROOT,
       CLAUDE_PEER_NAME: undefined,
       TMUX: undefined,
       TMUX_PANE: undefined,
     }).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
   );
-  const appServerCommand = `exec -a codex bun ${JSON.stringify(APP_SERVER_FIXTURE)} ${JSON.stringify(SERVER_SCRIPT)} app-server`;
+  const appServerCommand = appServerFixtureCommand(SERVER_SCRIPT);
   const transport = new StdioClientTransport({
     command: "bash",
     args: ["-c", appServerCommand],

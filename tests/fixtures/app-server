@@ -1,0 +1,8 @@
+const fixtureModule = process.env.CLAUDE_PEERS_TEST_APP_SERVER_MODULE;
+const childCwd = process.env.CLAUDE_PEERS_TEST_APP_SERVER_CHILD_CWD;
+
+if (!fixtureModule) throw new Error("CLAUDE_PEERS_TEST_APP_SERVER_MODULE is required");
+if (!childCwd) throw new Error("CLAUDE_PEERS_TEST_APP_SERVER_CHILD_CWD is required");
+
+process.chdir(childCwd);
+await import(fixtureModule);
