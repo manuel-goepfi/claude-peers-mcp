@@ -48,9 +48,11 @@ poller never claims or acknowledges mailbox rows itself.
 
 ## Managed auto-wake scope
 
-The shipped unit enables wake-only notifications for every supported client so
-legacy/manual-drain lanes retain their receive path. The standalone binary still
-defaults to no clients unless `NUDGE_CLIENTS` is set:
+The shipped unit enables wake-only notifications for every supported client.
+Native Codex hooks drain mail during a turn; the poller covers mail that arrives
+after the turn becomes idle. A final SQLite unread re-check suppresses the wake
+when a native hook drained after candidate discovery. The standalone binary
+still defaults to no clients unless `NUDGE_CLIENTS` is set:
 
 ```
 Environment=NUDGE_CLIENTS=codex,gemini,claude,cursor,agy,kimi,grok

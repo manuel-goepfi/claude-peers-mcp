@@ -85,6 +85,29 @@ After MCP or hook changes:
 
 Missing or unproven Codex/Gemini hooks intentionally produce `manual-drain`; use `check_messages` until registration and hook heartbeats prove the automatic path. For Codex, automatic registration and drain require a root-session hook whose `session_id` matches the rollout transcript filename. Internal or child hooks that cannot prove that join do not claim mail; the queued batch remains available to `check_messages` or the next proven root hook.
 
+### Shared Codex Desktop relay
+
+Use `bin/codex-shared-seat` only from a tmux pane when the Desktop app-server
+thread must remain the lane's peer identity. A successful launch produces:
+
+- one `node --experimental-strip-types bin/codex-appserver-relay.ts` child on
+  the pane TTY;
+- a private `claude-peers-codex-relay.*` runtime directory;
+- a 0600 `app-server.sock` and 0600 readiness file;
+- `$CODEX_HOME/logs/codex-shared-relay-<pane>.log`.
+
+Node >=22.6 is intentional for this one process. Do not replace it with Bun
+without a release-pinned proof that Bun's WebSocket client supports the
+Codex `ws+unix` upstream. The wrapper stops the relay and removes the runtime
+artifacts when the TUI exits.
+
+For a failed launch, inspect the pane-specific relay log, verify the upstream
+app-server socket, run the relay transport and pane-bind tests, then resume the
+same thread through the wrapper. A `409` live-pane conflict is fail-closed and
+must not be bypassed. Outside tmux the wrapper only co-attaches; it cannot
+publish an exact peer seat, so use a normal pane-local Codex session when peer
+tools are required.
+
 ## Upgrade order
 
 Upgrade the broker before its adapters because the broker owns schema compatibility:
@@ -151,6 +174,7 @@ Require the final command to print `ok`, retain the pre-compaction backup, start
 | Unsupported/newer schema | Doctor schema classification and running binary version | Stop the older broker; deploy a compatible broker. Do not downgrade the live database in place. |
 | Hook current but no automatic receipt | Doctor receiver mode/health, client restart, Codex `/hooks` trust | Restart, confirm trust, reinstall/check one scope, and use `check_messages` meanwhile. |
 | Hook or MCP entry stale | `--check`, doctor user/project classification | Re-run the relevant installer. |
+| Shared Codex seat has `pane missing` | Relay log, upstream socket, tmux pane, `/identity-by-thread`, pane-bind tests | Reopen through `bin/codex-shared-seat` in tmux. Do not infer identity by cwd or pane text. |
 | Duplicate user/project scope | Doctor `duplicate_scope` | Choose one owner. Install there, then explicitly run `--uninstall` for the other scope. |
 | Repeated auth/churn failures | Adapter stderr, broker readiness, process correlation | Restore broker reachability; the adapter receives a continuous grace period before self-exit. Restart only after the owner is stable. |
 | Messages remain `claimed` | Receiver health, claim age, hook execution | Let the 30-second lease expire, repair the receiver, then reclaim. Do not mark delivery manually. |

@@ -153,3 +153,94 @@ b5fd484 fix: persist nudge budgets across restarts
 - Installed unit equals the tracked unit; one poller process is active; heartbeat is `nudge_budget=ready`.
 - `bun bin/peers-doctor.ts`: broker/database ready, receiver errors `0`, summary `degraded` with one warning because historical rows retain dead adapters. This is topology debt, not a receive-path failure.
 - Local HEAD and remote branch both resolve to `b5fd484885e37deab6920c0a3f0ee9c8e517f4b0` before this documentation-only addendum.
+
+## Implementation closure addendum — 2026-08-15
+
+The remaining shared-app-server identity, long-turn drain, multi-client idle,
+and Codex approval work is complete in the working tree based on `e1607e8`.
+This addendum records the exact pre-publication acceptance evidence; the final
+commit and remote SHA are reported by the publishing session after commit.
+
+### Codex identity and hooks
+
+- `codexd` and `codexd resume` now attach through a pane-local observation
+  relay. The relay accepts only successful root `thread/start` and
+  `thread/resume` responses, then asks the broker to re-prove UID, controlling
+  TTY, tmux pane ancestry, and the one native interactive Codex TUI on that
+  TTY. Rendering width, pane numbers, cwd uniqueness, and status-line pixels
+  are not identity inputs.
+- The visible-Codex classifier now reads exact `/proc/<pid>/cmdline` argv
+  boundaries. An interactive initial prompt containing words such as `a`,
+  `review`, or `apply` is no longer mistaken for a Codex subcommand; real
+  `codex exec`, `review`, and other noninteractive commands remain excluded.
+- Codex `PostToolUse` drains only through an already-bound exact thread. It
+  cannot mint identity and does not use Stop's blocking decision. Claude uses
+  one `PostToolBatch` drain per parallel batch, not concurrent `PostToolUse`.
+  The official references are [Codex hooks](https://developers.openai.com/codex/hooks)
+  and [Claude Code hooks](https://code.claude.com/docs/en/hooks).
+
+### Codex A/B approval policy
+
+The operator explicitly classified `claude-peers` as a trusted same-user,
+loopback coordination server. Both `~/.codex/config.toml` and
+`~/.codex-b/config.toml` now set:
+
+```toml
+[mcp_servers.claude-peers]
+default_tools_approval_mode = "approve"
+```
+
+This is the official server-wide MCP default, so every peers tool inherits
+automatic approval unless an explicit per-tool override says otherwise. The
+current Codex A account passed an already-open hook receive and a fresh
+Clause5 outbound `send_message` call without an MCP approval dialog; the
+attached receipt was `APPROVAL-OUTBOUND-LIVE-OK`. Codex B loads the same
+effective policy, but its account currently reports `Not logged in`, so no B
+model turn was fabricated as live proof.
+
+### Current multi-client acceptance matrix
+
+| Client | Current acceptance |
+|---|---|
+| Codex A | PASS — old and fresh receive; fresh outbound peers tool ran without approval |
+| Codex B | CONFIG PASS / LIVE BLOCKED — correct effective policy, account not logged in |
+| Cursor `v2026.08.11-e8db854` | PASS — 10 tools discovered; message `17767` got one wake, drained, and printed `CURSOR-PEERS-NUDGE-OK` |
+| Grok 4.6 | PASS — message `17761` got one wake, drained, and printed `GROK-PEERS-NUDGE-OK` |
+| Kimi 0.36.1 | PASS — 10 tools connected; after disposable session approvals, message `17765` drained and printed `KIMI-PEERS-NUDGE-OK` |
+| Agy / Antigravity 1.1.13 | PASS — message `17762` got one wake, drained, and printed `AGY-PEERS-NUDGE-OK` |
+
+Every Agy, Kimi, Cursor, and Codex acceptance pane created by this test was
+closed afterward. Existing operator lanes were not restarted or killed.
+
+The live Cursor exercise exposed one final fail-open shape: Cursor can retain
+the just-submitted prompt dim in its composer. The old generic all-dim rule
+treated that retained text as an empty placeholder and appended the wake. The
+profile now accepts only the exact vendor placeholders `Plan, search, build
+anything` and `Add a follow-up`; retained or prefix-plus-typed text fails
+closed. A live retest then produced the clean `17767` receipt above.
+
+Agy 1.1.13 now recognizes its literal empty mode composer and ignores old
+completed transcript counters containing `thinking`; it still refuses a pane
+showing the active `esc to cancel` marker. The nudger therefore waits for real
+idle state and real undelivered mail.
+
+### Hooks versus NudgeR
+
+Hooks are the primary and more token-efficient receive path: they piggyback on
+a turn already in progress (`UserPromptSubmit`, Codex `PostToolUse`, Claude
+`PostToolBatch`, and `Stop`) and do not create a separate model turn merely to
+poll. NudgeR is the liveness fallback for genuinely idle manual-drain clients
+that have no compatible mid-turn hook surface. It wakes only an exact live
+seat with an exact undelivered row, an empty composer, and a bounded persisted
+attempt budget. Both paths are retained because hooks cannot wake every idle
+third-party TUI, while nudging every active turn would waste tokens and risk
+composer interference.
+
+### Final verification
+
+- Focused idle/submission gate: **159/159 tests**, 284 assertions.
+- Full `bun test`: **1,203/1,203 tests**, **3,806 assertions**, 77 files.
+- `bun run typecheck`: PASS.
+- Clean-install smoke: PASS for Claude, Codex, and Gemini using
+  `register-discover-send-ack` with no credentials required.
+- Broker and autodrain systemd services remained active during live acceptance.

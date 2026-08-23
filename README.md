@@ -7,7 +7,8 @@ This is the maintained Manzo downstream of [Louis Arge's upstream project](https
 ## Supported boundary
 
 - Linux with `/proc`, one operating-system user, and loopback networking.
-- Bun 1.3.11, pinned by `packageManager`, `engines`, and CI.
+- Bun 1.3.11, pinned by `packageManager`, `engines`, and CI. Node >=22.6 is
+  required only for the optional shared Codex Desktop relay described below.
 - At least one supported client: Claude Code, Codex CLI, or Gemini CLI.
 - Git for installation. `tmux` is optional and only needed for pane identity or explicit pane inspection. A systemd user manager is optional.
 - Remote brokers, multi-user authorization, Windows/macOS support, and shared-process multiplexing are not part of this release.
@@ -97,6 +98,30 @@ CODEX_HOME="$HOME/.codex-b" bun bin/install-codex-hook.ts --check
 
 The post-tool hooks are the supported mid-turn receive path. They inject queued mail before the next model request without typing into a busy pane. A tool-free model call cannot be interrupted and receives mail at its next supported hook boundary.
 - Gemini: `SessionStart` registration and `BeforeAgent` drain. The installer also renders its supported `mcpServers` entry.
+
+### Shared Codex Desktop seats
+
+`bin/codex-shared-seat` attaches an interactive tmux Codex TUI to the shared
+Desktop app-server through a private pane-local relay. The relay forwards the
+protocol unchanged. It observes only successful root `thread/start` and
+`thread/resume` responses, then publishes that exact thread/pane join to the
+loopback broker. This path does not depend on pane width, status-line text, or
+cwd uniqueness.
+
+The wrapper requires a verified `TMUX_PANE` for peer binding. Outside tmux it
+still performs the Desktop co-attach, but it deliberately creates no targetable
+peer identity because there is no exact pane proof; use a normal pane-local
+Codex session when non-tmux peer tools are required. The relay creates a 0700
+runtime directory under `$XDG_RUNTIME_DIR` or `/tmp`, a 0600 Unix socket and
+readiness file, and an owner-only log at
+`$CODEX_HOME/logs/codex-shared-relay-<pane>.log`. The wrapper removes its socket
+and readiness artifacts and terminates the relay when the TUI exits.
+
+The relay is the one documented Node runtime exception. Bun 1.3.11 can serve a
+Unix WebSocket but its client cannot connect to the Codex app-server's
+`ws+unix` endpoint. The relay therefore runs on Node >=22.6 with the pinned
+upstream `ws` package. `tests/codex-appserver-relay.test.ts` proves lifecycle
+forwarding, bind retry/idempotence, and owner-only artifact modes.
 
 Project scope is explicit:
 
@@ -207,6 +232,9 @@ History intentionally outlives ephemeral peer rows. Schema version 1 has no mess
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `CLAUDE_PEERS_PORT` | `7899` | Loopback broker port. |
+| `CLAUDE_PEERS_CODEX_APP_SERVER_SOCKET` | `$CODEX_HOME/app-server-control/app-server-control.sock` | Upstream socket used by the optional shared Codex Desktop relay. |
+| `CLAUDE_PEERS_CODEX_RELAY` | `<clone>/bin/codex-appserver-relay.ts` | Explicit relay implementation override for testing or packaging. |
+| `CLAUDE_PEERS_REAL_CODEX` | `codex` from `PATH` | Real Codex executable used by `bin/codex-shared-seat`. |
 | `CLAUDE_PEERS_HOST` / `CLAUDE_PEERS_HOSTNAME` | unset | Optional loopback-only bind assertions; non-loopback values are rejected. |
 | `CLAUDE_PEERS_DB` | `$HOME/.claude-peers.db` | SQLite database. |
 | `CLAUDE_PEERS_BACKUP` | `<db>.backup` | Verified migration/rollback backup. |
@@ -272,7 +300,7 @@ bun bin/install-broker-service.ts --uninstall
 
 The AP-063 bridge is a privileged, authenticated history cursor for a same-user observer. Compatibility keeps it enabled by default. Its token grants access to message history; protect it as a secret. Set `CLAUDE_PEERS_BRIDGE_ENABLED=false` for complete removal.
 
-The hook wake poller is separate from core delivery. The binary defaults to disabled; the shipped managed unit opts every supported hook/manual client into confirmed tmux wake submissions so existing lanes keep their receive path. It never claims or acknowledges mail itself. See [docs/systemd/README.md](docs/systemd/README.md).
+The hook wake poller is separate from core delivery. The binary defaults to disabled; the shipped managed unit opts every supported client into confirmed tmux wake submissions. Native Codex hooks drain during an active turn, while the poller covers mail arriving after the turn is already idle. It re-checks SQLite immediately before transport and never claims or acknowledges mail itself. See [docs/systemd/README.md](docs/systemd/README.md).
 
 ## Security model
 
