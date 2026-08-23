@@ -63,7 +63,6 @@ export function renderBrokerService(config: BrokerServiceConfig): string {
   return `# Managed by claude-peers. Use bin/install-broker-service.ts; do not edit in place.
 [Unit]
 Description=claude-peers broker
-After=default.target
 
 [Service]
 Type=simple

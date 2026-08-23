@@ -1,7 +1,7 @@
 [Unit]
 Description=claude-peers wake-only poller (wakes supported idle lanes for peer mail)
 Documentation=file://%h/claude-peers-mcp/bin/codex-autodrain-poller.ts
-After=default.target claude-peers-broker.service
+After=claude-peers-broker.service
 Wants=claude-peers-broker.service
 
 # Fail-loud cap: if the poller crashes >5 times in 60s, stop trying — operator
