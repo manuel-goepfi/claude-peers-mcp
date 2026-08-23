@@ -56,6 +56,118 @@ describe("tmux birth-time operator labels", () => {
     expect(tmux.calls).toContainEqual(["set-option", "-p", "-t", "%9", "@operator_label", "infra.4"]);
   });
 
+  test("a pane that disappears before its birth hook runs is skipped", () => {
+    const calls: string[][] = [];
+    const run: TmuxLabelRunner = (args) => {
+      calls.push(args);
+      if (args[0] === "display-message") return { ok: false, out: "" };
+      if (args[0] === "list-panes") return { ok: true, out: "%8\n%10\n" };
+      return { ok: false, out: "" };
+    };
+
+    expect(ensurePaneOperatorLabel("%9", run)).toEqual({ status: "skipped", reason: "pane-gone" });
+    expect(calls).toEqual([
+      ["display-message", "-p", "-t", "%9", expect.any(String)],
+      ["list-panes", "-a", "-F", "#{pane_id}"],
+    ]);
+  });
+
+  test("a snapshot failure remains failed when the target pane still exists", () => {
+    const run: TmuxLabelRunner = (args) => {
+      if (args[0] === "display-message") return { ok: false, out: "" };
+      if (args[0] === "list-panes") return { ok: true, out: "%8\n%9\n" };
+      return { ok: false, out: "" };
+    };
+
+    expect(ensurePaneOperatorLabel("%9", run)).toEqual({
+      status: "failed",
+      reason: "pane-snapshot-failed",
+    });
+  });
+
+  test("a pane-list failure does not disguise a snapshot failure as a vanished pane", () => {
+    const run: TmuxLabelRunner = () => ({ ok: false, out: "" });
+
+    expect(ensurePaneOperatorLabel("%9", run)).toEqual({
+      status: "failed",
+      reason: "pane-list-failed",
+    });
+  });
+
+  test("a pane that disappears between snapshot and label write is skipped", () => {
+    const tmux = fakeTmux({
+      snapshot: "%9\tinfra\t1\tgrok\t1\t\t\n",
+      setSucceeds: false,
+      allPanes: "%8\n",
+    });
+
+    expect(ensurePaneOperatorLabel("%9", tmux.run)).toEqual({ status: "skipped", reason: "pane-gone" });
+  });
+
+  test("a label write failure remains failed while the target pane still exists", () => {
+    const tmux = fakeTmux({
+      snapshot: "%9\tinfra\t1\tgrok\t1\t\t\n",
+      setSucceeds: false,
+      allPanes: "%8\n%9\n",
+    });
+
+    expect(ensurePaneOperatorLabel("%9", tmux.run)).toEqual({
+      status: "failed",
+      reason: "label-write-failed",
+    });
+  });
+
+  test("a pane-list failure does not disguise a label write failure as a vanished pane", () => {
+    const run: TmuxLabelRunner = (args) => {
+      if (args[0] === "display-message") return { ok: true, out: "%9\tinfra\t1\tgrok\t1\t\t\n" };
+      if (args[0] === "list-panes" && args.includes("-s")) return { ok: true, out: "%9\t\t\n" };
+      if (args[0] === "set-option") return { ok: false, out: "" };
+      return { ok: false, out: "" };
+    };
+
+    expect(ensurePaneOperatorLabel("%9", run)).toEqual({
+      status: "failed",
+      reason: "label-write-failed",
+    });
+  });
+
+  test("a pane that disappears between snapshot and sibling enumeration is skipped", () => {
+    const run: TmuxLabelRunner = (args) => {
+      if (args[0] === "display-message") return { ok: true, out: "%9\tinfra\t1\tgrok\t2\t\t\n" };
+      if (args[0] === "list-panes" && args.includes("-s")) return { ok: false, out: "" };
+      if (args[0] === "list-panes") return { ok: true, out: "%8\n" };
+      return { ok: false, out: "" };
+    };
+
+    expect(ensurePaneOperatorLabel("%9", run)).toEqual({ status: "skipped", reason: "pane-gone" });
+  });
+
+  test("a sibling-list failure remains failed while the target pane exists", () => {
+    const run: TmuxLabelRunner = (args) => {
+      if (args[0] === "display-message") return { ok: true, out: "%9\tinfra\t1\tgrok\t2\t\t\n" };
+      if (args[0] === "list-panes" && args.includes("-s")) return { ok: false, out: "" };
+      if (args[0] === "list-panes") return { ok: true, out: "%8\n%9\n" };
+      return { ok: false, out: "" };
+    };
+
+    expect(ensurePaneOperatorLabel("%9", run)).toEqual({
+      status: "failed",
+      reason: "session-list-failed",
+    });
+  });
+
+  test("a pane-list failure does not disguise a sibling-list failure as a vanished pane", () => {
+    const run: TmuxLabelRunner = (args) => {
+      if (args[0] === "display-message") return { ok: true, out: "%9\tinfra\t1\tgrok\t2\t\t\n" };
+      return { ok: false, out: "" };
+    };
+
+    expect(ensurePaneOperatorLabel("%9", run)).toEqual({
+      status: "failed",
+      reason: "session-list-failed",
+    });
+  });
+
   test("a deliberate one-pane window name is donated while generic grok is not", () => {
     const named = fakeTmux({ snapshot: "%10\treview\t0\tREVIEW-1996\t1\t\t\n" });
     expect(ensurePaneOperatorLabel("%10", named.run)).toEqual({ status: "labeled", label: "REVIEW-1996" });
@@ -82,5 +194,30 @@ describe("tmux birth-time operator labels", () => {
     expect(calls.filter((args) => args[0] === "set-option")).toEqual([
       ["set-option", "-p", "-t", "%2", "@operator_label", "infra.2"],
     ]);
+  });
+
+  test("install-time backfill tolerates a pane disappearing after enumeration", () => {
+    let allPaneQueries = 0;
+    const run: TmuxLabelRunner = (args) => {
+      if (args[0] === "list-panes" && args.includes("#{pane_id}")) {
+        allPaneQueries++;
+        return { ok: true, out: allPaneQueries === 1 ? "%9\n" : "" };
+      }
+      if (args[0] === "display-message") return { ok: false, out: "" };
+      return { ok: false, out: "" };
+    };
+
+    expect(labelAllUnlabeledPanes(run)).toEqual({ visited: 1, labeled: 0, failed: 0 });
+    expect(allPaneQueries).toBe(2);
+  });
+
+  test("install-time backfill counts a failed snapshot when the pane still exists", () => {
+    const run: TmuxLabelRunner = (args) => {
+      if (args[0] === "list-panes") return { ok: true, out: "%9\n" };
+      if (args[0] === "display-message") return { ok: false, out: "" };
+      return { ok: false, out: "" };
+    };
+
+    expect(labelAllUnlabeledPanes(run)).toEqual({ visited: 1, labeled: 0, failed: 1 });
   });
 });

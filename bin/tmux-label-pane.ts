@@ -14,6 +14,7 @@ export type TmuxLabelRunner = (args: string[]) => TmuxLabelCommandResult;
 
 export type PaneLabelResult =
   | { status: "preserved" | "labeled"; label: string }
+  | { status: "skipped"; reason: "pane-gone" }
   | { status: "failed"; reason: string };
 
 interface PaneSnapshot {
@@ -71,12 +72,26 @@ function usedOperatorLabels(raw: string, currentPaneId: string): string[] {
   return labels;
 }
 
+function panePresence(paneId: string, run: TmuxLabelRunner): "present" | "absent" | "unknown" {
+  const livePanes = run(["list-panes", "-a", "-F", "#{pane_id}"]);
+  if (!livePanes.ok) return "unknown";
+  return livePanes.out.split("\n").some((value) => value.trim() === paneId)
+    ? "present"
+    : "absent";
+}
+
 export function ensurePaneOperatorLabel(
   paneId: string,
   run: TmuxLabelRunner = runTmux,
 ): PaneLabelResult {
   const snapshotResult = run(["display-message", "-p", "-t", paneId, SNAPSHOT_FORMAT]);
-  if (!snapshotResult.ok) return { status: "failed", reason: "pane-not-found" };
+  if (!snapshotResult.ok) {
+    const presence = panePresence(paneId, run);
+    if (presence === "unknown") return { status: "failed", reason: "pane-list-failed" };
+    return presence === "present"
+      ? { status: "failed", reason: "pane-snapshot-failed" }
+      : { status: "skipped", reason: "pane-gone" };
+  }
   const pane = parseSnapshot(snapshotResult.out);
   if (!pane || pane.paneId !== paneId) return { status: "failed", reason: "invalid-pane-snapshot" };
 
@@ -89,7 +104,11 @@ export function ensurePaneOperatorLabel(
       "list-panes", "-s", "-t", pane.session,
       "-F", "#{pane_id}\t#{@operator_label}\t#{@peer_label}",
     ]);
-    if (!siblings.ok) return { status: "failed", reason: "session-list-failed" };
+    if (!siblings.ok) {
+      return panePresence(pane.paneId, run) === "absent"
+        ? { status: "skipped", reason: "pane-gone" }
+        : { status: "failed", reason: "session-list-failed" };
+    }
     label = chooseOperatorLabel(
       pane.session,
       pane.paneIndex,
@@ -102,8 +121,9 @@ export function ensurePaneOperatorLabel(
   // Birth-time allocation owns only the human label. Broker identity fields are
   // registration-owned and must never be fabricated for a zero-turn pane.
   const stamped = run(["set-option", "-p", "-t", pane.paneId, "@operator_label", label]);
-  return stamped.ok
-    ? { status: "labeled", label }
+  if (stamped.ok) return { status: "labeled", label };
+  return panePresence(pane.paneId, run) === "absent"
+    ? { status: "skipped", reason: "pane-gone" }
     : { status: "failed", reason: "label-write-failed" };
 }
 
