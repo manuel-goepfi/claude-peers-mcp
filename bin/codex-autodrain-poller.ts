@@ -240,11 +240,14 @@ const PROFILES: Record<string, IdleProfile> = {
   // Grok 4.6 draws its input as "│ ❯ ... │". Keep the older bare >/$ forms
   // for compatibility, but strip the box's right border before deciding whether
   // the input is empty. Real typed text remains and therefore still blocks a wake.
+  // Busy regex is proven live (Thinking… / Esc:cancel). Do not require quiescence:
+  // two unchanged idle ticks at a 15s interval is ~30s, which looks like "no
+  // nudger" on grok/manual-drain seats. Match claude/codex: first idle tick may wake.
   grok: { prompt: /(^|\n)(?:\s*│\s*❯\s|\s*[>$]\s)/,
           promptLine: /^(?:\s*│\s*❯|\s*[>$])/,
           strip: /^(?:.*?❯\s?|.*?[>$]\s?)/,
           stripTail: /(?:\x1b\[[0-9;]*m|\s)*│(?:\x1b\[[0-9;]*m|\s)*$/,
-          busy: [/esc(?::|\s+to\s+)(cancel|interrupt)/i], requiresQuiescence: true },
+          busy: [/esc(?::|\s+to\s+)(cancel|interrupt)/i] },
 };
 export function profileFor(clientType: string): IdleProfile {
   return PROFILES[clientType] ?? PROFILES.codex!;

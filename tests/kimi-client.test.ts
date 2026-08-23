@@ -80,7 +80,9 @@ describe("kimi idle profile", () => {
   test("clients with known busy vocabulary do NOT require quiescence", () => {
     expect(profileFor("codex").requiresQuiescence).toBeUndefined();
     expect(profileFor("claude").requiresQuiescence).toBeUndefined();
+    expect(profileFor("grok").requiresQuiescence).toBeUndefined();
     expect(profileFor("codex").busy.length).toBeGreaterThan(0);
+    expect(profileFor("grok").busy.length).toBeGreaterThan(0);
   });
 
   test("an unknown client still falls back to the codex profile", () => {

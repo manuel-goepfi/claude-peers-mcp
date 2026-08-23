@@ -126,6 +126,10 @@ describe("paneTextIsIdle", () => {
     expect(paneTextIsIdle(grokBusy, profileFor("grok"))).toBe(false);
   });
 
+  test("Grok with a proven busy marker does not wait for quiescence", () => {
+    expect(profileFor("grok").requiresQuiescence).toBeUndefined();
+  });
+
   test("NUDGE (agy): empty column-0 '>' prompt with indented output above", () => {
     const agyIdle = [
       "  ● [09:51:27] find /home/manzo running",
