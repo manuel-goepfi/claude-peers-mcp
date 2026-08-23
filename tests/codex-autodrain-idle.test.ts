@@ -135,6 +135,25 @@ describe("paneTextIsIdle", () => {
     expect(paneTextIsIdle(agyIdle, profileFor("agy"))).toBe(true);
   });
 
+  test("NUDGE (agy 1.1.13): mode label is the empty composer, not typed input", () => {
+    const agyIdle = [
+      "18.1k in | 2.5k out | 384 thinking",
+      "  Completed output above remains in the transcript.",
+      "> Accept-edits mode: file edits auto-approved (shift+tab to cycle)",
+      "? for shortcuts          accept-edits · Gemini 3.7 Flash · medium",
+    ].join("\n");
+    expect(paneTextIsIdle(agyIdle, profileFor("agy"))).toBe(true);
+  });
+
+  test("NUDGE (agy 1.1.19): colour SGR before the prompt glyph remains empty", () => {
+    const agyIdle = [
+      `${ESC}[38;2;7;54;66m────────────────────────${ESC}[39m`,
+      `${ESC}[38;2;38;139;210m>${ESC}[39m ${ESC}[38;2;131;148;150mAccept-edits mode: file edits auto-approved (shift+tab to cycle)${ESC}[39m`,
+      `${ESC}[38;2;131;148;150m? for shortcuts${ESC}[39m`,
+    ].join("\n");
+    expect(paneTextIsIdle(agyIdle, profileFor("agy"))).toBe(true);
+  });
+
   test("SKIP (agy): an INDENTED '>' line (blockquote in output) is not a prompt", () => {
     const agyQuote = [
       "  > quoted output line",

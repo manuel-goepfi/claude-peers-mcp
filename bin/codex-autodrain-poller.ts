@@ -211,12 +211,23 @@ const PROFILES: Record<string, IdleProfile> = {
   cursor: { prompt: /(^|\n)\s*→\s/, promptLine: /^\s*→/, strip: /^.*?→\s?/, busy: CURSOR_BUSY,
             placeholderText: /^(Plan, search, build anything|Add a follow-up)/,
             requiresQuiescence: true },
-  // agy (Google's agent CLI): bare ASCII `>` input prompt, but COLUMN-0
-  // anchored — all agy transcript/output lines are indented ≥1 space, so the
-  // usual ASCII-'>' ambiguity (blockquotes, diff context) does not apply as
-  // long as the regexes forbid leading whitespace. Do NOT add \s* here.
-  agy: { prompt: /(^|\n)>(\s|$)/, promptLine: /^>(\s|$)/, strip: /^>\s?/,
-         busy: [/esc to (cancel|interrupt)/i, /\bGenerating\b/i, /\bThinking\b/i] },
+  // agy / Antigravity CLI: bare ASCII `>` input prompt, but COLUMN-0 anchored.
+  // All transcript/output lines are indented at least one space, so do not add
+  // leading whitespace to these matchers. The empty composer can carry a mode
+  // label instead of a dim placeholder.
+  // Completed transcript counters contain the word "thinking", so matching it
+  // across the whole capture permanently false-busies an idle lane. Require
+  // quiescence instead; typed text remains non-placeholder and still blocks.
+  agy: { prompt: /(^|\n)>(\s|$)/, promptLine: /^>(\s|$)/,
+         // Agy 1.1.19 emits the prompt colour SGR before the glyph. Match only
+         // leading SGR sequences plus the already-validated column-zero `>`;
+         // preserve every sequence after the glyph for placeholder dim/colour
+         // analysis. Without this, the raw-line strip leaves `>` behind and an
+         // empty mode placeholder is misclassified as typed operator input.
+         strip: /^(?:\x1b\[[0-9;]*m)*>\s?/,
+         busy: [/esc to (cancel|interrupt)/i],
+         placeholderText: /^Accept-edits mode: file edits auto-approved \(shift\+tab to cycle\)$/i,
+         requiresQuiescence: true },
   // kimi (Moonshot's CLI): input is drawn in a rounded box, prompt line is
   // U+2502 + ">" ("│ >"). The busy vocabulary has NOT been observed mid-turn on
   // this host and could not be recovered from the binary, so this profile carries
@@ -605,6 +616,23 @@ export function lanesWithUnread(db: Database, nudgeableClients: string[] = NUDGE
     GROUP BY p.id
     HAVING unread > 0
   `).all(...nudgeableClients) as Lane[];
+}
+
+/**
+ * Re-read the exact recipient mailbox at the final transport boundary.
+ *
+ * Candidate discovery and pane validation take long enough for a native client
+ * hook to drain the mailbox in between. The initial Lane count is therefore
+ * evidence for scheduling only; it must never authorize a later keystroke.
+ */
+export function pendingUnreadForPeer(db: Database, peerId: string): number {
+  const row = db.query(`
+    SELECT COUNT(*) AS unread
+    FROM messages
+    WHERE to_id = ? AND delivered = 0
+  `).get(peerId) as { unread?: number } | null;
+  const unread = Number(row?.unread ?? 0);
+  return Number.isFinite(unread) && unread > 0 ? unread : 0;
 }
 
 // Confirm the pane still belongs to the lane (not a recycled/reused pane), so we
@@ -1516,8 +1544,9 @@ export function tick(db: Database, snapOverride?: TickSnapshot, deps: TickDeps =
         }
         continue;
       }
-      // Re-check at the last boundary before transport. The SQL already requires
-      // an undelivered row, but a stale or malformed Lane must still fail closed.
+      // The candidate count is a snapshot. Reject malformed/stale candidates
+      // before doing any pane work, then re-read SQLite immediately before the
+      // irreversible tmux transport below.
       if (hasNothingToDeliver(lane.unread)) continue;
       const since = clock() - (lastNudge.get(lane.id) ?? 0);
       if (since < NUDGE_COOLDOWN_MS) continue;                   // recently nudged — give it time to drain
@@ -1547,6 +1576,14 @@ export function tick(db: Database, snapOverride?: TickSnapshot, deps: TickDeps =
         continue;
       }
 
+      // A native UserPromptSubmit/PostToolBatch/Stop hook may have drained the
+      // inbox while this tick was resolving ownership and idle state. Never
+      // press Enter from the stale discovery snapshot. Use the fresh count in
+      // the notification too, so the visible wake cannot overstate the queue.
+      const currentUnread = pendingUnreadForPeer(db, lane.id);
+      if (hasNothingToDeliver(currentUnread)) continue;
+      const currentLane = currentUnread === lane.unread ? lane : { ...lane, unread: currentUnread };
+
       // Write-ahead reservation: record the attempt and cooldown before tmux.
       // A service restart or crash after submission can never mint another five
       // attempts for the same broker-authored unread episode.
@@ -1554,9 +1591,9 @@ export function tick(db: Database, snapOverride?: TickSnapshot, deps: TickDeps =
       nudgeAttempts.set(lane.id, reservedAttempts);
       lastNudge.set(lane.id, clock());
       if (!persistNudgeBudgetState()) return;
-      const result = (deps.nudgeLane ?? nudge)(lane, paneId);
+      const result = (deps.nudgeLane ?? nudge)(currentLane, paneId);
       if (result === "submitted") {
-        log(`nudged ${lane.name ?? "?"}/${lane.id} pane=${paneId} (${lane.unread} unread, attempt ${reservedAttempts})`);
+        log(`nudged ${lane.name ?? "?"}/${lane.id} pane=${paneId} (${currentUnread} unread, attempt ${reservedAttempts})`);
       } else {
         log(`wake submit unconfirmed for ${lane.name ?? "?"}/${lane.id} pane=${paneId} — attempt ${reservedAttempts} counted, mailbox remains queued`);
       }
