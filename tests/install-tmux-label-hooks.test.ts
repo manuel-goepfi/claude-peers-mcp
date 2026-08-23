@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 const installer = new URL("../bin/install-tmux-label-hooks", import.meta.url).pathname;
+const labeler = new URL("../bin/tmux-label-pane.ts", import.meta.url).pathname;
 const roots: string[] = [];
 
 afterEach(() => {
@@ -55,6 +56,7 @@ async function runInstaller(options: {
       CLAUDE_PEERS_TMUX_BIN: fakeTmux,
       CLAUDE_PEERS_FLOCK_BIN: fakeFlock,
       CLAUDE_PEERS_BUN_BIN: fakeBun,
+      CLAUDE_PEERS_TMUX_LABELER: labeler,
       CLAUDE_PEERS_TMUX_SOCKET: join(root, "tmux.sock"),
       CLAUDE_PEERS_TMUX_LABEL_LOCK: join(root, "label.lock"),
       CLAUDE_PEERS_TMUX_LABEL_LOG: labelLog,
