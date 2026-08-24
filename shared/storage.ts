@@ -546,6 +546,12 @@ function migrateLegacy(
     }
     db.run("DELETE FROM sqlite_sequence WHERE name='messages'");
     db.run("INSERT INTO sqlite_sequence(name, seq) VALUES('messages', ?)", [highWater]);
+    // Peer indexes survive the messages-table rebuild. Rebuild them inside the
+    // migration transaction so a current v1 database cannot collide with the
+    // final index names and every definition is converged to the v2 contract.
+    for (const index of [storageIndexes.peerReceiverMode, storageIndexes.peerSeatKey, storageIndexes.peerThreadId]) {
+      db.run(`DROP INDEX IF EXISTS ${index}`);
+    }
     createIndexes(db);
     createTriggers(db);
     db.run(seatKeyBackfillSql());

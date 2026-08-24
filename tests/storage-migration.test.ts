@@ -238,6 +238,12 @@ describe("versioned historical-message migration", () => {
     const retainedManifestBytes = readFileSync(`${backupPath}.manifest.json`);
 
     const db = legacyDatabase(dbPath);
+    db.run("ALTER TABLE peers ADD COLUMN receiver_mode TEXT NOT NULL DEFAULT 'unknown'");
+    db.run("ALTER TABLE peers ADD COLUMN seat_key TEXT");
+    db.run("ALTER TABLE peers ADD COLUMN thread_id TEXT");
+    db.run(`CREATE INDEX ${storageIndexes.peerReceiverMode} ON peers(receiver_mode)`);
+    db.run(`CREATE INDEX ${storageIndexes.peerSeatKey} ON peers(seat_key)`);
+    db.run(`CREATE INDEX ${storageIndexes.peerThreadId} ON peers(thread_id)`);
     db.run("PRAGMA user_version = 1");
     const before = storageSnapshot(db);
     const result = initializeStorage(db, { databasePath: dbPath, backupPath });
@@ -261,6 +267,13 @@ describe("versioned historical-message migration", () => {
       expect.objectContaining({ name: "request_id" }),
       expect.objectContaining({ name: "reply_to_id" }),
     ]));
+    expect(db.query("SELECT name,sql FROM sqlite_master WHERE type='index' AND name IN (?,?,?) ORDER BY name")
+      .all(storageIndexes.peerReceiverMode, storageIndexes.peerSeatKey, storageIndexes.peerThreadId))
+      .toEqual([
+        { name: storageIndexes.peerReceiverMode, sql: `CREATE INDEX ${storageIndexes.peerReceiverMode} ON peers(receiver_mode, id)` },
+        { name: storageIndexes.peerSeatKey, sql: `CREATE INDEX ${storageIndexes.peerSeatKey} ON peers(seat_key)` },
+        { name: storageIndexes.peerThreadId, sql: `CREATE INDEX ${storageIndexes.peerThreadId} ON peers(thread_id)` },
+      ].sort((a, b) => a.name.localeCompare(b.name)));
     db.close();
   });
 
