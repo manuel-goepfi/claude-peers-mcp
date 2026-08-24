@@ -19,7 +19,7 @@ const toolNames = [
   "whoami",
 ] as const;
 
-const doctorAdapterKeys = ["claude", "codex", "gemini", "cursor", "agy", "kimi", "grok", "unknown"] as const;
+const doctorAdapterKeys = ["claude", "codex", "gemini", "cursor", "agy", "kimi", "grok", "opencode", "unknown"] as const;
 
 const publicVariables = [
   "CLAUDE_PEERS_PORT",
@@ -143,7 +143,7 @@ describe("public distribution contract", () => {
   test("managed auto-wake covers post-idle Codex mail", () => {
     const unit = read("docs/systemd/claude-peers-codex-autodrain.service");
     const readme = read("README.md");
-    expect(unit).toContain("Environment=NUDGE_CLIENTS=codex,gemini,claude,cursor,agy,kimi,grok");
+    expect(unit).toContain("Environment=NUDGE_CLIENTS=codex,gemini,claude,cursor,agy,kimi,grok,opencode");
     expect(readme).toContain("opts every supported client");
     expect(readme).toContain("mail arriving after the turn is already idle");
     expect(unit).toContain("After=claude-peers-broker.service");

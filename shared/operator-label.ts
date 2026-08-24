@@ -11,7 +11,7 @@ export function stripResolvedNameSuffix(label: string): string {
 // they must never become a peer name — every lane would end up called "claude".
 const GENERIC_WINDOW_NAMES = new Set([
   "bash", "zsh", "sh", "fish", "claude", "codex", "cursor", "cursor-agent", "agent",
-  "kimi", "grok", "node", "npm", "npx", "bun", "tmux", "vim", "nvim", "nano", "less", "man", "ssh", "git",
+  "kimi", "grok", "opencode", "opencode.exe", "opencode-ai", "node", "npm", "npx", "bun", "tmux", "vim", "nvim", "nano", "less", "man", "ssh", "git",
 ]);
 
 /**

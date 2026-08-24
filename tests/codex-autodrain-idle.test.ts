@@ -150,6 +150,52 @@ describe("paneTextIsIdle", () => {
     expect(profileFor("grok").requiresQuiescence).toBeUndefined();
   });
 
+  test("NUDGE (OpenCode 1.18.21): exact grey placeholder in the empty boxed composer", () => {
+    const opencodeIdle = [
+      "  prior transcript",
+      `${ESC}[38;2;92;156;245m┃${ESC}[38;2;255;255;255m${ESC}[48;2;30;30;30m  ${ESC}[38;2;128;128;128mAsk anything... \"Fix a TODO in the codebase\"${ESC}[0m`,
+      "  Build · Ox Alpha (1M ctx, free preview) OpenRouter",
+      "╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀",
+      "~/Clause5:main  1.18.21",
+    ].join("\n");
+    expect(paneTextIsIdle(opencodeIdle, profileFor("opencode"))).toBe(true);
+    expect(profileFor("opencode").requiresQuiescence).toBe(true);
+  });
+
+  test("NUDGE (OpenCode narrow pane): word-boundary placeholder prefix remains empty", () => {
+    const opencodeIdle = `${ESC}[38;2;92;156;245m┃${ESC}[38;2;255;255;255m  ${ESC}[38;2;128;128;128mAsk anything... \"Fix a TODO in the${ESC}[0m`;
+    expect(paneTextIsIdle(opencodeIdle, profileFor("opencode"))).toBe(true);
+  });
+
+  test("SKIP (OpenCode): identical typed placeholder words in bright text are not empty", () => {
+    const planted = `${ESC}[38;2;92;156;245m┃${ESC}[38;2;255;255;255m  Ask anything... \"Fix a TODO in the codebase\"${ESC}[0m`;
+    expect(paneTextIsIdle(planted, profileFor("opencode"))).toBe(false);
+  });
+
+  test("SKIP (OpenCode): ordinary queued operator input is never submitted", () => {
+    const typed = `${ESC}[38;2;92;156;245m┃${ESC}[38;2;238;238;238m  deploy to production${ESC}[0m`;
+    expect(paneTextIsIdle(typed, profileFor("opencode"))).toBe(false);
+  });
+
+  test.each(["Prompt loading...", "Permission required", "Allow always", "Stop"])(
+    "SKIP (OpenCode): busy marker %s blocks the otherwise empty composer",
+    (marker) => {
+      const busy = [
+        marker,
+        `${ESC}[38;2;92;156;245m┃${ESC}[38;2;128;128;128m  Ask anything...${ESC}[0m`,
+      ].join("\n");
+      expect(paneTextIsIdle(busy, profileFor("opencode"))).toBe(false);
+    },
+  );
+
+  test("NUDGE (OpenCode): ordinary transcript prose mentioning Stop or Thinking is not a modal", () => {
+    const idle = [
+      "Stop conditions and Thinking states are documented above.",
+      `${ESC}[38;2;92;156;245m┃${ESC}[38;2;128;128;128m  Ask anything...${ESC}[0m`,
+    ].join("\n");
+    expect(paneTextIsIdle(idle, profileFor("opencode"))).toBe(true);
+  });
+
   test("NUDGE (agy): empty column-0 '>' prompt with indented output above", () => {
     const agyIdle = [
       "  ● [09:51:27] find /home/manzo running",
@@ -1338,6 +1384,10 @@ describe("nudge wording branches by receive path", () => {
 
   test("Grok is explicitly allowlisted as a manual-drain client", () => {
     expect(parseNudgeClients("grok")).toEqual(["grok"]);
+  });
+
+  test("OpenCode is explicitly allowlisted as a manual-drain client", () => {
+    expect(parseNudgeClients("opencode")).toEqual(["opencode"]);
   });
 });
 

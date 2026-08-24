@@ -258,6 +258,7 @@ export function shouldDisableBackgroundPolling(clientType: ClientType, receiverM
   return clientType === "claude" || clientType === "codex" || clientType === "gemini" || clientType === "cursor" || clientType === "agy"
     || clientType === "kimi"
     || clientType === "grok"
+    || clientType === "opencode"
     || clientType === "unknown"
     || receiverMode === "codex-hook" || receiverMode === "gemini-hook";
 }
@@ -625,7 +626,7 @@ export function registrationCwdResult(
   clientType: ClientType,
   cwdReader: (pid: number) => string | null = cwdOf,
 ): RegistrationCwdResult {
-  if (clientType === "codex" || clientType === "gemini" || clientType === "cursor" || clientType === "agy") {
+  if (clientType === "codex" || clientType === "gemini" || clientType === "cursor" || clientType === "agy" || clientType === "opencode") {
     const clientCwd = cwdReader(registerPid);
     if (clientCwd) return { cwd: clientCwd, source: "client", missingClientCwd: false };
     return { cwd: processCwd, source: "process-fallback", missingClientCwd: true };
@@ -643,7 +644,7 @@ export function registrationCwd(
 }
 
 export function registrationTtyPid(registerPid: number, clientType: ClientType, parentPid = process.ppid): number {
-  return clientType === "codex" || clientType === "gemini" || clientType === "cursor" || clientType === "agy"
+  return clientType === "codex" || clientType === "gemini" || clientType === "cursor" || clientType === "agy" || clientType === "opencode"
     ? registerPid : parentPid;
 }
 
@@ -2462,7 +2463,7 @@ async function main() {
   }
   // Set when app-server-hosted identity resolution exhausts every path and
   // falls back to the MCP server's own pid — the observer-${pid} signature.
-  if (myClientType === "codex" || myClientType === "gemini" || myClientType === "cursor" || myClientType === "agy" || myClientType === "kimi") {
+  if (myClientType === "codex" || myClientType === "gemini" || myClientType === "cursor" || myClientType === "agy" || myClientType === "kimi" || myClientType === "opencode") {
     const chainPid = findClientPidFromProcessChain(process.ppid, startupProcesses, myClientType);
     if (chainPid) {
       myRegisterPid = chainPid;

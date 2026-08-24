@@ -156,6 +156,35 @@ describe("composerSubmissionEvidence requires positive submit evidence", () => {
     const verticallyWrapped = probe.slice(1, 25).split("").join("\n");
     expect(composerSubmissionEvidence(`│ ❯ ${verticallyWrapped}`, probe)).toBe("held");
   });
+
+  test("OpenCode wake text inside the final boxed composer is HELD", () => {
+    const capture = [
+      "earlier transcript",
+      `┃  ${probe}`,
+      "┃  Build · Ox Alpha",
+      "╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀",
+    ].join("\n");
+    expect(composerSubmissionEvidence(capture, probe)).toBe("held");
+  });
+
+  test("OpenCode wake above a later empty boxed composer is SUBMITTED", () => {
+    const capture = [
+      probe,
+      "┃  Ask anything... \"Fix a TODO in the codebase\"",
+      "┃  Build · Ox Alpha",
+      "╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀",
+    ].join("\n");
+    expect(composerSubmissionEvidence(capture, probe)).toBe("submitted");
+  });
+
+  test("OpenCode empty composer without the wake is UNKNOWN, never forged as submitted", () => {
+    const capture = [
+      "┃  Ask anything... \"Fix a TODO in the codebase\"",
+      "┃  Build · Ox Alpha",
+      "╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀",
+    ].join("\n");
+    expect(composerSubmissionEvidence(capture, probe)).toBe("unknown");
+  });
 });
 
 describe("wakeInputTransport matches each TUI's accepted input path", () => {
@@ -163,7 +192,7 @@ describe("wakeInputTransport matches each TUI's accepted input path", () => {
     expect(wakeInputTransport("grok")).toBe("literal");
   });
 
-  test.each(["codex", "claude", "cursor", "gemini", "agy", "kimi", "unknown"])(
+  test.each(["codex", "claude", "cursor", "gemini", "agy", "kimi", "opencode", "unknown"])(
     "%s retains bracketed paste protection",
     (clientType) => {
       expect(wakeInputTransport(clientType)).toBe("bracketed-paste");

@@ -28,7 +28,7 @@ export interface ClientSurface {
 }
 
 export interface ProcessSummary {
-  client_roots: { claude: number; codex: number; gemini: number };
+  client_roots: { claude: number; codex: number; gemini: number; opencode: number };
   adapters: Record<ClientType, number>;
   orphaned_adapters: number;
   spare_parented_adapters: number;
@@ -218,11 +218,12 @@ function isPeerAdapterProcess(row: ProcessInfo, expectedServer: string): boolean
 }
 
 export function summarizeProcesses(processes: Map<number, ProcessInfo>, repoRoot: string): ProcessSummary {
-  const clientRoots = { claude: 0, codex: 0, gemini: 0 };
+  const clientRoots = { claude: 0, codex: 0, gemini: 0, opencode: 0 };
   for (const row of processes.values()) {
     if (isClientProcess(row, "claude")) clientRoots.claude++;
     if (isClientProcess(row, "codex") && !isCodexAppServerProcess(row)) clientRoots.codex++;
     if (isClientProcess(row, "gemini")) clientRoots.gemini++;
+    if (isClientProcess(row, "opencode")) clientRoots.opencode++;
   }
 
   const adapters: Record<ClientType, number> = {
@@ -233,6 +234,7 @@ export function summarizeProcesses(processes: Map<number, ProcessInfo>, repoRoot
     agy: 0,
     kimi: 0,
     grok: 0,
+    opencode: 0,
     unknown: 0,
   };
   let orphaned = 0;
@@ -336,7 +338,7 @@ function decodeDatabase(db: Database, version: number, processes: Map<number, Pr
       },
       (pid) => {
         const proc = processes.get(pid);
-        return proc !== undefined && (["claude", "codex", "gemini", "cursor", "agy", "kimi"] as const)
+        return proc !== undefined && (["claude", "codex", "gemini", "cursor", "agy", "kimi", "grok", "opencode"] as const)
           .some((client) => isClientProcess(proc, client));
       },
     ) === "dead";

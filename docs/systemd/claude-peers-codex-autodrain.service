@@ -46,7 +46,7 @@ Environment=TMUX_TMPDIR=/tmp
 # acknowledges mailbox rows. Native Codex hooks drain during a turn; the poller
 # covers mail that arrives after the turn is already idle. The final unread
 # re-check prevents a stale scan from typing after a native hook already drained.
-Environment=NUDGE_CLIENTS=codex,gemini,claude,cursor,agy,kimi,grok
+Environment=NUDGE_CLIENTS=codex,gemini,claude,cursor,agy,kimi,grok,opencode
 # Tunables (defaults shown; override here if needed):
 # Environment=POLL_INTERVAL_MS=15000
 # Environment=NUDGE_COOLDOWN_MS=60000

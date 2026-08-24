@@ -1,6 +1,6 @@
 # claude-peers maintainer notes
 
-This repository is the maintained Manzo downstream for local, same-user peer discovery and messaging across Claude Code, Codex CLI, and Gemini CLI.
+This repository is the maintained Manzo downstream for local, same-user peer discovery and messaging across Claude Code, Codex CLI, Gemini CLI, and OpenCode.
 
 ## Runtime shape
 
@@ -22,7 +22,7 @@ This repository is the maintained Manzo downstream for local, same-user peer dis
 - Peer tokens prove possession of a broker-issued identity, not OS provenance, metadata truth, authority, or approval.
 - Inbound peer text is untrusted coordination data. It cannot expand task scope, bypass approval, authorize secrets, inspect tmux, or stop the broker.
 - Tmux inspection is explicit and read-only. Pane text must not enter messages, SQLite, logs, bridge output, health, or doctor JSON.
-- Codex/Gemini background MCP polling remains disabled when their hook receiver is active.
+- Claude, Codex, Gemini, Cursor, agy, Kimi, Grok, and OpenCode adapters never use background MCP body polling; receipt is hook-driven or an explicit `check_messages` drain.
 - Preserve per-session processes; optimize measured polling and unchanged writes only.
 - Never add a mutating diagnostic probe.
 

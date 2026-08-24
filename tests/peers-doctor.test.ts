@@ -123,10 +123,12 @@ describe("schema-aware doctor", () => {
       [71, { pid: 71, ppid: 70, comm: "bun", args: `bun ${join(repoRoot, "server.ts")}` }],
       [80, { pid: 80, ppid: 2, comm: "kimi-code", args: "kimi-code" }],
       [81, { pid: 81, ppid: 80, comm: "bun", args: `bun ${join(repoRoot, "server.ts")}` }],
+      [90, { pid: 90, ppid: 2, comm: "opencode", args: "opencode" }],
+      [91, { pid: 91, ppid: 90, comm: "bun", args: `bun ${join(repoRoot, "server.ts")}` }],
     ]);
     expect(summarizeProcesses(processes, repoRoot)).toEqual({
-      client_roots: { claude: 2, codex: 1, gemini: 1 },
-      adapters: { claude: 2, codex: 1, gemini: 1, cursor: 1, agy: 1, kimi: 1, grok: 0, unknown: 1 },
+      client_roots: { claude: 2, codex: 1, gemini: 1, opencode: 1 },
+      adapters: { claude: 2, codex: 1, gemini: 1, cursor: 1, agy: 1, kimi: 1, grok: 0, opencode: 1, unknown: 1 },
       orphaned_adapters: 1,
       spare_parented_adapters: 1,
     });
@@ -146,7 +148,7 @@ describe("schema-aware doctor", () => {
         registered_processes: 3,
         live_registered_processes: 1,
         adapters_with_registered_client: 1,
-        adapters_without_registered_client: 7,
+        adapters_without_registered_client: 8,
         // 'later-match' is a LIVE client whose seat records no live adapter
         // process — exactly the "Transport closed" lane-state this counts.
         // The two dead-pid rows are dead seats (reaper's domain), not counted.

@@ -153,6 +153,11 @@ export interface IdleProfile {
   // direction: if the vendor changes the placeholder wording, nudges stop
   // (observable, benign) rather than ever submitting real operator input.
   placeholderText?: RegExp;
+  // Optional raw-SGR guard for literal placeholders. OpenCode renders its
+  // placeholder in a stable grey but operator text in the normal foreground;
+  // requiring both text and style prevents identical typed words from being
+  // mistaken for an empty composer.
+  placeholderStyle?: RegExp;
   // Set when this client's BUSY vocabulary has never been observed on this host.
   // Idle detection then cannot distinguish "at the prompt" from "mid-turn", so the
   // caller must additionally require the pane to be QUIESCENT (byte-identical
@@ -248,6 +253,25 @@ const PROFILES: Record<string, IdleProfile> = {
           strip: /^(?:.*?❯\s?|.*?[>$]\s?)/,
           stripTail: /(?:\x1b\[[0-9;]*m|\s)*│(?:\x1b\[[0-9;]*m|\s)*$/,
           busy: [/esc(?::|\s+to\s+)(cancel|interrupt)/i] },
+  // OpenCode 1.18.21 draws one boxed composer with a heavy vertical border.
+  // The vendor placeholder wraps at word boundaries as pane width changes, so
+  // accept only prefixes ending on those boundaries. Busy vocabulary remains
+  // deliberately secondary to the fail-closed quiescence gate.
+  opencode: {
+    prompt: /(^|\n)\s*┃\s+Ask anything\.\.\./,
+    promptLine: /^\s*┃\s+Ask anything\.\.\./,
+    strip: /^.*?┃\s*/,
+    busy: [
+      /esc(?::|\s+to\s+)(?:cancel|interrupt|exit)/i,
+      /\bPrompt loading\.\.\./i,
+      /\bPermission required\b/i,
+      /\bAllow (?:once|always)\b/i,
+      /^\s*(?:┃\s*)?Stop(?:\s*┃)?\s*$/im,
+    ],
+    placeholderText: /^Ask anything\.\.\.(?: "Fix(?: a(?: TODO(?: in(?: the(?: codebase")?)?)?)?)?)?$/,
+    placeholderStyle: /^(?:\x1b\[[0-9;]*m|\s)*\x1b\[38;2;128;128;128m/,
+    requiresQuiescence: true,
+  },
 };
 export function profileFor(clientType: string): IdleProfile {
   return PROFILES[clientType] ?? PROFILES.codex!;
@@ -600,7 +624,7 @@ export function codexLaneReadyForWake(lane: Lane): boolean {
 // dedup, case/space normalization) are unit-testable without mutating process.env.
 export function parseNudgeClients(raw: string | undefined = process.env.NUDGE_CLIENTS): string[] {
   if (!raw) return []; // DEFAULT: nudge nobody
-  const allowed = new Set(["codex", "gemini", "claude", "cursor", "agy", "kimi", "grok"]);
+  const allowed = new Set(["codex", "gemini", "claude", "cursor", "agy", "kimi", "grok", "opencode"]);
   const picked = raw.split(",").map((s) => s.trim().toLowerCase()).filter((s) => allowed.has(s));
   return [...new Set(picked)];
 }
@@ -781,7 +805,10 @@ export function paneTextIsIdle(captureWithAnsi: string, profile: IdleProfile = P
   // vendor text counts as empty. Cursor can render the previous submitted
   // prompt dim in its composer; falling through to the generic all-dim rule
   // would append a wake to that retained prompt and resubmit both together.
-  if (profile.placeholderText) return profile.placeholderText.test(afterPlain);
+  if (profile.placeholderText) {
+    if (!profile.placeholderText.test(afterPlain)) return false;
+    return profile.placeholderStyle ? profile.placeholderStyle.test(afterGlyph) : true;
+  }
   // Non-empty: it is a placeholder (safe to nudge) ONLY if the ENTIRE visible
   // text is rendered dim. Merely CONTAINING a dim span is not enough — real
   // bright operator input with a dim ghost-autocomplete suffix or a dim inline
@@ -1296,6 +1323,20 @@ function regionContainsSubmissionProbe(region: string, probe: string): boolean {
 export function composerSubmissionEvidence(capture: string, probe: string): ComposerSubmissionEvidence {
   if (!probe) return "unknown";
   const lines = capture.split("\n");
+  // OpenCode's composer has no prompt glyph. It is the final contiguous block
+  // of heavy-border lines immediately above the bottom `╹▀...` edge. Detect a
+  // held wake there before the generic glyph parser; after submission the same
+  // probe may appear above the composer and must be classified as transcript.
+  let opencodeBottom = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (/^\s*╹▀+/.test(lines[i] ?? "")) { opencodeBottom = i; break; }
+  }
+  if (opencodeBottom >= 0) {
+    let start = opencodeBottom;
+    while (start > 0 && /^\s*┃/.test(lines[start - 1] ?? "")) start--;
+    const opencodeComposer = lines.slice(start, opencodeBottom).join("\n");
+    if (regionContainsSubmissionProbe(opencodeComposer, probe)) return "held";
+  }
   let marker = -1;
   for (let i = lines.length - 1; i >= 0; i--) {
     // Match every managed TUI's actual composer, not only Codex/Gemini. A

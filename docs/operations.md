@@ -23,7 +23,7 @@ Treat the readiness state literally:
 
 Use the JSON report for automation. Gate on its exit status and `status`; do not parse human prose. The report contains counts and classifications, not message content, tokens, captured panes, arbitrary filesystem paths, or broker-log text.
 
-The `processes.adapters` object is a stable, complete diagnostic map with `claude`, `codex`, `gemini`, `cursor`, `agy`, `kimi`, `grok`, and `unknown` keys. Cursor, agy, Kimi, and Grok are process-classification entries; the supported install and release-smoke workflow remains Claude, Codex, and Gemini.
+The `processes.adapters` object is a stable, complete diagnostic map with `claude`, `codex`, `gemini`, `cursor`, `agy`, `kimi`, `grok`, `opencode`, and `unknown` keys. Cursor, agy, Kimi, Grok, and OpenCode are process-classification entries. OpenCode has a managed local-MCP installer; authenticated release-host smoke remains Claude, Codex, and Gemini until a separately armed OpenCode account is added to that gate.
 
 ## Ownership modes
 
@@ -70,11 +70,21 @@ Install each client at either user or project scope, not both. The doctor report
 bun bin/install-claude-hook.ts --check
 bun bin/install-codex-hook.ts --check
 bun bin/install-gemini-hook.ts --check
+bun bin/install-opencode-mcp.ts --check
 ```
 
 Correct installers are byte- and mtime-stable no-ops. A material change gets a unique 0600 sibling backup. `--restore <backup-path>` is guarded against restoring an unrelated backup or overwriting a subsequently edited install.
 
 Alternate Claude profiles are explicit: prefix both install and check with `CLAUDE_CONFIG_DIR=/path/to/profile`. Claude standby delivery uses a 10-second cadence for the first hour after Stop, then 60 seconds while the Claude process remains alive; later Stop events atomically refresh the fast deadline and current adapter PID. The `CLAUDE_PEERS_STANDBY_*` controls are documented in the README configuration table. Watcher state is owner-only under `CLAUDE_PEERS_STANDBY_RUNTIME_DIR`, `$XDG_RUNTIME_DIR`, or `$HOME/.cache` in that order.
+
+OpenCode's managed installer writes the official top-level `mcp` local-server shape to `~/.config/opencode/opencode.jsonc`, preserves unrelated entries, and pins `CLAUDE_PEERS_CLIENT_TYPE=opencode` for deterministic process classification:
+
+```bash
+bun bin/install-opencode-mcp.ts install
+bun bin/install-opencode-mcp.ts --check
+```
+
+OpenCode has no interactive external receive hook in this contract. It registers one stdio adapter per session in `manual-drain` mode, and the tmux poller wakes only a quiescent pane whose boxed composer contains the exact grey vendor placeholder. The wake submits one `check_messages` turn; typed text, permission prompts, loading states, busy panes, and unconfirmed Enter submissions fail closed.
 
 After MCP or hook changes:
 

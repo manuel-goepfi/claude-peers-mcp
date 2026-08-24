@@ -134,7 +134,7 @@ if [ -z "$NUDGE_CLIENTS" ]; then
   fi
   exit 0
 fi
-if ! printf '%s' "$NUDGE_CLIENTS" | grep -Eq '^(codex|gemini|claude|cursor|agy|kimi|grok)(,(codex|gemini|claude|cursor|agy|kimi|grok))*$'; then
+if ! printf '%s' "$NUDGE_CLIENTS" | grep -Eq '^(codex|gemini|claude|cursor|agy|kimi|grok|opencode)(,(codex|gemini|claude|cursor|agy|kimi|grok|opencode))*$'; then
   echo "$(date -Iseconds) watchdog: invalid NUDGE_CLIENTS=$NUDGE_CLIENTS — refusing to start" >> "$LOG"
   exit 1
 fi

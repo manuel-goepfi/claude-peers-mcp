@@ -55,7 +55,7 @@ when a native hook drained after candidate discovery. The standalone binary
 still defaults to no clients unless `NUDGE_CLIENTS` is set:
 
 ```
-Environment=NUDGE_CLIENTS=codex,gemini,claude,cursor,agy,kimi,grok
+Environment=NUDGE_CLIENTS=codex,gemini,claude,cursor,agy,kimi,grok,opencode
 ```
 
 The poller logs its state at startup (`nudge=DISABLED` or `nudge=codex,...`), so

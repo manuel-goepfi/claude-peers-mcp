@@ -5,7 +5,7 @@ import { findClientPidFromTable, findHookPeerPidsFromTable, findMcpPidFromTable 
 import { codexDrainRootDecision, codexHookRootDegradedReason, codexHookRootRefusalReason, codexHookSessionDiagnostic, peerName, publishBrokerIdentityToTmux, readPaneLabel, registrationTmuxPaneId, sessionIdFromHookInput, tmuxIdentityMirrorEnabled } from "../hooks/register-peer-session.ts";
 import { detectClientFromProcessChain, findBgSpareAncestor, initialReceiverMode, type ProcessInfo } from "../shared/client.ts";
 import { findNearestVisibleCodexProcessByStart, findVisibleCodexProcessByPaneId, isInteractiveNativeCodex, singleInteractiveCodexProcess } from "../shared/visible-codex.ts";
-import { findCodexAppServerAncestor, findVisibleCodexSession, mcpThreadIdFromRequestMeta, priorCodexPaneSeatReleased, registrationCwd, registrationCwdResult, registrationTtyPid, selectCodexManualDrainPid, selectInboxClaimIdentity, shouldUnregisterPeerOnShutdown, unresolvedAppServerToolDiagnostic } from "../server.ts";
+import { findCodexAppServerAncestor, findVisibleCodexSession, mcpThreadIdFromRequestMeta, priorCodexPaneSeatReleased, registrationCwd, registrationCwdResult, registrationTtyPid, selectCodexManualDrainPid, selectInboxClaimIdentity, shouldDisableBackgroundPolling, shouldUnregisterPeerOnShutdown, unresolvedAppServerToolDiagnostic } from "../server.ts";
 
 function table(rows: ProcessInfo[]): Map<number, ProcessInfo> {
   return new Map(rows.map((row) => [row.pid, row]));
@@ -91,6 +91,26 @@ describe("client detection", () => {
     expect(initialReceiverMode("grok")).toBe("manual-drain");
   });
 
+  test("detects OpenCode through its stdio MCP child and assigns manual-drain delivery", () => {
+    const processes = table([
+      { pid: 30, ppid: 20, comm: "bun", args: "bun /home/manzo/claude-peers-mcp/server.ts" },
+      { pid: 20, ppid: 10, comm: "opencode", args: "opencode" },
+      { pid: 10, ppid: 1, comm: "bash", args: "bash" },
+    ]);
+    expect(detectClientFromProcessChain(30, processes, {})).toBe("opencode");
+    expect(detectClientFromProcessChain(30, processes, { CLAUDE_PEERS_CLIENT_TYPE: "opencode.exe" })).toBe("opencode");
+    expect(initialReceiverMode("opencode")).toBe("manual-drain");
+    expect(shouldDisableBackgroundPolling("opencode", "manual-drain")).toBe(true);
+  });
+
+  test("a later opencode word is not mistaken for the OpenCode launcher", () => {
+    const processes = table([
+      { pid: 20, ppid: 10, comm: "node", args: "node build.js --client opencode" },
+      { pid: 10, ppid: 1, comm: "bash", args: "bash" },
+    ]);
+    expect(detectClientFromProcessChain(20, processes, {})).toBe("unknown");
+  });
+
   test("a bare 'agent' binary without the cursor-agent path is NOT Cursor", () => {
     const processes = table([
       { pid: 20, ppid: 10, comm: "agent", args: "/usr/local/bin/agent --serve" },
@@ -135,6 +155,7 @@ describe("client detection", () => {
     const src = readFileSync(new URL("../server.ts", import.meta.url), "utf8");
     expect(src).toContain('return clientType === "claude" || clientType === "codex" || clientType === "gemini"');
     expect(src).toContain('|| clientType === "kimi"');
+    expect(src).toContain('|| clientType === "opencode"');
     expect(src).toContain('|| clientType === "unknown"');
     expect(src).toContain("background observation poll disabled");
   });
@@ -152,6 +173,7 @@ describe("client detection", () => {
 
     expect(registrationCwd("/home/manzo/claude-peers-mcp", 10, "codex", cwdReader)).toBe("/home/manzo/Clause5");
     expect(registrationCwd("/home/manzo/claude-peers-mcp", 10, "gemini", cwdReader)).toBe("/home/manzo/Clause5");
+    expect(registrationCwd("/home/manzo/claude-peers-mcp", 10, "opencode", cwdReader)).toBe("/home/manzo/Clause5");
   });
 
   test("non-hook clients and missing client cwd fall back safely", () => {
@@ -170,6 +192,7 @@ describe("client detection", () => {
   test("tty lookup uses client PID only for hook-based clients", () => {
     expect(registrationTtyPid(10, "codex", 20)).toBe(10);
     expect(registrationTtyPid(10, "gemini", 20)).toBe(10);
+    expect(registrationTtyPid(10, "opencode", 20)).toBe(10);
     expect(registrationTtyPid(10, "claude", 20)).toBe(20);
     expect(registrationTtyPid(10, "unknown", 20)).toBe(20);
   });

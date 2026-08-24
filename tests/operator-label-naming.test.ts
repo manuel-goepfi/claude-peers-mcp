@@ -30,7 +30,7 @@ describe("isOperatorChosenWindowName", () => {
 
   test("rejects names a shell or tool sets on its own", () => {
     // Without this, every lane in the fleet would be called "claude".
-    for (const name of ["bash", "zsh", "claude", "codex", "cursor", "node", "npm", "vim", "git"]) {
+    for (const name of ["bash", "zsh", "claude", "codex", "cursor", "opencode", "opencode.exe", "opencode-ai", "node", "npm", "vim", "git"]) {
       expect(isOperatorChosenWindowName(name, "C5_lanes")).toBe(false);
     }
   });
@@ -61,6 +61,7 @@ describe("chooseOperatorLabel", () => {
   test("falls back to the ordinal when the window name is generic", () => {
     expect(chooseOperatorLabel("C5_lanes", "1", [], "claude")).toBe("C5_lanes.1");
     expect(chooseOperatorLabel("infra", "4", [], "grok", 1)).toBe("infra.1");
+    expect(chooseOperatorLabel("infra", "4", [], "opencode", 1)).toBe("infra.1");
     expect(chooseOperatorLabel("C5_lanes", "1", [], undefined)).toBe("C5_lanes.1");
   });
 

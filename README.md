@@ -1,6 +1,6 @@
 # claude-peers
 
-Local peer discovery and messaging for Claude Code, Codex CLI, and Gemini CLI.
+Local peer discovery and messaging for Claude Code, Codex CLI, Gemini CLI, and OpenCode.
 
 This is the maintained Manzo downstream of [Louis Arge's upstream project](https://github.com/louislva/claude-peers-mcp). The supported clone and issue/release surface for this contract is `manuel-goepfi/claude-peers-mcp`. It runs one stdio MCP adapter per client session and one loopback-only SQLite broker for the current Linux user. Peers can discover live sessions, route by exact identity or human-facing seat, exchange untrusted coordination messages, and inspect tmux context only when explicitly requested.
 
@@ -9,7 +9,7 @@ This is the maintained Manzo downstream of [Louis Arge's upstream project](https
 - Linux with `/proc`, one operating-system user, and loopback networking.
 - Bun 1.3.11, pinned by `packageManager`, `engines`, and CI. Node >=22.6 is
   required only for the optional shared Codex Desktop relay described below.
-- At least one supported client: Claude Code, Codex CLI, or Gemini CLI.
+- At least one supported client: Claude Code, Codex CLI, Gemini CLI, or OpenCode.
 - Git for installation. `tmux` is optional and only needed for pane identity or explicit pane inspection. A systemd user manager is optional.
 - Remote brokers, multi-user authorization, Windows/macOS support, and shared-process multiplexing are not part of this release.
 
@@ -18,7 +18,7 @@ The isolation boundary is the current UID. A malicious process running as the br
 ## Architecture
 
 ```text
-Claude / Codex / Gemini session
+Claude / Codex / Gemini / OpenCode session
           │ stdio MCP (one adapter per session)
           ▼
       server.ts ───────────────┐
@@ -58,9 +58,13 @@ codex mcp add claude-peers -- bun "$HOME/claude-peers-mcp/server.ts"
 
 # Gemini CLI: user scope
 gemini mcp add --scope user --transport stdio claude-peers bun "$HOME/claude-peers-mcp/server.ts"
+
+# OpenCode: user scope, installed atomically into ~/.config/opencode/opencode.jsonc
+bun bin/install-opencode-mcp.ts install
+bun bin/install-opencode-mcp.ts --check
 ```
 
-User scope is the canonical configuration so the peer bus works across repositories. `examples/claude-mcp.json` is an inert project-scope Claude template; copy and adapt it to `.mcp.json` only when deliberately choosing project scope instead of the user registration above. Codex stores MCP servers in `.codex/config.toml`; Gemini stores them under `mcpServers` in `.gemini/settings.json`.
+User scope is the canonical configuration so the peer bus works across repositories. `examples/claude-mcp.json` is an inert project-scope Claude template; copy and adapt it to `.mcp.json` only when deliberately choosing project scope instead of the user registration above. Codex stores MCP servers in `.codex/config.toml`; Gemini stores them under `mcpServers` in `.gemini/settings.json`; OpenCode stores local MCP servers under top-level `mcp` in `.config/opencode/opencode.jsonc`. The OpenCode installer preserves unrelated keys, creates a 0600 backup before a material edit, and sets `CLAUDE_PEERS_CLIENT_TYPE=opencode`. Restart OpenCode after installation.
 
 ### Install receive hooks
 
@@ -150,7 +154,7 @@ bun run smoke:install
 
 The doctor performs one `GET /health`, then uses same-user read-only process, config, and SQLite evidence. It never polls, claims, acknowledges, heartbeats, sends, or otherwise changes broker state. While the broker reports `starting` or `migrating`, schema queries are skipped. If health is unreachable while a live or ambiguous database owner exists, schema reads are refused.
 
-In JSON output, `processes.adapters` always contains the complete diagnostic key set: `claude`, `codex`, `gemini`, `cursor`, `agy`, `kimi`, `grok`, and `unknown`. Cursor, agy, Kimi, and Grok process detection does not expand the supported installer or release-smoke boundary above.
+In JSON output, `processes.adapters` always contains the complete diagnostic key set: `claude`, `codex`, `gemini`, `cursor`, `agy`, `kimi`, `grok`, `opencode`, and `unknown`. Cursor, agy, Kimi, Grok, and OpenCode are process-classification entries. OpenCode has the managed MCP installer above; authenticated release-host smoke remains Claude, Codex, and Gemini until a separately armed OpenCode account is added to that gate.
 
 Start two client sessions and ask one to call `list_peers`, then send with `send_to_peer` or `send_message`.
 
@@ -202,6 +206,7 @@ Queue insertion is not receipt, so every send also returns the recipient's live 
 | Codex with current hooks | `codex/codex-hook` | Prompt/start/post-tool/turn-end hook claim and acknowledgement. |
 | Gemini with current hooks | `gemini/gemini-hook` | `BeforeAgent` hook claim and acknowledgement. |
 | Codex or Gemini without a proven hook | `*/manual-drain` | `check_messages` until the hook registers and heartbeats successfully. |
+| OpenCode | `opencode/manual-drain` | The tmux auto-drain poller wakes an idle, empty composer; the lane calls `check_messages`. |
 | Unknown/send-only | `unknown/unknown` | Not a normal automatic receiver; bounded retention applies. |
 
 Every current client disables the MCP background observation poll. A consumer claims a batch only when it can render that batch into a hook result or an explicit `check_messages` tool response, then acknowledges the same claim. A failed acknowledgement leaves the claim available for redelivery after its lease expires. The compatibility scheduler remains configurable for benchmark and future-client work, but it never caches or renders a polled body.
