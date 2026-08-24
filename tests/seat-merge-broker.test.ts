@@ -90,6 +90,42 @@ describe("seat-anchored registration", () => {
     expect(JSON.parse(seatRows[0]!.seat_pids)).toEqual(expect.arrayContaining([serverPid, tuiPid]));
   });
 
+  test("a visible-client registration retains its separate MCP adapter pid", async () => {
+    const tuiPid = spawnHolder();
+    const adapterPid = spawnHolder();
+
+    const registered = await register(tuiPid, {
+      adapter_pid: adapterPid,
+      tmux_pane_id: "%702",
+      client_type: "opencode",
+      receiver_mode: "manual-drain",
+    });
+
+    const db = new Database(broker.dbPath, { readonly: true });
+    try {
+      const row = db.query("SELECT pid, seat_pids FROM peers WHERE id = ?").get(registered.id) as {
+        pid: number;
+        seat_pids: string;
+      };
+      expect(row.pid).toBe(tuiPid);
+      expect(JSON.parse(row.seat_pids)).toEqual(expect.arrayContaining([tuiPid, adapterPid]));
+    } finally {
+      db.close();
+    }
+  });
+
+  test("registration rejects an adapter pid that cannot be verified for this uid", async () => {
+    const tuiPid = spawnHolder();
+    const result = await register(tuiPid, {
+      adapter_pid: 2_147_483_647,
+      tmux_pane_id: "%703",
+      client_type: "opencode",
+      receiver_mode: "manual-drain",
+    }) as unknown as { error?: string };
+
+    expect(result.error).toContain("adapter PID/UID rejected");
+  });
+
   test("the adopting registrar keeps the seat token, so the co-registrant is not 401'd", async () => {
     const a = spawnHolder();
     const b = spawnHolder();

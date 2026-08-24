@@ -75,6 +75,10 @@ export interface Message {
 
 export interface RegisterRequest {
   pid: number;
+  // PID of the per-session MCP server when `pid` names the visible client TUI.
+  // Recording both lets delivery health distinguish a live adapter from a
+  // hook-only seat without sacrificing pane ownership by the client process.
+  adapter_pid?: number;
   cwd: string;
   git_root: string | null;
   // From `git rev-parse --absolute-git-dir` — see Peer.absolute_git_dir.

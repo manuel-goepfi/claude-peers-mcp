@@ -167,6 +167,16 @@ describe("paneTextIsIdle", () => {
     expect(paneTextIsIdle(opencodeIdle, profileFor("opencode"))).toBe(true);
   });
 
+  test("NUDGE (OpenCode): rotated grey vendor example remains an empty prompt", () => {
+    const opencodeIdle = `${ESC}[38;2;92;156;245m┃${ESC}[38;2;255;255;255m  ${ESC}[38;2;128;128;128mAsk anything... \"What is the tech stack of this project?\"${ESC}[0m`;
+    expect(paneTextIsIdle(opencodeIdle, profileFor("opencode"))).toBe(true);
+  });
+
+  test("SKIP (OpenCode): rotated vendor example in bright text is real input", () => {
+    const planted = `${ESC}[38;2;92;156;245m┃${ESC}[38;2;255;255;255m  Ask anything... \"What is the tech stack of this project?\"${ESC}[0m`;
+    expect(paneTextIsIdle(planted, profileFor("opencode"))).toBe(false);
+  });
+
   test("SKIP (OpenCode): identical typed placeholder words in bright text are not empty", () => {
     const planted = `${ESC}[38;2;92;156;245m┃${ESC}[38;2;255;255;255m  Ask anything... \"Fix a TODO in the codebase\"${ESC}[0m`;
     expect(paneTextIsIdle(planted, profileFor("opencode"))).toBe(false);

@@ -2570,6 +2570,7 @@ async function main() {
   //    summary/tmux context being recomputed from scratch).
   const buildRegisterPayload = () => ({
     pid: myRegisterPid,
+    adapter_pid: process.pid,
     cwd: myCwd,
     git_root: myGitRoot,
     absolute_git_dir: myAbsoluteGitDir,

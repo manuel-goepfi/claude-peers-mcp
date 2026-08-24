@@ -268,7 +268,10 @@ const PROFILES: Record<string, IdleProfile> = {
       /\bAllow (?:once|always)\b/i,
       /^\s*(?:┃\s*)?Stop(?:\s*┃)?\s*$/im,
     ],
-    placeholderText: /^Ask anything\.\.\.(?: "Fix(?: a(?: TODO(?: in(?: the(?: codebase")?)?)?)?)?)?$/,
+    // OpenCode rotates the quoted example (and may clip it at a pane-width word
+    // boundary). The exact 128-grey SGR below is the empty-input signal; keep
+    // the text grammar structural so a new vendor example does not strand mail.
+    placeholderText: /^Ask anything\.\.\.(?: "[^"\n]*"?)?$/,
     placeholderStyle: /^(?:\x1b\[[0-9;]*m|\s)*\x1b\[38;2;128;128;128m/,
     requiresQuiescence: true,
   },

@@ -1240,6 +1240,10 @@ function handleRegister(body: RegisterRequest): RegisterResult {
   // S3: PID/UID validation before issuing any token.
   const pidErr = verifyPidUid(body.pid);
   if (pidErr) return { ok: false, status: 403, error: `S3 PID/UID rejected: ${pidErr}` };
+  if (body.adapter_pid !== undefined) {
+    const adapterPidErr = verifyPidUid(body.adapter_pid);
+    if (adapterPidErr) return { ok: false, status: 403, error: `S3 adapter PID/UID rejected: ${adapterPidErr}` };
+  }
 
   // S5: bound the summary at registration too.
   if (body.summary && utf8Bytes(body.summary) > MAX_SUMMARY_BYTES) {
@@ -1669,7 +1673,10 @@ function handleRegister(body: RegisterRequest): RegisterResult {
       }
       // Seat identity is written last so it lands on both the insert and update
       // paths without threading two more binds through each statement.
-      updateSeatIdentity.run(effectiveSeatKey, serializeSeatPids(mergeSeatPids(seatMerge.pids, pidWriteValue, isPidAlive)), id);
+      const servingPids = body.adapter_pid === undefined
+        ? seatMerge.pids
+        : [...seatMerge.pids, body.adapter_pid];
+      updateSeatIdentity.run(effectiveSeatKey, serializeSeatPids(mergeSeatPids(servingPids, pidWriteValue, isPidAlive)), id);
       // Legacy rehydration deletes and recreates the same peer id while its
       // queued inbox survives. Preserve that continuous inbox's episode marker
       // so process replacement cannot replenish an exhausted nudge budget.
