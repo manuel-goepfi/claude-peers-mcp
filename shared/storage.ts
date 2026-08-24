@@ -17,7 +17,7 @@ import { dirname, resolve } from "node:path";
 import { fsyncDirectory } from "./fs-durability.ts";
 import { seatKeyBackfillSql, seatKeyPaneUpgradeSql } from "./seat.ts";
 
-export const STORAGE_SCHEMA_VERSION = 1;
+export const STORAGE_SCHEMA_VERSION = 2;
 export const OWNER_ONLY_UMASK = 0o077;
 
 export function hardenSqliteArtifacts(databasePath: string, uid = process.getuid?.() ?? -1): void {
@@ -139,6 +139,8 @@ const requiredMessageColumns = [
   "retention_at",
   "claimed_by",
   "claimed_at",
+  "request_id",
+  "reply_to_id",
 ] as const;
 
 export const storageIndexes = {
@@ -146,6 +148,8 @@ export const storageIndexes = {
   senderStatus: "idx_messages_sender_status",
   deliveredRetention: "idx_messages_delivered_retention",
   unknownReceiverRetention: "idx_messages_unknown_retention",
+  requestIdempotency: "idx_messages_request_idempotency",
+  replyUniqueness: "idx_messages_reply_uniqueness",
   peerReceiverMode: "idx_peers_receiver_mode",
   peerSeatKey: "idx_peers_seat_key",
   peerThreadId: "idx_peers_thread_id",
@@ -191,14 +195,21 @@ export function maximumSequenceHighWater(sequence: number, ids: unknown[]): numb
   return ids.reduce<number>((maximum, id) => Math.max(maximum, Number(id) || 0), Math.max(0, sequence));
 }
 
-export function storageSnapshot(db: Database): StorageSnapshot {
+export function storageSnapshot(
+  db: Database,
+  options: { includeCorrelation?: boolean } = {},
+): StorageSnapshot {
   const messageCols = storageTableColumns(db, "messages");
   const peerCols = storageTableColumns(db, "peers");
   const deliveredAt = messageCols.has("delivered_at") ? "delivered_at" : "NULL AS delivered_at";
   const claimedBy = messageCols.has("claimed_by") ? "claimed_by" : "NULL AS claimed_by";
   const claimedAt = messageCols.has("claimed_at") ? "claimed_at" : "NULL AS claimed_at";
+  const includeCorrelation = options.includeCorrelation !== false;
+  const correlationFields = includeCorrelation
+    ? `, ${messageCols.has("request_id") ? "request_id" : "NULL AS request_id"}, ${messageCols.has("reply_to_id") ? "reply_to_id" : "NULL AS reply_to_id"}`
+    : "";
   const rows = tableExists(db, "messages")
-    ? db.query(`SELECT id, from_id, to_id, text, sent_at, delivered, ${deliveredAt}, ${claimedBy}, ${claimedAt} FROM messages ORDER BY id`).all() as Array<Record<string, unknown>>
+    ? db.query(`SELECT id, from_id, to_id, text, sent_at, delivered, ${deliveredAt}, ${claimedBy}, ${claimedAt}${correlationFields} FROM messages ORDER BY id`).all() as Array<Record<string, unknown>>
     : [];
   const ids = rows.map((row) => row.id);
   const queued = rows.filter((row) => Number(row.delivered) === 0 && !row.claimed_by).length;
@@ -317,7 +328,9 @@ function createMessagesTable(db: Database, name = "messages"): void {
       delivered_at TEXT,
       retention_at TEXT,
       claimed_by TEXT,
-      claimed_at TEXT
+      claimed_at TEXT,
+      request_id TEXT,
+      reply_to_id TEXT
     )
   `);
 }
@@ -327,6 +340,8 @@ function createIndexes(db: Database): void {
   db.run(`CREATE INDEX ${storageIndexes.senderStatus} ON messages(from_id, id)`);
   db.run(`CREATE INDEX ${storageIndexes.deliveredRetention} ON messages(delivered, retention_at)`);
   db.run(`CREATE INDEX ${storageIndexes.unknownReceiverRetention} ON messages(delivered, sent_at, to_id)`);
+  db.run(`CREATE UNIQUE INDEX ${storageIndexes.requestIdempotency} ON messages(from_id, request_id) WHERE request_id IS NOT NULL`);
+  db.run(`CREATE UNIQUE INDEX ${storageIndexes.replyUniqueness} ON messages(to_id, reply_to_id) WHERE reply_to_id IS NOT NULL`);
   db.run(`CREATE INDEX ${storageIndexes.peerReceiverMode} ON peers(receiver_mode, id)`);
   db.run(`CREATE INDEX ${storageIndexes.peerSeatKey} ON peers(seat_key)`);
   db.run(`CREATE INDEX ${storageIndexes.peerThreadId} ON peers(thread_id)`);
@@ -394,7 +409,9 @@ function verifyBackup(path: string, manifest: StorageBackupManifest, expected: S
   try {
     integrity(backup);
     if (storageUserVersion(backup) !== manifest.source_user_version) throw new Error("backup user_version mismatch");
-    const snapshot = storageSnapshot(backup);
+    const snapshot = storageSnapshot(backup, {
+      includeCorrelation: manifest.target_user_version >= 2,
+    });
     if (!sameSnapshot(snapshot, expected) || !sameSnapshot(snapshot, manifest.snapshot)) {
       throw new Error("backup row digest or partition mismatch");
     }
@@ -403,16 +420,40 @@ function verifyBackup(path: string, manifest: StorageBackupManifest, expected: S
   }
 }
 
-function readManifest(path: string): StorageBackupManifest {
+function readManifest(path: string, expectedTargetVersion: number | null = STORAGE_SCHEMA_VERSION): StorageBackupManifest {
   const stat = lstatSync(path);
   if (stat.isSymbolicLink() || !stat.isFile() || (stat.mode & 0o077) !== 0) {
     throw new Error(`backup manifest is not a restrictive regular file: ${path}`);
   }
   const manifest = JSON.parse(readFileSync(path, "utf8")) as StorageBackupManifest;
-  if (manifest.manifest_version !== 1 || manifest.target_user_version !== STORAGE_SCHEMA_VERSION) {
+  if (
+    manifest.manifest_version !== 1 ||
+    !Number.isInteger(manifest.source_user_version) ||
+    !Number.isInteger(manifest.target_user_version) ||
+    (expectedTargetVersion !== null && manifest.target_user_version !== expectedTargetVersion)
+  ) {
     throw new Error("backup manifest version is unsupported");
   }
   return manifest;
+}
+
+function migrationBackupPath(basePath: string, sourceVersion: number): string {
+  const manifestPath = `${basePath}.manifest.json`;
+  const backupExists = existsSync(basePath);
+  const manifestExists = existsSync(manifestPath);
+  if (backupExists !== manifestExists) {
+    throw new Error("incomplete prior migration backup requires operator inspection");
+  }
+  if (!backupExists) return basePath;
+
+  const retained = readManifest(manifestPath, null);
+  verifyBackup(basePath, retained, retained.snapshot);
+  if (
+    retained.source_user_version === sourceVersion &&
+    retained.target_user_version === STORAGE_SCHEMA_VERSION
+  ) return basePath;
+
+  return `${basePath}.v${sourceVersion}-to-v${STORAGE_SCHEMA_VERSION}`;
 }
 
 function createOrVerifyBackup(
@@ -426,7 +467,7 @@ function createOrVerifyBackup(
     if (!existsSync(backupPath) || !existsSync(manifestPath)) {
       throw new Error("incomplete prior migration backup requires operator inspection");
     }
-    const manifest = readManifest(manifestPath);
+    const manifest = readManifest(manifestPath, STORAGE_SCHEMA_VERSION);
     verifyBackup(backupPath, manifest, snapshot);
     return { backupPath, manifestPath };
   }
@@ -479,25 +520,27 @@ function migrateLegacy(
     ensurePeerColumns(db);
     const oldColumns = storageTableColumns(db, "messages");
     if (oldColumns.size > 0) {
-      createMessagesTable(db, "messages_v1");
+      createMessagesTable(db, "messages_v2");
       const deliveredAt = oldColumns.has("delivered_at") ? "delivered_at" : "NULL";
       const claimedBy = oldColumns.has("claimed_by") ? "claimed_by" : "NULL";
       const claimedAt = oldColumns.has("claimed_at") ? "claimed_at" : "NULL";
+      const requestId = oldColumns.has("request_id") ? "request_id" : "NULL";
+      const replyToId = oldColumns.has("reply_to_id") ? "reply_to_id" : "NULL";
       const retentionAt = oldColumns.has("retention_at")
         ? "CASE WHEN delivered = 1 THEN COALESCE(retention_at, ?) ELSE retention_at END"
         : "CASE WHEN delivered = 1 THEN ? ELSE NULL END";
       db.prepare(`
-        INSERT INTO messages_v1 (
+        INSERT INTO messages_v2 (
           id, from_id, to_id, text, sent_at, delivered,
-          delivered_at, retention_at, claimed_by, claimed_at
+          delivered_at, retention_at, claimed_by, claimed_at, request_id, reply_to_id
         )
         SELECT id, from_id, to_id, text, sent_at, delivered,
-               ${deliveredAt}, ${retentionAt}, ${claimedBy}, ${claimedAt}
+               ${deliveredAt}, ${retentionAt}, ${claimedBy}, ${claimedAt}, ${requestId}, ${replyToId}
         FROM messages ORDER BY id
       `).run(migrationTimestamp);
       onCheckpoint?.("copy-complete");
       db.run("DROP TABLE messages");
-      db.run("ALTER TABLE messages_v1 RENAME TO messages");
+      db.run("ALTER TABLE messages_v2 RENAME TO messages");
     } else {
       createMessagesTable(db);
     }
@@ -578,8 +621,12 @@ export function initializeStorage(db: Database, options: InitializeStorageOption
 
   integrity(db);
   const before = storageSnapshot(db);
-  const backupPath = resolve(options.backupPath ?? `${options.databasePath}.backup`);
-  if (backupPath === resolve(options.databasePath)) throw new Error("backup path must differ from the live database path");
+  const baseBackupPath = resolve(options.backupPath ?? `${options.databasePath}.backup`);
+  if (baseBackupPath === resolve(options.databasePath)) throw new Error("backup path must differ from the live database path");
+  const backupPath = migrationBackupPath(baseBackupPath, version);
+  if (resolve(backupPath) === resolve(options.databasePath)) {
+    throw new Error("versioned backup path must differ from the live database path");
+  }
   const backup = createOrVerifyBackup(db, backupPath, version, before);
   options.onCheckpoint?.("backup-complete");
   const migrationTimestamp = options.migrationTimestamp ?? new Date().toISOString();
@@ -623,7 +670,7 @@ function restoreVerifiedStorageBackup(
   if (!preserveClosedSidecars && sidecarSuffixes.length > 0) {
     throw new Error("refusing restore while SQLite WAL/SHM sidecars exist; stop and checkpoint the broker first");
   }
-  const manifest = readManifest(manifestPath);
+  const manifest = readManifest(manifestPath, null);
   verifyBackup(backupPath, manifest, manifest.snapshot);
 
   const tmp = `${databasePath}.restore-${process.pid}-${crypto.randomUUID()}`;
@@ -676,7 +723,25 @@ export function restoreStorageAfterFailedMigration(options: { databasePath: stri
 }
 
 export function retentionPurgeSql(): string {
-  return `DELETE FROM messages INDEXED BY ${storageIndexes.deliveredRetention} WHERE delivered = 1 AND retention_at IS NOT NULL AND retention_at < ?`;
+  // Uncorrelated history expires normally. A correlated request remains while
+  // it is open; once its first reply exists, the request cannot expire before
+  // that reply. This keeps get_reply_status free of a reply-without-request
+  // oracle while retaining the existing TTL as the closed-correlation window.
+  return `DELETE FROM messages INDEXED BY ${storageIndexes.deliveredRetention}
+    WHERE delivered = 1 AND retention_at IS NOT NULL AND retention_at < ?1
+      AND (
+        request_id IS NULL
+        OR reply_to_id IS NOT NULL
+        OR EXISTS (
+          SELECT 1 FROM messages AS reply INDEXED BY ${storageIndexes.replyUniqueness}
+          WHERE reply.to_id = messages.from_id
+            AND reply.reply_to_id IS NOT NULL
+            AND reply.reply_to_id = messages.request_id
+            AND reply.delivered = 1
+            AND reply.retention_at IS NOT NULL
+            AND reply.retention_at < ?1
+        )
+      )`;
 }
 
 export function unknownReceiverPurgeSql(): string {

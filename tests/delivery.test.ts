@@ -869,6 +869,8 @@ describe("Live broker delivery features", () => {
         delivery?: {
           states?: boolean;
           vocabulary?: string[];
+          correlatedReplies?: boolean;
+          idempotentRequests?: boolean;
         };
         storage?: {
           schemaVersion?: number;
@@ -885,9 +887,11 @@ describe("Live broker delivery features", () => {
     expect(body.capabilities?.hookDrain?.reconcilePaneThread).toBe(true);
     expect(body.capabilities?.delivery?.states).toBe(true);
     expect(body.capabilities?.delivery?.vocabulary).toEqual(["queued", "claimed", "acknowledged", "unknown"]);
+    expect(body.capabilities?.delivery?.correlatedReplies).toBe(true);
+    expect(body.capabilities?.delivery?.idempotentRequests).toBe(true);
     expect(body.ready).toBe(true);
-    expect(body.schema_version).toBe(1);
-    expect(body.capabilities?.storage).toEqual({ schemaVersion: 1, readiness: true, retentionAt: true });
+    expect(body.schema_version).toBe(2);
+    expect(body.capabilities?.storage).toEqual({ schemaVersion: 2, readiness: true, retentionAt: true });
   });
 
   test("broker startup migrates an old peer/message schema", async () => {

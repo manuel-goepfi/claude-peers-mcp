@@ -57,6 +57,11 @@ export interface Message {
   id: number;
   from_id: PeerId;
   to_id: PeerId;
+  // Caller-owned idempotency/correlation key. Nullable for legacy rows and
+  // broadcasts; every current 1:1 send receives one.
+  request_id?: string | null;
+  // Links this message to a request sent by `to_id` to `from_id`.
+  reply_to_id?: string | null;
   // Sender's operator-facing seat label at delivery time, so the recipient can
   // refer to a peer the way the operator reads it on the pane border rather than
   // by id. Null when the sender has exited or never took a name; additive, so
@@ -237,6 +242,8 @@ export interface SendMessageRequest {
   from_id: PeerId;
   to_id: PeerId;
   text: string;
+  request_id?: string;
+  reply_to_id?: string;
 }
 
 export interface PeerSelector {
@@ -263,6 +270,12 @@ export type PeerResolveErrorCode =
   | "PEER_NOT_LIVE"
   | "AMBIGUOUS_TARGET";
 
+export type MessageCorrelationErrorCode =
+  | "INVALID_REQUEST_ID"
+  | "REQUEST_ID_CONFLICT"
+  | "REQUEST_NOT_FOUND"
+  | "REPLY_ALREADY_EXISTS";
+
 export interface PeerTarget {
   id: PeerId;
   name: string | null;
@@ -285,10 +298,12 @@ export interface PeerTarget {
 export interface SendMessageResponse {
   ok: boolean;
   id?: number;
+  request_id?: string;
+  deduplicated?: boolean;
   // Additive state contract. Older brokers omit this field; queue insertion is
   // the only success possible on send, so compatible clients may infer queued.
   state?: DeliveryState;
-  code?: PeerResolveErrorCode;
+  code?: PeerResolveErrorCode | MessageCorrelationErrorCode;
   error?: string;
   target?: PeerTarget;
   candidates?: PeerTarget[];
@@ -308,9 +323,32 @@ export interface SendToPeerRequest {
   from_id: PeerId;
   selector: PeerSelector;
   text: string;
+  request_id?: string;
+  reply_to_id?: string;
 }
 
 export type SendToPeerResponse = SendMessageResponse;
+
+export type ReplyDelivery = "claimed_here" | "claimed_elsewhere" | "acknowledged" | "none";
+
+export interface ReplyStatusRequest {
+  id: PeerId;
+  request_id: string;
+  caller_pid: number;
+  pid?: number;
+  thread_id?: string;
+}
+
+export interface ReplyStatusResponse {
+  ok: boolean;
+  status?: "pending" | "replied";
+  delivery?: ReplyDelivery;
+  request_id?: string;
+  drain_id?: string;
+  message?: Message;
+  code?: "INVALID_REQUEST_ID" | "REQUEST_NOT_FOUND";
+  error?: string;
+}
 
 export interface BroadcastResponse {
   ok: boolean;

@@ -326,8 +326,9 @@ describe("Bug 6 — delivered-message TTL purge (bounds unbounded DB growth)", (
 
   beforeEach(() => {
     db = new Database(":memory:");
-    db.run("CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, to_id TEXT, delivered INTEGER, delivered_at TEXT, retention_at TEXT)");
+    db.run("CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, from_id TEXT, to_id TEXT, delivered INTEGER, delivered_at TEXT, retention_at TEXT, request_id TEXT, reply_to_id TEXT)");
     db.run(`CREATE INDEX ${storageIndexes.deliveredRetention} ON messages(delivered, retention_at)`);
+    db.run(`CREATE UNIQUE INDEX ${storageIndexes.replyUniqueness} ON messages(to_id, reply_to_id) WHERE reply_to_id IS NOT NULL`);
   });
 
   // Mirror of the cleanStalePeers delivered-purge DELETE.
@@ -361,6 +362,24 @@ describe("Bug 6 — delivered-message TTL purge (bounds unbounded DB growth)", (
     db.run("INSERT INTO messages (to_id, delivered, delivered_at) VALUES ('a', 0, NULL)");
     purgeDelivered(Date.now());
     expect((db.query("SELECT COUNT(*) AS n FROM messages").get() as { n: number }).n).toBe(1);
+  });
+
+  test("an acknowledged open correlated request survives the ordinary delivered TTL", () => {
+    const old = new Date(Date.now() - 30 * 24 * 3600_000).toISOString();
+    db.run("INSERT INTO messages (from_id,to_id,delivered,delivered_at,retention_at,request_id) VALUES ('a','b',1,?,?,?)", [old, old, "req-open"]);
+    expect(purgeDelivered(Date.now())).toBe(0);
+    expect(db.query("SELECT request_id FROM messages").get()).toEqual({ request_id: "req-open" });
+  });
+
+  test("a request is retained until its linked reply reaches the same TTL", () => {
+    const old = new Date(Date.now() - 30 * 24 * 3600_000).toISOString();
+    const recent = new Date().toISOString();
+    db.run("INSERT INTO messages (from_id,to_id,delivered,delivered_at,retention_at,request_id) VALUES ('a','b',1,?,?,?)", [old, old, "req-linked"]);
+    db.run("INSERT INTO messages (from_id,to_id,delivered,delivered_at,retention_at,request_id,reply_to_id) VALUES ('b','a',1,?,?,?,?)", [recent, recent, "reply-id", "req-linked"]);
+    expect(purgeDelivered(Date.now())).toBe(0);
+    db.run("UPDATE messages SET delivered_at=?, retention_at=? WHERE reply_to_id='req-linked'", [old, old]);
+    expect(purgeDelivered(Date.now())).toBe(2);
+    expect(db.query("SELECT COUNT(*) AS n FROM messages").get()).toEqual({ n: 0 });
   });
 });
 

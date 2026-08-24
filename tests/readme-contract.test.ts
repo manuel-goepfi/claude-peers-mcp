@@ -10,6 +10,7 @@ const toolNames = [
   "list_peers",
   "send_message",
   "send_to_peer",
+  "get_reply_status",
   "inspect_peer_pane",
   "broadcast_message",
   "set_summary",

@@ -10,6 +10,7 @@ import {
   type BrokerLifecycleIdentity,
 } from "./shared/broker-lifecycle.ts";
 import { brokerServiceConfig, installedBrokerServiceIsCurrent } from "./shared/broker-service.ts";
+import { STORAGE_SCHEMA_VERSION } from "./shared/storage.ts";
 import type { DeliveryState, Peer, RegisterCliResponse, SendMessageResponse } from "./shared/types.ts";
 
 const EXIT = {
@@ -125,7 +126,7 @@ async function unregisterCli(context: CliContext): Promise<void> {
 }
 
 function validateLifecycleIdentity(value: unknown): BrokerLifecycleIdentity {
-  if (!isBrokerLifecycleIdentity(value, 1)) {
+  if (!isBrokerLifecycleIdentity(value, STORAGE_SCHEMA_VERSION)) {
     throw new CliError("unsafe", "broker lifecycle identity is missing required verification fields");
   }
   return value;
@@ -341,13 +342,14 @@ async function runCommand(command: string, args: string[], context: CliContext, 
     // tmux coordinate fallback (e.g. "infra:1.2") — and both are things a person
     // reads off the screen and types. A coordinate is resolved to a pane id HERE
     // because that needs tmux, which the broker deliberately does not run.
+    const requestId = crypto.randomUUID();
     let result: SendMessageResponse | undefined;
     for (const attempt of resolveSendTarget(toId)) {
       try {
         const candidate = await requestBroker<SendMessageResponse>({
           baseUrl: context.baseUrl,
           path: "/send-by-pid",
-          body: { caller_pid: process.pid, ...attempt, text: message },
+          body: { caller_pid: process.pid, ...attempt, text: message, request_id: requestId },
           timeoutMs: context.timeoutMs,
         });
         if (candidate?.ok === true) { result = candidate; break; }
@@ -360,9 +362,10 @@ async function runCommand(command: string, args: string[], context: CliContext, 
         from_id: context.identity.id,
         to_id: toId,
         text: message,
+        request_id: requestId,
       });
     }
-    if (!result || result.ok !== true || typeof result.id !== "number") {
+    if (!result || result.ok !== true || typeof result.id !== "number" || typeof result.request_id !== "string") {
       if (result?.ok === false) throw new CliError("target", "broker refused the message target");
       throw new CliError("malformed", "send response is invalid");
     }
@@ -373,12 +376,12 @@ async function runCommand(command: string, args: string[], context: CliContext, 
     // is reading.
     if (context.json) {
       console.log(JSON.stringify({
-        ok: true, command: "send", target: toId, message_id: result.id, state,
+        ok: true, command: "send", target: toId, message_id: result.id, request_id: result.request_id, state,
         sender: result.sender, recipient: result.recipient, warning: result.warning,
       }));
     } else {
       const asSeat = result.sender ? ` as ${result.sender.name ?? result.sender.id}` : "";
-      console.log(`Message queued to ${toId}${asSeat} (id ${result.id}).`);
+      console.log(`Message queued to ${toId}${asSeat} (id ${result.id}, request_id ${result.request_id}).`);
       if (result.warning) console.log(`WARNING: ${result.warning}`);
     }
     return;

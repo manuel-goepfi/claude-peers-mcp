@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { existsSync, lstatSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { chmodSync, existsSync, lstatSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -95,6 +96,25 @@ describe("versioned historical-message migration", () => {
     db.close();
   });
 
+  test("correlation uniqueness is owner-scoped and reply-direction-scoped", () => {
+    const dir = root();
+    const dbPath = join(dir, "correlation-uniqueness.db");
+    const db = new Database(dbPath);
+    initializeStorage(db, { databasePath: dbPath });
+    const insert = db.prepare(`INSERT INTO messages
+      (from_id,to_id,text,sent_at,delivered,request_id,reply_to_id)
+      VALUES (?,?,?,'2026-08-24T00:00:00.000Z',0,?,?)`);
+
+    insert.run("alice", "bob", "request", "same-request", null);
+    expect(() => insert.run("alice", "carol", "conflict", "same-request", null)).toThrow();
+    expect(() => insert.run("other", "bob", "allowed", "same-request", null)).not.toThrow();
+
+    insert.run("bob", "alice", "reply", "reply-one", "same-request");
+    expect(() => insert.run("bob", "alice", "second reply", "reply-two", "same-request")).toThrow();
+    expect(() => insert.run("carol", "other", "independent direction", "reply-three", "same-request")).not.toThrow();
+    db.close();
+  });
+
   test("unread episodes distinguish same-millisecond overlap from drain and refill", () => {
     const dir = root();
     const dbPath = join(dir, "unread-episodes.db");
@@ -160,7 +180,7 @@ describe("versioned historical-message migration", () => {
       migrationTimestamp,
       onReadiness(state) { readiness.push(state); },
     });
-    expect(result).toMatchObject({ version: 1, migrated: true, backupPath });
+    expect(result).toMatchObject({ version: STORAGE_SCHEMA_VERSION, migrated: true, backupPath });
     expect(readiness).toEqual(["starting", "migrating", "ready"]);
     expect(storageSnapshot(db)).toEqual(before);
     expect(db.query("PRAGMA foreign_key_list(messages)").all()).toHaveLength(0);
@@ -181,7 +201,7 @@ describe("versioned historical-message migration", () => {
     expect(lstatSync(`${backupPath}.manifest.json`).mode & 0o777).toBe(0o600);
     const manifest = JSON.parse(readFileSync(`${backupPath}.manifest.json`, "utf8")) as StorageBackupManifest;
     expect(manifest.source_user_version).toBe(0);
-    expect(manifest.target_user_version).toBe(1);
+    expect(manifest.target_user_version).toBe(STORAGE_SCHEMA_VERSION);
     expect(manifest.snapshot).toEqual(before);
     const backup = new Database(backupPath, { readonly: true });
     expect(storageSnapshot(backup)).toEqual(before);
@@ -192,6 +212,83 @@ describe("versioned historical-message migration", () => {
     expect(initializeStorage(db, { databasePath: dbPath, backupPath }).migrated).toBe(false);
     expect(storageSnapshot(db)).toEqual(afterFirst);
     db.close();
+  });
+
+  test("v1 to v2 migration rolls over an older verified backup without changing it", () => {
+    const dir = root();
+    const dbPath = join(dir, "v1-live.db");
+    const backupPath = join(dir, "retained.backup");
+    const oldBackup = legacyDatabase(backupPath);
+    const currentShape = storageSnapshot(oldBackup);
+    const oldSnapshot = storageSnapshot(oldBackup, { includeCorrelation: false });
+    expect(oldSnapshot.message_digest).not.toBe(currentShape.message_digest);
+    oldBackup.close();
+    chmodSync(backupPath, 0o600);
+    const oldManifest: StorageBackupManifest = {
+      manifest_version: 1,
+      created_at: "2026-08-01T00:00:00.000Z",
+      source_user_version: 0,
+      target_user_version: 1,
+      backup_sha256: createHash("sha256").update(readFileSync(backupPath)).digest("hex"),
+      snapshot: oldSnapshot,
+    };
+    writeFileSync(`${backupPath}.manifest.json`, `${JSON.stringify(oldManifest, null, 2)}\n`, { mode: 0o600 });
+    chmodSync(`${backupPath}.manifest.json`, 0o600);
+    const retainedDatabaseBytes = readFileSync(backupPath);
+    const retainedManifestBytes = readFileSync(`${backupPath}.manifest.json`);
+
+    const db = legacyDatabase(dbPath);
+    db.run("PRAGMA user_version = 1");
+    const before = storageSnapshot(db);
+    const result = initializeStorage(db, { databasePath: dbPath, backupPath });
+    const rolloverPath = `${backupPath}.v1-to-v2`;
+
+    expect(result).toMatchObject({
+      version: STORAGE_SCHEMA_VERSION,
+      migrated: true,
+      backupPath: rolloverPath,
+      backupManifestPath: `${rolloverPath}.manifest.json`,
+    });
+    expect(storageSnapshot(db)).toEqual(before);
+    expect(readFileSync(backupPath)).toEqual(retainedDatabaseBytes);
+    expect(readFileSync(`${backupPath}.manifest.json`)).toEqual(retainedManifestBytes);
+    expect(lstatSync(rolloverPath).mode & 0o777).toBe(0o600);
+    expect(lstatSync(`${rolloverPath}.manifest.json`).mode & 0o777).toBe(0o600);
+    const rolloverManifest = JSON.parse(readFileSync(`${rolloverPath}.manifest.json`, "utf8")) as StorageBackupManifest;
+    expect(rolloverManifest.source_user_version).toBe(1);
+    expect(rolloverManifest.target_user_version).toBe(2);
+    expect(db.query("PRAGMA table_info(messages)").all()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: "request_id" }),
+      expect.objectContaining({ name: "reply_to_id" }),
+    ]));
+    db.close();
+  });
+
+  test("a derived versioned backup path can never alias the live database", () => {
+    const dir = root();
+    const backupPath = join(dir, "collision.backup");
+    const dbPath = `${backupPath}.v1-to-v2`;
+    const retained = legacyDatabase(backupPath);
+    const retainedSnapshot = storageSnapshot(retained, { includeCorrelation: false });
+    retained.close();
+    chmodSync(backupPath, 0o600);
+    const retainedManifest: StorageBackupManifest = {
+      manifest_version: 1,
+      created_at: "2026-08-01T00:00:00.000Z",
+      source_user_version: 0,
+      target_user_version: 1,
+      backup_sha256: createHash("sha256").update(readFileSync(backupPath)).digest("hex"),
+      snapshot: retainedSnapshot,
+    };
+    writeFileSync(`${backupPath}.manifest.json`, `${JSON.stringify(retainedManifest, null, 2)}\n`, { mode: 0o600 });
+    chmodSync(`${backupPath}.manifest.json`, 0o600);
+
+    const live = legacyDatabase(dbPath);
+    live.run("PRAGMA user_version = 1");
+    expect(() => initializeStorage(live, { databasePath: dbPath, backupPath }))
+      .toThrow("versioned backup path must differ from the live database path");
+    expect(storageUserVersion(live)).toBe(1);
+    live.close();
   });
 
   test("partial v0 schema backfills only missing delivered retention anchors", () => {
@@ -235,7 +332,7 @@ describe("versioned historical-message migration", () => {
     expect((db.query("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(0);
     expect(storageSnapshot(db)).toEqual(before);
     expect(existsSync(backupPath)).toBe(true);
-    expect(initializeStorage(db, { databasePath: dbPath, backupPath }).version).toBe(1);
+    expect(initializeStorage(db, { databasePath: dbPath, backupPath }).version).toBe(STORAGE_SCHEMA_VERSION);
     db.close();
   });
 
@@ -251,7 +348,7 @@ describe("versioned historical-message migration", () => {
         if (checkpoint === "after-commit") throw new Error("injected post-commit stop");
       },
     })).toThrow("injected post-commit stop");
-    expect((db.query("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(1);
+    expect((db.query("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(STORAGE_SCHEMA_VERSION);
     expect(initializeStorage(db, { databasePath: dbPath, backupPath }).migrated).toBe(false);
     db.close();
   });
@@ -339,7 +436,7 @@ describe("versioned historical-message migration", () => {
         try { response = await fetch(`http://127.0.0.1:${port}/health`); } catch { await Bun.sleep(20); }
       }
       expect(response?.status).toBe(503);
-      expect(await response!.json()).toEqual({ status: "migrating", ready: false, schema_version: 1 });
+      expect(await response!.json()).toEqual({ status: "migrating", ready: false, schema_version: STORAGE_SCHEMA_VERSION });
       const operational = await fetch(`http://127.0.0.1:${port}/list-peers`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -420,9 +517,21 @@ describe("retention and index contracts", () => {
     )).toBe(true);
     expect(explainUsesIndex(
       db,
-      "DELETE FROM messages WHERE delivered=1 AND retention_at < ?",
+      retentionPurgeSql(),
       ["2026"],
       storageIndexes.deliveredRetention,
+    )).toBe(true);
+    expect(explainUsesIndex(
+      db,
+      retentionPurgeSql(),
+      ["2026"],
+      storageIndexes.replyUniqueness,
+    )).toBe(true);
+    expect(explainUsesIndex(
+      db,
+      "SELECT id FROM messages WHERE from_id=? AND request_id=? AND request_id IS NOT NULL",
+      ["p", "request-1"],
+      storageIndexes.requestIdempotency,
     )).toBe(true);
     expect(explainUsesIndex(
       db,

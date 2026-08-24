@@ -76,6 +76,7 @@ describe("/send-by-pid", () => {
 
   type Send = {
     ok?: boolean; id?: number; error?: string;
+    request_id?: string; deduplicated?: boolean;
     sender?: { id: string; name: string | null };
     target?: { id: string };
     warning?: string;
@@ -116,6 +117,32 @@ describe("/send-by-pid", () => {
     });
     expect(status).toBe(200);
     expect(json.sender?.id).toBe(seat);
+  });
+
+  test("uses the same caller-scoped idempotency path as token-authenticated sends", async () => {
+    const seatPid = spawnHolder();
+    const sender = await registerSeat("sbp-idempotent", "%2022", seatPid);
+    const target = await registerSeat("sbp-idempotent-target", "%2023", spawnHolder());
+    const body = {
+      caller_pid: seatPid,
+      to_id: target,
+      text: "one PID-attributed row",
+      request_id: "sbp-stable-request",
+    };
+    const first = await call<Send>("/send-by-pid", body);
+    const retry = await call<Send>("/send-by-pid", body);
+    expect(first).toMatchObject({ status: 200, json: { ok: true, request_id: "sbp-stable-request" } });
+    expect(retry).toMatchObject({
+      status: 200,
+      json: { ok: true, id: first.json.id, request_id: "sbp-stable-request", deduplicated: true },
+    });
+    const db = new Database(broker.dbPath, { readonly: true });
+    try {
+      expect(db.query("SELECT COUNT(*) AS count FROM messages WHERE from_id=? AND request_id=?")
+        .get(sender, "sbp-stable-request")).toEqual({ count: 1 });
+    } finally {
+      db.close();
+    }
   });
 
   test("refuses a caller that is inside NO registered seat", async () => {

@@ -3,7 +3,7 @@ import { Database } from "bun:sqlite";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { initializeStorage } from "../shared/storage.ts";
+import { initializeStorage, STORAGE_SCHEMA_VERSION } from "../shared/storage.ts";
 
 const doctor = new URL("../bin/peers-doctor.ts", import.meta.url).pathname;
 const doctorWrapper = new URL("../bin/peers-doctor.sh", import.meta.url).pathname;
@@ -59,7 +59,7 @@ function healthServer(requests: Array<{ method: string; path: string }>): Return
         ready: true,
         peers: 2,
         version: "0.1.0",
-        schema_version: 1,
+        schema_version: STORAGE_SCHEMA_VERSION,
         capabilities: { hookDrain: { claimByPid: true, ackByPid: true, hookHeartbeatByPid: true } },
       });
     },
@@ -94,8 +94,8 @@ describe("peers doctor safety", () => {
     try {
       const result = await runDoctor(server.port!, fixture);
       expect(result.exitCode).toBe(0);
-      expect(result.output).toContain("broker: ready version=0.1.0 schema=1");
-      expect(result.output).toContain("database: ready schema=1");
+      expect(result.output).toContain(`broker: ready version=0.1.0 schema=${STORAGE_SCHEMA_VERSION}`);
+      expect(result.output).toContain(`database: ready schema=${STORAGE_SCHEMA_VERSION}`);
       expect(requests).toEqual([{ method: "GET", path: "/health" }]);
     } finally {
       server.stop(true);

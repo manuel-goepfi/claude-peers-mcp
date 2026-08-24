@@ -68,8 +68,14 @@ export function renderInboundLine(m: Message): string {
   // masquerade as seats. from_name is a self-chosen, non-unique display label.
   const name = typeof m.from_name === "string" ? m.from_name.trim() : "";
   const nameAttr = name.length > 0 ? ` from_name="${attrEscape(name)}"` : "";
+  const requestAttr = typeof m.request_id === "string" && m.request_id.length > 0
+    ? ` request_id="${attrEscape(m.request_id)}"`
+    : "";
+  const replyAttr = typeof m.reply_to_id === "string" && m.reply_to_id.length > 0
+    ? ` reply_to_id="${attrEscape(m.reply_to_id)}"`
+    : "";
   const replyable = m.from_replyable === false || m.from_replyable === 0 ? "false" : "true";
-  return `<peer-message from="${attrEscape(m.from_id)}"${nameAttr} sent_at="${attrEscape(m.sent_at)}" relayed="${relayed}" replyable="${replyable}">\n${body}\n</peer-message>`;
+  return `<peer-message from="${attrEscape(m.from_id)}"${nameAttr}${requestAttr}${replyAttr} sent_at="${attrEscape(m.sent_at)}" relayed="${relayed}" replyable="${replyable}">\n${body}\n</peer-message>`;
 }
 
 export function renderInboundBatch(messages: Message[]): string {

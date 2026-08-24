@@ -318,7 +318,7 @@ describe("two-phase drain: claim → render → emit → ack", () => {
         peer_id: "selfrow",
         drain_id: "drain-7",
         messages: [
-          { id: 1, from_id: "peer-a", to_id: "selfrow", text: "hello there", sent_at: "2026-07-21T10:00:00Z" },
+          { id: 1, from_id: "peer-a", to_id: "selfrow", text: "hello there", sent_at: "2026-07-21T10:00:00Z", request_id: "reply-1", reply_to_id: "request-1" },
           { id: 2, from_id: null, to_id: "selfrow", text: "second message", sent_at: null }, // malformed
         ],
       }), 2);
@@ -328,7 +328,12 @@ describe("two-phase drain: claim → render → emit → ack", () => {
     expect(ctx).toContain("2 peer message(s) were queued");
     expect(ctx).toContain('<peer-receive-policy source="local-receive-path">');
     expect(ctx.indexOf("<peer-receive-policy")).toBeLessThan(ctx.indexOf("<peer-message "));
-    expect(ctx).toContain('<peer-message from="peer-a" sent_at="2026-07-21T10:00:00Z"');
+    const correlatedMessageTag = ctx.match(/<peer-message from="peer-a"[^>]*>/)?.[0];
+    expect(correlatedMessageTag).toContain('sent_at="2026-07-21T10:00:00Z"');
+    expect(correlatedMessageTag).toContain('relayed="false"');
+    expect(correlatedMessageTag).toContain('replyable="true"');
+    expect(correlatedMessageTag).toContain('request_id="reply-1"');
+    expect(correlatedMessageTag).toContain('reply_to_id="request-1"');
     expect(ctx).toContain("hello there");
     expect(ctx).toContain('from="unknown"'); // null field → placeholder, batch survives
     expect(ctx).toContain("second message");

@@ -43,6 +43,7 @@ import type {
   PeerTarget,
   TmuxPaneSnapshot,
   ThreadIdentityProofResponse,
+  ReplyStatusResponse,
 } from "./shared/types.ts";
 import { durableSeatKey } from "./shared/seat.ts";
 import { detectClientFromProcessChain, findBgSpareAncestor, findClientPidFromProcessChain, initialReceiverMode, isClientProcess, isCodexAppServerProcess, type ProcessInfo } from "./shared/client.ts";
@@ -233,6 +234,7 @@ const PEER_ID_BODY_PATHS = new Set([
   "/poll-messages",
   "/ack-messages",
   "/message-status",
+  "/reply-status",
   "/metrics",
 ]);
 
@@ -1656,7 +1658,7 @@ const TOOLS = [
   {
     name: "send_message",
     description:
-      "Send a message to another peer by live ID. Rejects stale or inactive IDs and returns live candidates when the target seat has relaunched. Prefer send_to_peer for human names or tmux selectors.",
+      "Send a correlated message to another peer by live ID. Returns request_id for idempotent retries and later get_reply_status checks. Prefer send_to_peer for human names or tmux selectors.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -1667,6 +1669,14 @@ const TOOLS = [
         message: {
           type: "string" as const,
           description: "The message to send",
+        },
+        request_id: {
+          type: "string" as const,
+          description: "Optional stable idempotency key matching [A-Za-z0-9._:-]{1,128}; generated when omitted",
+        },
+        reply_to_id: {
+          type: "string" as const,
+          description: "Optional request_id from an inbound peer-message; exact requester/responder direction is enforced",
         },
         include_tmux_context: {
           type: "boolean" as const,
@@ -1680,7 +1690,7 @@ const TOOLS = [
   {
     name: "send_to_peer",
     description:
-      "Send a message to one live peer using a selector: visible tmux pane address, human name, resolved runtime name, live ID, seat_key, or tmux session + pane ID. Ambiguous human names fail with candidate details instead of guessing.",
+      "Send a correlated message to one live peer using a selector. Returns request_id for idempotent retries and later get_reply_status checks.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -1701,6 +1711,14 @@ const TOOLS = [
           type: "string" as const,
           description: "The message to send",
         },
+        request_id: {
+          type: "string" as const,
+          description: "Optional stable idempotency key matching [A-Za-z0-9._:-]{1,128}; generated when omitted",
+        },
+        reply_to_id: {
+          type: "string" as const,
+          description: "Optional request_id from an inbound peer-message; exact requester/responder direction is enforced",
+        },
         include_tmux_context: {
           type: "boolean" as const,
           description:
@@ -1708,6 +1726,21 @@ const TOOLS = [
         },
       },
       required: ["selector", "message"],
+    },
+  },
+  {
+    name: "get_reply_status",
+    description:
+      "Check one caller-owned request_id immediately. If its reply is available, this exact session claims, renders, and acknowledges it through the same exclusive inbox lease as check_messages.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        request_id: {
+          type: "string" as const,
+          description: "The request_id returned by send_message or send_to_peer",
+        },
+      },
+      required: ["request_id"],
     },
   },
   {
@@ -1947,10 +1980,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     case "send_message": {
-      const { to_id, message, include_tmux_context } = args as {
+      const { to_id, message, include_tmux_context, request_id, reply_to_id } = args as {
         to_id: string;
         message: string;
         include_tmux_context?: boolean;
+        request_id?: string;
+        reply_to_id?: string;
       };
       if (!myId) {
         return {
@@ -1958,15 +1993,24 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           isError: true,
         };
       }
+      const effectiveRequestId = request_id ?? crypto.randomUUID();
       try {
         const result = await brokerFetch<SendMessageResponse>("/send-message", {
           from_id: myId,
           to_id,
           text: message,
+          request_id: effectiveRequestId,
+          ...(reply_to_id === undefined ? {} : { reply_to_id }),
         });
         if (!result.ok) {
           return {
             content: [{ type: "text" as const, text: `Failed to send: ${result.error}${formatPeerCandidates(result.candidates)}` }],
+            isError: true,
+          };
+        }
+        if (typeof result.request_id !== "string") {
+          return {
+            content: [{ type: "text" as const, text: "Broker accepted the message without correlation support; it may already be queued. Restart the broker before relying on reply status." }],
             isError: true,
           };
         }
@@ -1995,7 +2039,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const tmuxSnapshot = include_tmux_context === true && result.target ? await inspectPeerPane(result.target.id) : null;
         const tmuxText = tmuxSnapshot ? `\n\n${formatTmuxSnapshot(tmuxSnapshot)}` : "";
         return {
-          content: [{ type: "text" as const, text: `Message queued to ${formatPeerTarget(result.target)}.${statusLine}${deliveryWarningLine(result.recipient)}${tmuxText}${pending ?? ""}` }],
+          content: [{ type: "text" as const, text: `Message queued to ${formatPeerTarget(result.target)} request_id=${result.request_id}.${statusLine}${deliveryWarningLine(result.recipient)}${tmuxText}${pending ?? ""}` }],
         };
       } catch (e) {
         return {
@@ -2011,10 +2055,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     case "send_to_peer": {
-      const { selector, message, include_tmux_context } = args as {
+      const { selector, message, include_tmux_context, request_id, reply_to_id } = args as {
         selector: PeerSelector;
         message: string;
         include_tmux_context?: boolean;
+        request_id?: string;
+        reply_to_id?: string;
       };
       if (!myId) {
         return {
@@ -2022,6 +2068,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           isError: true,
         };
       }
+      const effectiveRequestId = request_id ?? crypto.randomUUID();
       try {
         let effectiveSelector = selector;
         if (selector?.tmux_target) {
@@ -2039,11 +2086,19 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           from_id: myId,
           selector: effectiveSelector,
           text: message,
+          request_id: effectiveRequestId,
+          ...(reply_to_id === undefined ? {} : { reply_to_id }),
         });
         if (!result.ok) {
           const tmuxHint = result.code === "PEER_NOT_FOUND" ? await tmuxOnlyPeerHint(effectiveSelector) : "";
           return {
             content: [{ type: "text" as const, text: `Failed to send: ${result.error}${formatPeerCandidates(result.candidates)}${tmuxHint}` }],
+            isError: true,
+          };
+        }
+        if (typeof result.request_id !== "string") {
+          return {
+            content: [{ type: "text" as const, text: "Broker accepted the message without correlation support; it may already be queued. Restart the broker before relying on reply status." }],
             isError: true,
           };
         }
@@ -2068,11 +2123,87 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const tmuxSnapshot = include_tmux_context === true && result.target ? await inspectPeerPane(result.target.id) : null;
         const tmuxText = tmuxSnapshot ? `\n\n${formatTmuxSnapshot(tmuxSnapshot)}` : "";
         return {
-          content: [{ type: "text" as const, text: `Message queued to ${formatPeerTarget(result.target)}.${statusLine}${deliveryWarningLine(result.recipient)}${tmuxText}${pending ?? ""}` }],
+          content: [{ type: "text" as const, text: `Message queued to ${formatPeerTarget(result.target)} request_id=${result.request_id}.${statusLine}${deliveryWarningLine(result.recipient)}${tmuxText}${pending ?? ""}` }],
         };
       } catch (e) {
         return {
           content: [{ type: "text" as const, text: `Error sending message: ${e instanceof Error ? e.message : String(e)}` }],
+          isError: true,
+        };
+      }
+    }
+
+    case "get_reply_status": {
+      const { request_id } = args as { request_id: string };
+      if (!myId) {
+        return {
+          content: [{ type: "text" as const, text: "Not registered with broker yet" }],
+          isError: true,
+        };
+      }
+      const identity = selectInboxClaimIdentity(
+        myClientType,
+        myRegisterPid,
+        process.pid,
+        appServerBoundThreadId,
+      );
+      if (!identity) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: "Cannot safely resolve this session for reply status; reopen the session or use its exact pane hook.",
+          }],
+          isError: true,
+        };
+      }
+      try {
+        const result = await brokerFetch<ReplyStatusResponse>("/reply-status", {
+          id: myId,
+          request_id,
+          caller_pid: process.pid,
+          ...(identity.kind === "thread"
+            ? { thread_id: identity.thread_id }
+            : { pid: identity.pid }),
+        });
+        if (!result.ok) {
+          return {
+            content: [{ type: "text" as const, text: `Reply status unavailable: ${result.error ?? "request not found"}` }],
+            isError: true,
+          };
+        }
+        if (result.status === "pending") {
+          return {
+            content: [{ type: "text" as const, text: `No reply yet for request_id=${request_id}.` }],
+          };
+        }
+        if (result.delivery !== "claimed_here") {
+          return {
+            content: [{
+              type: "text" as const,
+              text: `Reply status for request_id=${request_id}: replied, delivery=${result.delivery ?? "none"}.`,
+            }],
+          };
+        }
+        if (!result.message || !result.drain_id) {
+          throw new Error("reply claim returned no message or drain_id");
+        }
+        const batch: ClaimedInboxBatch = {
+          identity,
+          drainId: result.drain_id,
+          messages: [result.message],
+        };
+        const rendered = renderInboundBatch(batch.messages);
+        const acked = await ackClaimedInbox(batch, "get_reply_status");
+        const warning = acked ? "" : "\n\nWarning: acknowledgement failed; this reply may be delivered again after the claim lease expires.";
+        return {
+          content: [{
+            type: "text" as const,
+            text: `Reply for request_id=${request_id} (delivery=claimed_here):\n\n${rendered}${warning}`,
+          }],
+        };
+      } catch (e) {
+        return {
+          content: [{ type: "text" as const, text: `Error checking reply status: ${errMsg(e)}` }],
           isError: true,
         };
       }

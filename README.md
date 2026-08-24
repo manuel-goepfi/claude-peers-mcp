@@ -163,8 +163,9 @@ Start two client sessions and ask one to call `list_peers`, then send with `send
 | Tool | Contract |
 | --- | --- |
 | `list_peers` | List targetable peers by `machine`, exact `directory`, or worktree-aware `repo` scope; optional tmux filter. |
-| `send_message` | Send to one live broker ID. Stale IDs fail and return replacement candidates; no guessing. |
-| `send_to_peer` | Resolve one exact selector: ID, name, resolved name, seat key, visible tmux target, or tmux session plus pane ID. Ambiguity returns candidates and sends nothing. |
+| `send_message` | Send to one live broker ID. Returns a caller-scoped `request_id`; an optional stable ID makes retries idempotent. |
+| `send_to_peer` | Resolve one exact selector and send with the same request/retry contract. Ambiguity returns candidates and sends nothing. |
+| `get_reply_status` | Check one caller-owned `request_id`; an available reply is claimed and acknowledged through the same exclusive inbox lease as `check_messages`. |
 | `inspect_peer_pane` | Explicitly capture 1–200 lines from a peer pane, read-only, capped at 8 KiB. Does not claim or ack the caller's inbox. |
 | `broadcast_message` | Fan out to a bounded tmux/repo/name scope. At least one filter is required and filters combine with AND. |
 | `set_summary` | Set an explicit operator/agent summary visible to peers. There is no LLM or API-key auto-summary dependency. |
@@ -189,6 +190,8 @@ Tmux capture is always explicit through `inspect_peer_pane` or `include_tmux_con
 | `unknown` | The sender cannot prove a current row/state, including legacy delivered rows without an acknowledgement timestamp. |
 
 `expired` is retention telemetry only; the broker does not keep message tombstones. A missing row is never guessed to be queued or expired.
+
+Every current 1:1 send returns `request_id`. Callers may provide a stable value matching `[A-Za-z0-9._:-]{1,128}`; an identical retry returns the original row and a changed retry fails with `REQUEST_ID_CONFLICT`. To correlate a reply, send to the authenticated `from` route and pass the inbound `request_id` as `reply_to_id`. The broker enforces exact requester/responder direction and accepts only the first reply. `get_reply_status` reports `pending` or `replied`; reply bodies are returned only to the session that wins the ordinary claim lease, so racing `check_messages` cannot render the same body twice.
 
 Queue insertion is not receipt, so every send also returns the recipient's live delivery health in `recipient` (and a human `warning` when there is something to say). This is read from the recipient's actual queue at send time, not inferred from its configuration:
 
@@ -217,11 +220,11 @@ Every current client disables the MCP background observation poll. A consumer cl
 - Per peer: 600 protected requests and 60 message slots per rolling minute. Heartbeats are exempt from request throttling.
 - Broadcast: at most 60 targets. Hook claim: at most 25 messages and 64 KiB. Claim lease: 30 seconds.
 - Tmux capture: default 80 lines, maximum 200 lines and 8 KiB.
-- Delivered history: seven days by default, anchored at acknowledgement or migration retention time.
+- Delivered history: seven days by default, anchored at acknowledgement or migration retention time. An open correlated request is retained; after its reply arrives, the request remains at least as long as that reply.
 - Undelivered mail to an `unknown` receiver: seven days by default.
 - A dead recoverable seat keeps undelivered mail for 24 hours by default, with a one-hour floor.
 
-History intentionally outlives ephemeral peer rows. Schema version 1 has no message-to-peer foreign keys. Startup migration creates and verifies a restricted backup, preserves IDs/claims/high-water state, commits the version last, and restores atomically after post-commit verification failure.
+History intentionally outlives ephemeral peer rows. Schema version 2 has no message-to-peer foreign keys. Startup migration creates and verifies a restricted backup, preserves IDs/claims/correlation/high-water state, commits the version last, and restores atomically after post-commit verification failure. When an older verified migration backup already occupies the configured path, the next migration creates a versioned sibling and leaves the retained pair byte-identical.
 
 | Stored state | Retention behavior |
 | --- | --- |

@@ -53,6 +53,9 @@ import type {
   ThreadIdentityProofResponse,
   PeerResolveErrorCode,
   Message,
+  MessageCorrelationErrorCode,
+  ReplyStatusRequest,
+  ReplyStatusResponse,
 } from "./shared/types.ts";
 // #7 narrow (2026-05-14): predicate + TTL constant extracted to shared/
 // so tests can import the real symbol without spawning broker.ts (which
@@ -84,6 +87,7 @@ import {
   retentionPurgeSql,
   staleUndeliveredPurgeSql,
   unknownReceiverPurgeSql,
+  storageIndexes,
   STORAGE_SCHEMA_VERSION,
   type InitializeStorageResult,
   type StorageReadiness,
@@ -187,6 +191,7 @@ process.once("SIGINT", () => process.exit(0));
 const MAX_MSG_BYTES = 32 * 1024;       // 32 KB per message body
 const MAX_SUMMARY_BYTES = 1024;        // 1 KB per summary
 const MAX_NAME_BYTES = 128;            // 128 B per peer name
+const REQUEST_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/;
 const MAX_REQ_BYTES = 64 * 1024;       // 64 KB per HTTP request body
 const RATE_WINDOW_MS = 60_000;         // 1-minute rolling window
 const RATE_MAX_MSGS = 60;              // max messages sent per peer per window
@@ -220,6 +225,8 @@ const BROKER_CAPABILITIES = {
     sendToPeer: true,
     states: true,
     vocabulary: DELIVERY_STATES,
+    correlatedReplies: true,
+    idempotentRequests: true,
   },
   cli: {
     registerCli: true,
@@ -691,8 +698,23 @@ const selectPeersByGitRoot = db.prepare(`
 `);
 
 const insertMessage = db.prepare(`
-  INSERT INTO messages (from_id, to_id, text, sent_at, delivered)
-  VALUES (?, ?, ?, ?, 0)
+  INSERT INTO messages (from_id, to_id, text, sent_at, delivered, request_id, reply_to_id)
+  VALUES (?, ?, ?, ?, 0, ?, ?)
+`);
+
+const selectRequestByOwner = db.prepare(`
+  SELECT id, from_id, to_id, text, sent_at, delivered, delivered_at,
+         claimed_by, claimed_at, request_id, reply_to_id
+  FROM messages INDEXED BY ${storageIndexes.requestIdempotency}
+  WHERE from_id = ? AND request_id = ? AND request_id IS NOT NULL
+`);
+
+const selectReplyForRequest = db.prepare(`
+  SELECT m.*, p.name AS from_name,
+    CASE WHEN p.id IS NOT NULL AND p.non_targetable = 0 THEN 1 ELSE 0 END AS from_replyable
+  FROM messages AS m INDEXED BY ${storageIndexes.replyUniqueness}
+  LEFT JOIN peers AS p ON p.id = m.from_id
+  WHERE m.to_id = ? AND m.reply_to_id = ? AND m.reply_to_id IS NOT NULL
 `);
 
 // The join gives the recipient both the sender label and the current reply-route
@@ -2104,9 +2126,8 @@ function describePeerTarget(peer: Peer): PeerTarget {
   };
 }
 
-type ResolvePeerResult =
-  | { ok: true; peer: Peer }
-  | { ok: false; code: PeerResolveErrorCode; error: string; candidates?: PeerTarget[] };
+type ResolvePeerFailure = { ok: false; code: PeerResolveErrorCode; error: string; candidates?: PeerTarget[] };
+type ResolvePeerResult = { ok: true; peer: Peer } | ResolvePeerFailure;
 
 function selectorFields(selector: PeerSelector | undefined): string[] {
   if (!selector || typeof selector !== "object") return [];
@@ -2137,20 +2158,26 @@ function peerMatchesSelector(peer: Peer, selector: PeerSelector): boolean {
   return true;
 }
 
+function selectorValidationFailure(selector: PeerSelector | undefined): ResolvePeerFailure | null {
+  const fields = selectorFields(selector);
+  if (fields.length === 0) {
+    return { ok: false, code: "INVALID_SELECTOR", error: "target selector must include id, name, resolved_name, seat_key, or tmux pane fields" };
+  }
+  if (fields.length === 1 && fields[0] === "tmux_session") {
+    return { ok: false, code: "INVALID_SELECTOR", error: "tmux_session alone is not a unique peer selector; include tmux_pane_id or another identity field" };
+  }
+  return null;
+}
+
 function selectorWithoutId(selector: PeerSelector): PeerSelector {
   const { id: _id, ...rest } = selector;
   return rest;
 }
 
 function resolveFreshPeer(selector: PeerSelector | undefined): ResolvePeerResult {
-  const fields = selectorFields(selector);
-  if (fields.length === 0) {
-    return { ok: false, code: "INVALID_SELECTOR", error: "target selector must include id, name, resolved_name, seat_key, or tmux pane fields" };
-  }
+  const invalid = selectorValidationFailure(selector);
+  if (invalid) return invalid;
   const targetSelector = selector!;
-  if (fields.length === 1 && fields[0] === "tmux_session") {
-    return { ok: false, code: "INVALID_SELECTOR", error: "tmux_session alone is not a unique peer selector; include tmux_pane_id or another identity field" };
-  }
   // tmux_pane_id ALONE is accepted: pane ids are unique across the whole tmux
   // server, so the session adds description, not identity. This premise was wrong
   // in three places today — the seat key, the delivery-health check, and here — and
@@ -2272,47 +2299,197 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
   return body.include_inactive ? live : activeOnly(live);
 }
 
-function handleSendMessage(authedFromId: string, body: SendMessageRequest): SendMessageResponse {
-  // S6: from_id is ALWAYS the authenticated peer — body.from_id is ignored.
-  // S5: payload size cap.
-  if (typeof body.text !== "string") return { ok: false, error: "text must be string" };
-  if (utf8Bytes(body.text) > MAX_MSG_BYTES) return { ok: false, error: `text exceeds ${MAX_MSG_BYTES} bytes` };
-  const resolved = resolveFreshPeer({ id: body.to_id });
-  if (!resolved.ok) {
-    return { ok: false, code: resolved.code, error: resolved.error, candidates: resolved.candidates };
+type CorrelatedMessageRow = Message & {
+  delivered_at: string | null;
+  claimed_by: string | null;
+  claimed_at: string | null;
+};
+
+function storedDeliveryState(row: Pick<CorrelatedMessageRow, "delivered" | "delivered_at" | "claimed_by" | "claimed_at">): DeliveryState {
+  if (Number(row.delivered) === 1) return row.delivered_at ? "acknowledged" : "unknown";
+  return row.claimed_by && row.claimed_at && row.claimed_at >= claimCutoffIso() ? "claimed" : "queued";
+}
+
+type CorrelationErrorResponse = SendMessageResponse & { ok: false };
+
+function correlationError(code: MessageCorrelationErrorCode, error: string): CorrelationErrorResponse {
+  return { ok: false, code, error };
+}
+
+type NormalizedCorrelationIds = {
+  ok: true;
+  requestId: string;
+  replyToId: string | null;
+};
+
+function normalizeCorrelationIds(requestIdInput: unknown, replyToIdInput: unknown):
+  NormalizedCorrelationIds | CorrelationErrorResponse {
+  const requestId = requestIdInput === undefined ? crypto.randomUUID() : requestIdInput;
+  if (typeof requestId !== "string" || !REQUEST_ID_RE.test(requestId)) {
+    return correlationError("INVALID_REQUEST_ID", "request_id must match [A-Za-z0-9._:-]{1,128}");
   }
-  const target = resolved.peer;
-  const result = insertMessage.run(authedFromId, target.id, body.text, new Date().toISOString());
-  // Health is read AFTER the insert so `pending` counts this message too — the
-  // sender is asking "did this land", not "what was there before I sent".
-  const recipient = withSenderReplyWarning(authedFromId, recipientHealthFor(target));
+  const replyToId = replyToIdInput === undefined ? null : replyToIdInput;
+  if (replyToId !== null && (typeof replyToId !== "string" || !REQUEST_ID_RE.test(replyToId))) {
+    return correlationError("INVALID_REQUEST_ID", "reply_to_id must match [A-Za-z0-9._:-]{1,128}");
+  }
+  return { ok: true, requestId, replyToId };
+}
+
+function storedRetry(
+  authedFromId: string,
+  targetId: string,
+  text: string,
+  requestId: string,
+  replyToId: string | null,
+): SendMessageResponse | null {
+  const existing = selectRequestByOwner.get(authedFromId, requestId) as CorrelatedMessageRow | null;
+  if (!existing) return null;
+  if (
+    existing.to_id !== targetId ||
+    existing.text !== text ||
+    (existing.reply_to_id ?? null) !== replyToId
+  ) {
+    return correlationError("REQUEST_ID_CONFLICT", "request_id already exists with different message data");
+  }
   return {
     ok: true,
-    id: Number(result.lastInsertRowid),
-    state: "queued",
+    id: existing.id,
+    request_id: requestId,
+    deduplicated: true,
+    state: storedDeliveryState(existing),
+  };
+}
+
+function storedSelectorRetry(
+  authedFromId: string,
+  selector: PeerSelector,
+  text: string,
+  requestId: string,
+  replyToId: string | null,
+): SendMessageResponse | null {
+  const existing = selectRequestByOwner.get(authedFromId, requestId) as CorrelatedMessageRow | null;
+  if (!existing) return null;
+  const originalTarget = selectPeerById.get(existing.to_id) as Peer | null;
+  if (!originalTarget || !peerMatchesSelector(originalTarget, selector)) {
+    return correlationError("REQUEST_ID_CONFLICT", "request_id already exists with different message data");
+  }
+  return storedRetry(authedFromId, existing.to_id, text, requestId, replyToId);
+}
+
+function decorateCorrelatedResponse(
+  authedFromId: string,
+  outcome: SendMessageResponse,
+  target: Peer | null,
+): SendMessageResponse {
+  if (!outcome.ok || !target) return outcome;
+  const recipient = withSenderReplyWarning(authedFromId, recipientHealthFor(target));
+  return {
+    ...outcome,
     target: describePeerTarget(target),
     recipient,
     warning: recipient.warning ?? undefined,
   };
 }
 
-function handleSendToPeer(authedFromId: string, body: SendToPeerRequest): SendMessageResponse {
+function insertCorrelatedMessage(
+  authedFromId: string,
+  target: Peer,
+  text: string,
+  requestIdInput: unknown,
+  replyToIdInput: unknown,
+): SendMessageResponse {
+  const normalized = normalizeCorrelationIds(requestIdInput, replyToIdInput);
+  if (!normalized.ok) return normalized;
+  const { requestId, replyToId } = normalized;
+
+  const outcome = db.transaction((): SendMessageResponse => {
+    const retry = storedRetry(authedFromId, target.id, text, requestId, replyToId);
+    if (retry) return retry;
+
+    if (replyToId !== null) {
+      const request = selectRequestByOwner.get(target.id, replyToId) as CorrelatedMessageRow | null;
+      if (!request || request.to_id !== authedFromId) {
+        return correlationError("REQUEST_NOT_FOUND", "request not found");
+      }
+      if (selectReplyForRequest.get(target.id, replyToId)) {
+        return correlationError("REPLY_ALREADY_EXISTS", "request already has a reply");
+      }
+    }
+
+    const inserted = insertMessage.run(
+      authedFromId,
+      target.id,
+      text,
+      new Date().toISOString(),
+      requestId,
+      replyToId,
+    );
+    return {
+      ok: true,
+      id: Number(inserted.lastInsertRowid),
+      request_id: requestId,
+      state: "queued",
+    };
+  })();
+
+  return decorateCorrelatedResponse(authedFromId, outcome, target);
+}
+
+function handleSendMessage(authedFromId: string, body: SendMessageRequest): SendMessageResponse {
+  // S6: from_id is ALWAYS the authenticated peer — body.from_id is ignored.
   if (typeof body.text !== "string") return { ok: false, error: "text must be string" };
   if (utf8Bytes(body.text) > MAX_MSG_BYTES) return { ok: false, error: `text exceeds ${MAX_MSG_BYTES} bytes` };
-  const resolved = resolveFreshPeer(body.selector);
+  const normalized = normalizeCorrelationIds(body.request_id, body.reply_to_id);
+  if (!normalized.ok) return normalized;
+  const retry = storedRetry(authedFromId, body.to_id, body.text, normalized.requestId, normalized.replyToId);
+  if (retry) {
+    return decorateCorrelatedResponse(
+      authedFromId,
+      retry,
+      (selectPeerById.get(body.to_id) as Peer | null) ?? null,
+    );
+  }
+  const resolved = resolveFreshPeer({ id: body.to_id });
   if (!resolved.ok) {
     return { ok: false, code: resolved.code, error: resolved.error, candidates: resolved.candidates };
   }
-  const result = insertMessage.run(authedFromId, resolved.peer.id, body.text, new Date().toISOString());
-  const recipient = withSenderReplyWarning(authedFromId, recipientHealthFor(resolved.peer));
-  return {
-    ok: true,
-    id: Number(result.lastInsertRowid),
-    state: "queued",
-    target: describePeerTarget(resolved.peer),
-    recipient,
-    warning: recipient.warning ?? undefined,
-  };
+  return insertCorrelatedMessage(
+    authedFromId,
+    resolved.peer,
+    body.text,
+    normalized.requestId,
+    normalized.replyToId,
+  );
+}
+
+function handleSendToPeer(authedFromId: string, body: SendToPeerRequest): SendMessageResponse {
+  if (typeof body.text !== "string") return { ok: false, error: "text must be string" };
+  if (utf8Bytes(body.text) > MAX_MSG_BYTES) return { ok: false, error: `text exceeds ${MAX_MSG_BYTES} bytes` };
+  const normalized = normalizeCorrelationIds(body.request_id, body.reply_to_id);
+  if (!normalized.ok) return normalized;
+  const selector = body.selector && typeof body.selector === "object" ? body.selector : undefined;
+  const invalid = selectorValidationFailure(selector);
+  if (invalid) return { ok: false, code: invalid.code, error: invalid.error };
+  const retry = storedSelectorRetry(authedFromId, selector!, body.text, normalized.requestId, normalized.replyToId);
+  if (retry) {
+    const stored = selectRequestByOwner.get(authedFromId, normalized.requestId) as CorrelatedMessageRow | null;
+    return decorateCorrelatedResponse(
+      authedFromId,
+      retry,
+      stored ? ((selectPeerById.get(stored.to_id) as Peer | null) ?? null) : null,
+    );
+  }
+  const resolved = resolveFreshPeer(selector);
+  if (!resolved.ok) {
+    return { ok: false, code: resolved.code, error: resolved.error, candidates: resolved.candidates };
+  }
+  return insertCorrelatedMessage(
+    authedFromId,
+    resolved.peer,
+    body.text,
+    normalized.requestId,
+    normalized.replyToId,
+  );
 }
 
 // /message-status: sender-scoped state lookup for messages the caller inserted.
@@ -2341,6 +2518,80 @@ function handleMessageStatus(authedFromId: string, body: { ids: number[] }):
       : { id, state: "unknown" as const, delivered: false, delivered_at: null };
   });
   return { ok: true, statuses };
+}
+
+type ReplyStatusResult = ReplyStatusResponse & { httpStatus?: number };
+
+function handleReplyStatus(authedFromId: string, body: ReplyStatusRequest): ReplyStatusResult {
+  if (typeof body.request_id !== "string" || !REQUEST_ID_RE.test(body.request_id)) {
+    return {
+      ok: false,
+      code: "INVALID_REQUEST_ID",
+      error: "request_id must match [A-Za-z0-9._:-]{1,128}",
+    };
+  }
+
+  const exact = typeof body.thread_id === "string" && body.thread_id.length > 0
+    ? authThreadDrain(body.thread_id, Number(body.caller_pid))
+    : authPidDrain(Number(body.pid), Number(body.caller_pid));
+  if (!exact.ok || exact.id !== authedFromId) {
+    return { ok: false, error: "exact session identity rejected", httpStatus: 403 };
+  }
+
+  const request = selectRequestByOwner.get(authedFromId, body.request_id) as CorrelatedMessageRow | null;
+  if (!request) {
+    return { ok: false, code: "REQUEST_NOT_FOUND", error: "request not found" };
+  }
+
+  const current = selectReplyForRequest.get(authedFromId, body.request_id) as CorrelatedMessageRow | null;
+  if (!current) {
+    return {
+      ok: true,
+      status: "pending",
+      delivery: "none",
+      request_id: body.request_id,
+    };
+  }
+  if (Number(current.delivered) === 1) {
+    return {
+      ok: true,
+      status: "replied",
+      delivery: "acknowledged",
+      request_id: body.request_id,
+    };
+  }
+  const cutoff = claimCutoffIso();
+  if (current.claimed_by && current.claimed_at && current.claimed_at >= cutoff) {
+    return {
+      ok: true,
+      status: "replied",
+      delivery: "claimed_elsewhere",
+      request_id: body.request_id,
+    };
+  }
+
+  const drainId = generateDrainId(authedFromId);
+  const claimedAt = new Date().toISOString();
+  const claimed = claimMessage.run(drainId, claimedAt, current.id, authedFromId, cutoff);
+  if (claimed.changes === 1) {
+    runtimeMetrics.recordQueueToBuffer(current.id, current.sent_at, Date.now());
+    return {
+      ok: true,
+      status: "replied",
+      delivery: "claimed_here",
+      request_id: body.request_id,
+      drain_id: drainId,
+      message: current,
+    };
+  }
+
+  const raced = selectReplyForRequest.get(authedFromId, body.request_id) as CorrelatedMessageRow | null;
+  return {
+    ok: true,
+    status: raced ? "replied" : "pending",
+    delivery: raced && Number(raced.delivered) === 1 ? "acknowledged" : raced ? "claimed_elsewhere" : "none",
+    request_id: body.request_id,
+  };
 }
 
 // /broadcast-message: fanout send by scope. Requires at least one scope
@@ -2400,7 +2651,7 @@ function handleBroadcast(authedFromId: string, body: BroadcastRequest): Broadcas
   let sent = 0;
   db.transaction(() => {
     for (const t of activeTargets) {
-      insertMessage.run(authedFromId, t.id, body.text, now);
+      insertMessage.run(authedFromId, t.id, body.text, now, null, null);
       sent++;
     }
   })();
@@ -3073,22 +3324,33 @@ function handleSendByPid(body: Record<string, unknown>): SendMessageResponse & {
   const selector: PeerSelector = typeof body.to_id === "string" && body.to_id
     ? { id: body.to_id }
     : (body.selector as PeerSelector | undefined) ?? {};
+  const normalized = normalizeCorrelationIds(body.request_id, body.reply_to_id);
+  if (!normalized.ok) return { ...normalized, status: 400 };
+  const invalid = selectorValidationFailure(selector);
+  if (invalid) return { ok: false, status: 400, code: invalid.code, error: invalid.error };
+  const retry = storedSelectorRetry(sender.id, selector, body.text, normalized.requestId, normalized.replyToId);
+  if (retry) {
+    const stored = selectRequestByOwner.get(sender.id, normalized.requestId) as CorrelatedMessageRow | null;
+    const decorated = decorateCorrelatedResponse(
+      sender.id,
+      retry,
+      stored ? ((selectPeerById.get(stored.to_id) as Peer | null) ?? null) : null,
+    );
+    return decorated.ok ? { ...decorated, sender: describePeerTarget(sender) } : { ...decorated, status: 400 };
+  }
   const resolved = resolveFreshPeer(selector);
   if (!resolved.ok) {
     return { ok: false, status: 404, code: resolved.code, error: resolved.error, candidates: resolved.candidates };
   }
 
-  const result = insertMessage.run(sender.id, resolved.peer.id, body.text, new Date().toISOString());
-  const recipient = withSenderReplyWarning(sender.id, recipientHealthFor(resolved.peer));
-  return {
-    ok: true,
-    id: Number(result.lastInsertRowid),
-    state: "queued",
-    target: describePeerTarget(resolved.peer),
-    recipient,
-    warning: recipient.warning ?? undefined,
-    sender: describePeerTarget(sender),
-  };
+  const result = insertCorrelatedMessage(
+    sender.id,
+    resolved.peer,
+    body.text,
+    normalized.requestId,
+    normalized.replyToId,
+  );
+  return result.ok ? { ...result, sender: describePeerTarget(sender) } : { ...result, status: 400 };
 }
 
 function handleHookHeartbeatByPid(body: HookHeartbeatByPidRequest): { ok: boolean; peer_id?: string; error?: string; status?: number } {
@@ -3625,6 +3887,21 @@ requestHandler = async (req: Request) => {
           return Response.json(handleBroadcast(auth.id, body as unknown as BroadcastRequest));
         case "/message-status":
           return Response.json(handleMessageStatus(auth.id, { ids: (body.ids as number[]) ?? [] }));
+        case "/reply-status": {
+          const result = handleReplyStatus(auth.id, {
+            id: auth.id,
+            request_id: typeof body.request_id === "string" ? body.request_id : "",
+            caller_pid: Number(body.caller_pid),
+            ...(typeof body.thread_id === "string"
+              ? { thread_id: body.thread_id }
+              : { pid: Number(body.pid) }),
+          });
+          if (result.httpStatus) {
+            return Response.json({ ok: false, error: result.error }, { status: result.httpStatus });
+          }
+          const { httpStatus: _httpStatus, ...publicResult } = result;
+          return Response.json(publicResult);
+        }
         case "/lifecycle-identity":
           return Response.json(lifecycleIdentity());
         case "/poll-messages": {
