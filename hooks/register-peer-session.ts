@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 import { closeSync, existsSync, readFileSync, readlinkSync, statSync } from "node:fs";
-import { isClientProcess as sharedIsClientProcess, isCodexAppServerProcess, type ProcessInfo } from "../shared/client.ts";
+import { isClientProcess as sharedIsClientProcess, isCodexAppServerProcess, parseProcessTableSnapshot, type ProcessInfo } from "../shared/client.ts";
 import {
   brokerIdentityPaneTarget as sharedBrokerIdentityPaneTarget,
   publishBrokerIdentityToTmux as sharedPublishBrokerIdentityToTmux,
@@ -209,13 +209,8 @@ export function codexHookRootDegradedReason(value: unknown): CodexHookRootDegrad
   return transcriptSessionId(input.transcript_path) ? null : "unparseable-transcript-path";
 }
 
-async function readHookInput(): Promise<Record<string, unknown> | null> {
-  if (process.stdin.isTTY) return null;
+function parseHookInput(text: string): Record<string, unknown> | null {
   try {
-    const text = await Promise.race([
-      Bun.stdin.text(),
-      new Promise<string>((resolve) => setTimeout(() => resolve(""), 1500)),
-    ]);
     if (!text.trim()) return null;
     const parsed = JSON.parse(text);
     return parsed && typeof parsed === "object" && !Array.isArray(parsed)
@@ -227,22 +222,26 @@ async function readHookInput(): Promise<Record<string, unknown> | null> {
   }
 }
 
-function processTable(): Map<number, ProcessInfo> {
-  const table = new Map<number, ProcessInfo>();
-  const proc = Bun.spawnSync(["ps", "-eo", "pid=,ppid=,comm=,args="]);
-  if (proc.exitCode !== 0) return table;
-  const text = new TextDecoder().decode(proc.stdout);
-  for (const line of text.split("\n")) {
-    const m = line.trim().match(/^(\d+)\s+(\d+)\s+(\S+)\s*(.*)$/);
-    if (!m) continue;
-    table.set(Number(m[1]), {
-      pid: Number(m[1]),
-      ppid: Number(m[2]),
-      comm: m[3] ?? "",
-      args: m[4] ?? "",
-    });
+async function readHookInput(): Promise<Record<string, unknown> | null> {
+  if (process.stdin.isTTY) return null;
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const text = await Promise.race([
+      Bun.stdin.text(),
+      new Promise<string>((resolve) => {
+        timeout = setTimeout(() => resolve(""), 1500);
+      }),
+    ]);
+    return parseHookInput(text);
+  } finally {
+    if (timeout) clearTimeout(timeout);
   }
-  return table;
+}
+
+function processTable(): Map<number, ProcessInfo> {
+  const proc = Bun.spawnSync(["ps", "-eo", "pid=,ppid=,tty=,comm=,args="]);
+  if (proc.exitCode !== 0) return new Map();
+  return parseProcessTableSnapshot(new TextDecoder().decode(proc.stdout));
 }
 
 export function findClientPidFromTable(
@@ -297,6 +296,17 @@ function getTty(pid: number): string | null {
     const proc = Bun.spawnSync(["ps", "-o", "tty=", "-p", String(pid)]);
     const tty = new TextDecoder().decode(proc.stdout).trim();
     return tty && tty !== "?" && tty !== "??" ? tty : null;
+  } catch {
+    return null;
+  }
+}
+
+function tmuxPaneTty(paneId: string): string | null {
+  try {
+    const proc = Bun.spawnSync(["tmux", "display-message", "-p", "-t", paneId, "#{pane_tty}"]);
+    if (proc.exitCode !== 0) return null;
+    const tty = new TextDecoder().decode(proc.stdout).trim();
+    return tty || null;
   } catch {
     return null;
   }
@@ -522,8 +532,13 @@ async function metadata(threadId: string | null = null): Promise<RegisterMetadat
   if (!pid && CLIENT_TYPE === "codex") {
     const appServer = findCodexAppServerAncestor(process.ppid, table);
     const visibleCwdHint = appServer ? (cwdOf(appServer.pid) ?? process.cwd()) : process.cwd();
-    const readers = { getTty, cwdOf, environOf };
     const inheritedPaneId = process.env.TMUX_PANE ?? process.env.CLAUDE_PEER_TMUX_PANE_ID;
+    const readers = {
+      getTty,
+      cwdOf,
+      environOf,
+      paneTtyHint: inheritedPaneId ? tmuxPaneTty(inheritedPaneId) : null,
+    };
     const exactVisible = inheritedPaneId
       ? findVisibleCodexProcessByPaneId(table, null, inheritedPaneId, readers)
       : null;
@@ -577,7 +592,7 @@ async function metadata(threadId: string | null = null): Promise<RegisterMetadat
     cwd,
     git_root: await getGitRoot(cwd),
     absolute_git_dir: await getAbsoluteGitDir(cwd),
-    tty: getTty(pid),
+    tty: table.get(pid)?.tty ?? getTty(pid),
     name,
     tmux,
     identity_env: identityEnv,
@@ -648,8 +663,10 @@ async function ensureBroker(): Promise<void> {
   }
 }
 
-export async function runRegistration(): Promise<void> {
-  const hookInput = await readHookInput();
+export async function runRegistration(rawHookInput?: string): Promise<void> {
+  const hookInput = rawHookInput === undefined
+    ? await readHookInput()
+    : parseHookInput(rawHookInput);
   const threadId = sessionIdFromHookInput(hookInput);
   if (CLIENT_TYPE === "codex") {
     const diagnostic = codexHookSessionDiagnostic(hookInput);

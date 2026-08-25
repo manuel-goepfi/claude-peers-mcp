@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { isClientProcess, isCodexAppServerProcess } from "../shared/client.ts";
 import { findClientPidFromTable, findHookPeerPidsFromTable, findMcpPidFromTable } from "../hooks/codex-drain-peer-inbox.ts";
 import { codexDrainRootDecision, codexHookRootDegradedReason, codexHookRootRefusalReason, codexHookSessionDiagnostic, peerName, publishBrokerIdentityToTmux, readPaneLabel, registrationTmuxPaneId, sessionIdFromHookInput, tmuxIdentityMirrorEnabled } from "../hooks/register-peer-session.ts";
-import { detectClientFromProcessChain, findBgSpareAncestor, initialReceiverMode, type ProcessInfo } from "../shared/client.ts";
+import { detectClientFromProcessChain, findBgSpareAncestor, initialReceiverMode, parseProcessTableSnapshot, type ProcessInfo } from "../shared/client.ts";
 import { findNearestVisibleCodexProcessByStart, findVisibleCodexProcessByPaneId, isInteractiveNativeCodex, singleInteractiveCodexProcess } from "../shared/visible-codex.ts";
 import { findCodexAppServerAncestor, findVisibleCodexSession, mcpThreadIdFromRequestMeta, priorCodexPaneSeatReleased, registrationCwd, registrationCwdResult, registrationTtyPid, selectCodexManualDrainPid, selectInboxClaimIdentity, shouldDisableBackgroundPolling, shouldUnregisterPeerOnShutdown, unresolvedAppServerToolDiagnostic } from "../server.ts";
 
@@ -20,6 +20,23 @@ function canCreateTmuxSession(): boolean {
 }
 
 describe("client detection", () => {
+  test("parses TTY and argv from one process-table snapshot", () => {
+    const processes = parseProcessTableSnapshot([
+      "200 1 pts/10 codex codex --remote ws://127.0.0.1:4000 --cd /repo",
+      "201 1 ? bun bun /repo/server.ts",
+    ].join("\n"));
+
+    expect(processes.get(200)).toEqual({
+      pid: 200,
+      ppid: 1,
+      tty: "pts/10",
+      comm: "codex",
+      args: "codex --remote ws://127.0.0.1:4000 --cd /repo",
+    });
+    expect(processes.get(201)?.tty).toBeNull();
+    expect(processes.get(201)?.args).toBe("bun /repo/server.ts");
+  });
+
   test("explicit override wins", () => {
     const processes = table([{ pid: 10, ppid: 1, comm: "bash", args: "bash" }]);
     expect(detectClientFromProcessChain(10, processes, { CLAUDE_PEERS_CLIENT_TYPE: "codex" })).toBe("codex");
@@ -329,6 +346,38 @@ describe("client detection", () => {
       .toMatchObject({ pid: 201, env: { TMUX_PANE: "%2432" } });
     expect(findVisibleCodexProcessByPaneId(processes, "/home/manzo/Clause5", "%9999", readers))
       .toBeNull();
+  });
+
+  test("pane lookup reuses snapshot TTY data without spawning a probe per Codex candidate", () => {
+    const processes = new Map<number, ProcessInfo>([
+      [200, { pid: 200, ppid: 1, tty: "pts/10", comm: "codex", args: "codex resume" }],
+      [201, { pid: 201, ppid: 1, tty: "pts/11", comm: "codex", args: "codex resume" }],
+    ]);
+    let ttyProbeCount = 0;
+    let cwdReadCount = 0;
+    let environmentReadCount = 0;
+    const visible = findVisibleCodexProcessByPaneId(processes, null, "%2432", {
+      paneTtyHint: "/dev/pts/11",
+      getTty: () => {
+        ttyProbeCount += 1;
+        return null;
+      },
+      cwdOf: () => {
+        cwdReadCount += 1;
+        return "/home/manzo/Clause5";
+      },
+      environOf: (pid) => {
+        environmentReadCount += 1;
+        return pid === 201
+          ? { CLAUDE_PEER_NAME: "infra.12", TMUX_PANE: "%2432" }
+          : { CLAUDE_PEER_NAME: "infra.11", TMUX_PANE: "%2404" };
+      },
+    });
+
+    expect(visible).toMatchObject({ pid: 201, tty: "pts/11" });
+    expect(ttyProbeCount).toBe(0);
+    expect(cwdReadCount).toBe(1);
+    expect(environmentReadCount).toBe(1);
   });
 
   test("collapses a Node launcher and its native Codex child into one pane-local session", () => {

@@ -19,6 +19,7 @@ export interface VisibleCodexReaders {
   cwdOf?: (pid: number) => string | null;
   environOf?: (pid: number) => Record<string, string | undefined>;
   processStartTicks?: (pid: number) => number | null;
+  paneTtyHint?: string | null;
 }
 
 function commandName(value: string): string {
@@ -33,6 +34,14 @@ function defaultGetTty(pid: number): string | null {
   } catch {
     return null;
   }
+}
+
+function snapshotTty(row: ProcessInfo, ttyReader: (pid: number) => string | null): string | null {
+  return row.tty === undefined ? ttyReader(row.pid) : row.tty;
+}
+
+function normalizedTty(value: string): string {
+  return value.replace(/^\/dev\//, "");
 }
 
 function defaultCwdOf(pid: number): string | null {
@@ -171,7 +180,7 @@ export function findSingleVisibleCodexProcess(
 
   for (const row of rows) {
     if (!isVisibleCodexProcess(row)) continue;
-    const tty = ttyReader(row.pid);
+    const tty = snapshotTty(row, ttyReader);
     if (!tty) continue;
     const cwd = cwdReader(row.pid);
     if (!cwd || cwd !== cwdHint) continue;
@@ -192,13 +201,15 @@ export function findVisibleCodexProcessByPaneId(
   const ttyReader = readers.getTty ?? defaultGetTty;
   const cwdReader = readers.cwdOf ?? defaultCwdOf;
   const envReader = readers.environOf ?? defaultEnvironOf;
+  const paneTty = readers.paneTtyHint ? normalizedTty(readers.paneTtyHint) : null;
   const rows = processes instanceof Map ? processes.values() : processes;
   const candidates: VisibleCodexCandidate[] = [];
 
   for (const row of rows) {
     if (!isVisibleCodexProcess(row)) continue;
-    const tty = ttyReader(row.pid);
+    const tty = snapshotTty(row, ttyReader);
     if (!tty) continue;
+    if (paneTty && normalizedTty(tty) !== paneTty) continue;
     const cwd = cwdReader(row.pid);
     if (!cwd || (cwdHint !== null && cwd !== cwdHint)) continue;
     const env = envReader(row.pid);

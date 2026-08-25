@@ -46,7 +46,7 @@ import type {
   ReplyStatusResponse,
 } from "./shared/types.ts";
 import { durableSeatKey } from "./shared/seat.ts";
-import { detectClientFromProcessChain, findBgSpareAncestor, findClientPidFromProcessChain, initialReceiverMode, isClientProcess, isCodexAppServerProcess, type ProcessInfo } from "./shared/client.ts";
+import { detectClientFromProcessChain, findBgSpareAncestor, findClientPidFromProcessChain, initialReceiverMode, isClientProcess, isCodexAppServerProcess, parseProcessTableSnapshot, type ProcessInfo } from "./shared/client.ts";
 import { findSingleVisibleCodexProcess } from "./shared/visible-codex.ts";
 import { waitForCodexAppServerSeatProof } from "./shared/appserver-seat-proof.ts";
 import {
@@ -651,25 +651,14 @@ export function registrationTtyPid(registerPid: number, clientType: ClientType, 
 }
 
 function processTable(): Map<number, ProcessInfo> {
-  const result = new Map<number, ProcessInfo>();
   try {
-    const proc = Bun.spawnSync(["ps", "-eo", "pid=,ppid=,comm=,args="]);
-    if (proc.exitCode !== 0) return result;
-    const text = new TextDecoder().decode(proc.stdout);
-    for (const line of text.split("\n")) {
-      const m = line.trim().match(/^(\d+)\s+(\d+)\s+(\S+)\s*(.*)$/);
-      if (!m) continue;
-      result.set(Number(m[1]), {
-        pid: Number(m[1]),
-        ppid: Number(m[2]),
-        comm: m[3] ?? "",
-        args: m[4] ?? "",
-      });
-    }
+    const proc = Bun.spawnSync(["ps", "-eo", "pid=,ppid=,tty=,comm=,args="]);
+    if (proc.exitCode !== 0) return new Map();
+    return parseProcessTableSnapshot(new TextDecoder().decode(proc.stdout));
   } catch (e) {
     log(`processTable: ${errMsg(e)}`);
   }
-  return result;
+  return new Map();
 }
 
 // --- F2: Process-ancestry tmux detection ---

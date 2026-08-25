@@ -13,7 +13,7 @@ afterEach(() => {
 
 function runWrapper(
   registrationBody: string | null,
-  options: { input?: string; minimalEnv?: boolean; codexHome?: string; installWrapper?: boolean; path?: string } = {},
+  options: { input?: string; minimalEnv?: boolean; codexHome?: string; installWrapper?: boolean; path?: string; extraEnv?: Record<string, string> } = {},
 ): { exitCode: number; stdout: string; stderr: string; log: string } {
   const root = mkdtempSync(join(tmpdir(), "codex-register-wrapper-"));
   roots.push(root);
@@ -24,7 +24,14 @@ function runWrapper(
   if (registrationBody !== null) writeFileSync(join(hooks, "register-peer-session.ts"), registrationBody);
   const env = options.minimalEnv
     ? { PATH: options.path ?? process.env.PATH ?? "", CLAUDE_PEERS_ROOT: root }
-    : { ...process.env, PATH: options.path ?? process.env.PATH ?? "", CLAUDE_PEERS_ROOT: root, CODEX_HOME: codexHome };
+    : {
+      ...process.env,
+      PATH: options.path ?? process.env.PATH ?? "",
+      CLAUDE_PEERS_ROOT: root,
+      CODEX_HOME: codexHome,
+      XDG_RUNTIME_DIR: join(root, "run"),
+      ...options.extraEnv,
+    };
   const proc = Bun.spawnSync(["/usr/bin/bash", SHELL_WRAPPER], {
     env,
     stdin: options.input === undefined ? "ignore" : new TextEncoder().encode(options.input),
@@ -52,8 +59,7 @@ describe("Codex registration wrapper", () => {
   test("executes registration in the hook process with the original input", () => {
     const input = JSON.stringify({ session_id: "thread-123", hook_event_name: "SessionStart" });
     const result = runWrapper(`
-      export async function runRegistration() {
-        const input = await Bun.stdin.text();
+      export async function runRegistration(input) {
         if (input !== ${JSON.stringify(input)}) throw new Error("hook input changed");
       }
     `, { input });
@@ -62,6 +68,138 @@ describe("Codex registration wrapper", () => {
     expect(result.stderr).toBe("");
     expect(result.stdout).toBe("");
     expect(result.log).toBe("");
+  });
+
+  test("runs duplicate SessionStart registration hooks once per exact pane and thread", async () => {
+    const root = mkdtempSync(join(tmpdir(), "codex-register-single-flight-"));
+    roots.push(root);
+    const hooks = join(root, "hooks");
+    const codexHome = join(root, "codexhome");
+    const countFile = join(root, "registrations");
+    mkdirSync(hooks, { recursive: true });
+    copyFileSync(BUN_WRAPPER, join(hooks, "codex-register-peer-session.ts"));
+    writeFileSync(join(hooks, "register-peer-session.ts"), `
+      import { appendFileSync } from "node:fs";
+      export async function runRegistration() {
+        appendFileSync(${JSON.stringify(countFile)}, "registered\\n");
+        await Bun.sleep(250);
+      }
+    `);
+    const input = JSON.stringify({ session_id: "thread-duplicate", hook_event_name: "SessionStart" });
+    const env = {
+      ...process.env,
+      CLAUDE_PEERS_ROOT: root,
+      CODEX_HOME: codexHome,
+      XDG_RUNTIME_DIR: join(root, "run"),
+      TMUX_PANE: "%4242",
+    };
+    const launch = () => Bun.spawn(["/usr/bin/bash", SHELL_WRAPPER], {
+      env,
+      stdin: new TextEncoder().encode(input),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const duplicates = Array.from({ length: 8 }, launch);
+
+    expect(await Promise.all(duplicates.map((process) => process.exited))).toEqual(Array(8).fill(0));
+    const sequentialDuplicate = launch();
+    expect(await sequentialDuplicate.exited).toBe(0);
+    expect(readFileSync(countFile, "utf8").trim().split("\n")).toHaveLength(1);
+  });
+
+  test("does not coalesce different threads launched in the same pane", async () => {
+    const root = mkdtempSync(join(tmpdir(), "codex-register-distinct-"));
+    roots.push(root);
+    const hooks = join(root, "hooks");
+    const codexHome = join(root, "codexhome");
+    const countFile = join(root, "registrations");
+    mkdirSync(hooks, { recursive: true });
+    copyFileSync(BUN_WRAPPER, join(hooks, "codex-register-peer-session.ts"));
+    writeFileSync(join(hooks, "register-peer-session.ts"), `
+      import { appendFileSync } from "node:fs";
+      export async function runRegistration() {
+        appendFileSync(${JSON.stringify(countFile)}, "registered\\n");
+        await Bun.sleep(100);
+      }
+    `);
+    const env = {
+      ...process.env,
+      CLAUDE_PEERS_ROOT: root,
+      CODEX_HOME: codexHome,
+      XDG_RUNTIME_DIR: join(root, "run"),
+      TMUX_PANE: "%4242",
+    };
+    const launch = (sessionId: string) => Bun.spawn(["/usr/bin/bash", SHELL_WRAPPER], {
+      env,
+      stdin: new TextEncoder().encode(JSON.stringify({ session_id: sessionId, hook_event_name: "SessionStart" })),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const first = launch("thread-a");
+    const second = launch("thread-b");
+
+    expect(await Promise.all([first.exited, second.exited])).toEqual([0, 0]);
+    expect(readFileSync(countFile, "utf8").trim().split("\n")).toHaveLength(2);
+  });
+
+  test("lets a duplicate contender retry when the lock owner fails", async () => {
+    const root = mkdtempSync(join(tmpdir(), "codex-register-retry-"));
+    roots.push(root);
+    const hooks = join(root, "hooks");
+    const codexHome = join(root, "codexhome");
+    const attemptFile = join(root, "attempts");
+    const leaderMarker = join(root, "leader");
+    const successFile = join(root, "success");
+    mkdirSync(hooks, { recursive: true });
+    copyFileSync(BUN_WRAPPER, join(hooks, "codex-register-peer-session.ts"));
+    writeFileSync(join(hooks, "register-peer-session.ts"), `
+      import { appendFileSync, closeSync, openSync, writeFileSync } from "node:fs";
+      export async function runRegistration() {
+        appendFileSync(${JSON.stringify(attemptFile)}, "attempted\\n");
+        try {
+          const fd = openSync(${JSON.stringify(leaderMarker)}, "wx");
+          closeSync(fd);
+          await Bun.sleep(150);
+          process.exitCode = 1;
+        } catch {
+          writeFileSync(${JSON.stringify(successFile)}, "ok");
+        }
+      }
+    `);
+    const input = JSON.stringify({ session_id: "thread-retry", hook_event_name: "SessionStart" });
+    const env = {
+      ...process.env,
+      CLAUDE_PEERS_ROOT: root,
+      CODEX_HOME: codexHome,
+      XDG_RUNTIME_DIR: join(root, "run"),
+      TMUX_PANE: "%4242",
+    };
+    const launch = () => Bun.spawn(["/usr/bin/bash", SHELL_WRAPPER], {
+      env,
+      stdin: new TextEncoder().encode(input),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const first = launch();
+    const second = launch();
+
+    expect(await Promise.all([first.exited, second.exited])).toEqual([0, 0]);
+    expect(readFileSync(attemptFile, "utf8").trim().split("\n")).toHaveLength(2);
+    expect(readFileSync(successFile, "utf8")).toBe("ok");
+  });
+
+  test("logs unavailable single-flight storage and still attempts registration", () => {
+    const input = JSON.stringify({ session_id: "thread-no-lock", hook_event_name: "SessionStart" });
+    const result = runWrapper(`
+      export async function runRegistration() { console.log('{"ran":true}'); }
+    `, {
+      input,
+      extraEnv: { TMUX_PANE: "%4242", XDG_RUNTIME_DIR: "/dev/null" },
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual({ ran: true });
+    expect(result.log).toContain("single-flight unavailable");
   });
 
   test("converts a failed registration into a visible warning and retained log", () => {

@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 import { readFileSync, readlinkSync } from "node:fs";
-import { isClientProcess as sharedIsClientProcess, isCodexAppServerProcess as sharedIsCodexAppServerProcess, type ProcessInfo } from "../shared/client.ts";
+import { isClientProcess as sharedIsClientProcess, isCodexAppServerProcess as sharedIsCodexAppServerProcess, parseProcessTableSnapshot, type ProcessInfo } from "../shared/client.ts";
 import { renderInboundBatch } from "../shared/render.ts";
 import type { ClientType, Message, ReceiverMode } from "../shared/types.ts";
 import { findSingleVisibleCodexProcess } from "../shared/visible-codex.ts";
@@ -93,21 +93,9 @@ function log(msg: string): void {
 }
 
 function processTable(): Map<number, ProcRow> {
-  const table = new Map<number, ProcRow>();
-  const proc = Bun.spawnSync(["ps", "-ewwo", "pid=,ppid=,comm=,args="]);
-  if (proc.exitCode !== 0) return table;
-  const text = new TextDecoder().decode(proc.stdout);
-  for (const line of text.split("\n")) {
-    const m = line.trim().match(/^(\d+)\s+(\d+)\s+(\S+)\s*(.*)$/);
-    if (!m) continue;
-    table.set(Number(m[1]), {
-      pid: Number(m[1]),
-      ppid: Number(m[2]),
-      comm: m[3] ?? "",
-      args: m[4] ?? "",
-    });
-  }
-  return table;
+  const proc = Bun.spawnSync(["ps", "-ewwo", "pid=,ppid=,tty=,comm=,args="]);
+  if (proc.exitCode !== 0) return new Map();
+  return parseProcessTableSnapshot(new TextDecoder().decode(proc.stdout));
 }
 
 function isClientProcess(row: ProcRow, clientType = CLIENT_TYPE): boolean {
@@ -220,7 +208,8 @@ export function isHostedWithoutSeat(
   if (!appServer) return false;
   let current: number | undefined = startPid;
   for (let i = 0; i < 30 && current !== undefined; i++) {
-    if (ttyReader(current)) return false; // a tty means a real seat exists
+    const snapshot = table.get(current)?.tty;
+    if (snapshot === undefined ? ttyReader(current) : snapshot) return false; // a tty means a real seat exists
     if (current === appServer.pid) break;
     current = table.get(current)?.ppid;
     if (current !== undefined && current <= 1) break;

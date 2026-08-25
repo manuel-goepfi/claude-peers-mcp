@@ -4,8 +4,28 @@ import type { ClientType, ReceiverMode } from "./types.ts";
 export interface ProcessInfo {
   pid: number;
   ppid: number;
+  /** Controlling TTY captured in the same process-table snapshot, or null. */
+  tty?: string | null;
   comm: string;
   args: string;
+}
+
+export function parseProcessTableSnapshot(text: string): Map<number, ProcessInfo> {
+  const table = new Map<number, ProcessInfo>();
+  for (const line of text.split("\n")) {
+    const match = line.trim().match(/^(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s*(.*)$/);
+    if (!match) continue;
+    const pid = Number(match[1]);
+    const rawTty = match[3] ?? "";
+    table.set(pid, {
+      pid,
+      ppid: Number(match[2]),
+      tty: rawTty && rawTty !== "?" && rawTty !== "??" ? rawTty : null,
+      comm: match[4] ?? "",
+      args: match[5] ?? "",
+    });
+  }
+  return table;
 }
 
 function normalizedClient(value: string | undefined): ClientType | null {
