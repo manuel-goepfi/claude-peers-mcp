@@ -2822,9 +2822,16 @@ function reconciledReceiverState(target: Peer, duplicates: Peer[]): Pick<
  * Join an exact visible Codex pane identity to an exact thread UUID. The caller
  * is responsible for proving the join source (the public relay route below
  * derives it from a successful app-server lifecycle response). This remains
- * narrower than /register: it never infers by cwd/name, never moves a live
- * concrete pane identity, and never adds the shared app-server PID to the
- * visible seat's liveness set.
+ * narrower than /register: it never infers by cwd/name and never adds the
+ * shared app-server PID to the visible seat's liveness set.
+ *
+ * Resume-across-pane (#4): when the same Codex thread is already bound to
+ * another pane (live or dead), the latest explicit reconcile wins. The
+ * destination pane keeps its peer id + token (so its live hooks keep working);
+ * prior owners — including still-live panes — fold into it (mail moves, rows
+ * delete). Live losers are marked superseded so leftover MCP/hooks step down
+ * instead of reclaiming with a stale token. Public routing name stays the
+ * destination pane label.
  */
 function handleReconcilePaneThread(body: ReconcilePaneThreadRequest): ReconcilePaneThreadResult {
   if (typeof body.id !== "string" || body.id.length === 0) {
@@ -2868,15 +2875,11 @@ function handleReconcilePaneThread(body: ReconcilePaneThreadRequest): ReconcileP
     if (duplicates.some((peer) => peer.client_type !== "codex")) {
       return { ok: false, status: 409, error: "thread is already bound to another client" };
     }
-    if (duplicates.some((peer) =>
-      (peer.tmux_pane_id !== null || peer.seat_key !== null) && peerSeatAlive(peer)
-    )) {
-      return { ok: false, status: 409, error: "thread is already bound to another live pane" };
-    }
 
     const receiverState = reconciledReceiverState(target, duplicates);
 
     for (const duplicate of duplicates) {
+      if (peerSeatAlive(duplicate)) supersededPeerIds.add(duplicate.id);
       migrated += foldPeerRowInto(target.id, duplicate.id);
       foldedIds.push(duplicate.id);
     }
@@ -3012,13 +3015,9 @@ function codexPaneThreadBindConflict(threadId: string, paneId: string): Reconcil
   if (rows.some((peer) => peer.client_type !== "codex")) {
     return { ok: false, status: 409, error: "thread is already bound to another client" };
   }
-  if (rows.some((peer) =>
-    peer.tmux_pane_id !== paneId &&
-    (peer.tmux_pane_id !== null || peer.seat_key !== null) &&
-    peerSeatAlive(peer)
-  )) {
-    return { ok: false, status: 409, error: "thread is already bound to another live pane" };
-  }
+  // Same-thread live panes are allowed: handleReconcilePaneThread transfers
+  // continuity to this pane (latest explicit resume wins) instead of 409.
+  void paneId;
   return null;
 }
 

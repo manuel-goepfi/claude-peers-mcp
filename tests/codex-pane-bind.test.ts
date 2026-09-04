@@ -76,7 +76,9 @@ async function waitForFile(path: string): Promise<void> {
       // Deliberately give the native process a different /proc cwd. Production
       // broker hardening cannot read that magic link; binding must use the
       // tmux-proven pane path instead.
-      const command = `(cd /; exec "${codexBinary}" 60) & tui=$!; bun "${FIXTURE}" "${broker.port}" "${resultPath}" "${THREAD_A}" "${THREAD_B}" "${THREAD_A}"; while [ ! -f "${mainConflictTrigger}" ]; do sleep 0.05; done; bun "${FIXTURE}" "${broker.port}" "${mainConflictPath}" "${THREAD_B}"; wait "$tui"`;
+      // Set @operator_label inside the pane before the bind client runs so the
+      // race against an external set-option cannot mint the window-name fallback.
+      const command = `tmux set-option -p -t "$TMUX_PANE" @operator_label bind.test; (cd /; exec "${codexBinary}" 60) & tui=$!; bun "${FIXTURE}" "${broker.port}" "${resultPath}" "${THREAD_A}" "${THREAD_B}" "${THREAD_A}"; while [ ! -f "${mainConflictTrigger}" ]; do sleep 0.05; done; bun "${FIXTURE}" "${broker.port}" "${mainConflictPath}" "${THREAD_B}"; wait "$tui"`;
       const created = Bun.spawnSync([
         "tmux", "new-session", "-d", "-s", session, "-n", "bind", "-c", root,
         "bash", "-c", command,
@@ -86,9 +88,6 @@ async function waitForFile(path: string): Promise<void> {
         "tmux", "list-panes", "-t", session, "-F", "#{pane_id}",
       ]).stdout).trim();
       expect(paneId).toMatch(/^%\d+$/);
-      expect(Bun.spawnSync([
-        "tmux", "set-option", "-p", "-t", paneId, "@operator_label", "bind.test",
-      ]).exitCode).toBe(0);
 
       await waitForFile(resultPath);
       const results = JSON.parse(readFileSync(resultPath, "utf8")) as Array<{
@@ -263,9 +262,18 @@ async function waitForFile(path: string): Promise<void> {
         body: Record<string, unknown>;
       }>;
       expect(conflictResults).toHaveLength(2);
-      expect(conflictResults.map((result) => result.status)).toEqual([409, 200]);
-      expect(conflictResults[0]!.body.error).toBe("thread is already bound to another live pane");
-      expect(conflictResults[1]!.body.thread_id).toBe(THREAD_B);
+      // Latest explicit resume wins: conflict pane absorbs THREAD_A (and its mail).
+      expect(conflictResults[0]!.status).toBe(200);
+      expect(conflictResults[0]!.body).toMatchObject({
+        ok: true,
+        thread_id: THREAD_A,
+      });
+      const conflictPeerId = String(conflictResults[0]!.body.id);
+      expect(conflictResults[1]!.status).toBe(200);
+      expect(conflictResults[1]!.body).toMatchObject({
+        id: conflictPeerId,
+        thread_id: THREAD_B,
+      });
 
       await Bun.write(mainConflictTrigger, "bind\n");
       await waitForFile(mainConflictPath);
@@ -274,17 +282,32 @@ async function waitForFile(path: string): Promise<void> {
         body: Record<string, unknown>;
       }>;
       expect(mainConflictResults).toHaveLength(1);
-      expect(mainConflictResults[0]!.status).toBe(409);
-      expect(mainConflictResults[0]!.body.error).toBe("thread is already bound to another live pane");
+      expect(mainConflictResults[0]!.status).toBe(200);
+      expect(mainConflictResults[0]!.body).toMatchObject({
+        thread_id: THREAD_B,
+      });
+      const mainPeerId = String(mainConflictResults[0]!.body.id);
 
       const preservedDb = new Database(broker.dbPath, { readonly: true });
       const preserved = preservedDb.query(`
         SELECT lower(thread_id) AS thread_id, unread_episode,
-               (SELECT COUNT(*) FROM messages WHERE to_id = peers.id AND delivered = 0) AS queued
+               (SELECT COUNT(*) FROM messages WHERE to_id = peers.id AND delivered = 0) AS queued,
+               tmux_pane_id
         FROM peers WHERE id = ?
-      `).get(panePeerId) as { thread_id: string; unread_episode: number; queued: number };
+      `).get(mainPeerId) as { thread_id: string; unread_episode: number; queued: number; tmux_pane_id: string };
+      const goneConflict = preservedDb.query("SELECT id FROM peers WHERE id = ?").get(conflictPeerId);
+      const goneOriginal = preservedDb.query("SELECT id FROM peers WHERE id = ?").get(panePeerId);
       preservedDb.close();
-      expect(preserved).toEqual({ thread_id: THREAD_A, unread_episode: 7, queued: 1 });
+      expect(preserved).toEqual({
+        thread_id: THREAD_B,
+        // Episode is per peer row: fold bumps the empty destination once when
+        // mail arrives; it does not copy the prior owner's episode counter.
+        unread_episode: 1,
+        queued: 1,
+        tmux_pane_id: paneId,
+      });
+      expect(goneConflict).toBeNull();
+      expect(goneOriginal).toBeNull();
 
       const outside = await fetch(`${broker.url}/bind-codex-pane-thread`, {
         method: "POST",

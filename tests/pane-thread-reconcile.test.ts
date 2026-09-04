@@ -482,15 +482,17 @@ describe("pane/thread reconciliation", () => {
       .toEqual([Number(queuedCandidate.json.id)]);
   });
 
-  test("refuses to fold a thread identity that is already bound to another concrete pane", async () => {
+  test("transfers a live prior pane for the same thread onto the destination pane", async () => {
+    const thread = "22222222-3333-4444-8555-666666666666";
     const firstPid = spawnHolder();
     const secondPid = spawnHolder();
-    await register(firstPid, {
+    const senderPid = spawnHolder();
+    const first = await register(firstPid, {
       name: "concrete.1",
       tty: "pts/906",
       tmux_session: "infra",
       tmux_pane_id: "%906",
-      thread_id: "22222222-3333-4444-8555-666666666666",
+      thread_id: thread,
     });
     const second = await register(secondPid, {
       name: "concrete.2",
@@ -498,16 +500,61 @@ describe("pane/thread reconciliation", () => {
       tmux_session: "infra",
       tmux_pane_id: "%907",
     });
+    const sender = await register(senderPid, { name: "live-transfer-sender", client_type: "claude" });
+    const sent = await call("/send-message", {
+      id: sender.json.id,
+      from_id: sender.json.id,
+      to_id: first.json.id,
+      text: "mail follows live resume",
+    });
+    expect(sent.status).toBe(200);
 
     const response = await call("/reconcile-pane-thread", {
       id: second.json.id,
       pid: secondPid,
       caller_pid: process.pid,
       tmux_pane_id: "%907",
-      thread_id: "22222222-3333-4444-8555-666666666666",
+      thread_id: thread,
     });
-    expect(response.status).toBe(409);
-    expect(response.json.error).toBe("thread is already bound to another live pane");
+    expect(response.status).toBe(200);
+    expect(response.json).toMatchObject({
+      ok: true,
+      id: second.json.id,
+      thread_id: thread,
+      folded: 1,
+      migrated: 1,
+    });
+
+    const db = new Database(broker.dbPath, { readonly: true });
+    const row = db.query(
+      "SELECT id, pid, name, tmux_pane_id, thread_id FROM peers WHERE thread_id = ?",
+    ).get(thread) as { id: string; pid: number; name: string; tmux_pane_id: string; thread_id: string };
+    const mail = db.query(
+      "SELECT to_id, text FROM messages WHERE text = 'mail follows live resume'",
+    ).get() as { to_id: string; text: string };
+    const gone = db.query("SELECT id FROM peers WHERE id = ?").get(String(first.json.id));
+    db.close();
+    expect(row).toEqual({
+      id: String(second.json.id),
+      pid: secondPid,
+      name: "concrete.2",
+      tmux_pane_id: "%907",
+      thread_id: thread,
+    });
+    expect(mail).toEqual({ to_id: String(second.json.id), text: "mail follows live resume" });
+    expect(gone).toBeNull();
+
+    // Stale token from the prior live pane must step down as superseded.
+    const stale = await fetch(`${broker.url}/set-summary`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Peer-Token": String(first.json.token),
+      },
+      body: JSON.stringify({ id: first.json.id, summary: "should not stick" }),
+    });
+    expect(stale.status).toBe(409);
+    expect(await stale.json()).toMatchObject({ error: "superseded" });
   });
 
   test("refuses a valid Codex pane adopting a thread owned by another client", async () => {

@@ -234,6 +234,7 @@ client.on("error", (error) => {
       409,
       '{"error":"pane does not contain exactly one interactive native Codex TUI"}',
     )).toBe(true);
+    // Historical non-retryable conflict string (live-pane transfer now succeeds instead).
     expect(retryableCodexPaneBindFailure(
       409,
       '{"error":"thread is already bound to another live pane"}',
