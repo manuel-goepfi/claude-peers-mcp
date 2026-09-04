@@ -1027,6 +1027,44 @@ async function ackClaimedInbox(batch: ClaimedInboxBatch, via: string): Promise<b
 }
 
 /**
+ * True when Claude Code marked this process as a child/tool session
+ * (`CLAUDE_CODE_CHILD_SESSION`). Nested `codex exec` inherits the parent
+ * operator env; this flag is the strongest signal not to squat that seat.
+ */
+export function isClaudeChildSessionEnv(
+  env: Record<string, string | undefined> | NodeJS.ProcessEnv,
+): boolean {
+  const raw = env.CLAUDE_CODE_CHILD_SESSION;
+  if (raw == null || raw === "") return false;
+  const normalized = String(raw).trim().toLowerCase();
+  return normalized !== "0" && normalized !== "false" && normalized !== "no";
+}
+
+/**
+ * Nested non-Claude clients under an operator Claude (e.g. `codex exec`
+ * spawned from orch.4) inherit CLAUDE_PEER_NAME + TMUX_PANE and would squat
+ * the parent seat without this classifier. Claude→Claude nesting stays on
+ * classifySubagentAncestry / .task.<pid>.
+ */
+export function classifyNestedForeignClientAncestry(frames: AncestryFrame[]): boolean {
+  for (const f of frames) {
+    if (frameIsClaudeBinary(f)) return true;
+  }
+  return false;
+}
+
+export function nestedOperatorChildClientType(
+  clientType: ClientType,
+  env: Record<string, string | undefined> | NodeJS.ProcessEnv,
+  frames: AncestryFrame[],
+): ClientType | null {
+  if (clientType === "claude" || clientType === "unknown") return null;
+  if (isClaudeChildSessionEnv(env)) return clientType;
+  if (classifyNestedForeignClientAncestry(frames)) return clientType;
+  return null;
+}
+
+/**
  * #11 (2026-05-14): Resolve the peer name from the launch environment.
  *
  * Fallback chain:
@@ -1047,8 +1085,12 @@ async function ackClaimedInbox(batch: ClaimedInboxBatch, via: string): Promise<b
  * returns the operator seat ONLY. Operator-facing bare-claude sessions
  * (grandparent is a shell) are unaffected.
  *
- * Pure function: takes pre-computed isTaskSubagent boolean rather than
- * calling it directly so tests can stub the result deterministically.
+ * Nested foreign-client overlay: Claude-spawned codex/agy/… sessions that
+ * inherit the operator name append `.${clientType}.child.${pid}` so they
+ * cannot squat find_peer({name}) or seat-supersede the parent.
+ *
+ * Pure function: takes pre-computed isTaskSubagent / nestedChildClient rather
+ * than calling classifiers directly so tests can stub results deterministically.
  * Mirrored by tests/phase-b-11-name-fallback.test.ts.
  */
 export function resolvePeerName(
@@ -1056,6 +1098,7 @@ export function resolvePeerName(
   tmuxFallbackName: string | null,
   isTaskSubagentResult: boolean,
   pid: number,
+  nestedChildClient: ClientType | null = null,
 ): string {
   const observerFallback = `observer-${pid}`;
   let peerName = envName ?? tmuxFallbackName ?? observerFallback;
@@ -1071,6 +1114,11 @@ export function resolvePeerName(
   // is already pid-unique.
   if (isTaskSubagentResult && peerName !== observerFallback) {
     peerName = `${peerName}.task.${pid}`;
+  } else if (nestedChildClient && peerName !== observerFallback) {
+    // Claude-spawned foreign clients (codex exec / agy / …) inherit the
+    // operator CLAUDE_PEER_NAME; suffix so find_peer(name=orch.4) stays on
+    // the operator seat and seat-supersede cannot thrash parent vs child.
+    peerName = `${peerName}.${nestedChildClient}.child.${pid}`;
   }
   return peerName;
 }
@@ -1811,7 +1859,7 @@ const TOOLS = [
   {
     name: "find_peer",
     description:
-      "Find Claude Code instances by human-readable name (set via CLAUDE_PEER_NAME env var), tmux session, name substring, and/or tmux presence. All provided filters AND together. Returns matching peer IDs across all peers on this machine. Task-subagent spawns are suffixed `.task.<pid>` (per WT-08 R6.1) so exact-name match returns only the operator-facing seat.",
+      "Find Claude Code instances by human-readable name (set via CLAUDE_PEER_NAME env var), tmux session, name substring, and/or tmux presence. All provided filters AND together. Returns matching peer IDs across all peers on this machine. Task-subagent spawns are suffixed `.task.<pid>` (per WT-08 R6.1) and Claude-spawned nested foreign clients (e.g. codex exec) are suffixed `.<client>.child.<pid>` so exact-name match returns only the operator-facing seat.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -2665,9 +2713,21 @@ async function main() {
       ? `${tmuxInfo.session}.${tmuxInfo.pane_id}`
       : null);
   const isSubagent = isTaskSubagent();
-  let peerName: string = resolvePeerName(envName, tmuxFallbackName, isSubagent, myRegisterPid);
+  const nestedFrames = isSubagent ? [] : readAncestryFrames(process.ppid);
+  const nestedChildClient = isSubagent
+    ? null
+    : nestedOperatorChildClientType(myClientType, identityEnv, nestedFrames);
+  let peerName: string = resolvePeerName(
+    envName,
+    tmuxFallbackName,
+    isSubagent,
+    myRegisterPid,
+    nestedChildClient,
+  );
   if (isSubagent && peerName.includes(".task.")) {
     log(`Task subagent detected — peer name suffixed: ${peerName}`);
+  } else if (nestedChildClient && peerName.includes(`.${nestedChildClient}.child.`)) {
+    log(`Nested ${nestedChildClient} under Claude — peer name suffixed: ${peerName}`);
   }
 
   log(`CWD: ${myCwd}`);

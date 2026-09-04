@@ -593,3 +593,86 @@ describe("delivery honesty over the wire", () => {
     expect(sent.warning).toBeTruthy();
   });
 });
+
+describe("cross-client same-pane register cannot seat-supersede the parent", () => {
+  let broker: TestBroker;
+  const tokens = new Map<string, string>();
+  const children = new Set<ReturnType<typeof Bun.spawn>>();
+
+  beforeAll(async () => {
+    broker = await startTestBroker({ prefix: "cross-client-seat" });
+  }, 35_000);
+
+  afterAll(async () => {
+    for (const child of children) child.kill();
+    await broker.stop();
+  });
+
+  function spawnHolder(): number {
+    const child = Bun.spawn(["sleep", "60"], { stdout: "ignore", stderr: "ignore" });
+    children.add(child);
+    return child.pid;
+  }
+
+  async function call<T>(path: string, body: Record<string, unknown>): Promise<{ status: number; json: T }> {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    const claimedId = (body.id as string | undefined) ?? (body.from_id as string | undefined);
+    if (claimedId && tokens.has(claimedId)) headers["X-Peer-Token"] = tokens.get(claimedId)!;
+    const res = await fetch(`${broker.url}${path}`, { method: "POST", headers, body: JSON.stringify(body) });
+    const json = (await res.json()) as Record<string, unknown>;
+    if (json.id && json.token) tokens.set(json.id as string, json.token as string);
+    return { status: res.status, json: json as T };
+  }
+
+  test("nested codex with the same name/pane does not step down live Claude", async () => {
+    const claudePid = spawnHolder();
+    const codexPid = spawnHolder();
+    const claude = await call<{ id: string; token: string }>("/register", {
+      pid: claudePid,
+      cwd: "/orch/project",
+      git_root: "/orch/project",
+      tty: "pts/5",
+      name: "orch.4",
+      tmux_session: "orch",
+      tmux_window_index: "1",
+      tmux_window_name: "orch4",
+      tmux_pane_id: "%6",
+      client_type: "claude",
+      receiver_mode: "claude-channel",
+      summary: "",
+    });
+    expect(claude.status).toBe(200);
+
+    const nested = await call<{ id: string }>("/register", {
+      pid: codexPid,
+      cwd: "/orch/project",
+      git_root: "/orch/project",
+      tty: null,
+      name: "orch.4",
+      tmux_session: "orch",
+      tmux_window_index: "1",
+      tmux_window_name: "orch4",
+      tmux_pane_id: "%6",
+      client_type: "codex",
+      receiver_mode: "codex-hook",
+      summary: "",
+    });
+    expect(nested.status).toBe(200);
+    expect(nested.json.id).not.toBe(claude.json.id);
+
+    // Claude token must still authorize — cross-client register must not supersede it.
+    const summary = await call<{ ok?: boolean; error?: string }>("/set-summary", {
+      id: claude.json.id,
+      summary: "still the operator seat",
+    });
+    expect(summary.status).toBe(200);
+
+    const db = new Database(broker.dbPath, { readonly: true });
+    const rows = db.query(
+      "SELECT id, client_type, name FROM peers WHERE tmux_pane_id = '%6' ORDER BY client_type",
+    ).all() as Array<{ id: string; client_type: string; name: string }>;
+    db.close();
+    expect(rows).toHaveLength(2);
+    expect(rows.map((r) => r.client_type).sort()).toEqual(["claude", "codex"]);
+  });
+});

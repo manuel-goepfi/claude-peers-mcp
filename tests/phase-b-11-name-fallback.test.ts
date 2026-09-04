@@ -31,6 +31,9 @@ import {
   isHumanOperatorLabel,
   resolvePeerName,
   classifySubagentAncestry,
+  classifyNestedForeignClientAncestry,
+  isClaudeChildSessionEnv,
+  nestedOperatorChildClientType,
   stripResolvedNameSuffix,
 } from "../server";
 import { findClientPidFromProcessChain, isClientProcess, isCodexAppServerProcess, type ProcessInfo } from "../shared/client";
@@ -269,6 +272,44 @@ describe("#11 — classifySubagentAncestry (seat-fix v2 pure classifier)", () =>
 
   test("empty chain → NOT subagent (fail-closed)", () => {
     expect(classifySubagentAncestry([])).toBe(false);
+  });
+});
+
+describe("nested foreign client under Claude (orch.4 / codex-exec class)", () => {
+  test("CLAUDE_CODE_CHILD_SESSION marks nested child env", () => {
+    expect(isClaudeChildSessionEnv({ CLAUDE_CODE_CHILD_SESSION: "1" })).toBe(true);
+    expect(isClaudeChildSessionEnv({ CLAUDE_CODE_CHILD_SESSION: "true" })).toBe(true);
+    expect(isClaudeChildSessionEnv({ CLAUDE_CODE_CHILD_SESSION: "0" })).toBe(false);
+    expect(isClaudeChildSessionEnv({})).toBe(false);
+  });
+
+  test("ancestry with a claude binary classifies nested foreign client", () => {
+    expect(classifyNestedForeignClientAncestry([
+      { comm: "codex", args: "codex exec -C /tmp" },
+      { comm: "node", args: "node /bin/codex" },
+      { comm: "claude", args: "/home/manzo/.local/bin/claude -n orch.4" },
+    ])).toBe(true);
+    expect(classifyNestedForeignClientAncestry([
+      { comm: "codex", args: "codex" },
+      { comm: "bash", args: "-bash" },
+    ])).toBe(false);
+  });
+
+  test("codex under Claude child env does not squat orch.4", () => {
+    expect(nestedOperatorChildClientType("codex", { CLAUDE_CODE_CHILD_SESSION: "1" }, [])).toBe("codex");
+    expect(resolvePeerName("orch.4", null, false, 2173778, "codex"))
+      .toBe("orch.4.codex.child.2173778");
+  });
+
+  test("operator Claude is never treated as nested foreign child", () => {
+    expect(nestedOperatorChildClientType("claude", { CLAUDE_CODE_CHILD_SESSION: "1" }, [
+      { comm: "claude", args: "claude" },
+    ])).toBeNull();
+    expect(resolvePeerName("orch.4", null, false, 2281455, null)).toBe("orch.4");
+  });
+
+  test("task suffix wins over nested-child suffix when both would apply", () => {
+    expect(resolvePeerName("orch.4", null, true, 99, "codex")).toBe("orch.4.task.99");
   });
 });
 

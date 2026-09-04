@@ -855,6 +855,7 @@ const selectSamePaneSelfDuplicates = db.prepare(`
   SELECT id, pid FROM peers
   WHERE non_targetable = 0
     AND tmux_session = ? AND tmux_pane_id = ? AND cwd = ? AND name = ? AND pid != ?
+    AND COALESCE(client_type, 'unknown') = ?
   ORDER BY last_seen DESC
 `);
 
@@ -1295,6 +1296,9 @@ function handleRegister(body: RegisterRequest): RegisterResult {
 
   const now = new Date().toISOString();
   const token = generateToken();
+  // Resolved once: seat-dedup/supersede is same-client-type only so a nested
+  // `codex exec` cannot step down the parent Claude seat on the same pane.
+  const requestedClientType = validClientType(body.client_type);
 
   // Collapse stale self-duplicates on this pane to at most one BEFORE rehydration.
   // A closed-and-reopened pane (new PID, same cwd + name, same pane) accumulates
@@ -1308,7 +1312,14 @@ function handleRegister(body: RegisterRequest): RegisterResult {
   // a DIFFERENT session sharing the pane (different cwd) is never touched, so the
   // recovery path still owns it.
   if (body.tmux_session && body.tmux_pane_id && body.name) {
-    const dups = selectSamePaneSelfDuplicates.all(body.tmux_session, body.tmux_pane_id, body.cwd, body.name, body.pid) as { id: string; pid: number }[];
+    const dups = selectSamePaneSelfDuplicates.all(
+      body.tmux_session,
+      body.tmux_pane_id,
+      body.cwd,
+      body.name,
+      body.pid,
+      requestedClientType,
+    ) as { id: string; pid: number }[];
     // Seat-supersede: any LIVE older duplicate on this exact seat is a leftover
     // server (its session was resumed/replaced but its MCP process kept running).
     // body.pid is the newest registrant → authoritative. Mark the live leftovers
@@ -1361,7 +1372,6 @@ function handleRegister(body: RegisterRequest): RegisterResult {
   // inherits only from CONFIRMED-DEAD rows, so on a pane holding both a dead
   // server row and a live TUI row it would adopt the dead one and leave the live
   // one standing — re-creating the very duplicate this exists to collapse.
-  const requestedClientType = validClientType(body.client_type);
   const seatKey = durableSeatKey(body);
   const seatMerge: { fromIds: string[]; pids: number[]; token: string | null } = { fromIds: [], pids: [], token: null };
   type ThreadBoundCodexSeat = Peer & { token: string; seat_key: string | null; seat_pids: string | null };
