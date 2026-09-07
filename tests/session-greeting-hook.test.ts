@@ -16,7 +16,7 @@
  *   - truncation notice fires only for rows hidden by the cap, not for rows
  *     skipped as empty (no false "roster capped" line).
  */
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -131,6 +131,17 @@ function mockBroker(
 const emptyClaim = () => Response.json({ peer_id: "self", drain_id: "d0", messages: [] });
 
 describe("roster rendering", () => {
+  // The greeting emits the full policy; the canonical renderer emits it once per
+  // receiving peer id. Isolate that state per test so equivalence holds.
+  let policyStateDir = "";
+  beforeEach(() => {
+    policyStateDir = mkdtempSync(join(tmpdir(), "claude-peers-policy-state-"));
+    process.env.CLAUDE_PEERS_STATE_DIR = policyStateDir;
+  });
+  afterEach(() => {
+    delete process.env.CLAUDE_PEERS_STATE_DIR;
+    rmSync(policyStateDir, { recursive: true, force: true });
+  });
   test("fresh peers render, stale (>90s) and self are excluded, identity block present", async () => {
     const root = mkdtempSync(join(tmpdir(), "greeting-roster-"));
     roots.push(root);
