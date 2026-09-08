@@ -69,5 +69,15 @@ messaging. No direct database repair or message deletion was performed.
   correctly ineligible for a wake.
 
 Fleet-wide recovery remains incomplete until the standalone connection and
-the outstanding accounting/new-lane exchanges are verified. A closed retired
+the outstanding accounting exchange are verified. A closed retired
 pane is excluded from the live fleet, not counted as a messaging failure.
+
+## New-lane follow-up
+
+The orchestrator confirmed the two audit prompts had not been submitted and
+pressed Enter in both panes. After their first turns began, exact thread reads
+succeeded. Replaying those existing threads through their verified pane relays
+restored one correctly thread-bound `codex-hook` registration per pane. Both
+original orchestrator probes subsequently received correlated MCP replies.
+No native process or account server was restarted. This supersedes the earlier
+unverified report that their adapters required a session restart.
