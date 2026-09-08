@@ -14,6 +14,7 @@ export interface SeatProofWaitOptions {
   totalTimeoutMs?: number;
   sleep?: (ms: number) => Promise<void>;
   boundThreadId?: () => string | null;
+  appServerPid?: number;
 }
 
 /**
@@ -28,6 +29,7 @@ export function verifyCodexAppServerSeatProof(
   requestThreadId: string,
   proof: ThreadIdentityProofResponse,
   boundThreadId: string | null = null,
+  appServerPid?: number,
 ): SeatProofVerdict {
   // Re-check after the broker await. Two tool calls can enter while the
   // connection is still unbound; one may bind it before the other's proof
@@ -38,7 +40,18 @@ export function verifyCodexAppServerSeatProof(
   }
   if (proof.thread_id.toLowerCase() !== requestThreadId.toLowerCase()) return { ok: false, reason: "thread mismatch" };
   if (proof.client_type !== "codex") return { ok: false, reason: "not a Codex seat" };
-  if (!proof.tmux_pane_id) return { ok: false, reason: "pane missing" };
+  if (!proof.tmux_pane_id) {
+    // Desktop conversations have no terminal seat. The request's exact thread
+    // must still be hook-owned by THIS adapter's independently discovered host.
+    // Partial/stale pane metadata is not a Desktop identity.
+    if (Number.isInteger(appServerPid) && appServerPid! > 1 && proof.pid === appServerPid
+      && proof.receiver_mode === "codex-hook" && proof.tmux_pane_id === null
+      && proof.tmux_session === null && proof.tmux_window_index === null
+      && proof.tmux_window_name === null && proof.tty === null && proof.seat_key === null) {
+      return { ok: true };
+    }
+    return { ok: false, reason: "pane missing" };
+  }
   if (!proof.seat_key) return { ok: false, reason: "durable seat missing" };
   if (proof.seat_key !== durableSeatKey(proof)) return { ok: false, reason: "durable seat mismatch" };
   return { ok: true };
@@ -79,7 +92,7 @@ export async function waitForCodexAppServerSeatProof(
     if (remainingMs <= 0) break;
     try {
       const proof = await fetchProof(AbortSignal.timeout(Math.min(requestTimeoutMs, remainingMs)));
-      const verdict = verifyCodexAppServerSeatProof(requestThreadId, proof, boundThreadId());
+      const verdict = verifyCodexAppServerSeatProof(requestThreadId, proof, boundThreadId(), options.appServerPid);
       if (verdict.ok) return { ok: true, proof };
       lastReason = verdict.reason;
     } catch (error) {

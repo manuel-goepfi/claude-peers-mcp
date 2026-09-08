@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import { ensurePaneOperatorLabel } from "./bin/tmux-label-pane.ts";
 /**
  * claude-peers broker daemon
  *
@@ -10,6 +11,7 @@
  */
 
 import { Database } from "bun:sqlite";
+import { LiveMailboxGroups,liveGroupPrefix,liveMailboxIdsSql } from "./shared/live-mailbox-groups.ts";
 import { readFileSync, writeFileSync, renameSync, chmodSync, statSync, existsSync, truncateSync, unlinkSync } from "node:fs";
 import { timingSafeEqual } from "node:crypto";
 // L6: top-level node:fs import (was inline require() in verifyPidUid hot path).
@@ -328,6 +330,8 @@ if (Number.isFinite(testMigrationPause) && testMigrationPause > 0) {
 }
 
 const db = new Database(DB_PATH);
+const liveGroups = new LiveMailboxGroups(db);
+const mailboxIdsSql = liveMailboxIdsSql;
 let storage: InitializeStorageResult;
 try {
   storage = initializeStorage(db, {
@@ -522,7 +526,8 @@ const insertCliPeer = db.prepare(`
 `);
 
 const deleteCliPeerByPid = db.prepare(`
-  DELETE FROM peers WHERE pid = ? AND non_targetable = 1 RETURNING id
+  DELETE FROM peers WHERE pid = ? AND non_targetable = 1 AND client_type = 'unknown'
+    AND COALESCE(seat_key, '') NOT LIKE 'live:%' RETURNING id
 `);
 
 const updatePeerRegistration = db.prepare(`
@@ -640,11 +645,11 @@ const updateName = db.prepare(`
 `);
 
 const deletePeer = db.prepare(`
-  DELETE FROM peers WHERE id = ?
+  DELETE FROM peers WHERE id = ? AND (seat_key IS NULL OR seat_key NOT LIKE 'live:%')
 `);
 
 const countUnreadForPeer = db.prepare(`
-  SELECT COUNT(*) AS count FROM messages WHERE to_id = ? AND delivered = 0
+  SELECT COUNT(*) AS count FROM messages WHERE to_id IN (${mailboxIdsSql}) AND delivered = 0
 `);
 
 const bumpUnreadEpisode = db.prepare(`
@@ -652,6 +657,7 @@ const bumpUnreadEpisode = db.prepare(`
 `);
 
 function foldPeerRowInto(targetId: string, sourceId: string): number {
+  if(db.query("SELECT 1 FROM peers WHERE id IN (?,?) AND seat_key LIKE 'live:%'").get(targetId,sourceId))throw new Error("live mailbox groups retain original IDs");
   const targetUnreadBefore = Number((countUnreadForPeer.get(targetId) as { count: number }).count);
   const moved = db.run(
     "UPDATE messages SET to_id = ? WHERE to_id = ? AND delivered = 0",
@@ -674,15 +680,17 @@ const selectAllPeers = db.prepare(`
 // row's single pid when it is absent, so omitting it here would silently
 // downgrade every liveness and reap decision to pid-only — the exact behaviour
 // seat identity exists to replace, and a downgrade no test would notice.
-const publicPeerColumns = `
+// Thread ownership is needed for stable internal routing, but must be stripped
+// before returning discovery results (see handleListPeers).
+const resolutionPeerColumns = `
   id, pid, cwd, git_root, absolute_git_dir, tty, name, resolved_name,
-  tmux_session, tmux_window_index, tmux_window_name, tmux_pane_id,
+  tmux_session, tmux_window_index, tmux_window_name, tmux_pane_id, thread_id,
   client_type, receiver_mode, last_hook_seen_at, last_drain_at,
   last_drain_error, summary, registered_at, last_seen, seat_key, seat_pids
 `;
 
 const selectAllTargetablePeers = db.prepare(`
-  SELECT ${publicPeerColumns} FROM peers WHERE non_targetable = 0
+  SELECT ${resolutionPeerColumns} FROM peers WHERE non_targetable = 0
 `);
 
 const selectTargetablePeerCount = db.prepare(`
@@ -690,11 +698,11 @@ const selectTargetablePeerCount = db.prepare(`
 `);
 
 const selectPeersByDirectory = db.prepare(`
-  SELECT ${publicPeerColumns} FROM peers WHERE cwd = ? AND non_targetable = 0
+  SELECT ${resolutionPeerColumns} FROM peers WHERE cwd = ? AND non_targetable = 0
 `);
 
 const selectPeersByGitRoot = db.prepare(`
-  SELECT ${publicPeerColumns} FROM peers WHERE git_root = ? AND non_targetable = 0
+  SELECT ${resolutionPeerColumns} FROM peers WHERE git_root = ? AND non_targetable = 0
 `);
 
 const insertMessage = db.prepare(`
@@ -702,19 +710,21 @@ const insertMessage = db.prepare(`
   VALUES (?, ?, ?, ?, 0, ?, ?)
 `);
 
-const selectRequestByOwner = db.prepare(`
+const selectMailboxRequests = db.prepare(`
   SELECT id, from_id, to_id, text, sent_at, delivered, delivered_at,
          claimed_by, claimed_at, request_id, reply_to_id
   FROM messages INDEXED BY ${storageIndexes.requestIdempotency}
-  WHERE from_id = ? AND request_id = ? AND request_id IS NOT NULL
+  WHERE from_id IN (${mailboxIdsSql}) AND request_id = ? AND request_id IS NOT NULL
+  ORDER BY id LIMIT 2
 `);
+const selectRequestByOwner={get(owner:string,key:string){const rows=selectMailboxRequests.all(owner,key);if(rows.length>1)throw new Error("ambiguous mailbox request key");return rows[0]??null;}};
 
 const selectReplyForRequest = db.prepare(`
   SELECT m.*, p.name AS from_name,
     CASE WHEN p.id IS NOT NULL AND p.non_targetable = 0 THEN 1 ELSE 0 END AS from_replyable
   FROM messages AS m INDEXED BY ${storageIndexes.replyUniqueness}
   LEFT JOIN peers AS p ON p.id = m.from_id
-  WHERE m.to_id = ? AND m.reply_to_id = ? AND m.reply_to_id IS NOT NULL
+  WHERE m.to_id IN (${mailboxIdsSql}) AND m.reply_to_id = ? AND m.reply_to_id IS NOT NULL
 `);
 
 // The join gives the recipient both the sender label and the current reply-route
@@ -725,26 +735,26 @@ const selectUndelivered = db.prepare(`
     CASE WHEN p.id IS NOT NULL AND p.non_targetable = 0 THEN 1 ELSE 0 END AS from_replyable
   FROM messages m
   LEFT JOIN peers p ON p.id = m.from_id
-  WHERE m.to_id = ? AND m.delivered = 0
+  WHERE m.to_id IN (${mailboxIdsSql}) AND m.delivered = 0
     AND (m.claimed_at IS NULL OR m.claimed_at < ?)
   ORDER BY m.sent_at ASC
 `);
 
 const markDeliveredScoped = db.prepare(`
   UPDATE messages SET delivered = 1, delivered_at = ?, retention_at = ?, claimed_by = NULL, claimed_at = NULL
-  WHERE id = ? AND to_id = ? AND delivered = 0
+  WHERE id = ? AND to_id IN (${mailboxIdsSql}) AND delivered = 0
     AND (claimed_at IS NULL OR claimed_at < ?)
 `);
 
 const markDeliveredClaimedScoped = db.prepare(`
   UPDATE messages SET delivered = 1, delivered_at = ?, retention_at = ?, claimed_by = NULL, claimed_at = NULL
-  WHERE id = ? AND to_id = ? AND claimed_by = ?
+  WHERE id = ? AND to_id IN (${mailboxIdsSql}) AND claimed_by = ?
 `);
 
 // Companion lookup for latency telemetry: reads sent_at + from_id BEFORE
 // the ack marks the row delivered, so we can log queue→ack ms per message.
 const selectMsgForLatency = db.prepare(`
-  SELECT from_id, sent_at FROM messages WHERE id = ? AND to_id = ?
+  SELECT from_id, sent_at FROM messages WHERE id = ? AND to_id IN (${mailboxIdsSql})
 `);
 
 // /poll-by-pid: resolves an MCP server PID to its peer row. Used by the
@@ -780,7 +790,7 @@ const selectIdentityProofByThread = db.prepare(`
 const claimMessage = db.prepare(`
   UPDATE messages
   SET claimed_by = ?, claimed_at = ?
-  WHERE id = ? AND to_id = ? AND delivered = 0
+  WHERE id = ? AND to_id IN (${mailboxIdsSql}) AND delivered = 0
     AND (claimed_at IS NULL OR claimed_at < ?)
 `);
 
@@ -792,14 +802,15 @@ const claimMessage = db.prepare(`
 // Excludes the caller's own PID: live same-PID refresh is handled by PID-dedup,
 // not rehydration.
 const selectRehydrateCandidatesByPane = db.prepare(`
-  SELECT id, pid, last_seen, git_root, unread_episode FROM peers
-  WHERE non_targetable = 0
+  SELECT id, pid, last_seen, git_root, unread_episode, thread_id FROM peers
+  WHERE non_targetable = 0 AND (seat_key IS NULL OR seat_key NOT LIKE 'live:%')
     AND tmux_session = ?
     AND tmux_pane_id = ?
     AND cwd = ?
     AND (git_root = ? OR git_root IS NULL)
     AND ((? IS NULL OR ? IS NULL) OR tmux_window_index IS NULL OR tmux_window_name IS NULL OR (tmux_window_index = ? AND tmux_window_name = ?))
     AND pid != ?
+    AND (thread_id IS NULL OR lower(thread_id) = lower(?))
   ORDER BY CASE WHEN (? IS NOT NULL AND git_root = ?) THEN 0 ELSE 1 END, last_seen DESC LIMIT 3
 `);
 
@@ -817,11 +828,12 @@ const selectRehydrateCandidatesByPane = db.prepare(`
 // Ordered exact-repo-first, then newest: the surviving id is the one most
 // recently advertised to the fleet, so the fewest senders hold a stale reference.
 const selectSeatOccupants = db.prepare(`
-  SELECT id, pid, seat_pids, token, client_type, last_seen FROM peers
+  SELECT id, pid, seat_pids, token, client_type, last_seen, thread_id FROM peers
   WHERE non_targetable = 0
     AND seat_key = ?1
     AND cwd = ?2
     AND (git_root = ?3 OR git_root IS NULL)
+    AND (thread_id IS NULL OR lower(thread_id) = lower(?4))
   ORDER BY CASE WHEN (?3 IS NOT NULL AND git_root = ?3) THEN 0 ELSE 1 END, last_seen DESC
   LIMIT 8
 `);
@@ -829,8 +841,8 @@ const selectSeatOccupants = db.prepare(`
 const updateSeatIdentity = db.prepare(`UPDATE peers SET seat_key = ?, seat_pids = ? WHERE id = ?`);
 
 const selectRehydrateCandidatesByWindow = db.prepare(`
-  SELECT id, pid, last_seen, git_root, unread_episode FROM peers
-  WHERE non_targetable = 0
+  SELECT id, pid, last_seen, git_root, unread_episode, thread_id FROM peers
+  WHERE non_targetable = 0 AND (seat_key IS NULL OR seat_key NOT LIKE 'live:%')
     AND tmux_session = ?
     AND tmux_pane_id IS NULL
     AND tmux_window_index = ?
@@ -838,6 +850,7 @@ const selectRehydrateCandidatesByWindow = db.prepare(`
     AND cwd = ?
     AND (git_root = ? OR git_root IS NULL)
     AND pid != ?
+    AND (thread_id IS NULL OR lower(thread_id) = lower(?))
   ORDER BY CASE WHEN (? IS NOT NULL AND git_root = ?) THEN 0 ELSE 1 END, last_seen DESC LIMIT 3
 `);
 
@@ -852,8 +865,8 @@ const selectRehydrateCandidatesByWindow = db.prepare(`
 // (different cwd → the recovery/rehydration path owns that). PID-liveness is
 // checked in code (the query returns candidates; we act only on the dead ones).
 const selectSamePaneSelfDuplicates = db.prepare(`
-  SELECT id, pid FROM peers
-  WHERE non_targetable = 0
+  SELECT id, pid, thread_id FROM peers
+  WHERE non_targetable = 0 AND (seat_key IS NULL OR seat_key NOT LIKE 'live:%')
     AND tmux_session = ? AND tmux_pane_id = ? AND cwd = ? AND name = ? AND pid != ?
     AND COALESCE(client_type, 'unknown') = ?
   ORDER BY last_seen DESC
@@ -893,7 +906,7 @@ const selectBroadcastTargets = db.prepare(`
 const selectMessageStatuses = db.prepare(`
   SELECT id, delivered, delivered_at, claimed_by, claimed_at
   FROM messages
-  WHERE from_id = ? AND id IN (SELECT value FROM json_each(?))
+  WHERE from_id IN (${mailboxIdsSql}) AND id IN (SELECT value FROM json_each(?))
 `);
 
 // AP-063: bridge cursor read. Returns ALL messages with id > cursor, regardless
@@ -1050,8 +1063,16 @@ function authPeer(req: Request, claimedId: string | undefined, path: string): { 
     console.error(`[broker] auth fail on ${path}: invalid token for ${claimedId}`);
     return { ok: false, status: 401, error: "invalid token for peer" };
   }
+  const stored=selectPeerById.get(row.id) as Peer|null;
+  if(liveGroupPrefix(stored?.seat_key)){
+    const current=liveGroups.current(row.id);
+    if(!current)return {ok:false,status:409,error:"runtime mailbox group expired"};
+    if(current.peer.non_targetable===1&&!groupAliasPaths.has(path))return {ok:false,status:403,error:"companion has messaging access only"};
+  }
   return { ok: true, id: row.id };
 }
+
+const groupAliasPaths=new Set(["/send-message","/send-to-peer","/poll-messages","/ack-messages","/message-status","/reply-status","/list-peers","/heartbeat","/metrics","/lifecycle-identity","/unregister"]);
 
 // --- Seat-supersede signal ---
 // When a NEWER process registers for an existing peer's exact tmux seat (same
@@ -1186,6 +1207,13 @@ function hookMetadata(peerId: string, body: { client_type?: ClientType; receiver
   return { clientType: "unknown", receiverMode: validReceiverMode(current?.receiver_mode, "unknown") };
 }
 
+// Pane location and labels cannot establish conversation ownership. Once a
+// thread is known, an absent/different incoming thread cannot inherit, merge,
+// supersede, or purge its inbox. Thread-less legacy rows may still be enriched.
+function registrationThreadCompatible(stored: string | null | undefined, incoming: string | null | undefined): boolean {
+  return !stored || (Boolean(incoming) && stored.toLowerCase() === incoming!.toLowerCase());
+}
+
 function nullableStableValueCompatible(existingValue: string | null | undefined, incomingValue: string | null | undefined): boolean {
   const existing = existingValue ?? null;
   const incoming = incomingValue ?? null;
@@ -1205,7 +1233,7 @@ function ttyCompatibleForSamePid(existingValue: string | null | undefined, incom
 }
 
 function selectAvailableMessages(peerId: string): Message[] {
-  return selectUndelivered.all(peerId, claimCutoffIso()) as Message[];
+  return (selectUndelivered.all(peerId, claimCutoffIso()) as Message[]).map(message=>({...message,from_replyable:senderIsReplyable(message.from_id)?1:0}));
 }
 
 function generateDrainId(peerId: string): string {
@@ -1241,7 +1269,8 @@ function handleRegisterCli(body: Record<string, unknown>): RegisterCliResult {
   const replacedIds = db.transaction(() => {
     // A previous hard-killed CLI can leave a non-targetable row until the
     // reaper runs. PID reuse is safe to collapse because these rows can never
-    // receive mail and ordinary session rows are excluded by the flag.
+    // receive mail. Restrict cleanup to prior CLI rows: retired companion
+    // identities are also non-targetable but retain correlated history.
     const replaced = deleteCliPeerByPid.all(request.pid) as Array<{ id: string }>;
     insertCliPeer.run(id, request.pid, now, now, token);
     return replaced.map((row) => row.id);
@@ -1259,10 +1288,95 @@ function handleRegisterCli(body: Record<string, unknown>): RegisterCliResult {
   };
 }
 
+function handleLiveGroupRegistration(body:RegisterRequest):RegisterResult|null {
+  try{
+    if(body.native_claude_companion!==undefined && typeof body.native_claude_companion!=="boolean")throw new Error("invalid native companion flag");
+    if(body.native_claude_companion){
+      if(body.client_type!=="claude"||!body.thread_id||!body.adapter_pid)throw new Error("invalid native companion request");
+      const bound=liveGroups.bind(body.adapter_pid,body.pid,body.thread_id);
+      return {ok:true,value:{id:bound.native.id,token:bound.native.token!,name:bound.native.name,resolved_name:bound.native.resolved_name,
+        client_type:"claude",receiver_mode:validReceiverMode(bound.native.receiver_mode,"claude")}};
+    }
+    const rows=db.query("SELECT * FROM peers WHERE pid=? AND seat_key LIKE 'live:%'").all(body.pid) as Peer[];
+    if(!rows.length)return null;
+    if(rows.length!==1)throw new Error("ambiguous runtime group refresh");
+    const current=liveGroups.current(rows[0]!.id);
+    if(current && current.peer.id===current.native.id && body.client_type==="claude" && body.tmux_pane_id===current.proof.pane_id
+      && body.thread_id && body.thread_id.toLowerCase()!==current.native.thread_id!.toLowerCase()){
+      if(!liveGroups.retire(current.native.id))throw new Error("native conversation switch could not retire previous mailbox group");
+      return null;
+    }
+    if(!current || (body.thread_id??null)!==(current.peer.thread_id??null) || body.client_type!==current.peer.client_type)throw new Error("runtime group refresh proof changed");
+    db.run("UPDATE peers SET last_seen=? WHERE id=?",[new Date().toISOString(),current.peer.id]);
+    return {ok:true,value:{id:current.peer.id,token:current.peer.token!,name:current.native.name,resolved_name:current.native.resolved_name,
+      client_type:"claude",receiver_mode:validReceiverMode(current.peer.receiver_mode,"claude")}};
+  }catch(error){return {ok:false,status:409,error:error instanceof Error?error.message:"runtime mailbox grouping refused"};}
+}
+
+// A threadless reconnect may reuse only one proven interactive native process.
+// Shared app-server PIDs and historical IDs are never inferred into a thread.
+function nativeCodexKeeper(input: Pick<RegisterRequest,"pid"|"tmux_pane_id"|"cwd"|"git_root"|"tty"|"absolute_git_dir">): (Peer & {token:string}) | null {
+  const rows=db.query("SELECT * FROM peers WHERE pid=? AND client_type='codex' AND thread_id IS NOT NULL AND length(thread_id)>0")
+    .all(input.pid) as Array<Peer & {token:string}>;
+  if(rows.length!==1)return null;
+  const keeper=rows[0]!;
+  if(keeper.non_targetable || !keeper.token || !input.tmux_pane_id || keeper.tmux_pane_id!==input.tmux_pane_id
+    || keeper.cwd!==input.cwd || !nullableStableValueCompatible(keeper.git_root,input.git_root)
+    || !nullableStableValueCompatible(keeper.absolute_git_dir,input.absolute_git_dir ?? null)
+    || !ttyCompatibleForSamePid(keeper.tty,input.tty))return null;
+  const pane=tmuxPaneBindProof(input.tmux_pane_id);
+  if(!pane || processTty(input.pid)!==pane.pane_tty || nativeInteractiveCodexOnTty(pane.pane_tty)?.pid!==input.pid
+    || !pidWithAncestors(input.pid).includes(pane.pane_pid))return null;
+  try {
+    const stat=readFileSync(`/proc/${input.pid}/stat`,"utf8");
+    const ticks=Number(Bun.spawnSync(["getconf","CLK_TCK"],{stdout:"pipe",stderr:"ignore"}).stdout.toString().trim());
+    const boot=Number(readFileSync("/proc/stat","utf8").match(/^btime (\d+)$/m)?.[1]);
+    const born=(boot+Number(stat.slice(stat.lastIndexOf(")")+1).trim().split(/\s+/)[19])/ticks)*1000;
+    if(!(ticks>0) || !Number.isFinite(born) || !Number.isFinite(Date.parse(keeper.registered_at)) || Date.parse(keeper.registered_at)+1000<born)return null;
+  } catch {return null;}
+  return keeper;
+}
+
+function hasAnyMessageHistory(id:string):boolean {
+  return Boolean(db.query("SELECT 1 FROM messages WHERE from_id=? OR to_id=? LIMIT 1").get(id,id));
+}
+
+function recoverThreadlessCodex(body:RegisterRequest):RegisterResult|null {
+  if(body.client_type!=="codex" || body.thread_id)return null;
+  // Only the actual interactive native process is eligible for this recovery.
+  // App-server and other non-interactive registrations keep their existing flow.
+  // Derive the TTY from the process, not the caller's claimed pane or tty.
+  const nativeTty=processTty(body.pid);
+  if(!nativeTty || nativeInteractiveCodexOnTty(nativeTty)?.pid!==body.pid)return null;
+  if(!db.query("SELECT 1 FROM peers WHERE pid=? AND client_type='codex' AND thread_id IS NOT NULL AND length(thread_id)>0").get(body.pid))return null;
+  const keeper=nativeCodexKeeper(body);
+  if(!keeper || (body.adapter_pid && !pidWithAncestors(body.adapter_pid).includes(body.pid))) {
+    return {ok:false,status:409,error:"threadless Codex registration cannot prove one native thread owner"};
+  }
+  const duplicates=db.query("SELECT * FROM peers WHERE pid=? AND id<>?").all(body.pid,keeper.id) as Peer[];
+  if(duplicates.some(peer=>liveGroupPrefix(peer.seat_key) || peer.client_type!=="codex" || peer.thread_id || peer.tmux_pane_id!==keeper.tmux_pane_id
+    || peer.cwd!==keeper.cwd || hasAnyMessageHistory(peer.id))) {
+    return {ok:false,status:409,error:"Codex duplicate has independent identity or history; automatic replacement refused"};
+  }
+  // No await: history checks and deletion cannot interleave with incoming mail.
+  db.transaction(()=>{for(const duplicate of duplicates)deletePeer.run(duplicate.id);})();
+  for(const duplicate of duplicates){buckets.delete(duplicate.id);supersededPeerIds.delete(duplicate.id);}
+  return {ok:true,value:{id:keeper.id,token:keeper.token,name:keeper.name,resolved_name:keeper.resolved_name,
+    client_type:"codex",receiver_mode:validReceiverMode(keeper.receiver_mode,"codex")}};
+}
+
 function handleRegister(body: RegisterRequest): RegisterResult {
   // S3: PID/UID validation before issuing any token.
   const pidErr = verifyPidUid(body.pid);
   if (pidErr) return { ok: false, status: 403, error: `S3 PID/UID rejected: ${pidErr}` };
+  // Atomic admission check: the relay can bind after the poller's read-only
+  // snapshot. Do not mint an observer ID or return the bound thread's token.
+  if (body.discovery_only && body.client_type === "codex" && body.tmux_pane_id
+    && db.query(`SELECT 1 FROM peers WHERE pid = ? AND tmux_pane_id = ?
+      AND client_type = 'codex' AND thread_id IS NOT NULL AND length(thread_id) > 0`)
+      .get(body.pid, body.tmux_pane_id)) {
+    return { ok: false, status: 409, error: "Codex pane already has a thread binding; discovery must observe it" };
+  }
   if (body.adapter_pid !== undefined) {
     const adapterPidErr = verifyPidUid(body.adapter_pid);
     if (adapterPidErr) return { ok: false, status: 403, error: `S3 adapter PID/UID rejected: ${adapterPidErr}` };
@@ -1294,6 +1408,8 @@ function handleRegister(body: RegisterRequest): RegisterResult {
     }
   }
 
+  const reconnect=recoverThreadlessCodex(body);if(reconnect)return reconnect;
+  const grouped=handleLiveGroupRegistration(body);if(grouped)return grouped;
   const now = new Date().toISOString();
   const token = generateToken();
   // Resolved once: seat-dedup/supersede is same-client-type only so a nested
@@ -1312,14 +1428,15 @@ function handleRegister(body: RegisterRequest): RegisterResult {
   // a DIFFERENT session sharing the pane (different cwd) is never touched, so the
   // recovery path still owns it.
   if (body.tmux_session && body.tmux_pane_id && body.name) {
-    const dups = selectSamePaneSelfDuplicates.all(
+    const dups = (selectSamePaneSelfDuplicates.all(
       body.tmux_session,
       body.tmux_pane_id,
       body.cwd,
       body.name,
       body.pid,
       requestedClientType,
-    ) as { id: string; pid: number }[];
+    ) as { id: string; pid: number; thread_id: string | null }[])
+      .filter((row) => registrationThreadCompatible(row.thread_id, body.thread_id));
     // Seat-supersede: any LIVE older duplicate on this exact seat is a leftover
     // server (its session was resumed/replaced but its MCP process kept running).
     // body.pid is the newest registrant → authoritative. Mark the live leftovers
@@ -1421,12 +1538,14 @@ function handleRegister(body: RegisterRequest): RegisterResult {
       seatKey,
       body.cwd,
       body.git_root,
+      body.thread_id ?? null,
     ) as Array<{
-      id: string; pid: number; seat_pids: string | null; token: string | null; client_type: ClientType | null; last_seen: string;
+      id: string; pid: number; seat_pids: string | null; token: string | null; client_type: ClientType | null; last_seen: string; thread_id: string | null;
     }>)
       // A row whose last_seen is unparseable is untrustworthy state, not a seat
       // to adopt — the same judgement rehydration makes.
-      .filter((o) => Number.isFinite(new Date(o.last_seen).getTime()));
+      .filter((o) => Number.isFinite(new Date(o.last_seen).getTime())
+        && registrationThreadCompatible(o.thread_id, body.thread_id));
     // A seat hosts one agent at a time, but which software occupies it can
     // change (a pane that ran codex yesterday runs claude today). Only merge
     // rows whose client is compatible — an unknown-typed row is compatible with
@@ -1476,6 +1595,7 @@ function handleRegister(body: RegisterRequest): RegisterResult {
         body.tmux_window_index ?? null,
         body.tmux_window_name ?? null,
         body.pid,
+        body.thread_id ?? null,
         body.git_root,
         body.git_root
       )
@@ -1486,10 +1606,12 @@ function handleRegister(body: RegisterRequest): RegisterResult {
         body.cwd,
         body.git_root,
         body.pid,
+        body.thread_id ?? null,
         body.git_root,
         body.git_root
-      )) as { id: string; pid: number; last_seen: string; git_root: string | null; unread_episode: number }[];
+      )) as { id: string; pid: number; last_seen: string; git_root: string | null; unread_episode: number; thread_id: string | null }[];
     for (const c of candidates) {
+      if (!registrationThreadCompatible(c.thread_id, body.thread_id)) continue;
       const lastSeenMs = new Date(c.last_seen).getTime();
       if (!Number.isFinite(lastSeenMs)) continue;
       const ageMs = Date.now() - lastSeenMs; // for the inherit log only; NOT gated
@@ -1582,9 +1704,9 @@ function handleRegister(body: RegisterRequest): RegisterResult {
     ttyCompatibleForSamePid(existing.tty, body.tty) &&
     // Thread-keyed seats: one shared-host pid serves many threads. A row with a
     // DIFFERENT thread id is another thread's identity, never this one's refresh
-    // — adopting it would steal that thread's id, token, and inbox. Null on
-    // either side stays compatible (legacy rows, thread-less registrants).
-    nullableStableValueCompatible(existing.thread_id, body.thread_id ?? null) &&
+    // — adopting it would steal that thread's id, token, and inbox. Only a
+    // thread-less stored row may be enriched; missing input is not ownership.
+    registrationThreadCompatible(existing.thread_id, body.thread_id) &&
     (requestedClientType === "unknown" || existingClientType === "unknown" || existingClientType === clientType));
   const id = inheritedId ?? (samePidRefresh ? existing!.id : null) ?? generateId();
 
@@ -1679,9 +1801,9 @@ function handleRegister(body: RegisterRequest): RegisterResult {
       // Thread-keyed seats: a row carrying a DIFFERENT thread id is another
       // thread of the same shared-host pid — someone else's row, not a stale
       // self to replace. Deleting it (and its mail) was exactly how the second
-      // codexd thread's registration erased the first thread's inbox. Null on
-      // either side keeps the legacy same-pid dedup.
-      if (existing && existing.id !== id && nullableStableValueCompatible(existing.thread_id, bodyThreadId)) {
+      // codexd thread's registration erased the first thread's inbox. Only a
+      // thread-less stored row permits legacy same-pid dedup.
+      if (existing && existing.id !== id && registrationThreadCompatible(existing.thread_id, bodyThreadId)) {
         deletePeer.run(existing.id);
         // Clean the abandoned id's undelivered mail too. Unlike the rehydrate
         // path (which INHERITS the old id so mail still resolves), this dedup
@@ -1787,7 +1909,7 @@ function handleSetName(body: SetNameRequest): { name: string | null; resolved_na
 function disambiguateName(rawName: string | null, selfId: string, windowName?: string | null): string | null {
   if (!rawName) return null;
   const rows = db.query(
-    "SELECT id, pid, seat_pids, COALESCE(resolved_name, name) AS name, tmux_window_name AS win FROM peers WHERE non_targetable = 0 AND COALESCE(resolved_name, name) IS NOT NULL AND id != ?"
+    "SELECT id, pid, seat_pids, seat_key, COALESCE(resolved_name, name) AS name, tmux_window_name AS win FROM peers WHERE non_targetable = 0 AND COALESCE(resolved_name, name) IS NOT NULL AND id != ?"
   ).all(selfId) as { id: string; pid: number; seat_pids: string | null; name: string; win: string | null }[];
   // A just-superseded predecessor is still PID-alive until its next heartbeat
   // consumes the step-down signal — registration flags it (supersededPeerIds)
@@ -1896,7 +2018,8 @@ function isPidAlive(pid: number): boolean {
  * Rows written before seat_pids existed carry an empty set and fall back to the
  * single registered pid — exactly the old behaviour.
  */
-function peerSeatAlive(peer: Pick<Peer, "pid"> & { seat_pids?: string | null }): boolean {
+function peerSeatAlive(peer: Pick<Peer, "pid"> & {id?:string;seat_key?:string|null;seat_pids?: string | null }): boolean {
+  if(liveGroupPrefix(peer.seat_key))return Boolean(peer.id&&liveGroups.current(peer.id));
   return seatPidsAlive(parseSeatPids(peer.seat_pids), peer.pid, isPidAlive);
 }
 
@@ -1905,7 +2028,7 @@ function peerSeatAlive(peer: Pick<Peer, "pid"> & { seat_pids?: string | null }):
 // that a pane without a session is still a seat, so the same row could be a pane seat
 // to registration and a tty seat to resolution.
 function activePeerKey(peer: Peer): string {
-  return durableSeatKey(peer) ?? `id:${peer.id}`;
+  return liveGroupPrefix(peer.seat_key) ?? durableSeatKey(peer) ?? `id:${peer.id}`;
 }
 
 function isHookBackedClientPeer(peer: Pick<Peer, "client_type" | "receiver_mode" | "tty" | "tmux_session" | "tmux_pane_id">): boolean {
@@ -1979,13 +2102,13 @@ function shouldPermanentlyReapPeer(peer: Peer, now: number): boolean {
 
 // Count undelivered mail for a peer id (cheap, indexed on to_id).
 const countUndelivered = db.prepare(
-  "SELECT COUNT(*) AS n FROM messages WHERE to_id = ? AND delivered = 0",
+  `SELECT COUNT(*) AS n FROM messages WHERE to_id IN (${mailboxIdsSql}) AND delivered = 0`,
 );
 
 // Queue depth + age of the oldest waiting message, for sender-facing delivery
 // health. Same index as countUndelivered.
 const selectQueueFacts = db.prepare(
-  "SELECT COUNT(*) AS n, MIN(sent_at) AS oldest FROM messages WHERE to_id = ? AND delivered = 0",
+  `SELECT COUNT(*) AS n, MIN(sent_at) AS oldest FROM messages WHERE to_id IN (${mailboxIdsSql}) AND delivered = 0`,
 );
 
 /**
@@ -2008,10 +2131,7 @@ const selectSenderReplyable = db.prepare(
   "SELECT non_targetable FROM peers WHERE id = ?",
 );
 
-function senderIsReplyable(fromId: string): boolean {
-  const row = selectSenderReplyable.get(fromId) as { non_targetable: number } | null;
-  return row !== null && row.non_targetable === 0;
-}
+function senderIsReplyable(fromId:string):boolean {return resolveFreshPeer({id:fromId}).ok;}
 
 function withSenderReplyWarning(fromId: string, health: RecipientDeliveryHealth): RecipientDeliveryHealth {
   if (senderIsReplyable(fromId)) return health;
@@ -2062,6 +2182,7 @@ function recipientHealthFor(peer: Peer): RecipientDeliveryHealth {
 function liveAndFreshPeers(peers: Peer[]): Peer[] {
   const now = Date.now();
   return peers.filter((p) => {
+    if(liveGroupPrefix(p.seat_key))return Boolean(liveGroups.current(p.id));
     if (peerIsReapable(p, now)) {
       if (!shouldPermanentlyReapPeer(p, now)) return false;
       // Decouple mail-reap from row-reap: a DEAD seat that still holds
@@ -2103,11 +2224,25 @@ function livePeersForResolution(peers: Peer[]): Peer[] {
 }
 
 function activeOnly(peers: Peer[]): Peer[] {
+  const rank = (p: Peer): [number, number, string] => [
+    p.thread_id ? 1 : 0,
+    Date.parse(p.registered_at) || 0,
+    p.id,
+  ];
   const byKey = new Map<string, Peer>();
   for (const peer of peers) {
+    if (supersededPeerIds.has(peer.id)) continue;
     const key = activePeerKey(peer);
     const prior = byKey.get(key);
-    if (!prior || new Date(peer.last_seen).getTime() >= new Date(prior.last_seen).getTime()) {
+    // Heartbeats establish liveness, never ownership. Ranking by last_seen
+    // makes two adapters for one pane recommend each other as stale on every
+    // heartbeat. Prefer the explicit conversation binding, then registration
+    // generation, with a deterministic tie-break for legacy duplicates.
+    const current = rank(peer);
+    const previous = prior ? rank(prior) : null;
+    if (!previous || current[0] > previous[0]
+      || (current[0] === previous[0] && current[1] > previous[1])
+      || (current[0] === previous[0] && current[1] === previous[1] && current[2] > previous[2])) {
       byKey.set(key, peer);
     }
   }
@@ -2201,6 +2336,12 @@ function resolveFreshPeer(selector: PeerSelector | undefined): ResolvePeerResult
   const activePeers = activeOnly(livePeersForResolution(allPeers));
 
   if (targetSelector.id) {
+    const stored=selectPeerById.get(targetSelector.id) as Peer|null;
+    if(liveGroupPrefix(stored?.seat_key)){
+      const target=liveGroups.target(targetSelector.id);
+      return target && peerMatchesSelector(target,selectorWithoutId(targetSelector))
+        ? {ok:true,peer:target} : {ok:false,code:"STALE_PEER_ID",error:"runtime mailbox group is inactive or selector conflicts"};
+    }
     const liveIdMatch = activePeers.find((p) => p.id === targetSelector.id) ?? null;
     if (liveIdMatch) {
       if (peerMatchesSelector(liveIdMatch, targetSelector)) return { ok: true, peer: liveIdMatch };
@@ -2306,7 +2447,7 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
   }
 
   const live = liveAndFreshPeers(peers);
-  return body.include_inactive ? live : activeOnly(live);
+  return (body.include_inactive ? live : activeOnly(live)).map(({ thread_id: _threadId, ...peer }) => peer);
 }
 
 type CorrelatedMessageRow = Message & {
@@ -2345,6 +2486,12 @@ function normalizeCorrelationIds(requestIdInput: unknown, replyToIdInput: unknow
   return { ok: true, requestId, replyToId };
 }
 
+function sameMailbox(a:string,b:string):boolean {
+  if(a===b)return true;
+  const left=selectPeerById.get(a) as Peer|null,right=selectPeerById.get(b) as Peer|null;
+  const group=liveGroupPrefix(left?.seat_key);return Boolean(group&&group===liveGroupPrefix(right?.seat_key));
+}
+
 function storedRetry(
   authedFromId: string,
   targetId: string,
@@ -2355,7 +2502,7 @@ function storedRetry(
   const existing = selectRequestByOwner.get(authedFromId, requestId) as CorrelatedMessageRow | null;
   if (!existing) return null;
   if (
-    existing.to_id !== targetId ||
+    !sameMailbox(existing.to_id,targetId) ||
     existing.text !== text ||
     (existing.reply_to_id ?? null) !== replyToId
   ) {
@@ -2381,7 +2528,8 @@ function storedSelectorRetry(
   if (!existing) return null;
   const originalTarget = selectPeerById.get(existing.to_id) as Peer | null;
   if (!originalTarget || !peerMatchesSelector(originalTarget, selector)) {
-    return correlationError("REQUEST_ID_CONFLICT", "request_id already exists with different message data");
+    const target=resolveFreshPeer(selector);
+    if(!target.ok || !sameMailbox(existing.to_id,target.peer.id))return correlationError("REQUEST_ID_CONFLICT", "request_id already exists with different message data");
   }
   return storedRetry(authedFromId, existing.to_id, text, requestId, replyToId);
 }
@@ -2418,7 +2566,7 @@ function insertCorrelatedMessage(
 
     if (replyToId !== null) {
       const request = selectRequestByOwner.get(target.id, replyToId) as CorrelatedMessageRow | null;
-      if (!request || request.to_id !== authedFromId) {
+      if (!request || !sameMailbox(request.to_id,authedFromId)) {
         return correlationError("REQUEST_NOT_FOUND", "request not found");
       }
       if (selectReplyForRequest.get(target.id, replyToId)) {
@@ -2591,7 +2739,7 @@ function handleReplyStatus(authedFromId: string, body: ReplyStatusRequest): Repl
       delivery: "claimed_here",
       request_id: body.request_id,
       drain_id: drainId,
-      message: current,
+      message: {...current, from_replyable: senderIsReplyable(current.from_id) ? 1 : 0},
     };
   }
 
@@ -2722,6 +2870,15 @@ function handleAckMessages(body: AckMessagesRequest): { ok: boolean; acked: numb
 }
 
 function handleUnregister(body: { id: string }): void {
+  const grouped=selectPeerById.get(body.id) as Peer|null;
+  if(grouped?.client_type==="codex" && !liveGroupPrefix(grouped.seat_key) && !grouped.thread_id && !hasAnyMessageHistory(grouped.id)
+    && nativeCodexKeeper(grouped)) {
+    deletePeer.run(grouped.id);buckets.delete(grouped.id);supersededPeerIds.delete(grouped.id);return;
+  }
+  if(liveGroupPrefix(grouped?.seat_key)){
+    if(grouped!.non_targetable===1)db.run("UPDATE peers SET token=NULL WHERE id=?",[body.id]);
+    return;
+  }
   // Graceful shutdown with queued mail: KEEP the row. Deleting it here made
   // the undelivered mail orphaned (swept within one 30s tick) and forced the
   // successor to mint a fresh id — any MCP-server restart with mail in flight
@@ -2773,6 +2930,8 @@ function resolvePidPeer(pid: number): { ok: true; id: string } | { ok: false; pe
   if (!Number.isInteger(pid) || pid <= 1) {
     return { ok: false, status: 400, error: "invalid pid" };
   }
+  const grouped=db.query("SELECT id FROM peers WHERE pid=? AND seat_key LIKE 'live:%'").all(pid) as Array<{id:string}>;
+  if(grouped.length){if(grouped.length!==1||!liveGroups.current(grouped[0]!.id))return {ok:false,status:409,error:"runtime mailbox group expired"};return {ok:true,id:grouped[0]!.id};}
   const peerRow = selectPeerIdByPid.get(pid) as { id: string } | null;
   if (!peerRow) return { ok: false, peer_id: "" };
   return { ok: true, id: peerRow.id };
@@ -2788,6 +2947,8 @@ function authPidDrain(pid: number, callerPid: number): { ok: true; id: string } 
   if (!resolved.ok) {
     return { ok: false, status: resolved.status ?? 404, error: resolved.error ?? "peer not found", peer_id: resolved.peer_id };
   }
+  const owner=selectPeerById.get(resolved.id) as Peer|null;
+  if(liveGroupPrefix(owner?.seat_key)&&owner?.non_targetable===1&&callerPid!==pid&&!pidWithAncestors(callerPid).includes(pid))return {ok:false,status:403,error:"caller is not inside this companion"};
   const targetErr = verifyPidUid(pid);
   if (targetErr) return { ok: false, status: 403, error: `target rejected: ${targetErr}` };
   return { ok: true, id: resolved.id };
@@ -2844,6 +3005,8 @@ function reconciledReceiverState(target: Peer, duplicates: Peer[]): Pick<
  * destination pane label.
  */
 function handleReconcilePaneThread(body: ReconcilePaneThreadRequest): ReconcilePaneThreadResult {
+  const grouped=selectPeerById.get(body.id) as Peer|null;
+  if(liveGroupPrefix(grouped?.seat_key))return {ok:false,status:409,error:"runtime mailbox group cannot transfer conversations"};
   if (typeof body.id !== "string" || body.id.length === 0) {
     return { ok: false, status: 400, error: "invalid id" };
   }
@@ -2889,7 +3052,13 @@ function handleReconcilePaneThread(body: ReconcilePaneThreadRequest): ReconcileP
     const receiverState = reconciledReceiverState(target, duplicates);
 
     for (const duplicate of duplicates) {
-      if (peerSeatAlive(duplicate)) supersededPeerIds.add(duplicate.id);
+      // An exact-thread paneless adapter is another connection to this
+      // conversation, not a displaced pane. Let its existing 401 recovery
+      // re-register against the proven thread binding instead of terminating
+      // its stdio transport. A different concrete pane still steps down.
+      const displacedPane = duplicate.tmux_pane_id
+        && activePeerKey(duplicate) !== activePeerKey(target);
+      if (peerSeatAlive(duplicate) && displacedPane) supersededPeerIds.add(duplicate.id);
       migrated += foldPeerRowInto(target.id, duplicate.id);
       foldedIds.push(duplicate.id);
     }
@@ -3152,7 +3321,7 @@ function resolveLiveThreadIdentity(threadId: string):
 
   const normalizedThreadId = threadId.toLowerCase();
   const matches = (selectIdentityProofByThread.all(normalizedThreadId) as ThreadIdentityRow[])
-    .filter((row) => seatPidsAlive(parseSeatPids(row.seat_pids), row.pid, isPidAlive));
+    .filter((row) => { const full=selectPeerById.get(row.id) as Peer|null; return Boolean(full && peerSeatAlive(full)); });
   if (matches.length === 0) return { ok: false, status: 404, error: "peer not found" };
   if (matches.length !== 1) return { ok: false, status: 409, error: "ambiguous live thread identity" };
 
@@ -3373,6 +3542,11 @@ function handleHookHeartbeatByPid(body: HookHeartbeatByPidRequest): { ok: boolea
 function handleHookHeartbeatByThread(body: HookHeartbeatByThreadRequest): { ok: boolean; peer_id?: string; error?: string; status?: number } {
   const auth = authThreadDrain(body.thread_id, Number(body.caller_pid));
   if (!auth.ok) return { ok: false, status: auth.status, error: auth.error };
+  const target=selectPeerById.get(auth.id) as Peer|null;
+  if(target?.client_type==="claude" && target.tmux_pane_id){
+    try{liveGroups.attestNativeHook(Number(body.caller_pid),body.thread_id,auth.id);}
+    catch{return {ok:false,status:409,error:"native hook ownership proof unavailable"};}
+  }
   return handleHookHeartbeatWithAuth(body, auth);
 }
 
@@ -3719,6 +3893,10 @@ requestHandler = async (req: Request) => {
       // thread UUID is joined to the same UUID persisted by the session hook;
       // same-UID caller verification matches the hook drain boundary. No bearer
       // token is returned.
+      if(path==="/identity-by-native-claude"){
+        try{const {peer}=liveGroups.nativeIdentity(Number(body.caller_pid));const {token:_token,seat_pids:_pids,...publicPeer}=peer;return Response.json(publicPeer);}
+        catch{return Response.json({error:"native Claude ownership proof unavailable"},{status:409});}
+      }
       if (path === "/identity-by-thread") {
         const res = handleIdentityByThread({
           thread_id: typeof body.thread_id === "string" ? body.thread_id : "",
@@ -3853,6 +4031,17 @@ requestHandler = async (req: Request) => {
               client_type: clientType,
               receiver_mode: validReceiverMode(target?.receiver_mode, clientType),
             };
+            const group=liveGroups.current(auth.id);
+            if(group){
+              const label=ensurePaneOperatorLabel(group.proof.pane_id,(args)=>{
+                const result=Bun.spawnSync(["tmux","-S",group.proof.socket_path,...args],{stdout:"pipe",stderr:"ignore",timeout:1500});
+                return {ok:result.exitCode===0,out:new TextDecoder().decode(result.stdout).trimEnd()};
+              },group.proof.socket_path);
+              if(label.status==="preserved" || label.status==="labeled"){
+                db.run("UPDATE peers SET name=?,resolved_name=?,tmux_session=? WHERE substr(seat_key,1,69)=?",[label.label,label.label,group.proof.session_name,liveGroupPrefix(group.native.seat_key)!]);
+                response.name=label.label;response.resolved_name=label.label;response.tmux_session=group.proof.session_name;
+              }
+            }
             // Seat-supersede (one-shot): a newer process took this peer's exact
             // tmux seat → tell this old server to step down. Cleared on send so the
             // signal fires exactly once; if the old server ignores it (already

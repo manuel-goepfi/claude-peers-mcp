@@ -54,6 +54,32 @@ await new Promise(() => {});
 }
 
 describe("codexd shared app-server launcher", () => {
+  test("headless attachment uses the exact verified override socket", async () => {
+    const root = mkdtempSync(join(tmpdir(), "shared-seat-headless-endpoint-"));
+    roots.push(root);
+    const socket = join(root, "explicit.sock");
+    const fakeCodex = join(root, "codex");
+    writeFileSync(fakeCodex, '#!/bin/sh\nprintf "%s\\n" "$@"\n');
+    chmodSync(fakeCodex, 0o755);
+    const upstream = await startUnixSocket(root, socket, "explicit-upstream");
+    try {
+      const result = Bun.spawnSync([LAUNCHER, "resume", "exact-thread"], {
+        cwd: root,
+        env: { ...process.env, TMUX_PANE: undefined,
+          CODEX_HOME: join(root, "different-home"),
+          CLAUDE_PEERS_REAL_CODEX: fakeCodex,
+          CLAUDE_PEERS_CODEX_APP_SERVER_SOCKET: socket },
+        stdout: "pipe", stderr: "pipe",
+      });
+      expect(result.exitCode).toBe(0);
+      expect(new TextDecoder().decode(result.stdout).trim().split("\n"))
+        .toEqual(["--remote", `unix://${socket}`, "--cd", root, "resume", "exact-thread"]);
+    } finally {
+      upstream.kill();
+      await upstream.exited;
+    }
+  });
+
   test("does not fall back from an absent Codex B socket to a live Codex A socket", async () => {
     const root = mkdtempSync(join(tmpdir(), "claude-peers-shared-seat-no-upstream-"));
     roots.push(root);
@@ -278,7 +304,7 @@ printf '%s\n' "$@" >"$FAKE_SHARED_STATE/tui.args"
       expect(result.exitCode).toBe(0);
       expect(new TextDecoder().decode(result.stderr)).toContain("no verified tmux pane");
       expect(readFileSync(join(state, "tui.args"), "utf8")).toBe(
-        `--remote\nunix://\n--cd\n${root}\nresume\nexact-thread\n`,
+        `--remote\nunix://${upstreamSocket}\n--cd\n${root}\nresume\nexact-thread\n`,
       );
     } finally {
       upstream.kill();

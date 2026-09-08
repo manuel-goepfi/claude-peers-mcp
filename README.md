@@ -35,6 +35,17 @@ A peer row is anchored to a **seat** — the operator-visible place an agent liv
 
 One seat is one row with one id. Several processes legitimately register for the same seat — a Claude session registers its MCP server pid *and*, from the SessionStart hook, its TUI pid — so registration **merges** onto the existing seat instead of minting a second identity: the newest row's id survives, the duplicate's undelivered mail migrates to it, and every registering pid is recorded in `seat_pids`. The seat counts as alive while any of those pids is alive, so an MCP server killed at compact/resume does not make an occupied pane look dead. Merging replaces superseding for co-registrants: nothing is told to step down and no mail is dropped.
 
+Each open tmux pane receives one visible `session.number` name. The number stays
+with that pane while it remains open, even when panes move or layout indexes
+change. Renaming the tmux session changes the prefix and pane numbers. Closing a
+pane releases its number; no permanent seat registry survives the pane.
+
+Native Claude and its MCP companion may share one runtime-scoped mailbox after
+the hook proves the exact conversation, account, process lifetime, and pane.
+The original peer IDs remain intact for history and correlation. An alias cannot
+be selected as a second seat, inherit a display name, or survive a native
+process replacement without fresh proof.
+
 ## Clean installation
 
 ```bash
@@ -112,10 +123,37 @@ protocol unchanged. It observes only successful root `thread/start` and
 loopback broker. This path does not depend on pane width, status-line text, or
 cwd uniqueness.
 
-The wrapper requires a verified `TMUX_PANE` for peer binding. Outside tmux it
-still performs the Desktop co-attach, but it deliberately creates no targetable
-peer identity because there is no exact pane proof; use a normal pane-local
-Codex session when non-tmux peer tools are required. The relay creates a 0700
+When an operator installs `~/bin/codexr`, bare `resume` and `resume --all`
+use its `--desktop` indexed picker before starting a relay. An exact selected
+UUID re-enters this shared launcher. Other resume flags keep the native path.
+`CLAUDE_PEERS_CODEX_RESUME_PICKER` overrides that optional executable; set it
+to `native` to retain the native picker. Custom upstream socket overrides
+keep the native path rather than silently changing the selected socket.
+
+Ephemeral `thread/start` helpers are ignored. The native TUI creates these
+for structured background work on the same connection; they must not replace
+the displayed task's peer binding.
+
+Headless shared-server registration hooks use exact thread identity when they
+have no proved inherited pane. The presence of a single visible TUI elsewhere
+on the host is not an identity proof and is never adopted by that hook.
+
+For the standard A/B/C account homes, the launcher also enables automatic
+`[A]`, `[B]`, or `[C]` task-title prefixes. The relay preserves client messages
+and adds a scoped `thread/name/set` request when the displayed task receives a
+descriptive name, including names changed by another UI subscriber. Existing
+names are labeled on resume. Already labeled names do not trigger another
+write. Empty names, other tasks, and ephemeral helpers are ignored. Unknown
+homes or a socket override pointing outside the selected home disable labeling
+rather than guessing an account. There is no polling or model call for labels.
+
+The wrapper requires a verified `TMUX_PANE` for pane binding. Outside tmux it
+still performs the Desktop co-attach without inventing a terminal seat. Desktop
+MCP messaging can use an exact hook-owned thread identity only when its PID
+matches the adapter's independently discovered app-server host, its receiver is
+`codex-hook`, and all terminal/seat fields are null. Such identities are not
+tmux wake targets. Both paths connect to the exact verified account socket,
+including an explicit socket override. The relay creates a 0700
 runtime directory under `$XDG_RUNTIME_DIR` or `/tmp`, a 0600 Unix socket and
 readiness file, and an owner-only log at
 `$CODEX_HOME/logs/codex-shared-relay-<pane>.log`. The wrapper removes its socket
@@ -361,3 +399,5 @@ The gate records client versions, installs user-scope MCP and receive-hook confi
 ## License
 
 MIT. Copyright (c) 2026 Louis Arge. See [LICENSE](LICENSE).
+
+Generic Read/Execute/Follow/Implement TASK.md task titles are replaced by the first descriptive TASK.md heading in the task cwd, retaining the account prefix. Lane headings omit account metadata and date suffixes. Missing or oversized files preserve the original title. Descriptive task names are preserved; task file content is never executed. New relay processes load this behavior.

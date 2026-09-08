@@ -19,7 +19,7 @@
  * removed ⇔ validation passed.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -31,6 +31,8 @@ afterEach(() => {
 });
 
 interface RunOpts {
+  heartbeatAgeSeconds?: number;
+  serviceAgeSeconds?: number;
   env?: Record<string, string>;      // extra env (e.g. NUDGE_CLIENTS)
   file?: string | null;              // nudge-clients file content (null = absent)
   pollerRunning?: boolean;           // pgrep stub reports a live poller
@@ -65,7 +67,13 @@ async function runWatchdog(opts: RunOpts = {}) {
 echo "$*" >> '${systemctlLog}'
 printf 'XDG_RUNTIME_DIR=%s DBUS_SESSION_BUS_ADDRESS=%s\\n' "\${XDG_RUNTIME_DIR-}" "\${DBUS_SESSION_BUS_ADDRESS-}" >> '${systemctlLog}'
 case "$2" in
-  show) printf '%s\\n' '${loadState}'; exit ${showExit} ;;
+  show)
+    if [[ "$*" == *ActiveEnterTimestamp* ]]; then
+      echo '${new Date(Date.now() - (opts.serviceAgeSeconds ?? 300) * 1000).toISOString()}'
+    else
+      printf '%s\\n' '${loadState}'
+    fi
+    exit ${showExit} ;;
   is-active) exit ${activeExit} ;;
   restart) exit ${restartExit} ;;
   *) exit 1 ;;
@@ -81,6 +89,10 @@ esac
   const log = join(root, "watchdog.log");
   const heartbeat = join(root, "heartbeat");
   writeFileSync(heartbeat, "seed");
+  if (opts.heartbeatAgeSeconds !== undefined) {
+    const then = new Date(Date.now() - opts.heartbeatAgeSeconds * 1000);
+    utimesSync(heartbeat, then, then);
+  }
   const tmuxTmp = join(root, "tmux-empty");
   mkdirSync(tmuxTmp);
   const child = Bun.spawn(["bash", script], {
@@ -110,6 +122,21 @@ esac
 }
 
 describe("systemd supervision takes precedence over the tmux fallback", () => {
+  test("newly started unit gets grace despite an old heartbeat", async () => {
+    const r = await runWatchdog({ heartbeatAgeSeconds: 300, serviceAgeSeconds: 1,
+      systemd: { managerAvailable: true, active: true } });
+    expect(r.code).toBe(0);
+    expect(r.systemctl).not.toContain("--user restart");
+  });
+  test("an active but stale poller is restarted through its owner", async () => {
+    const r = await runWatchdog({
+      heartbeatAgeSeconds: 300,
+      systemd: { managerAvailable: true, active: true },
+    });
+    expect(r.code).toBe(0);
+    expect(r.systemctl).toContain("--user restart claude-peers-codex-autodrain.service");
+    expect(r.pkills).toBe("");
+  });
   test("active unit returns before the fallback opt-in gate (planted regression guard)", async () => {
     const uid = process.getuid?.();
     if (uid === undefined) throw new Error("systemd supervision test requires a Unix uid");

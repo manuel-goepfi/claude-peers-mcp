@@ -8,6 +8,7 @@ describe("pane/thread reconciliation", () => {
   let broker: TestBroker;
   const tokens = new Map<string, string>();
   const children = new Set<ReturnType<typeof Bun.spawn>>();
+  let recoveryPane = 970;
 
   beforeAll(async () => {
     broker = await startTestBroker({ prefix: "pane-thread-reconcile" });
@@ -71,6 +72,24 @@ describe("pane/thread reconciliation", () => {
       ...overrides,
     });
   }
+
+  test("late background discovery cannot mint a second ID after a thread binds", async () => {
+    const pid = spawnHolder();
+    const location = { tmux_session: "discovery", tmux_pane_id: "%99981" };
+    const thread = crypto.randomUUID();
+    const bound = await register(pid, { ...location, thread_id: thread, receiver_mode: "codex-hook" });
+    expect(bound.status).toBe(200);
+    expect((await call("/hook-heartbeat-by-thread", { thread_id: thread, caller_pid: process.pid,
+      client_type: "codex", receiver_mode: "codex-hook" })).status).toBe(200);
+    const observer = await register(pid, { ...location, discovery_only: true });
+    expect(observer.status).toBe(409);
+    expect(observer.json.token).toBeUndefined();
+    const read = new Database(broker.dbPath, { readonly: true });
+    try {
+      const rows = read.query("SELECT id, receiver_mode FROM peers WHERE pid = ?").all(pid);
+      expect(rows).toEqual([{ id: bound.json.id, receiver_mode: "codex-hook" }]);
+    } finally { read.close(); }
+  });
 
   test("folds a thread-only row into its exact pane row without dropping mail", async () => {
     const hostPid = spawnHolder();
@@ -604,6 +623,48 @@ describe("pane/thread reconciliation", () => {
     afterDb.close();
   });
 
+  test("rename, move, close and reuse never delivers the prior thread's mail to the replacement", async () => {
+    const thread = "77777777-2222-4333-8444-555555555555";
+    const replacementThread = "77777777-2222-4333-8444-666666666666";
+    const firstPid = spawnHolder();
+    const destinationPid = spawnHolder();
+    const sender = await register(spawnHolder(), { name: "lifecycle-sender", client_type: "claude" });
+    const first = await register(firstPid, { name: "lifecycle-old", tty: "pts/960",
+      tmux_session: "lifecycle", tmux_pane_id: "%960", thread_id: thread });
+    const renamed = await call("/set-name", { id: first.json.id, name: "lifecycle-renamed" });
+    expect(renamed.status).toBe(200);
+    const sent = await call("/send-message", { from_id: sender.json.id,
+      to_id: first.json.id, text: "mail owned by original thread" });
+    expect(sent.status).toBe(200);
+    const destination = await register(destinationPid, { name: "lifecycle-destination",
+      tty: "pts/961", tmux_session: "lifecycle", tmux_pane_id: "%961" });
+    const moved = await call("/reconcile-pane-thread", { id: destination.json.id,
+      pid: destinationPid, caller_pid: process.pid, tmux_pane_id: "%961", thread_id: thread });
+    expect(moved.status).toBe(200);
+    const db = new Database(broker.dbPath, { readonly: true });
+    try {
+      expect(db.query("SELECT name FROM peers WHERE thread_id = ?").get(thread))
+        .toEqual({ name: "lifecycle-destination" });
+      expect(db.query("SELECT to_id FROM messages WHERE id = ?").get(Number(sent.json.id)))
+        .toEqual({ to_id: destination.json.id });
+      await stopHolder(firstPid);
+      await stopHolder(destinationPid);
+      const replacement = await register(spawnHolder(), { name: "lifecycle-destination",
+        tty: "pts/961", tmux_session: "lifecycle", tmux_pane_id: "%961", thread_id: replacementThread });
+      expect(replacement.status).toBe(200);
+      const claim = await call("/claim-by-thread", { thread_id: replacementThread,
+        caller_pid: process.pid, client_type: "codex", receiver_mode: "codex-hook",
+        drain_id: "replacement-must-not-inherit" });
+      expect(claim.status).toBe(200);
+      expect((claim.json.messages as Array<{ text: string }>).map((m) => m.text))
+        .not.toContain("mail owned by original thread");
+      expect(db.query("SELECT delivered FROM messages WHERE id = ?").get(Number(sent.json.id)))
+        .toEqual({ delivered: 0 });
+      expect(db.query("SELECT thread_id FROM peers WHERE id = (SELECT to_id FROM messages WHERE id = ?)")
+        .get(Number(sent.json.id))).toEqual({ thread_id: thread });
+    } finally { db.close(); }
+  });
+
   test("adopts a dead prior pane for the same thread and preserves its mail", async () => {
     const thread = "66666666-7777-4888-8999-aaaaaaaaaaaa";
     const oldPid = spawnHolder();
@@ -653,6 +714,88 @@ describe("pane/thread reconciliation", () => {
     expect((claim.json.messages as Array<{ text: string }>).map((message) => message.text))
       .toEqual(["mail survives dead-pane resume"]);
   });
+
+  for (const mode of ["seat", "legacy-pane", "legacy-window"] as const) {
+    for (const identity of ["same", "different", "missing"] as const) {
+      test(`${mode} recovery preserves thread ownership for ${identity} incoming identity`, async () => {
+        const thread = crypto.randomUUID();
+        const pane = `%${recoveryPane++}`;
+        const location = { name: `recovery-${thread}`, tmux_session: "recovery",
+          tmux_window_index: pane, tmux_window_name: "recovery",
+          tmux_pane_id: mode === "legacy-window" ? null : pane };
+        const oldPid = spawnHolder();
+        const old = await register(oldPid, { ...location, thread_id: thread });
+        expect(old.status).toBe(200);
+        const sender = await register(spawnHolder(), { name: `sender-${thread}`, client_type: "claude" });
+        const sent = await call("/send-message", { from_id: sender.json.id, to_id: old.json.id, text: thread });
+        expect(sent.status).toBe(200);
+        if (mode !== "seat") {
+          const fixture = new Database(broker.dbPath);
+          fixture.run("UPDATE peers SET seat_key = NULL WHERE id = ?", [String(old.json.id)]);
+          fixture.close();
+        }
+        await stopHolder(oldPid);
+        const incomingThread = identity === "same" ? thread : identity === "different" ? crypto.randomUUID() : null;
+        const next = await register(spawnHolder(), { ...location, thread_id: incomingThread });
+        expect(next.status).toBe(200);
+        if (identity === "same") expect(next.json.id).toBe(old.json.id);
+        else expect(next.json.id).not.toBe(old.json.id);
+        const check = new Database(broker.dbPath, { readonly: true });
+        try {
+          expect(check.query("SELECT p.thread_id, m.delivered FROM messages m JOIN peers p ON p.id=m.to_id WHERE m.id=?")
+            .get(Number(sent.json.id))).toEqual({ thread_id: thread, delivered: 0 });
+        } finally { check.close(); }
+      });
+    }
+  }
+
+  test("repeated pane reuse preserves all old inboxes and resumes the oldest thread", async () => {
+    const location = { name: "many-reuses", tmux_session: "reuses", tmux_pane_id: "%9999" };
+    const sender = await register(spawnHolder(), { name: "many-reuses-sender", client_type: "claude" });
+    const prior: Array<{ id: string; thread: string }> = [];
+    for (let index = 0; index < 10; index++) {
+      const pid = spawnHolder();
+      const thread = crypto.randomUUID();
+      const row = await register(pid, { ...location, thread_id: thread });
+      expect(row.status).toBe(200);
+      prior.push({ id: String(row.json.id), thread });
+      expect((await call("/send-message", { from_id: sender.json.id, to_id: row.json.id, text: thread })).status).toBe(200);
+      await stopHolder(pid);
+    }
+    const resumed = await register(spawnHolder(), { ...location, thread_id: prior[0]!.thread });
+    expect(resumed.status).toBe(200);
+    expect(resumed.json.id).toBe(prior[0]!.id);
+    const check = new Database(broker.dbPath, { readonly: true });
+    try {
+      for (const old of prior) {
+        expect(check.query("SELECT thread_id FROM peers WHERE id=?").get(old.id)).toEqual({ thread_id: old.thread });
+        expect(check.query("SELECT text FROM messages WHERE to_id=? AND delivered=0").all(old.id)).toEqual([{ text: old.thread }]);
+      }
+    } finally { check.close(); }
+    const claim = await call("/claim-by-thread", { thread_id: prior[0]!.thread,
+      caller_pid: process.pid, client_type: "codex", receiver_mode: "codex-hook",
+      drain_id: "oldest-resumed-thread" });
+    expect(claim.status).toBe(200);
+    expect((claim.json.messages as Array<{ text: string }>).map((m) => m.text)).toEqual([prior[0]!.thread]);
+  });
+
+  for (const incoming of ["missing", "different"] as const) {
+    test(`same-pid ${incoming} identity cannot erase a known thread`, async () => {
+      const pid = spawnHolder();
+      const thread = crypto.randomUUID();
+      const old = await register(pid, { name: "shared-host-original", thread_id: thread });
+      expect(old.status).toBe(200);
+      const next = await register(pid, { name: "shared-host-next",
+        thread_id: incoming === "missing" ? null : crypto.randomUUID() });
+      expect(next.status).toBe(200);
+      expect(next.json.id).not.toBe(old.json.id);
+      const check = new Database(broker.dbPath, { readonly: true });
+      try {
+        expect(check.query("SELECT thread_id FROM peers WHERE id=?").get(String(old.json.id)))
+          .toEqual({ thread_id: thread });
+      } finally { check.close(); }
+    });
+  }
 
   test("rolls back every fold write on a mid-transaction SQLite failure and retries cleanly", async () => {
     const thread = "88888888-9999-4aaa-8bbb-cccccccccccc";

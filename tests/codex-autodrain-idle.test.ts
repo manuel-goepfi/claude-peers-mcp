@@ -11,6 +11,8 @@
  * i.e. a dim placeholder = empty input = nudgeable.
  */
 import { describe, test, expect } from "bun:test";
+import { Database } from "bun:sqlite";
+import { boundCodexSeatIdentity } from "../bin/codex-autodrain-poller.ts";
 import { paneTextIsIdle, everyVisibleCharIsDim, profileFor } from "../bin/codex-autodrain-poller.ts";
 
 const ESC = "\x1b";
@@ -1031,6 +1033,60 @@ function registerResponse(name = "pr.1"): RegisterResponse {
 }
 
 describe("reconcileVisibleCodexSeats", () => {
+  test("database lookup selects the exact bound seat, never a threadless duplicate or ambiguous owner", () => {
+    const db = new Database(":memory:");
+    try {
+      db.run(`CREATE TABLE peers (id TEXT, name TEXT, resolved_name TEXT, client_type TEXT,
+        receiver_mode TEXT, cwd TEXT, tmux_session TEXT, tmux_pane_id TEXT, seat_key TEXT,
+        pid INTEGER, thread_id TEXT)`);
+      const seat = visibleSeat();
+      expect(boundCodexSeatIdentity(db, seat)).toEqual({ kind: "absent" });
+      db.run(`INSERT INTO peers VALUES ('bound','pr.1','pr.1','codex','codex-hook',
+        '/repo','pr','%200','pane:pr:%200',200,'thread-one')`);
+      db.run(`INSERT INTO peers VALUES ('ghost','pr.1','pr.2','codex','manual-drain',
+        '/repo','pr','%200','pane:pr:%200',200,NULL)`);
+      expect(boundCodexSeatIdentity(db, seat)).toEqual({ kind: "bound", identity: {
+        id: "bound", name: "pr.1", resolved_name: "pr.1", client_type: "codex", receiver_mode: "codex-hook",
+      } });
+      expect(boundCodexSeatIdentity(db, { ...seat, cwd: "/different" })).toEqual({ kind: "ambiguous" });
+      db.run("UPDATE peers SET thread_id = 'thread-two' WHERE id = 'ghost'");
+      expect(boundCodexSeatIdentity(db, seat)).toEqual({ kind: "ambiguous" });
+    } finally { db.close(); }
+  });
+
+  test("discovery mirrors the verified identity without registering a threadless competitor", async () => {
+    __resetCodexSeatReconcileStateForTest();
+    const identity = { ...registerResponse(), id: "verified", receiver_mode: "codex-hook" as const };
+    const published: string[] = [];
+    let registrations = 0;
+    await reconcileVisibleCodexSeats(emptySeatSnap(), {
+      now: () => 50_000, visibleSeats: () => [visibleSeat()],
+      boundIdentityForSeat: () => ({ kind: "bound", identity }),
+      gitValue: async () => null,
+      postBroker: async () => { registrations++; return registerResponse() as any; },
+      publishBrokerIdentityToTmux: (value) => {
+        published.push(value.id); return { ok: true, target: "%200", failedOptions: [] };
+      },
+    });
+    expect(registrations).toBe(0);
+    expect(published).toEqual(["verified"]);
+  });
+
+  test("ambiguous existing ownership never creates or advertises a discovery row", async () => {
+    __resetCodexSeatReconcileStateForTest();
+    let sideEffects = 0;
+    await reconcileVisibleCodexSeats(emptySeatSnap(), {
+      now: () => 50_000, visibleSeats: () => [visibleSeat()],
+      boundIdentityForSeat: () => ({ kind: "ambiguous" }),
+      gitValue: async () => null,
+      postBroker: async () => { sideEffects++; return registerResponse() as any; },
+      publishBrokerIdentityToTmux: () => {
+        sideEffects++; return { ok: true, target: "%200", failedOptions: [] };
+      },
+    });
+    expect(sideEffects).toBe(0);
+  });
+
   test("registers a visible seat without fabricating hook health", async () => {
     __resetCodexSeatReconcileStateForTest();
     const posts: Array<{ path: string; body: any }> = [];

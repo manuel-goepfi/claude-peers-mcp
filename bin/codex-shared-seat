@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Attach an interactive Codex TUI to the shared Desktop app-server through a
 # pane-local observation relay. The relay does not rewrite protocol messages;
-# it only publishes successful thread/start and thread/resume identities to the
-# local broker using the exact tmux pane that launched this process.
+# it publishes successful thread/start and thread/resume identities to the
+# local broker using the exact tmux pane that launched this process. Known
+# account homes also enable account prefixes on that task's descriptive title.
 
 set -euo pipefail
 umask 077
@@ -24,9 +25,20 @@ if [[ ! -S "$UPSTREAM_SOCKET" ]]; then
   printf 'codex-shared-seat: codexd attaches to an already-running Desktop app-server; start that account app-server or use its pane-local launcher (for Codex B: codex2)\n' >&2
   exit 1
 fi
+# Optional operator picker: bare resume reads the local index, then re-enters
+# this launcher with an exact UUID. Exact resumes and other native flags retain
+# their original path; no relay or additional writer is started for a picker.
+RESUME_PICKER="${CLAUDE_PEERS_CODEX_RESUME_PICKER:-$HOME/bin/codexr}"
+if [[ "${1:-}" == resume ]] && { [[ $# == 1 ]] || [[ $# == 2 && "$2" == --all ]]; } \
+  && [[ -x "$RESUME_PICKER" ]] \
+  && [[ "$UPSTREAM_SOCKET" == "$CODEX_STATE_HOME/app-server-control/app-server-control.sock" ]]; then
+  exec env CODEXR_REAL_CODEX="$REAL_CODEX" CODEXR_SHARED_SEAT_LAUNCHER="$SELF" \
+    "$RESUME_PICKER" --desktop "${@:2}"
+fi
+
 if [[ ! "$PANE_ID" =~ ^%[0-9]+$ ]]; then
   printf 'codex-shared-seat: no verified tmux pane; using the shared app-server without pane binding\n' >&2
-  exec "$REAL_CODEX" --remote unix:// --cd "$PWD" "$@"
+  exec "$REAL_CODEX" --remote "unix://$UPSTREAM_SOCKET" --cd "$PWD" "$@"
 fi
 if [[ ! -f "$RELAY" ]]; then
   printf 'codex-shared-seat: relay missing: %s\n' "$RELAY" >&2
@@ -62,12 +74,21 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
+ACCOUNT_SLOT=""
+# Never guess a label when an explicit socket override points at another home.
+if [[ "$UPSTREAM_SOCKET" == "$CODEX_STATE_HOME/app-server-control/app-server-control.sock" ]]; then
+  case "$CODEX_STATE_HOME" in
+    "$HOME/.codex") ACCOUNT_SLOT=A ;;
+    "$HOME/.codex-b"|"$HOME/.codex-b-remote") ACCOUNT_SLOT=B ;;
+    "$HOME/.codex-c"|"$HOME/.codex-c-remote") ACCOUNT_SLOT=C ;;
+  esac
+fi
 node --experimental-strip-types "$RELAY" \
   --pane "$PANE_ID" \
   --socket "$RELAY_SOCKET" \
   --upstream "$UPSTREAM_SOCKET" \
   --ready "$READY_FILE" \
-  --broker-port "$BROKER_PORT" >>"$RELAY_LOG" 2>&1 &
+  --broker-port "$BROKER_PORT" --account-slot "$ACCOUNT_SLOT" >>"$RELAY_LOG" 2>&1 &
 RELAY_PID=$!
 
 for _ in {1..100}; do

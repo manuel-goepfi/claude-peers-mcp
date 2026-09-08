@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import { ensurePaneOperatorLabel } from "./bin/tmux-label-pane.ts";
 /**
  * claude-peers MCP server
  *
@@ -58,7 +59,7 @@ import {
 } from "./shared/tmux-identity.ts";
 import { frameUntrusted, renderInboundBatch, renderInboundLine } from "./shared/render.ts";
 export { frameUntrusted, renderInboundBatch, renderInboundLine } from "./shared/render.ts";
-import { MCP_SERVER_INSTRUCTIONS } from "./shared/peer-authority-policy.ts";
+import { MCP_SERVER_INSTRUCTIONS, MESSAGE_ROUTING_HINT } from "./shared/peer-authority-policy.ts";
 import { PEERS_VERSION } from "./shared/version.ts";
 import { brokerIsReady, openOwnerOnlyAppendLog } from "./shared/broker-client.ts";
 import { brokerServiceConfig, installedBrokerServiceIsCurrent } from "./shared/broker-service.ts";
@@ -265,7 +266,7 @@ export function shouldDisableBackgroundPolling(clientType: ClientType, receiverM
     || receiverMode === "codex-hook" || receiverMode === "gemini-hook";
 }
 
-async function brokerFetch<T>(
+export async function brokerFetch<T>(
   path: string,
   body: unknown,
   _retry = false,
@@ -279,7 +280,12 @@ async function brokerFetch<T>(
     method: "POST",
     headers,
     body: JSON.stringify(body),
-    signal,
+    // Every attempt needs a deadline, including heartbeat and registration.
+    // A hung fetch otherwise holds heartbeatInFlight forever and prevents
+    // scheduleHeartbeat from scheduling the next recovery attempt.
+    signal: signal
+      ? AbortSignal.any([signal, AbortSignal.timeout(3_000)])
+      : AbortSignal.timeout(3_000),
   });
   if (res.status === 401 && path !== "/register" && !_retry && !shuttingDown) {
     // S2 recovery: broker was restarted (or our token was rotated). Re-register
@@ -673,7 +679,7 @@ async function detectTmuxPane(startPid = process.ppid): Promise<TmuxPaneInfo | n
       // pane_index appended as 5th field for the CLAUDE_PEER_NAME tmux-fallback
       // path. parseTmuxPanes treats it as optional, so older callers parsing
       // 4-field output continue to work.
-      ["tmux", "list-panes", "-a", "-F", "#{pane_pid}\t#{session_name}\t#{window_index}\t#{window_name}\t#{pane_index}\t#{pane_id}\t#{window_panes}"],
+      tmuxCommand(["list-panes", "-a", "-F", "#{pane_pid}\t#{session_name}\t#{window_index}\t#{window_name}\t#{pane_index}\t#{pane_id}\t#{window_panes}"]),
       { stdout: "pipe", stderr: "ignore" }
     );
     const listText = await new Response(listProc.stdout).text();
@@ -770,6 +776,11 @@ let resolveAppServerIdentityForToolCall: (threadId: string | null) => Promise<Ap
   reason: "identity resolver is not initialized",
 });
 let myTmuxInfo: TmuxPaneInfo | null = null;
+let ownsOperatorPaneIdentity = true;
+
+export function configurePaneIdentityOwnership(taskSubagent: boolean, nestedClient: ClientType | null): void {
+  ownsOperatorPaneIdentity = !taskSubagent && nestedClient === null;
+}
 let latestTmuxMirrorFailure: string | null = null;
 
 export function unresolvedAppServerToolDiagnostic(toolName: string, reason: string): string {
@@ -795,7 +806,7 @@ function processAlive(pid: number): boolean {
 function tmuxPaneAlive(paneId: string | undefined): boolean {
   if (!paneId) return false;
   try {
-    return Bun.spawnSync(["tmux", "display-message", "-p", "-t", paneId, "#{pane_id}"], {
+    return Bun.spawnSync(tmuxCommand(["display-message", "-p", "-t", paneId, "#{pane_id}"]), {
       stdout: "ignore",
       stderr: "ignore",
     }).exitCode === 0;
@@ -1123,9 +1134,15 @@ export function resolvePeerName(
   return peerName;
 }
 
+function tmuxCommand(args: string[]): string[] {
+  const binary = process.env.CLAUDE_PEERS_TMUX_BIN ?? "tmux";
+  const socket = process.env.CLAUDE_PEERS_TMUX_SOCKET;
+  return socket ? [binary, "-S", socket, ...args] : [binary, ...args];
+}
+
 function runTmux(args: string[]): string | null {
   try {
-    const result = Bun.spawnSync(["tmux", ...args], { stderr: "ignore" });
+    const result = Bun.spawnSync(tmuxCommand(args), { stderr: "ignore" });
     if (result.exitCode !== 0) return null;
     return new TextDecoder().decode(result.stdout).trim();
   } catch {
@@ -1135,7 +1152,7 @@ function runTmux(args: string[]): string | null {
 
 async function runTmuxTimed(args: string[], timeoutMs: number): Promise<string | null> {
   try {
-    const proc = Bun.spawn(["tmux", ...args], { stdout: "pipe", stderr: "ignore" });
+    const proc = Bun.spawn(tmuxCommand(args), { stdout: "pipe", stderr: "ignore" });
     void proc.exited.catch(() => {});
     let timeout: ReturnType<typeof setTimeout> | null = null;
     const completed = Promise.all([
@@ -1166,7 +1183,7 @@ function readTmuxPaneOption(target: string, optionName: string): string | null {
 
 function setTmuxPaneOption(target: string, optionName: string, value: string): boolean {
   try {
-    const result = Bun.spawnSync(["tmux", "set-option", "-p", "-t", target, optionName, value], {
+    const result = Bun.spawnSync(tmuxCommand(["set-option", "-p", "-t", target, optionName, value]), {
       stdout: "ignore",
       stderr: "ignore",
     });
@@ -1280,7 +1297,7 @@ export function publishBrokerIdentityToTmux(identity: {
   client_type: ClientType;
   receiver_mode: ReceiverMode;
 }, tmuxInfo: TmuxPaneInfo | null = myTmuxInfo, options: { updateOperatorLabel?: boolean } = {}): TmuxMirrorResult {
-  if (!tmuxIdentityMirrorEnabled()) return { ok: true, target: null, failedOptions: [], skipped: true };
+  if (!ownsOperatorPaneIdentity || !tmuxIdentityMirrorEnabled()) return { ok: true, target: null, failedOptions: [], skipped: true };
   const target = sharedBrokerIdentityPaneTarget(tmuxInfo);
   const now = Date.now();
   const key = target ? `${tmuxIdentityWriteKey(identity, target)}:${options.updateOperatorLabel === true}` : null;
@@ -1315,7 +1332,8 @@ export function publishBrokerIdentityToTmux(identity: {
 // rather than log an unconditional "cleared"). An empty array means all unsets
 // succeeded OR the pane is gone (both acceptable — a gone pane advertises nothing).
 const PEER_TMUX_OPTIONS = ["@peer_id", "@peer_label", "@peer_resolved_name", "@peer_client_type", "@peer_receiver_mode"];
-function clearBrokerIdentityFromTmux(paneTarget: string): string[] {
+export function clearBrokerIdentityFromTmux(paneTarget: string): string[] {
+  if (!ownsOperatorPaneIdentity) return [];
   const failed: string[] = [];
   for (const opt of PEER_TMUX_OPTIONS) {
     // -u unsets the pane-scoped option. runTmux returns null on non-zero exit /
@@ -1387,32 +1405,11 @@ function readUsedOperatorLabels(session: string, currentPaneId: string): string[
 }
 
 function resolveTmuxOperatorLabel(tmuxInfo: TmuxPaneInfo | null): string | null {
-  if (!tmuxInfo?.session || !tmuxInfo.pane_id) return null;
-
-  const paneTarget = tmuxInfo.pane_id;
-  const operatorLabel = readTmuxPaneOption(paneTarget, "@operator_label");
-  const existing = preservedTmuxOperatorLabel(
-    operatorLabel,
-    readTmuxPaneOption(paneTarget, "@peer_label"),
-    tmuxInfo.session,
-  );
-  if (existing) {
-    if (!cleanTmuxOptionValue(operatorLabel)) {
-      setTmuxPaneOption(paneTarget, "@operator_label", existing);
-    }
-    return existing;
-  }
-
-  const label = chooseOperatorLabel(
-    tmuxInfo.session,
-    tmuxInfo.pane_index,
-    readUsedOperatorLabels(tmuxInfo.session, tmuxInfo.pane_id),
-    tmuxInfo.window_name,
-    tmuxInfo.window_panes,
-  );
-  setTmuxPaneOption(paneTarget, "@operator_label", label);
-  setTmuxPaneOption(paneTarget, "@peer_label", label);
-  return label;
+  if (!tmuxInfo?.pane_id) return null;
+  if (!ownsOperatorPaneIdentity) return readTmuxPaneOption(tmuxInfo.pane_id,"@operator_label");
+  const result=ensurePaneOperatorLabel(tmuxInfo.pane_id);
+  if (result.status === "labeled" || result.status === "preserved") return result.label;
+  throw new Error("Open pane label is unavailable; refusing an independent name");
 }
 
 async function drainPendingMessages(): Promise<string | null> {
@@ -1439,6 +1436,15 @@ function receiverFresh(p: Pick<Peer, "receiver_mode" | "last_hook_seen_at">): bo
   return Date.now() - new Date(p.last_hook_seen_at).getTime() < 120_000;
 }
 
+export function hookActivityLabel(p: Pick<Peer, "receiver_mode" | "last_hook_seen_at">): string | null {
+  const hookMode = p.receiver_mode === "codex-hook" || p.receiver_mode === "gemini-hook";
+  if (!hookMode) return null;
+  if (!p.last_hook_seen_at) return "hook_event=not_observed (hook delivery is not yet proven)";
+  return receiverFresh(p)
+    ? "hook_event=recent"
+    : "hook_event=not_recent (event-driven; this timestamp alone does not prove failure)";
+}
+
 /**
  * `manual-drain` is an old protocol label, not a claim that an operator must
  * intervene. Keep the receiver mode for wire compatibility, but render the
@@ -1456,8 +1462,10 @@ export function manualDrainRoutingHint(p: Pick<Peer, "client_type" | "tmux_pane_
   return "delivery=check_messages (pane exists but client type is unknown, so no safe automatic route is known)";
 }
 
-function receiverLine(p: Pick<Peer, "client_type" | "receiver_mode" | "last_hook_seen_at" | "last_drain_at" | "last_drain_error" | "tmux_pane_id">): string {
-  const parts = [`Receiver: ${p.client_type}/${p.receiver_mode}`];
+export function receiverLine(p: Pick<Peer, "client_type" | "receiver_mode" | "last_hook_seen_at" | "last_drain_at" | "last_drain_error" | "tmux_pane_id">): string {
+  const parts = [`Receiver: ${p.client_type}/${p.receiver_mode}`, "presence=active"];
+  const activity = hookActivityLabel(p);
+  if (activity) parts.push(activity);
   if (p.last_hook_seen_at) parts.push(`hook_seen=${p.last_hook_seen_at}`);
   if (p.last_drain_at) parts.push(`last_drain=${p.last_drain_at}`);
   if (p.last_drain_error) parts.push(`last_error=${p.last_drain_error}`);
@@ -1479,13 +1487,13 @@ export function sendStatusHint(target: SendMessageResponse["target"] | undefined
     const fresh = target.last_hook_seen_at && Date.now() - new Date(target.last_hook_seen_at).getTime() < 120_000;
     return fresh
       ? " Still queued; Codex receiver is hook-enabled and will drain on its next prompt."
-      : " Still queued; Codex hook is stale, so the receiver may need check_messages.";
+      : " Still queued; Codex receiver presence is active and registered in hook mode, but no recent hook event was observed. Hooks are event-driven, so this timestamp alone does not prove failure. Delivery is expected at the next prompt or tool boundary if the hook runs; ask that lane to call check_messages if this handoff is urgent.";
   }
   if (target.receiver_mode === "gemini-hook") {
     const fresh = target.last_hook_seen_at && Date.now() - new Date(target.last_hook_seen_at).getTime() < 120_000;
     return fresh
       ? " Still queued; Gemini receiver is hook-enabled and will drain on its next prompt."
-      : " Still queued; Gemini hook is stale, so the receiver may need check_messages.";
+      : " Still queued; Gemini receiver presence is active and registered in hook mode, but no recent hook event was observed. Hooks are event-driven, so this timestamp alone does not prove failure. Delivery is expected at the next prompt or tool boundary if the hook runs; ask that lane to call check_messages if this handoff is urgent.";
   }
   // A pane plus a known client type IS an automatic delivery path: the autodrain
   // poller types a nudge into that pane and the lane calls check_messages itself.
@@ -1534,7 +1542,7 @@ export function sendStatusHint(target: SendMessageResponse["target"] | undefined
  * Render the broker's evidence-based delivery health for the sender.
  *
  * The mode hints above are inferences from the receiver's configuration ("hook
- * is stale, so the receiver MAY need check_messages"). This is what the queue
+ * has no recent event, so urgent delivery may need check_messages"). This is what the queue
  * actually looks like: how many messages are waiting, how long the oldest has
  * waited, and whether anything can prompt the recipient at all. Rendered on its
  * own line because a sender that reads nothing else must still read this.
@@ -1620,7 +1628,7 @@ async function inspectPeerPane(peerId: string, lineCount = TMUX_CAPTURE_DEFAULT_
   if (!target) return { ok: false, peer_id: peerId, error: `Peer ${peerId} has no tmux pane metadata` };
 
   const requestedLines = clampTmuxLineCount(lineCount);
-  const proc = Bun.spawnSync(["tmux", "capture-pane", "-p", "-t", target, "-S", `-${requestedLines}`], {
+  const proc = Bun.spawnSync(tmuxCommand(["capture-pane", "-p", "-t", target, "-S", `-${requestedLines}`]), {
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -1695,7 +1703,7 @@ const TOOLS = [
   {
     name: "send_message",
     description:
-      "Send a correlated message to another peer by live ID. Returns request_id for idempotent retries and later get_reply_status checks. Prefer send_to_peer for human names or tmux selectors.",
+      "Send a correlated message to another peer by live ID. Returns request_id for idempotent retries and later get_reply_status checks. Prefer send_to_peer for human names or tmux selectors. " + MESSAGE_ROUTING_HINT,
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -1727,7 +1735,7 @@ const TOOLS = [
   {
     name: "send_to_peer",
     description:
-      "Send a correlated message to one live peer using a selector. Returns request_id for idempotent retries and later get_reply_status checks.",
+      "Send a correlated message to one live peer using a selector. Returns request_id for idempotent retries and later get_reply_status checks. " + MESSAGE_ROUTING_HINT,
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -1885,7 +1893,7 @@ const TOOLS = [
   {
     name: "check_messages",
     description:
-      "Check for new messages from other peer instances. This is the normal, automatic delivery path for any lane whose receiver_mode is manual-drain: the autodrain poller nudges the pane and the lane calls this. \"Manual\" names the API, not who invokes it — when that poller is running and configured for the client, such lanes receive mail without anyone intervening — but it is not guaranteed, so a lane that has never drained should call this itself. Also a fallback for Claude/Codex/Gemini lanes whose drain hook is missing or stale.",
+      "Check for new messages from other peer instances. This is the normal, automatic delivery path for any lane whose receiver_mode is manual-drain: the autodrain poller nudges the pane and the lane calls this. \"Manual\" names the API, not who invokes it — when that poller is running and configured for the client, such lanes receive mail without anyone intervening — but it is not guaranteed, so a lane that has never drained should call this itself. Also a fallback for Claude/Codex/Gemini lanes whose drain hook is missing, has reported an error, or has not run at a recent event boundary.",
     inputSchema: {
       type: "object" as const,
       properties: {},
@@ -2447,7 +2455,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const lines = matches.map((p) => {
           const resolved = p.resolved_name && p.resolved_name !== p.name ? ` resolved=${p.resolved_name}` : "";
           const manual = p.receiver_mode === "manual-drain" || p.receiver_mode === "unknown";
-          const receiver = ` receiver=${p.client_type}/${p.receiver_mode}${!manual && !receiverFresh(p) ? " stale" : ""}`;
+          const hookActivity = hookActivityLabel(p);
+          const receiver = ` receiver=${p.client_type}/${p.receiver_mode} presence=active${hookActivity ? ` ${hookActivity}` : ""}${p.last_drain_error ? ` last_error=${p.last_drain_error}` : ""}`;
           const routing = manual ? ` ${manualDrainRoutingHint(p)}` : "";
           return `${p.id}${p.name ? ` (${p.name})` : ""}${resolved}${receiver}${routing}${p.tmux_session ? ` [tmux ${p.tmux_session}:${p.tmux_window_name}]` : ""}`;
         });
@@ -2705,18 +2714,19 @@ async function main() {
   // `codex.2`, etc.) so `find_peer({ name })` follows what the operator sees.
   // The stable tmux pane_id still travels separately as `tmux_pane_id`; it is
   // not the operator-facing name unless all human-label resolution fails.
-  const envName = spareAncestor ? null : (identityEnv.CLAUDE_PEER_NAME ?? null);
-  const tmuxOperatorLabel = envName ? null : resolveTmuxOperatorLabel(tmuxInfo);
-  const tmuxFallbackName =
-    tmuxOperatorLabel ??
-    (tmuxInfo && tmuxInfo.pane_id
-      ? `${tmuxInfo.session}.${tmuxInfo.pane_id}`
-      : null);
   const isSubagent = isTaskSubagent();
   const nestedFrames = isSubagent ? [] : readAncestryFrames(process.ppid);
   const nestedChildClient = isSubagent
     ? null
     : nestedOperatorChildClientType(myClientType, identityEnv, nestedFrames);
+  configurePaneIdentityOwnership(isSubagent,nestedChildClient);
+  const envName = spareAncestor || tmuxInfo?.pane_id ? null : (identityEnv.CLAUDE_PEER_NAME ?? null);
+  const tmuxOperatorLabel = resolveTmuxOperatorLabel(tmuxInfo);
+  const tmuxFallbackName =
+    tmuxOperatorLabel ??
+    (tmuxInfo && tmuxInfo.pane_id
+      ? `${tmuxInfo.session}.${tmuxInfo.pane_id}`
+      : null);
   let peerName: string = resolvePeerName(
     envName,
     tmuxFallbackName,
@@ -2748,9 +2758,29 @@ async function main() {
   // 4. Register with broker (and define the re-register closure so 401
   //    recovery in brokerFetch() can rebuild auth state without the original
   //    summary/tmux context being recomputed from scratch).
+  const nativeClaudeCompanion = myClientType === "claude" && !isSubagent && !nestedChildClient && Boolean(tmuxInfo?.pane_id)
+    && Boolean(findClientPidFromProcessChain(process.ppid, startupProcesses, "claude"));
+  const refreshNativeClaudeIdentity = async () => {
+    if (!nativeClaudeCompanion) return;
+    const proof = await brokerFetch<ThreadIdentityProofResponse>("/identity-by-native-claude", { caller_pid: process.pid }, false);
+    const nativePid = findClientPidFromProcessChain(process.ppid, processTable(), "claude");
+    if (!nativePid || proof.pid !== nativePid || proof.client_type !== "claude" || !proof.thread_id
+      || (appServerBoundThreadId && appServerBoundThreadId !== proof.thread_id)) {
+      throw new Error("native Claude hook identity changed or unavailable");
+    }
+    myRegisterPid = proof.pid;
+    appServerBoundThreadId = proof.thread_id;
+    appServerIdentityOwnedByHook = true;
+    myCwd = proof.cwd;
+    myGitRoot = proof.git_root;
+    myAbsoluteGitDir = proof.absolute_git_dir;
+    tty = proof.tty;
+    peerName = proof.name ?? peerName;
+  };
   const buildRegisterPayload = () => ({
     pid: myRegisterPid,
     adapter_pid: process.pid,
+    native_claude_companion: nativeClaudeCompanion,
     cwd: myCwd,
     git_root: myGitRoot,
     absolute_git_dir: myAbsoluteGitDir,
@@ -2785,6 +2815,7 @@ async function main() {
           caller_pid: process.pid,
       }, false, signal), {
         boundThreadId: () => appServerBoundThreadId,
+        appServerPid: codexAppServerAncestor.pid,
       });
     if (!waited.ok) return { ok: false, reason: `hook-owned seat proof unavailable: ${waited.reason}` };
     const proof = waited.proof;
@@ -2876,6 +2907,7 @@ async function main() {
 
   const performRegistration = async () => {
     if (spareAncestor) await refreshSpareIdentity();
+    await refreshNativeClaudeIdentity();
     const reg = await brokerFetch<RegisterResponse>("/register", buildRegisterPayload());
     if (shuttingDown) {
       // Cleanup won the race while /register was in flight — tear the fresh
@@ -2920,6 +2952,7 @@ async function main() {
   // the recursive /register call does not send a stale header.
   reregisterPeer = async () => {
     myToken = null;
+    await refreshNativeClaudeIdentity();
     const r = await brokerFetch<RegisterResponse>("/register", buildRegisterPayload());
     myId = r.id;
     myToken = r.token;
@@ -2963,7 +2996,7 @@ async function main() {
   if (appServerUnresolved) {
     log("app-server-hosted spawn with unresolved identity — deferring registration until first tool call");
   }
-  if (!spareAncestor && !appServerUnresolved) {
+  if (!spareAncestor && !appServerUnresolved && !nativeClaudeCompanion) {
     await ensureRegistered();
   } else if (spareAncestor) {
     const promotionTimer = setInterval(() => {
@@ -3134,7 +3167,20 @@ async function main() {
     }
     heartbeatInFlight = true;
     try {
-      const heartbeat = await brokerFetch<HeartbeatResponse>("/heartbeat", { id: myId, client_type: myClientType, receiver_mode: myReceiverMode });
+      const heartbeat = await brokerFetch<HeartbeatResponse & {name?:string;resolved_name?:string;tmux_session?:string}>("/heartbeat", { id: myId, client_type: myClientType, receiver_mode: myReceiverMode });
+      if (heartbeat.name && heartbeat.resolved_name) {
+        peerName=heartbeat.name; myOperatorName=heartbeat.name; myResolvedName=heartbeat.resolved_name;
+        if (heartbeat.tmux_session && myTmuxInfo) {
+          myTmuxInfo={...myTmuxInfo,session:heartbeat.tmux_session};
+          if (tmuxInfo?.pane_id===myTmuxInfo.pane_id) tmuxInfo={...tmuxInfo,session:heartbeat.tmux_session};
+        }
+      } else if (ownsOperatorPaneIdentity && myTmuxInfo?.pane_id) {
+        const canonical=resolveTmuxOperatorLabel(myTmuxInfo);
+        if (canonical && canonical!==myOperatorName) {
+          const renamed=await brokerFetch<{name:string|null;resolved_name:string|null}>("/set-name",{id:myId,name:canonical});
+          peerName=canonical; myOperatorName=renamed.name; myResolvedName=renamed.resolved_name;
+        }
+      }
       // Seat-supersede: a NEWER process registered for our exact tmux seat (our
       // session was `--resume`d / replaced but we kept running). We are the stale
       // leftover causing seat churn → exit cleanly so the seat resolves to the one

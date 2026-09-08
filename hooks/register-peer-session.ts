@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import { ensurePaneOperatorLabel } from "../bin/tmux-label-pane.ts";
 import { closeSync, existsSync, readFileSync, readlinkSync, statSync } from "node:fs";
 import { isClientProcess as sharedIsClientProcess, isCodexAppServerProcess, parseProcessTableSnapshot, type ProcessInfo } from "../shared/client.ts";
 import {
@@ -14,8 +15,8 @@ import {
   cleanTmuxOptionValue,
   isHumanOperatorLabel,
 } from "../shared/operator-label.ts";
-import { findSingleVisibleCodexProcess, findVisibleCodexProcessByPaneId } from "../shared/visible-codex.ts";
-import { brokerIsReady, openOwnerOnlyAppendLog, requestBroker } from "../shared/broker-client.ts";
+import { findVisibleCodexProcessByPaneId, type VisibleCodexReaders } from "../shared/visible-codex.ts";
+import { BrokerRequestError, brokerIsReady, openOwnerOnlyAppendLog, requestBroker } from "../shared/broker-client.ts";
 import { brokerServiceConfig, installedBrokerServiceIsCurrent } from "../shared/broker-service.ts";
 
 const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
@@ -454,7 +455,7 @@ export function readPaneLabel(
       failures++;
       continue;
     }
-    const label = result.peerResolvedName ?? result.operatorLabel;
+    const label = result.operatorLabel ?? result.peerResolvedName;
     if (label) return label;
   }
   if (failures === 2) {
@@ -484,26 +485,6 @@ function readUsedOperatorLabels(session: string, currentPaneId: string): string[
   }
 }
 
-function stampOperatorLabelIfMissing(paneId: string, label: string): void {
-  try {
-    const existing = Bun.spawnSync(["tmux", "show-options", "-p", "-t", paneId, "-v", "@operator_label"], {
-      stdout: "pipe",
-      stderr: "ignore",
-    });
-    if (cleanTmuxOptionValue(new TextDecoder().decode(existing.stdout))) return;
-    const stamped = Bun.spawnSync(["tmux", "set-option", "-p", "-t", paneId, "@operator_label", label], {
-      stdout: "ignore",
-      stderr: "ignore",
-    });
-    if (stamped.exitCode !== 0) {
-      log(`tmux operator-label stamp failed pane=${paneId}; registration name is not durable`);
-    }
-  } catch (e) {
-    // Pane options are best-effort; registration still proceeds with the
-    // computed name, but the loss of durability must be diagnosable.
-    log(`tmux operator-label stamp failed pane=${paneId}; registration name is not durable: ${e instanceof Error ? e.message : String(e)}`);
-  }
-}
 
 export function peerName(
   clientType: HookClientType,
@@ -513,7 +494,7 @@ export function peerName(
   paneLabel: string | null = readPaneLabel(tmux?.pane_id),
   usedLabels?: Iterable<string>,
 ): string {
-  if (clientType === "codex" && paneLabel) return paneLabel;
+  if (paneLabel) return paneLabel;
   const envName = env.CLAUDE_PEER_NAME?.trim();
   if (envName) return envName;
   if (paneLabel) return paneLabel;
@@ -525,13 +506,22 @@ export function peerName(
   return `${clientType}-${pid}`;
 }
 
+export function inheritedCodexHookSeat(
+  table: Map<number, ProcessInfo>,
+  paneId: string | undefined,
+  readers: VisibleCodexReaders,
+) {
+  // A sole visible TUI can belong to another account/task. Shared hosts must
+  // use their exact thread identity unless an inherited pane is proved.
+  return paneId ? findVisibleCodexProcessByPaneId(table, null, paneId, readers) : null;
+}
+
 async function metadata(threadId: string | null = null): Promise<RegisterMetadata | null> {
   const table = processTable();
   let identityEnv: Record<string, string | undefined> = process.env;
   let pid = findClientPidFromTable(table);
   if (!pid && CLIENT_TYPE === "codex") {
     const appServer = findCodexAppServerAncestor(process.ppid, table);
-    const visibleCwdHint = appServer ? (cwdOf(appServer.pid) ?? process.cwd()) : process.cwd();
     const inheritedPaneId = process.env.TMUX_PANE ?? process.env.CLAUDE_PEER_TMUX_PANE_ID;
     const readers = {
       getTty,
@@ -539,22 +529,15 @@ async function metadata(threadId: string | null = null): Promise<RegisterMetadat
       environOf,
       paneTtyHint: inheritedPaneId ? tmuxPaneTty(inheritedPaneId) : null,
     };
-    const exactVisible = inheritedPaneId
-      ? findVisibleCodexProcessByPaneId(table, null, inheritedPaneId, readers)
-      : null;
-    const visible = inheritedPaneId
-      ? exactVisible
-      : findSingleVisibleCodexProcess(table, visibleCwdHint, readers);
+    const visible = inheritedCodexHookSeat(table, inheritedPaneId, readers);
     if (visible) {
       pid = visible.pid;
       identityEnv = visible.env;
-      log(exactVisible
-        ? `app-server hook identity resolved via inherited pane ${inheritedPaneId} pid=${pid} cwd=${visible.cwd}`
-        : `app-server hook identity resolved via sole visible TTY pid=${pid} cwd=${visibleCwdHint}`);
+      log(`app-server hook identity resolved via inherited pane ${inheritedPaneId} pid=${pid} cwd=${visible.cwd}`);
     } else if (appServer && threadId) {
       // Thread-keyed seat: the shared app-server hosts threads with NO visible
-      // TUI anchor — no pane env, or several visible TUIs making "sole visible"
-      // ambiguous (the codexd/Desktop co-attach topology). The caller has
+      // TUI anchor (the codexd/Desktop co-attach topology). Unrelated visible
+      // TUIs must never become an identity fallback. The caller has
       // already proven this hook belongs to the root thread (transcript match),
       // and the ThreadId IS the durable identity: content-addressed, survives
       // tmux restarts, and the thread-routed drain claims land on it exactly.
@@ -583,10 +566,11 @@ async function metadata(threadId: string | null = null): Promise<RegisterMetadat
   }
   const cwd = cwdOf(pid) ?? process.cwd();
   const tmux = detectTmuxPane(pid, identityEnv);
-  const name = peerName(CLIENT_TYPE, pid, tmux, identityEnv);
-  if (tmux?.session && tmux.pane_id && isHumanOperatorLabel(name, tmux.session)) {
-    stampOperatorLabelIfMissing(tmux.pane_id, name);
+  const canonical=tmux?.pane_id ? ensurePaneOperatorLabel(tmux.pane_id) : null;
+  if (canonical && canonical.status!=="labeled" && canonical.status!=="preserved") {
+    log("Open pane label unavailable; registration deferred"); return null;
   }
+  const name=peerName(CLIENT_TYPE,pid,tmux,identityEnv,canonical && "label" in canonical ? canonical.label : null);
   return {
     pid,
     cwd,
@@ -701,6 +685,13 @@ export async function runRegistration(rawHookInput?: string): Promise<void> {
 
   try {
     await ensureBroker();
+    // Pin an existing resumed native before legacy registration can replace it.
+    // Only a missing thread may proceed to first registration without proof.
+    if(CLIENT_TYPE==="claude" && threadId){
+      try{await post("/hook-heartbeat-by-thread",{thread_id:threadId,caller_pid:process.pid,
+        client_type:CLIENT_TYPE,receiver_mode:RECEIVER_MODE,status:"ok",drained:0});}
+      catch(error){if(!(error instanceof BrokerRequestError && error.status===404))throw error;}
+    }
     const reg = await post<RegisterResponse>("/register", {
       pid: meta.pid,
       cwd: meta.cwd,
@@ -719,7 +710,7 @@ export async function runRegistration(rawHookInput?: string): Promise<void> {
       summary: "",
     });
     publishBrokerIdentityToTmux(reg, meta.tmux, meta.identity_env);
-    const heartbeatPath = CLIENT_TYPE === "codex" && threadId
+    const heartbeatPath = (CLIENT_TYPE === "codex" || CLIENT_TYPE === "claude") && threadId
       ? "/hook-heartbeat-by-thread"
       : "/hook-heartbeat-by-pid";
     await post(heartbeatPath, {

@@ -17,8 +17,13 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   __testBrokerFetchForTest,
+  configurePaneIdentityOwnership,
+  clearBrokerIdentityFromTmux,
   __testSetBrokerAuthStateForTest,
   listPeersRoutingHint,
   normalizeTmuxTargetSelector,
@@ -414,10 +419,10 @@ describe("Operator-label fallback — human name first, pane_id metadata last", 
 
     expect(source).toContain("function publishBrokerIdentityToTmux");
     const helperStart = source.indexOf("function publishBrokerIdentityToTmux");
-    const helperSlice = source.slice(helperStart, helperStart + 1600);
+    const helperSlice = source.slice(helperStart);
 
-    expect(helperSlice).toContain('readPaneOption(paneTarget, "@operator_label")');
-    expect(helperSlice).toContain("options.updateOperatorLabel || !existingOperatorLabel");
+    expect(helperSlice).toContain('readPaneOption(paneTarget,"@operator_label")');
+    expect(helperSlice).not.toContain('setOption("@operator_label"');
     expect(helperSlice).toContain('setOption("@peer_id", identity.id)');
     expect(helperSlice).toContain('setOption("@peer_label", displayLabel)');
     expect(helperSlice).toContain('setOption("@peer_resolved_name", identity.resolved_name ?? "")');
@@ -449,24 +454,22 @@ describe("Operator-label fallback — human name first, pane_id metadata last", 
 
   const tmuxAvailable = canCreateTmuxSession();
 
-  (tmuxAvailable ? test : test.skip)("broker identity mirror writes tmux pane options without overwriting operator label", () => {
-
+  (tmuxAvailable ? test : test.skip)("broker identity mirror writes peer fields without replacing the pane label", () => {
+    const root = mkdtempSync(join(tmpdir(), "claude-peers-mirror-"));
+    const socket = join(root, "tmux.sock");
     const session = `claude-peers-test-${process.pid}-${Date.now()}`;
-    const created = Bun.spawnSync(["tmux", "new-session", "-d", "-s", session], { stdout: "ignore", stderr: "ignore" });
+    const priorSocket = process.env.CLAUDE_PEERS_TMUX_SOCKET;
+    process.env.CLAUDE_PEERS_TMUX_SOCKET = socket;
+    const tmux = (...args: string[]) => Bun.spawnSync(["tmux", "-S", socket, ...args], { stdout: "pipe", stderr: "ignore" });
+    const created = tmux("new-session", "-d", "-s", session);
     expect(created.exitCode).toBe(0);
 
     try {
-      const paneIdResult = Bun.spawnSync(["tmux", "display-message", "-p", "-t", `${session}:0.0`, "#{pane_id}"], {
-        stdout: "pipe",
-        stderr: "ignore",
-      });
+      const paneIdResult = tmux("display-message", "-p", "-t", `${session}:0.0`, "#{pane_id}");
       const paneId = new TextDecoder().decode(paneIdResult.stdout).trim();
       expect(paneId).toMatch(/^%/);
 
-      Bun.spawnSync(["tmux", "set-option", "-p", "-t", paneId, "@operator_label", "human.7"], {
-        stdout: "ignore",
-        stderr: "ignore",
-      });
+      tmux("set-option", "-p", "-t", paneId, "@operator_label", "human.7");
 
       publishBrokerIdentityToTmux({
         id: "peer123",
@@ -482,19 +485,28 @@ describe("Operator-label fallback — human name first, pane_id metadata last", 
       });
 
       const readOption = (name: string): string => {
-        const result = Bun.spawnSync(["tmux", "show-options", "-p", "-t", paneId, "-v", name], {
-          stdout: "pipe",
-          stderr: "ignore",
-        });
+        const result = tmux("show-options", "-p", "-t", paneId, "-v", name);
         return new TextDecoder().decode(result.stdout).trim();
       };
 
       expect(readOption("@operator_label")).toBe("human.7");
       expect(readOption("@peer_id")).toBe("peer123");
-      expect(readOption("@peer_label")).toBe("broker.7");
+      expect(readOption("@peer_label")).toBe("human.7");
       expect(readOption("@peer_resolved_name")).toBe("broker.7#2");
       expect(readOption("@peer_client_type")).toBe("codex");
       expect(readOption("@peer_receiver_mode")).toBe("codex-hook");
+
+      for (const child of [{task:true,nested:null},{task:false,nested:"grok" as const}]) {
+        configurePaneIdentityOwnership(child.task,child.nested);
+        const result=publishBrokerIdentityToTmux({id:"child",name:"child",resolved_name:"child",
+          client_type:"grok",receiver_mode:"manual-drain"},{session,pane_id:paneId},{updateOperatorLabel:true});
+        expect(result.skipped).toBe(true);
+        expect(clearBrokerIdentityFromTmux(paneId)).toEqual([]);
+        expect(readOption("@operator_label")).toBe("human.7");
+        expect(readOption("@peer_id")).toBe("peer123");
+        expect(readOption("@peer_label")).toBe("human.7");
+      }
+      configurePaneIdentityOwnership(false,null);
 
       publishBrokerIdentityToTmux({
         id: "peer456",
@@ -509,11 +521,15 @@ describe("Operator-label fallback — human name first, pane_id metadata last", 
         pane_id: paneId,
       }, { updateOperatorLabel: true });
 
-      expect(readOption("@operator_label")).toBe("broker.8");
+      expect(readOption("@operator_label")).toBe("human.7");
       expect(readOption("@peer_id")).toBe("peer456");
       expect(readOption("@peer_receiver_mode")).toBe("manual-drain");
     } finally {
-      Bun.spawnSync(["tmux", "kill-session", "-t", session], { stdout: "ignore", stderr: "ignore" });
+      configurePaneIdentityOwnership(false,null);
+      tmux("kill-server");
+      if (priorSocket === undefined) delete process.env.CLAUDE_PEERS_TMUX_SOCKET;
+      else process.env.CLAUDE_PEERS_TMUX_SOCKET = priorSocket;
+      rmSync(root, { recursive: true, force: true });
     }
   });
 

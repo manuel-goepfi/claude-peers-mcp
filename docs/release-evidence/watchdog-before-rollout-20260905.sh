@@ -43,7 +43,6 @@ POLLER=/home/manzo/claude-peers-mcp/bin/codex-autodrain-poller.ts
 LOG="${AUTODRAIN_LOG:-/home/manzo/.claude-peers-codex-autodrain.log}"
 HEARTBEAT="${AUTODRAIN_HEARTBEAT:-/home/manzo/.claude-peers-autodrain.heartbeat}"
 SYSTEMD_UNIT="${AUTODRAIN_SYSTEMD_UNIT:-claude-peers-codex-autodrain.service}"
-STALE_AFTER_S=70
 
 # Pane names must exist before an agent registers. In particular, a zero-turn
 # Grok pane launches no MCP adapter, so registration cannot stamp its label.
@@ -57,8 +56,8 @@ if [ -r "$TMUX_LABEL_HOOK_INSTALLER" ]; then
 fi
 
 # The user service is the single primary poller owner. Check whether its unit
-# can be resolved before examining the fallback opt-in: an active unit with a
-# fresh heartbeat is a clean no-op; a stale or inactive unit is restarted. Do NOT start the
+# can be resolved before examining the fallback opt-in: an active unit is a
+# clean no-op; an inactive but resolvable unit is restarted. Do NOT start the
 # tmux fallback after a reachable unit fails to restart, because that turns a
 # failed managed service into two competing supervisors on its next recovery.
 #
@@ -85,23 +84,7 @@ if [ -n "$SYSTEMCTL_BIN" ]; then
   SYSTEMD_SHOW_STATUS=$?
   if [ "$SYSTEMD_SHOW_STATUS" -eq 0 ] && [ -n "$SYSTEMD_LOAD_STATE" ] && [ "$SYSTEMD_LOAD_STATE" != "not-found" ]; then
     if "$SYSTEMCTL_BIN" --user is-active --quiet "$SYSTEMD_UNIT"; then
-      now=$(date +%s)
-      hb=$(stat -c %Y "$HEARTBEAT" 2>/dev/null || echo 0)
-      if [ "$hb" -gt 0 ] && [ "$((now - hb))" -ge 0 ] && [ "$((now - hb))" -le "$STALE_AFTER_S" ]; then
-        exit 0
-      fi
-      # Old/missing heartbeat is not readiness. Give a newly started unit a
-      # full grace window, including when an old heartbeat survived restart.
-      started_text=$("$SYSTEMCTL_BIN" --user show --property=ActiveEnterTimestamp --value "$SYSTEMD_UNIT" 2>/dev/null)
-      started=$(date -d "$started_text" +%s 2>/dev/null || echo 0)
-      if [ -z "$started_text" ] || [ "$started" -le 0 ] || [ "$started" -gt "$now" ]; then
-        echo "$(date -Iseconds) watchdog: active unit has no fresh heartbeat and startup age is unknown" >> "$LOG"
-        exit 1
-      fi
-      if [ "$((now - started))" -le "$STALE_AFTER_S" ]; then
-        exit 0
-      fi
-      echo "$(date -Iseconds) watchdog: active unit heartbeat stale or missing — requesting managed restart" >> "$LOG"
+      exit 0
     fi
     if "$SYSTEMCTL_BIN" --user restart "$SYSTEMD_UNIT"; then
       exit 0
@@ -175,6 +158,7 @@ tmux() { "$TMUX_BIN" -S "$TMUX_SOCK" "$@"; }
 # (POLL_INTERVAL_MS, default 15s). Allow ~4 missed ticks before declaring it
 # wedged, so a single slow tick or a brief tmux contention spike doesn't trigger
 # a needless restart.
+STALE_AFTER_S=70
 
 POLLER_PIDS=$(pgrep -f "$POLLER_MATCH" 2>/dev/null)
 POLLER_COUNT=$(printf '%s\n' "$POLLER_PIDS" | grep -c .)

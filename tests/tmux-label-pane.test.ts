@@ -168,9 +168,9 @@ describe("tmux birth-time operator labels", () => {
     });
   });
 
-  test("a deliberate one-pane window name is donated while generic grok is not", () => {
+  test("window names never replace automatic pane ordinals", () => {
     const named = fakeTmux({ snapshot: "%10\treview\t0\tREVIEW-1996\t1\t\t\n" });
-    expect(ensurePaneOperatorLabel("%10", named.run)).toEqual({ status: "labeled", label: "REVIEW-1996" });
+    expect(ensurePaneOperatorLabel("%10", named.run)).toEqual({ status: "labeled", label: "review.1" });
 
     const generic = fakeTmux({ snapshot: "%11\tinfra\t4\tgrok\t1\t\t\n" });
     expect(ensurePaneOperatorLabel("%11", generic.run)).toEqual({ status: "labeled", label: "infra.1" });
@@ -219,5 +219,24 @@ describe("tmux birth-time operator labels", () => {
     };
 
     expect(labelAllUnlabeledPanes(run)).toEqual({ visited: 1, labeled: 0, failed: 1 });
+  });
+});
+
+describe("existing ordinal collision repair",()=>{
+  test("current-prefix owner keeps its ordinal ahead of an older-prefix claimant",()=>{
+    const siblings="%9\tmarketing.1\t\n%10\tC5 Marketing.1\t\n%11\tC5 Marketing.4\t";
+    const old=fakeTmux({snapshot:"%9\tC5 Marketing\t0\tbash\t3\tmarketing.1\t\n",siblings});
+    const current=fakeTmux({snapshot:"%10\tC5 Marketing\t1\tbash\t3\tC5 Marketing.1\t\n",siblings});
+    expect(ensurePaneOperatorLabel("%9",old.run)).toEqual({status:"labeled",label:"C5 Marketing.5"});
+    expect(ensurePaneOperatorLabel("%10",current.run)).toEqual({status:"preserved",label:"C5 Marketing.1"});
+  });
+  test("equal legacy or canonical contenders use numeric pane IDs, never list order",()=>{
+    for(const prefix of ["old","Current"]) {
+      const siblings=`%10\t${prefix}.1\t\n%9\t${prefix}.1\t`;
+      const winner=fakeTmux({snapshot:`%9\tCurrent\t1\tbash\t2\t${prefix}.1\t\n`,siblings});
+      const loser=fakeTmux({snapshot:`%10\tCurrent\t0\tbash\t2\t${prefix}.1\t\n`,siblings});
+      expect(ensurePaneOperatorLabel("%10",loser.run)).toEqual({status:"labeled",label:"Current.2"});
+      expect(ensurePaneOperatorLabel("%9",winner.run)).toEqual({status:prefix==="Current"?"preserved":"labeled",label:"Current.1"});
+    }
   });
 });

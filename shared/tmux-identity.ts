@@ -1,3 +1,4 @@
+import { ensurePaneOperatorLabel } from "../bin/tmux-label-pane.ts";
 import type { ClientType, ReceiverMode } from "./types.ts";
 import type { TmuxPaneInfo } from "./tmux.ts";
 
@@ -122,20 +123,22 @@ export function publishBrokerIdentityToTmux(
   const paneTarget = brokerIdentityPaneTarget(tmuxInfo, options.env ?? process.env);
   if (!paneTarget) return { ok: true, target: null, failedOptions: [] };
 
-  const displayLabel = identity.name || identity.resolved_name || identity.id;
+  // Broker disambiguation is diagnostic. It must never become the pane name.
+  const readPaneOption = options.readPaneOption ?? defaultReadPaneOption;
+  let displayLabel: string | null;
+  if (options.setPaneOption || options.readPaneOption) {
+    displayLabel=cleanTmuxOptionValue(readPaneOption(paneTarget,"@operator_label"));
+  } else {
+    const result=ensurePaneOperatorLabel(paneTarget);
+    displayLabel=result.status==="labeled" || result.status==="preserved" ? result.label : null;
+  }
+  if (!displayLabel) return {ok:false,target:paneTarget,failedOptions:["@operator_label"]};
   const failedOptions: string[] = [];
   const setPaneOption = options.setPaneOption ?? defaultSetPaneOption;
   const setOption = (optionName: string, value: string) => {
     if (!setPaneOption(paneTarget, optionName, value)) failedOptions.push(optionName);
   };
 
-  if (options.writeOperatorLabel ?? true) {
-    const readPaneOption = options.readPaneOption ?? defaultReadPaneOption;
-    const existingOperatorLabel = readPaneOption(paneTarget, "@operator_label");
-    if ((options.updateOperatorLabel || !existingOperatorLabel) && displayLabel) {
-      setOption("@operator_label", displayLabel);
-    }
-  }
   setOption("@peer_id", identity.id);
   setOption("@peer_label", displayLabel);
   setOption("@peer_resolved_name", identity.resolved_name ?? "");

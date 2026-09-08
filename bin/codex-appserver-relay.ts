@@ -1,8 +1,10 @@
 #!/usr/bin/env bun
 
-import { chmodSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, unlinkSync, writeFileSync, readFileSync, statSync } from "node:fs";
+import { join } from "node:path";
 import { createServer } from "node:http";
 import { createRequire } from "node:module";
+import { randomUUID } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import type WebSocketType from "ws";
 import type { RawData, WebSocketServer as WebSocketServerType } from "ws";
@@ -43,6 +45,52 @@ function parsedObject(text: string): Record<string, unknown> | null {
   }
 }
 
+/** TASK.md is title data only; never execute or interpret its instructions. */
+export function taskFileTitle(cwd: string): string | undefined {
+  try {
+    const path = join(cwd, "TASK.md");
+    const stat = statSync(path);
+    if (!stat.isFile() || stat.size > 128 * 1024) return undefined;
+    const text = readFileSync(path, "utf8");
+    const heading = text.match(/^# +(.+)$/m)?.[1];
+    if (!heading) return undefined;
+    const lane = /^Lane:/i.test(heading);
+    let title = heading.replace(/^(?:Task|Lane):\s*/i, "")
+      .replace(/\s*\(Codex account[^)]*\)\s*$/i, "").trim();
+    if (lane) title = title.replace(/-\d{8}$/, "").replace(/[-_]+/g, " ");
+    title = title.replace(/[`*_]/g, "").replace(/[\x00-\x1f\x7f]/g, " ").replace(/\s+/g, " ").trim();
+    if (!title || /^(?:task|instructions|lane)$/i.test(title)) return undefined;
+    return (title.charAt(0).toUpperCase() + title.slice(1)).slice(0, 100);
+  } catch { return undefined; }
+}
+
+export function taskAwareTitle(name: unknown, cwd: string): unknown {
+  if (typeof name !== "string") return name;
+  const plain = name.replace(/^(?:\[[ABC]\]\s*)+/, "");
+  if (!/^(?:\d*|t)?\s*(?:read|execute|follow|implement)\b.*\bTASK\.md\b/i.test(plain)) return name;
+  return taskFileTitle(cwd) ?? name;
+}
+
+export function accountPrefixedTitle(slot: string | undefined, name: unknown): string | null {
+  if (!slot || !/^[ABC]$/.test(slot) || typeof name !== "string" || !name.trim()) return null;
+  const title = `[${slot}] ${name.replace(/^(?:\[[ABC]\]\s*)+/, "").trim()}`;
+  return title === name ? null : title;
+}
+
+/** Only name notifications for the task displayed in this pane are eligible. */
+export function accountTitleUpdate(
+  message: Record<string, unknown> | null,
+  rootThreadId: string | null,
+  slot?: string,
+  cwd?: string,
+): { threadId: string; name: string } | null {
+  if (!rootThreadId || message?.method !== "thread/name/updated") return null;
+  const params = message.params as Record<string, unknown> | undefined;
+  if (!params || params.threadId !== rootThreadId) return null;
+  const name = accountPrefixedTitle(slot, cwd ? taskAwareTitle(params.threadName, cwd) : params.threadName);
+  return name ? { threadId: rootThreadId, name } : null;
+}
+
 /** Record only top-level TUI lifecycle requests that make a pane own a task. */
 export function observeCodexLifecycleRequest(
   text: string,
@@ -51,6 +99,11 @@ export function observeCodexLifecycleRequest(
   const message = parsedObject(text);
   if (!message) return;
   if (message.method !== "thread/start" && message.method !== "thread/resume") return;
+  // The native TUI starts ephemeral structured-output helpers on this same
+  // connection after a user turn. They are not the task displayed in the pane.
+  const params = message.params;
+  if (params && typeof params === "object" && !Array.isArray(params)
+    && (params as Record<string, unknown>).ephemeral === true) return;
   const key = requestKey(message.id);
   if (!key) return;
   pending.set(key, { method: message.method });
@@ -58,7 +111,7 @@ export function observeCodexLifecycleRequest(
 
 /**
  * Resolve the exact thread returned for a request observed above. Errors,
- * notifications, detached reviews, subagents, and thread/fork are deliberately
+ * notifications, ephemeral helpers, detached reviews, subagents, and thread/fork are deliberately
  * ignored so a background thread can never replace the pane's root identity.
  */
 export function successfulCodexLifecycleThreadId(
@@ -85,6 +138,7 @@ interface RelayOptions {
   upstreamSocketPath: string;
   readyPath: string;
   brokerPort: number;
+  accountSlot?: string;
 }
 
 function parseOptions(args: string[]): RelayOptions {
@@ -109,7 +163,9 @@ function parseOptions(args: string[]): RelayOptions {
   if (!Number.isInteger(brokerPort) || brokerPort < 1 || brokerPort > 65535) {
     throw new Error("invalid --broker-port");
   }
-  return { paneId, socketPath, upstreamSocketPath, readyPath, brokerPort };
+  const accountSlot = values.get("--account-slot") || undefined;
+  if (accountSlot && !/^[ABC]$/.test(accountSlot)) throw new Error("invalid --account-slot");
+  return { paneId, socketPath, upstreamSocketPath, readyPath, brokerPort, accountSlot };
 }
 
 function textMessage(data: RawData, binary: boolean): string | null {
@@ -130,12 +186,15 @@ export function openCodexUpstreamWebSocket(socketPath: string): WebSocketType {
   });
 }
 
-async function bindPaneThread(options: RelayOptions, threadId: string): Promise<boolean> {
+export async function bindPaneThread(options: RelayOptions, threadId: string,
+  isCurrent: () => boolean,
+  deps: { request?: (url: string, init: RequestInit) => Promise<Response>; delay?: typeof sleep } = {},
+): Promise<boolean> {
   const suffix = threadId.slice(-8);
   let lastError = "unknown broker error";
-  for (let attempt = 0; attempt < 20; attempt++) {
+  for (let attempt = 0; isCurrent(); attempt++) {
     try {
-      const response = await fetch(`http://127.0.0.1:${options.brokerPort}/bind-codex-pane-thread`, {
+      const response = await (deps.request ?? fetch)(`http://127.0.0.1:${options.brokerPort}/bind-codex-pane-thread`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -156,7 +215,9 @@ async function bindPaneThread(options: RelayOptions, threadId: string): Promise<
     } catch (error) {
       lastError = error instanceof Error ? error.message : String(error);
     }
-    await sleep(100);
+    if (!isCurrent()) return false;
+    if (attempt === 0) console.error("[codex-relay] binding unavailable; retrying while this client and task remain current");
+    await (deps.delay ?? sleep)(Math.min(15_000, 100 * 2 ** Math.min(attempt, 8)));
   }
   console.error(`[codex-relay] bind failed pane=${options.paneId} thread=t${suffix}: ${lastError}`);
   return false;
@@ -178,8 +239,6 @@ function closeWebSocket(socket: WebSocketType, code: number, reason: Buffer): vo
 }
 
 export async function runCodexAppserverRelay(options: RelayOptions): Promise<void> {
-  const boundThreads = new Set<string>();
-  const bindsInFlight = new Set<string>();
   const httpServer = createServer((_request, response) => {
     response.writeHead(404);
     response.end();
@@ -193,9 +252,25 @@ export async function runCodexAppserverRelay(options: RelayOptions): Promise<voi
   });
 
   socketServer.on("connection", (client) => {
+    const bindsInFlight = new Set<string>();
     const pending = new Map<string, PendingCodexLifecycle>();
     const queued: Array<{ data: RawData; binary: boolean }> = [];
     const upstream = openCodexUpstreamWebSocket(options.upstreamSocketPath);
+    let rootThreadId: string | null = null;
+    let rootCwd = process.cwd();
+    const titleRequestPrefix = `claude-peers-title-${randomUUID()}-`;
+    let titleSequence = 0;
+    const renameTask = (update: { threadId: string; name: string } | null) => {
+      if (!update || upstream.readyState !== WebSocket.OPEN) return;
+      // A separate, explicitly scoped RPC leaves the client's messages intact.
+      // Its private response is consumed here; normal name notifications still
+      // reach both the native TUI and other subscribers such as the desktop UI.
+      upstream.send(JSON.stringify({
+        id: `${titleRequestPrefix}${++titleSequence}`,
+        method: "thread/name/set",
+        params: update,
+      }));
+    };
 
     upstream.on("open", () => {
       for (const item of queued.splice(0)) upstream.send(item.data, { binary: item.binary });
@@ -207,14 +282,33 @@ export async function runCodexAppserverRelay(options: RelayOptions): Promise<voi
       else if (upstream.readyState === WebSocket.CONNECTING) queued.push({ data, binary });
     });
     upstream.on("message", (data, binary) => {
-      if (client.readyState === WebSocket.OPEN) client.send(data, { binary });
       const text = textMessage(data, binary);
+      const message = text === null ? null : parsedObject(text);
+      if (typeof message?.id === "string" && message.id.startsWith(titleRequestPrefix)) {
+        if (message.error) console.error("[codex-relay] account title update failed");
+        return;
+      }
+      if (client.readyState === WebSocket.OPEN) client.send(data, { binary });
       const threadId = text === null ? null : successfulCodexLifecycleThreadId(text, pending);
-      if (!threadId || boundThreads.has(threadId) || bindsInFlight.has(threadId)) return;
+      if (threadId) {
+        rootThreadId = threadId;
+        const result = message?.result as { thread?: { name?: unknown; cwd?: string } } | undefined;
+        rootCwd = result?.thread?.cwd || process.cwd();
+        const name = accountPrefixedTitle(options.accountSlot, taskAwareTitle(result?.thread?.name, rootCwd));
+        if (name) renameTask({ threadId, name });
+      } else {
+        renameTask(accountTitleUpdate(message, rootThreadId, options.accountSlot, rootCwd));
+      }
+      // A lifecycle response is fresh binding evidence. A previous successful
+      // bind cannot suppress it: the task may have moved or the broker restarted.
+      // Duplicate responses are already consumed by the pending-request map.
+      if (!threadId || bindsInFlight.has(threadId)) return;
       bindsInFlight.add(threadId);
-      void bindPaneThread(options, threadId).then((bound) => {
-        if (bound) boundThreads.add(threadId);
-      }).finally(() => {
+      void bindPaneThread(options, threadId, () =>
+        client.readyState === WebSocket.OPEN
+        && upstream.readyState === WebSocket.OPEN
+        && rootThreadId === threadId,
+      ).finally(() => {
         bindsInFlight.delete(threadId);
       });
     });

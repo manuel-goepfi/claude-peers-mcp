@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   codexUpstreamWebSocketUrl,
+  accountPrefixedTitle,
+  accountTitleUpdate,
   observeCodexLifecycleRequest,
   retryableCodexPaneBindFailure,
   successfulCodexLifecycleThreadId,
@@ -15,6 +17,22 @@ const RELAY = new URL("../bin/codex-appserver-relay.ts", import.meta.url).pathna
 const WS_RUNTIME = new URL("../node_modules/ws/index.js", import.meta.url).pathname;
 
 describe("Codex shared-app-server relay observation", () => {
+  test("account labels retain descriptive names and do not accumulate", () => {
+    expect(accountPrefixedTitle("A", "Inspect tmux lanes")).toBe("[A] Inspect tmux lanes");
+    expect(accountPrefixedTitle("B", "[B] Existing title")).toBeNull();
+    expect(accountPrefixedTitle("C", "[A] [B] Saved title")).toBe("[C] Saved title");
+    expect(accountPrefixedTitle(undefined, "Unknown account")).toBeNull();
+    expect(accountPrefixedTitle("C", null)).toBeNull();
+    expect(accountPrefixedTitle("C", "")).toBeNull();
+  });
+
+  test("account labels ignore other tasks, helpers, and unrelated notifications", () => {
+    const message = { method: "thread/name/updated", params: { threadId: THREAD, threadName: "UI title" } };
+    expect(accountTitleUpdate(message, THREAD, "C")).toEqual({ threadId: THREAD, name: "[C] UI title" });
+    expect(accountTitleUpdate(message, "other-task", "C")).toBeNull();
+    expect(accountTitleUpdate(message, null, "C")).toBeNull();
+    expect(accountTitleUpdate({ ...message, method: "thread/started" }, THREAD, "C")).toBeNull();
+  });
   test("the production Node runtime forwards a Unix-domain WebSocket", async () => {
     const root = mkdtempSync(join(tmpdir(), "claude-peers-relay-ws-"));
     const upstreamSocket = join(root, "upstream.sock");
@@ -60,7 +78,7 @@ socketServer.on("connection", (client) => {
     if (binary) return client.send(data, { binary });
     let request;
     try { request = JSON.parse(String(data)); } catch { return client.send(data); }
-    if (request.method !== "thread/start") return client.send(data);
+    if (request.method !== "thread/start" && request.method !== "thread/resume") return client.send(data);
     const response = JSON.stringify({ id: request.id, result: { thread: { id: process.env.THREAD_ID } } });
     client.send(response);
     client.send(response);
@@ -117,11 +135,11 @@ const WebSocket = require(process.env.WS_RUNTIME);
 const client = new WebSocket(process.env.RELAY_URL);
 const timer = setTimeout(() => process.exit(3), 4000);
 client.on("open", () => client.send(JSON.stringify({ method: "thread/start", id: 7, params: { cwd: "/repo" } })));
-client.on("message", (data) => {
+client.once("message", (data) => {
   clearTimeout(timer);
   process.stdout.write(String(data));
-  client.terminate();
-  process.exit(0);
+  // Remain connected through the transient binding retry, like an open TUI.
+  setTimeout(() => { client.terminate(); process.exit(0); }, 500);
 });
 client.on("error", (error) => {
   clearTimeout(timer);
@@ -129,7 +147,7 @@ client.on("error", (error) => {
   process.exit(2);
 });
 `;
-      const client = Bun.spawnSync(["node", "-e", clientScript], {
+      const client = Bun.spawn(["node", "-e", clientScript], {
         env: {
           ...process.env,
           WS_RUNTIME,
@@ -137,16 +155,16 @@ client.on("error", (error) => {
         },
         stdout: "pipe",
         stderr: "pipe",
-        timeout: 6_000,
       });
+      await client.exited;
       if (client.exitCode !== 0) {
-        const clientError = new TextDecoder().decode(client.stderr);
+        const clientError = await new Response(client.stderr).text();
         relay.kill("SIGTERM");
         await relay.exited;
         relay = null;
         throw new Error(`relay client exit=${client.exitCode}: ${clientError}; relay=${await relayStderr}`);
       }
-      expect(JSON.parse(new TextDecoder().decode(client.stdout))).toEqual({
+      expect(JSON.parse(await new Response(client.stdout).text())).toEqual({
         id: 7,
         result: { thread: { id: THREAD } },
       });
@@ -159,6 +177,18 @@ client.on("error", (error) => {
         thread_id: THREAD,
       });
       expect(bindRequests[1]).toEqual(bindRequests[0]);
+      // A fresh client resumes the same task after its broker binding was
+      // lost or moved. A past successful bind is not current identity proof.
+      const resumed = Bun.spawn(["node", "-e", clientScript.replace('method: "thread/start"', 'method: "thread/resume"')], {
+        env: { ...process.env, WS_RUNTIME, RELAY_URL: codexUpstreamWebSocketUrl(relaySocket) },
+        stdout: "pipe", stderr: "pipe",
+      });
+      await resumed.exited;
+      expect(resumed.exitCode).toBe(0);
+      const rebindDeadline = Date.now() + 1_000;
+      while (Date.now() < rebindDeadline && bindRequests.length < 3) await Bun.sleep(25);
+      expect(bindRequests).toHaveLength(3);
+      expect(bindRequests[2]).toEqual(bindRequests[0]);
     } finally {
       if (relay) {
         relay.kill("SIGTERM");
@@ -195,6 +225,24 @@ client.on("error", (error) => {
       result: { thread: { id: THREAD, turns: [] } },
     }), pending)).toBe(THREAD);
   });
+
+  test("ephemeral structured helpers cannot replace the native TUI task", () => {
+    const pending = new Map<string, PendingCodexLifecycle>();
+    observeCodexLifecycleRequest(JSON.stringify({
+      method: "thread/start", id: "startup", params: { ephemeral: false },
+    }), pending);
+    observeCodexLifecycleRequest(JSON.stringify({
+      method: "thread/start", id: "temporary-structured", params: { ephemeral: true },
+    }), pending);
+    expect(successfulCodexLifecycleThreadId(JSON.stringify({
+      id: "temporary-structured", result: { thread: { id: "helper-task" } },
+    }), pending)).toBeNull();
+    expect(successfulCodexLifecycleThreadId(JSON.stringify({
+      id: "startup", result: { thread: { id: THREAD } },
+    }), pending)).toBe(THREAD);
+    expect(pending.size).toBe(0);
+  });
+
 
   test("ignores forks, detached reviews, notifications, errors, and malformed payloads", () => {
     const pending = new Map<string, PendingCodexLifecycle>();

@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
+import { inheritedCodexHookSeat } from "../hooks/register-peer-session.ts";
 import { isClientProcess, isCodexAppServerProcess } from "../shared/client.ts";
 import { findClientPidFromTable, findHookPeerPidsFromTable, findMcpPidFromTable } from "../hooks/codex-drain-peer-inbox.ts";
 import { codexDrainRootDecision, codexHookRootDegradedReason, codexHookRootRefusalReason, codexHookSessionDiagnostic, peerName, publishBrokerIdentityToTmux, readPaneLabel, registrationTmuxPaneId, sessionIdFromHookInput, tmuxIdentityMirrorEnabled } from "../hooks/register-peer-session.ts";
@@ -20,6 +21,18 @@ function canCreateTmuxSession(): boolean {
 }
 
 describe("client detection", () => {
+  test("headless shared-server hook cannot adopt the sole unrelated visible TUI", () => {
+    const processes = table([
+      { pid: 200, ppid: 1, tty: "pts/10", comm: "codex", args: "codex resume" },
+    ]);
+    const readers = {
+      cwdOf: () => "/repo",
+      environOf: () => ({ TMUX_PANE: "%22", CLAUDE_PEER_NAME: "other-task" }),
+    };
+    expect(inheritedCodexHookSeat(processes, undefined, readers)).toBeNull();
+    expect(inheritedCodexHookSeat(processes, "%99", readers)).toBeNull();
+    expect(inheritedCodexHookSeat(processes, "%22", readers)?.pid).toBe(200);
+  });
   test("parses TTY and argv from one process-table snapshot", () => {
     const processes = parseProcessTableSnapshot([
       "200 1 pts/10 codex codex --remote ws://127.0.0.1:4000 --cd /repo",
@@ -533,7 +546,7 @@ describe("client detection", () => {
     }, "orch.5")).toBe("orch.5");
     expect(peerName("claude", 201, { session: "infra", pane_id: "%312" }, {
       CLAUDE_PEER_NAME: "infra.2",
-    }, "infra.3")).toBe("infra.2");
+    }, "infra.3")).toBe("infra.3");
   });
 
   test("Claude hook names ignore pane_index and keep a sticky pane label", () => {
@@ -552,7 +565,7 @@ describe("client detection", () => {
       reads++;
       return reads === 1
         ? { ok: false, peerResolvedName: null, operatorLabel: null }
-        : { ok: true, peerResolvedName: "orch.5", operatorLabel: "stale-human" };
+        : { ok: true, peerResolvedName: "stale-broker.8", operatorLabel: "orch.5" };
     });
 
     expect(label).toBe("orch.5");
@@ -915,7 +928,7 @@ describe("client detection", () => {
       const paneId = new TextDecoder().decode(paneIdResult.stdout).trim();
       expect(paneId).toMatch(/^%/);
 
-      Bun.spawnSync(["tmux", "set-option", "-p", "-t", paneId, "@operator_label", "human.pr"], {
+      Bun.spawnSync(["tmux", "set-option", "-p", "-t", paneId, "@operator_label", `${session}.4`], {
         stdout: "ignore",
         stderr: "ignore",
       });
@@ -947,9 +960,9 @@ describe("client detection", () => {
 
       expect(result.ok).toBe(true);
       expect(result.target).toBe(paneId);
-      expect(readOption("@operator_label")).toBe("human.pr");
+      expect(readOption("@operator_label")).toBe(`${session}.4`);
       expect(readOption("@peer_id")).toBe("fresh-peer");
-      expect(readOption("@peer_label")).toBe("pr.1");
+      expect(readOption("@peer_label")).toBe(`${session}.4`);
       expect(readOption("@peer_resolved_name")).toBe("pr.1");
       expect(readOption("@peer_client_type")).toBe("codex");
       expect(readOption("@peer_receiver_mode")).toBe("codex-hook");

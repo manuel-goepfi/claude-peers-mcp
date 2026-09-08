@@ -31,6 +31,29 @@ function proof(overrides: Partial<ThreadIdentityProofResponse> = {}): ThreadIden
 }
 
 describe("app-server Codex thread seat proof", () => {
+  test("accepts a pane-less hook identity only for the adapter's own app-server", () => {
+    const desktop = proof({ tty: null, tmux_session: null, tmux_window_index: null,
+      tmux_window_name: null, tmux_pane_id: null, seat_key: null });
+    expect(verifyCodexAppServerSeatProof(THREAD_ID, desktop, null, 200)).toEqual({ ok: true });
+    for (const host of [undefined, 201, 0]) {
+      expect(verifyCodexAppServerSeatProof(THREAD_ID, desktop, null, host).ok).toBe(false);
+    }
+    expect(verifyCodexAppServerSeatProof("other-thread", desktop, null, 200).ok).toBe(false);
+    expect(verifyCodexAppServerSeatProof(THREAD_ID, desktop, "other-thread", 200).ok).toBe(false);
+    for (const partial of [{ tty: "pts/4" }, { tmux_session: "infra" },
+      { tmux_window_index: "1" }, { tmux_window_name: "peers" },
+      { seat_key: "pane:infra:%4" }, { receiver_mode: "manual-drain" as const }]) {
+      expect(verifyCodexAppServerSeatProof(THREAD_ID, { ...desktop, ...partial }, null, 200).ok).toBe(false);
+    }
+  });
+
+  test("the wait path passes verified app-server ownership for Desktop", async () => {
+    const desktop = proof({ tty: null, tmux_session: null, tmux_window_index: null,
+      tmux_window_name: null, tmux_pane_id: null, seat_key: null });
+    expect(await waitForCodexAppServerSeatProof(THREAD_ID, async () => desktop,
+      { appServerPid: 200, attempts: 1 })).toEqual({ ok: true, proof: desktop });
+  });
+
   test("accepts the hook-owned durable pane for the request's exact thread", () => {
     expect(verifyCodexAppServerSeatProof(THREAD_ID, proof())).toEqual({ ok: true });
     expect(verifyCodexAppServerSeatProof(THREAD_ID.toUpperCase(), proof())).toEqual({ ok: true });

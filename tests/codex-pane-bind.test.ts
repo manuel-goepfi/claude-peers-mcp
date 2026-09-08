@@ -105,11 +105,11 @@ async function waitForFile(path: string): Promise<void> {
       ]).stdout).trim().split("\t");
       expect(mirrored).toEqual([
         String(results[0]!.body.id),
-        "bind.test",
-        "bind.test",
+        `${session}.1`,
+        `${session}.1`,
         "codex",
         "manual-drain",
-        "bind.test",
+        `${session}.1`,
       ]);
 
       const db = new Database(broker.dbPath, { readonly: true });
@@ -127,7 +127,7 @@ async function waitForFile(path: string): Promise<void> {
       expect(rows).toHaveLength(1);
       expect(rows[0]).toMatchObject({
         cwd: root,
-        name: "bind.test",
+        name: `${session}.1`,
         client_type: "codex",
         tmux_pane_id: paneId,
         thread_id: THREAD_A,
@@ -167,7 +167,7 @@ async function waitForFile(path: string): Promise<void> {
       };
       expect(hookRegistration).toMatchObject({
         id: results[0]!.body.id,
-        name: "bind.test",
+        name: `${session}.1`,
         receiver_mode: "manual-drain",
       });
       const hookHeartbeat = await fetch(`${broker.url}/hook-heartbeat-by-thread`, {
@@ -216,7 +216,7 @@ async function waitForFile(path: string): Promise<void> {
       expect(afterHookRows[0]).toMatchObject({
         id: results[0]!.body.id,
         pid: tuiPid,
-        name: "bind.test",
+        name: `${session}.1`,
         tmux_pane_id: paneId,
         thread_id: THREAD_A,
         receiver_mode: "codex-hook",

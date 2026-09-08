@@ -48,6 +48,9 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { publishBrokerIdentityToTmux } from "../shared/tmux-identity.ts";
+import type { BrokerIdentityForTmux } from "../shared/tmux-identity.ts";
+import { durableSeatKey } from "../shared/seat.ts";
+import { LiveMailboxGroups, liveGroupPrefix, liveMailboxIdsSql } from "../shared/live-mailbox-groups.ts";
 import type { ReconcilePaneThreadResponse, RegisterResponse } from "../shared/types.ts";
 import { isVisibleCodexArgs, singleInteractiveCodexProcess } from "../shared/visible-codex.ts";
 import {
@@ -632,7 +635,14 @@ export function parseNudgeClients(raw: string | undefined = process.env.NUDGE_CL
   return [...new Set(picked)];
 }
 const NUDGEABLE_CLIENTS = parseNudgeClients();
-export function lanesWithUnread(db: Database, nudgeableClients: string[] = NUDGEABLE_CLIENTS): Lane[] {
+function currentNativeMailbox(db: Database, id: string): boolean {
+  const current = new LiveMailboxGroups(db).current(id);
+  return current?.native.id === id;
+}
+const correlatedMailboxIdsSql = liveMailboxIdsSql.replace("owner.id=?", "owner.id=p.id");
+
+export function lanesWithUnread(db: Database, nudgeableClients: string[] = NUDGEABLE_CLIENTS,
+  nativeIsCurrent: (id: string) => boolean = id => currentNativeMailbox(db,id)): Lane[] {
   // No nudgeable client types → nothing to nudge. Return empty WITHOUT building a
   // `WHERE ... IN ()` (invalid SQL in SQLite) — and the tick() caller short-circuits
   // before this on the same condition, so this is just a defensive second guard.
@@ -641,16 +651,16 @@ export function lanesWithUnread(db: Database, nudgeableClients: string[] = NUDGE
   // Candidate selection is fail-closed: only an exact peer/message join over a
   // currently undelivered row can produce a lane. Hook state, pane visibility,
   // and delivered history are never substitutes for real pending mail.
-  return db.query(`
+  return (db.query(`
     SELECT p.id, p.name, p.pid, p.client_type, p.tmux_pane_id, p.thread_id,
            p.seat_key, p.receiver_mode, p.last_hook_seen_at, p.unread_episode,
            COUNT(m.id) AS unread
     FROM peers p
-    JOIN messages m ON m.to_id = p.id AND m.delivered = 0
+    JOIN messages m ON m.to_id IN (${correlatedMailboxIdsSql}) AND m.delivered = 0
     WHERE p.client_type IN (${placeholders})
     GROUP BY p.id
     HAVING unread > 0
-  `).all(...nudgeableClients) as Lane[];
+  `).all(...nudgeableClients) as Lane[]).filter(lane => !liveGroupPrefix(lane.seat_key) || nativeIsCurrent(lane.id));
 }
 
 /**
@@ -660,11 +670,14 @@ export function lanesWithUnread(db: Database, nudgeableClients: string[] = NUDGE
  * hook to drain the mailbox in between. The initial Lane count is therefore
  * evidence for scheduling only; it must never authorize a later keystroke.
  */
-export function pendingUnreadForPeer(db: Database, peerId: string): number {
+export function pendingUnreadForPeer(db: Database, peerId: string,
+  nativeIsCurrent: (id: string) => boolean = id => currentNativeMailbox(db,id)): number {
+  const peer = db.query("SELECT seat_key FROM peers WHERE id=?").get(peerId) as {seat_key: string|null}|null;
+  if (liveGroupPrefix(peer?.seat_key) && !nativeIsCurrent(peerId)) return 0;
   const row = db.query(`
     SELECT COUNT(*) AS unread
     FROM messages
-    WHERE to_id = ? AND delivered = 0
+    WHERE to_id IN (${liveMailboxIdsSql}) AND delivered = 0
   `).get(peerId) as { unread?: number } | null;
   const unread = Number(row?.unread ?? 0);
   return Number.isFinite(unread) && unread > 0 ? unread : 0;
@@ -1040,6 +1053,28 @@ let codexSeatReconcileInFlight = false;
 type PostBrokerFn = typeof postBroker;
 type PublishIdentityFn = typeof publishBrokerIdentityToTmux;
 
+export type BoundCodexSeatIdentity =
+  | { kind: "absent" }
+  | { kind: "ambiguous" }
+  | { kind: "bound"; identity: BrokerIdentityForTmux };
+
+/** Discovery reads routing metadata only; it must not obtain a peer token. */
+export function boundCodexSeatIdentity(db: Database, seat: VisibleCodexSeat): BoundCodexSeatIdentity {
+  const rows = db.query(`SELECT id, name, resolved_name, client_type, receiver_mode,
+      cwd, tmux_session, tmux_pane_id, seat_key FROM peers
+    WHERE pid = ? AND tmux_pane_id = ? AND client_type = 'codex'
+      AND thread_id IS NOT NULL AND length(thread_id) > 0`)
+    .all(seat.pid, seat.tmux.pane_id ?? null) as Array<BrokerIdentityForTmux & {
+      cwd: string; tmux_session: string | null; tmux_pane_id: string; seat_key: string | null;
+    }>;
+  if (rows.length === 0) return { kind: "absent" };
+  const row = rows[0]!;
+  if (rows.length !== 1 || row.cwd !== seat.cwd || row.tmux_session !== seat.tmux.session
+    || row.seat_key !== durableSeatKey(row)) return { kind: "ambiguous" };
+  const { id, name, resolved_name, client_type, receiver_mode } = row;
+  return { kind: "bound", identity: { id, name, resolved_name, client_type, receiver_mode } };
+}
+
 export interface ReconcileVisibleCodexSeatsDeps {
   enabled?: boolean;
   dryRun?: boolean;
@@ -1051,6 +1086,7 @@ export interface ReconcileVisibleCodexSeatsDeps {
   publishBrokerIdentityToTmux?: PublishIdentityFn;
   threadIdForPane?: (paneId: string) => string | null;
   callerPid?: number;
+  boundIdentityForSeat?: (seat: VisibleCodexSeat) => BoundCodexSeatIdentity;
 }
 
 export function __resetCodexSeatReconcileStateForTest(): void {
@@ -1082,6 +1118,12 @@ export async function reconcileVisibleCodexSeats(snap: TickSnapshot, deps: Recon
           log(`DRY_RUN would reconcile codex seat ${seat.name} pid=${seat.pid} pane=${seat.tmux.pane_id ?? "?"}`);
           continue;
         }
+        const bound = deps.boundIdentityForSeat?.(seat);
+        if (bound?.kind === "ambiguous") continue;
+        if (bound?.kind === "bound") {
+          publish(bound.identity, seat.tmux);
+          continue;
+        }
         const gitRoot = await git(seat.cwd, ["rev-parse", "--show-toplevel"]);
         const bare = await git(seat.cwd, ["rev-parse", "--is-bare-repository"]);
         const absoluteGitDir = bare === "true" ? null : await git(seat.cwd, ["rev-parse", "--absolute-git-dir"]);
@@ -1099,6 +1141,7 @@ export async function reconcileVisibleCodexSeats(snap: TickSnapshot, deps: Recon
           client_type: "codex",
           receiver_mode: "manual-drain",
           preserve_token: true,
+          discovery_only: true,
           summary: "",
         });
         publish(reg, seat.tmux);
@@ -1379,26 +1422,39 @@ export function composerStillHolds(capture: string, probe: string): boolean {
  * false and do not count the wake. Mail remains untouched in the broker because
  * this poller has no claim or acknowledgement capability.
  */
-function submitPaneText(paneId: string, text: string, clientType: string): boolean {
+export function submitPaneText(paneId: string, text: string, clientType: string, deps: {
+  command?: typeof sh;
+  enterText?: typeof enterWakeText;
+  sleep?: (seconds: string) => void;
+} = {}): boolean {
+  const command = deps.command ?? sh;
+  const enterText = deps.enterText ?? enterWakeText;
+  const sleep = deps.sleep ?? ((seconds: string) => { Bun.spawnSync(["sleep", seconds]); });
   const probe = submissionProbe(text);
 
   // Do NOT re-type if a previous attempt is still sitting in the composer.
   // Confirmed submission means an unconfirmed batch is retried next tick, and
   // re-sending ~8KB each time would stack burst after burst into a composer that
   // is already failing to submit. Re-Enter the text that is already there.
-  const before = sh(["tmux", "capture-pane", "-p", "-t", paneId]);
-  const alreadyHeld = before.ok && composerStillHolds(before.out, probe);
-  if (!alreadyHeld && !enterWakeText(paneId, text, clientType)) return false;
+  const before = command(["tmux", "capture-pane", "-p", "-e", "-t", paneId]);
+  if (!before.ok) return false;
+  const profile = profileFor(clientType);
+  if (profile.busy.some((pattern) => pattern.test(stripAnsi(before.out)))) return false;
+  const alreadyHeld = composerStillHolds(before.out, probe);
+  // Ownership/idle discovery preceded budget persistence. Revalidate the
+  // newest capture before writing: the operator or a hook may have acted.
+  if (!alreadyHeld && !paneTextIsIdle(before.out, profile)) return false;
+  if (!alreadyHeld && !enterText(paneId, text, clientType)) return false;
 
   // Settle longer than the TUI's paste-burst window before submitting.
-  Bun.spawnSync(["sleep", SUBMIT_SETTLE_S]);
-  if (!sh(["tmux", "send-keys", "-t", paneId, "Enter"]).ok) return false;
+  sleep(SUBMIT_SETTLE_S);
+  if (!command(["tmux", "send-keys", "-t", paneId, "Enter"]).ok) return false;
 
   // Poll rather than sleep once: submission latency varies with what the TUI is
   // doing, and a fixed wait either wastes time or reports a false failure.
   for (let attempt = 0; attempt < SUBMIT_CONFIRM_ATTEMPTS; attempt++) {
-    Bun.spawnSync(["sleep", SUBMIT_CONFIRM_INTERVAL_S]);
-    const capture = sh(["tmux", "capture-pane", "-p", "-t", paneId]);
+    sleep(SUBMIT_CONFIRM_INTERVAL_S);
+    const capture = command(["tmux", "capture-pane", "-p", "-t", paneId]);
     if (!capture.ok) return false; // pane vanished — cannot claim delivery
     if (composerSubmissionEvidence(capture.out, probe) === "submitted") return true;
   }
@@ -1518,6 +1574,9 @@ export function tick(db: Database, snapOverride?: TickSnapshot, deps: TickDeps =
       SELECT DISTINCT to_id AS id
       FROM messages
       WHERE delivered = 0
+      UNION SELECT p.id FROM peers p WHERE EXISTS (
+        SELECT 1 FROM messages WHERE delivered=0 AND to_id IN (${correlatedMailboxIdsSql})
+      )
     `).all() as Array<{ id: string }>).map(({ id }) => id));
     const budgetIds = new Set([
       ...nudgeAttempts.keys(),
@@ -1712,7 +1771,9 @@ function scheduledTick(db: Database): void {
   try {
     const snap = takeSnapshot();
     if (snap) {
-      void reconcileVisibleCodexSeats(snap).catch((e) => {
+      void reconcileVisibleCodexSeats(snap, {
+        boundIdentityForSeat: (seat) => boundCodexSeatIdentity(db, seat),
+      }).catch((e) => {
         log(`codex seat reconcile threw: ${e instanceof Error ? e.message : String(e)} (loop continues)`);
       });
       tick(db, snap);

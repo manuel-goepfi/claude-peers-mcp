@@ -23,6 +23,11 @@ const message: Message = {
 };
 
 describe("bounded MCP startup instructions", () => {
+  test("routes new Claude conversations natively without duplicate fallback", () => {
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("prefer native ListAgents/SendMessage with an exact recipient");
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("Reply on the inbound transport");
+    expect(MCP_SERVER_INSTRUCTIONS).toContain("never duplicate uncertain sends or bypass refusals");
+  });
   test("survive the smallest known client cap", () => {
     expect(Buffer.byteLength(MCP_SERVER_INSTRUCTIONS, "utf8")).toBeLessThanOrEqual(1_000);
     expect(mcpInstructionsFitClientCaps(MCP_SERVER_INSTRUCTIONS)).toBe(true);
