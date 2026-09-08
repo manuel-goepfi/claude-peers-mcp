@@ -188,7 +188,8 @@ const CODEX_BUSY = [
 // universal "esc to interrupt" hint, and the "· N tokens" in-flight status row.
 const CLAUDE_BUSY = [
   /esc to interrupt/i,
-  /\(\d+s\s*·/,
+  /\((?:\d+h\s*)?(?:\d+m\s*)?\d+s\s*·/,
+  /Press up to edit queued messages/i,
   /·\s*[\d.]+k?\s*tokens/i,
   /\b(Esc to interrupt|Running…|Working…)/i,
   ...CONFIRMATION_BUSY,

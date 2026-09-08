@@ -331,6 +331,10 @@ function claudeIdleCapture(afterGlyph: string): string {
 }
 
 describe("paneTextIsIdle — claude profile", () => {
+  test("SKIP: long-running Claude turn and queued messages are not idle", () => {
+    expect(paneTextIsIdle(`✽ Brewing… (14m 11s · ↓ 43.0k tokens)\n${claudeIdleCapture("")}`, CLAUDE)).toBe(false);
+    expect(paneTextIsIdle(`❯ Press up to edit queued messages\n${claudeIdleCapture("")}`, CLAUDE)).toBe(false);
+  });
   test("NUDGE: idle ❯ prompt, empty input", () => {
     expect(paneTextIsIdle(claudeIdleCapture(""), CLAUDE)).toBe(true);
   });
