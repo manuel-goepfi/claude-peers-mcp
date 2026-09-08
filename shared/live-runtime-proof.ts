@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { processStartIdentity } from "./broker-lifecycle.ts";
+import { runtimePaneRow } from "./runtime-pane-snapshot.ts";
 
 export interface SeatRuntimeProof {
   runtime_key: string;
@@ -27,12 +28,7 @@ const readers: RuntimeProofReaders = {
   read: (path) => readFileSync(path, "utf8"),
   start: processStartIdentity,
   socketOwner: (path) => { const s = statSync(path); return s.isSocket() ? s.uid : null; },
-  pane: (socket, pane) => {
-    const result = Bun.spawnSync(["tmux", "-S", socket, "display-message", "-p", "-t", pane,
-      "#{pid}\t#{pane_pid}\t#{pane_id}\t#{session_id}\t#{session_name}"],
-    { stdout: "pipe", stderr: "ignore", timeout: 250 });
-    return result.exitCode === 0 ? new TextDecoder().decode(result.stdout).trimEnd() : null;
-  },
+  pane: runtimePaneRow,
   uid: process.getuid?.() ?? -1,
 };
 

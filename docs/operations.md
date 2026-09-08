@@ -132,6 +132,11 @@ This prevents new duplicates; it does not delete historical duplicate rows.
 Desktop-only MCP tools can bind to an exact hook-owned thread without a pane
 when its host PID matches the adapter's independently discovered app-server
 ancestor and all terminal/seat fields are null. This grants no tmux wake target.
+Runtime ownership checks share one bounded tmux pane snapshot per broker request.
+Snapshots are discarded between requests: a later request must observe pane ownership
+again. A failed lookup stays a refusal, and a later request can retry it. This avoids
+repeating a short, failure-prone tmux probe for each member of a mailbox group.
+
 Existing MCP adapter processes must reload before using changed adapter code;
 a broker restart alone does not reload them. Confirm the reload scope before
 refreshing a shared Desktop account's loaded tasks.

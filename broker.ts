@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 import { ensurePaneOperatorLabel } from "./bin/tmux-label-pane.ts";
+import { withRuntimePaneSnapshot } from "./shared/runtime-pane-snapshot.ts";
 /**
  * claude-peers broker daemon
  *
@@ -130,7 +131,7 @@ const server = Bun.serve({
   port: PORT,
   hostname: HOSTNAME,
   fetch(request) {
-    return requestHandler(request);
+    return withRuntimePaneSnapshot(() => requestHandler(request));
   },
 });
 if (server.hostname !== HOSTNAME) {
