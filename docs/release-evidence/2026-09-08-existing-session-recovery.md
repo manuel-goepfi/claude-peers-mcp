@@ -68,8 +68,8 @@ messaging. No direct database repair or message deletion was performed.
   230 assertions. After the nudger-only restart, the busy orchestrator was
   correctly ineligible for a wake.
 
-Fleet-wide recovery remains incomplete until the standalone connection and
-the outstanding accounting exchange are verified. A closed retired
+Fleet-wide recovery remains incomplete until the standalone connection is
+restored and verified. A closed retired
 pane is excluded from the live fleet, not counted as a messaging failure.
 
 ## New-lane follow-up
@@ -81,3 +81,9 @@ restored one correctly thread-bound `codex-hook` registration per pane. Both
 original orchestrator probes subsequently received correlated MCP replies.
 No native process or account server was restarted. This supersedes the earlier
 unverified report that their adapters required a session restart.
+
+The accounting lane subsequently sent its correlated probe reply; the
+orchestrator acknowledged it at 15:47:13 UTC. Both new audit-lane replies were
+also acknowledged. The remaining confirmed failure is the standalone review-d
+client. The operator was asked about reopening only that saved conversation;
+no answer authorizing an exception to the no-restart instruction has arrived.
