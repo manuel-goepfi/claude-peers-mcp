@@ -12,7 +12,7 @@ import { ensurePaneOperatorLabel } from "./bin/tmux-label-pane.ts";
 
 import { Database } from "bun:sqlite";
 import { LiveMailboxGroups,liveGroupPrefix,liveMailboxIdsSql } from "./shared/live-mailbox-groups.ts";
-import { readFileSync, writeFileSync, renameSync, chmodSync, statSync, existsSync, truncateSync, unlinkSync } from "node:fs";
+import { readFileSync, readdirSync, writeFileSync, renameSync, chmodSync, statSync, existsSync, truncateSync, unlinkSync } from "node:fs";
 import { timingSafeEqual } from "node:crypto";
 // L6: top-level node:fs import (was inline require() in verifyPidUid hot path).
 import { DELIVERY_STATES } from "./shared/types.ts";
@@ -3105,12 +3105,14 @@ interface TmuxPaneBindProof {
 
 function processTty(pid: number): string | null {
   try {
-    const result = Bun.spawnSync(["ps", "-o", "tty=", "-p", String(pid)], {
-      stdout: "pipe",
-      stderr: "ignore",
-    });
-    if (result.exitCode !== 0) return null;
-    return normalizedTtyForIdentity(new TextDecoder().decode(result.stdout));
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const ttyDevice = Number(stat.slice(stat.lastIndexOf(")") + 2).split(/\s+/)[4]);
+    if (!Number.isInteger(ttyDevice) || ttyDevice <= 0) return null;
+    for (const entry of readdirSync("/dev/pts", { withFileTypes: true })) {
+      if (!entry.isCharacterDevice() || !/^\d+$/.test(entry.name)) continue;
+      if (Number(statSync(`/dev/pts/${entry.name}`).rdev) === ttyDevice) return `pts/${entry.name}`;
+    }
+    return null;
   } catch {
     return null;
   }
@@ -3125,6 +3127,7 @@ function tmuxPaneBindProof(paneId: string): TmuxPaneBindProof | null {
     const result = Bun.spawnSync(["tmux", "display-message", "-p", "-t", paneId, format], {
       stdout: "pipe",
       stderr: "ignore",
+      timeout: 500,
     });
     if (result.exitCode !== 0) return null;
     const [actualPane, rawPanePid, rawTty, paneCurrentPath, session, windowIndex, windowName, operatorLabel, peerLabel] =
@@ -3152,27 +3155,33 @@ function tmuxPaneBindProof(paneId: string): TmuxPaneBindProof | null {
 }
 
 function processTableRowsOnTty(tty: string): ProcessInfo[] {
-  try {
-    const result = Bun.spawnSync(["ps", "-t", tty, "-o", "pid=,ppid=,comm=,args="], {
-      stdout: "pipe",
-      stderr: "ignore",
-    });
-    if (result.exitCode !== 0) return [];
-    const rows: ProcessInfo[] = [];
-    for (const line of new TextDecoder().decode(result.stdout).split("\n")) {
-      const match = line.trim().match(/^(\d+)\s+(\d+)\s+(\S+)\s*(.*)$/);
-      if (!match) continue;
+  const target = `/dev/${normalizedTtyForIdentity(tty)}`;
+  let ttyDevice: number;
+  try { ttyDevice = Number(statSync(target).rdev); }
+  catch { return []; }
+  const rows: ProcessInfo[] = [];
+  for (const entry of readdirSync("/proc", { withFileTypes: true })) {
+    if (!entry.isDirectory() || !/^\d+$/.test(entry.name)) continue;
+    const pid = Number(entry.name);
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      const fields = stat.slice(stat.lastIndexOf(")") + 2).split(/\s+/);
+      const ppid = Number(fields[1]);
+      if (!Number.isInteger(ppid) || Number(fields[4]) !== ttyDevice) continue;
+      const comm = readFileSync(`/proc/${pid}/comm`, "utf8").trim();
       rows.push({
-        pid: Number(match[1]),
-        ppid: Number(match[2]),
-        comm: match[3]!,
-        args: match[4] ?? "",
+        pid,
+        ppid,
+        comm,
+        // Selection reads exact argv only for Codex-looking candidates. Avoid
+        // asking ps to read every process command line from process memory.
+        args: comm,
       });
+    } catch {
+      // Processes can exit while /proc is being inspected.
     }
-    return rows;
-  } catch {
-    return [];
   }
+  return rows;
 }
 
 function nativeInteractiveCodexOnTty(tty: string): ProcessInfo | null {
@@ -3181,7 +3190,7 @@ function nativeInteractiveCodexOnTty(tty: string): ProcessInfo | null {
 
 function gitValue(cwd: string, args: string[]): string | null {
   try {
-    const result = Bun.spawnSync(["git", "-C", cwd, ...args], { stdout: "pipe", stderr: "ignore" });
+    const result = Bun.spawnSync(["git", "-C", cwd, ...args], { stdout: "pipe", stderr: "ignore", timeout: 250 });
     if (result.exitCode !== 0) return null;
     return new TextDecoder().decode(result.stdout).trim() || null;
   } catch {
@@ -4034,7 +4043,7 @@ requestHandler = async (req: Request) => {
             const group=liveGroups.current(auth.id);
             if(group){
               const label=ensurePaneOperatorLabel(group.proof.pane_id,(args)=>{
-                const result=Bun.spawnSync(["tmux","-S",group.proof.socket_path,...args],{stdout:"pipe",stderr:"ignore",timeout:1500});
+                const result=Bun.spawnSync(["tmux","-S",group.proof.socket_path,...args],{stdout:"pipe",stderr:"ignore",timeout:250});
                 return {ok:result.exitCode===0,out:new TextDecoder().decode(result.stdout).trimEnd()};
               },group.proof.socket_path);
               if(label.status==="preserved" || label.status==="labeled"){

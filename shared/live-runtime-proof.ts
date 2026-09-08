@@ -30,7 +30,7 @@ const readers: RuntimeProofReaders = {
   pane: (socket, pane) => {
     const result = Bun.spawnSync(["tmux", "-S", socket, "display-message", "-p", "-t", pane,
       "#{pid}\t#{pane_pid}\t#{pane_id}\t#{session_id}\t#{session_name}"],
-    { stdout: "pipe", stderr: "ignore", timeout: 1500 });
+    { stdout: "pipe", stderr: "ignore", timeout: 250 });
     return result.exitCode === 0 ? new TextDecoder().decode(result.stdout).trimEnd() : null;
   },
   uid: process.getuid?.() ?? -1,
