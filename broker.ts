@@ -3128,7 +3128,7 @@ function tmuxPaneBindProof(paneId: string): TmuxPaneBindProof | null {
     const result = Bun.spawnSync(["tmux", "display-message", "-p", "-t", paneId, format], {
       stdout: "pipe",
       stderr: "ignore",
-      timeout: 500,
+      timeout: 1500,
     });
     if (result.exitCode !== 0) return null;
     const [actualPane, rawPanePid, rawTty, paneCurrentPath, session, windowIndex, windowName, operatorLabel, peerLabel] =
@@ -3174,9 +3174,11 @@ function processTableRowsOnTty(tty: string): ProcessInfo[] {
         pid,
         ppid,
         comm,
-        // Selection reads exact argv only for Codex-looking candidates. Avoid
-        // asking ps to read every process command line from process memory.
-        args: comm,
+        // Node/Bun shims need their script argument to identify Codex. Read
+        // argv only after filtering by TTY and a possible client executable.
+        args: /^(node|bun|codex(?:-.*)?)$/.test(comm)
+          ? readFileSync(`/proc/${pid}/cmdline`, "utf8").replaceAll("\0", " ").trim()
+          : comm,
       });
     } catch {
       // Processes can exit while /proc is being inspected.

@@ -311,7 +311,8 @@ test("Desktop MCP adopts its exact host-owned thread and cannot switch inboxes",
     ).get(threadId) as Record<string, unknown> | null;
     db.close();
     expect(row).toEqual({
-      name: `${session}.9`,
+      // The stale infra.9 prefix does not reserve a number in this session.
+      name: `${session}.1`,
       pid: panePid,
       tty: paneTty?.replace(/^\/dev\//, ""),
       thread_id: threadId,
