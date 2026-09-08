@@ -40,3 +40,34 @@ The orchestrator was asked to collect replies from all open C5 Codex lanes.
 That fleet report is pending. One account MCP reload returned a timeout, so
 acceptance of that particular reload is unknown despite subsequent successful
 messaging. No direct database repair or message deletion was performed.
+
+## Follow-up audit at 15:42 UTC
+
+- Broker and nudger health checks passed. All 27 targeted recovery probes were
+  delivered; 20 had correlated replies at the 15:32 UTC read-only audit.
+- The orchestrator acknowledged the fleet contact request and independently
+  received replies from additional lanes, including the local-auth and engine
+  batch-two lanes. Explicit follow-ups obtained correlated replies from the
+  fix-3208 and ASME-QW250 lanes as well. Accounting was actively working;
+  its probe delivery alone is not a two-way verification.
+- The QW451 story lane had separate pane and thread mailboxes. Replaying the
+  independently verified existing thread through its genuine relay folded one
+  duplicate. Its original probe was subsequently delivered and received a
+  correlated PASS reply without restarting its conversation.
+- The standalone review-d Codex client still fails both inbox and send with
+  `Transport closed`. It has no account-control listener, so the shared account
+  reload did not cover it. Its native `/mcp` inventory confirms the failed
+  connection. No process restart or speculative configuration change was made.
+- Two newly launched shared-account audit lanes were initially unbound. Their
+  panes showed unsubmitted initial task text and the account server returned
+  `no rollout found` for their visible initial thread IDs. Recovery therefore
+  stopped before binding; the orchestrator was asked to verify task submission.
+  These observations do not establish an adapter defect or justify a restart.
+- The nudger's idle detector now recognizes multi-minute Claude turn timers
+  and queued-message indicators. Focused idle/wake tests passed: 144 tests,
+  230 assertions. After the nudger-only restart, the busy orchestrator was
+  correctly ineligible for a wake.
+
+Fleet-wide recovery remains incomplete until the standalone connection and
+the outstanding accounting/new-lane exchanges are verified. A closed retired
+pane is excluded from the live fleet, not counted as a messaging failure.
