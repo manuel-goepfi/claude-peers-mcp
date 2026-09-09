@@ -229,7 +229,7 @@ Upgrade the broker before its adapters because the broker owns schema compatibil
 5. Wait for `ready`, then run the doctor and inspect the retained backup and manifest if a migration occurred.
 6. Reinstall/check hooks and restart client adapters.
 7. Re-confirm Codex hook trust.
-8. Run `bun run verify`, the capacity evidence gate, and the separately armed real-client smoke gate before release.
+8. Run `bun run verify`, the capacity evidence gate, and the separately armed real-client smoke gate before release. The legacy polling capacity gate is currently unavailable, so that release requirement remains unmet. `bench/delivery-fleet.ts` supplies bounded explicit-MCP workload evidence; it does not satisfy the unavailable gate or replace the native-client release verdict.
 
 Never start older and newer brokers against the same database. A newer-than-supported schema is a hard compatibility stop.
 

@@ -376,7 +376,22 @@ bun run smoke:install
 bun run verify
 ```
 
-The capacity gate is intentionally long and retains 108 records:
+For the current explicit MCP receive path, run the bounded isolated delivery
+workload (2 to 50 fixture adapters, 1 to 10 rounds):
+
+```bash
+bun bench/delivery-fleet.ts --peers 50 --rounds 3 --output docs/release-evidence/delivery-fleet.json
+```
+
+It checks rendered requests and correlated replies against persisted message
+counts and acknowledgement timestamps. It uses a private broker and database,
+and does not prove native hook delivery or account/pane ownership. Run with an
+external process-group deadline and resource limits on a shared host.
+
+The legacy polling capacity campaign below retains 108 records. It is currently
+unavailable: its fake tmux lacks the required open-pane snapshot, and its polling
+latency gates do not represent the current explicit receive path. Do not use it
+as current capacity or release proof:
 
 ```bash
 bun run benchmark:peers -- --peers 1,10,50 --repetitions 3 --stages baseline,instrumented,tmux-suppressed,adaptive

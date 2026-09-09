@@ -1,0 +1,23 @@
+{
+  "mode": "explicit-mcp-delivery",
+  "started_at": "2026-09-09T16:37:49.885Z",
+  "finished_at": "2026-09-09T16:38:41.273Z",
+  "peers": 50,
+  "rounds": 3,
+  "total": 300,
+  "acknowledged": 300,
+  "replies": 150,
+  "health_ms": {
+    "count": 6,
+    "p50_ms": 64.89572799999951,
+    "p95_ms": 163.75403400000505,
+    "max_ms": 163.75403400000505
+  },
+  "exchange_ms": {
+    "count": 150,
+    "p50_ms": 8645.768847,
+    "p95_ms": 8962.229165,
+    "max_ms": 9019.912723000001
+  },
+  "native_hooks_verified": false
+}
