@@ -65,6 +65,7 @@ function errorMessage(error: unknown): string {
 export function retryableCodexSeatProofReason(reason: string): boolean {
   return reason === "pane missing" || reason === "identity proof request timed out" ||
     /Broker error \(\/identity-by-thread\): 404\b/.test(reason) ||
+    /^Broker error \(\/identity-by-thread\): 403 \{"error":"target rejected: pid [1-9][0-9]* not alive"\}$/.test(reason) ||
     /Broker error \(\/identity-by-thread\): 409\b.*ambiguous live thread identity/.test(reason);
 }
 

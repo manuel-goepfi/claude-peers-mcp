@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { Database } from "bun:sqlite";
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { startTestBroker, type TestBroker } from "./helpers/test-broker.ts";
@@ -83,3 +86,67 @@ test("legacy duplicate registrations with tied timestamps resolve consistently",
     expect(sent.ok).toBe(true);
   }
 });
+
+
+test.skipIf(!Bun.which("tmux"))("name routing survives recipient restart in the same real pane with sender unchanged", async () => {
+  const root = mkdtempSync(join(tmpdir(), "routing-restart-"));
+  const socket = join(root, "tmux");
+  const session = "restart-proof";
+  const tmux = (...args: string[]) => {
+    const result = Bun.spawnSync(["tmux", "-S", socket, ...args]);
+    if (result.exitCode !== 0) throw new Error(result.stderr.toString());
+    return result.stdout.toString().trim();
+  };
+  const sender = await register("%997");
+  const registerRecipient = async () => {
+    const row = tmux("display-message", "-p", "-t", session, "#{pane_id}|#{pane_pid}|#{pane_tty}").split("|");
+    const recipient = await call("/register", {
+      pid: Number(row[1]), cwd: "/routing-restart", name: `${session}.1`,
+      tmux_session: session, tmux_pane_id: row[0], tty: row[2],
+      client_type: "unknown", receiver_mode: "unknown", thread_id: crypto.randomUUID(),
+    });
+    expect(recipient.id).toBeTruthy();
+    return { ...recipient, pane: row[0] };
+  };
+  const db = new Database(broker.dbPath, { readonly: true });
+  try {
+    tmux("new-session", "-d", "-s", session, "exec sleep 120");
+    const old = await registerRecipient();
+    const before = await call("/send-to-peer", { from_id: sender.id,
+      selector: { name: `${session}.1` }, text: "before restart", request_id: "pane-before" });
+    expect(before.ok).toBe(true);
+    expect((await call("/poll-messages", { id: old.id })).messages.map((m: any) => m.id)).toContain(before.id);
+    expect((await call("/ack-messages", { id: old.id, ids: [before.id] })).acked).toBe(1);
+    tmux("respawn-pane", "-k", "-t", old.pane, "exec sleep 120");
+    await Bun.sleep(50);
+    const current = await registerRecipient();
+    expect(current.pane).toBe(old.pane);
+    expect(current.id).not.toBe(old.id);
+    const stale = await call("/send-to-peer", { from_id: sender.id,
+      selector: { id: old.id }, text: "must not redirect", request_id: "pane-stale" });
+    expect(stale.ok).toBe(false);
+    expect(stale.code).toBe("STALE_PEER_ID");
+    const payload = { from_id: sender.id, selector: { name: `${session}.1` },
+      text: "after restart", request_id: "pane-after" };
+    const after = await call("/send-to-peer", payload);
+    expect(after.ok).toBe(true);
+    expect((await call("/send-to-peer", payload)).id).toBe(after.id);
+    expect((await call("/poll-messages", { id: current.id })).messages.map((m: any) => m.id)).toContain(after.id);
+    expect((await call("/ack-messages", { id: current.id, ids: [after.id] })).acked).toBe(1);
+    const reply = await call("/send-message", { from_id: current.id, to_id: sender.id,
+      text: "ACK", request_id: "pane-reply", reply_to_id: "pane-after" });
+    expect(reply.ok).toBe(true);
+    expect((await call("/poll-messages", { id: sender.id })).messages.map((m: any) => m.id)).toContain(reply.id);
+    expect((await call("/ack-messages", { id: sender.id, ids: [reply.id] })).acked).toBe(1);
+    const rows = db.query("SELECT request_id, delivered FROM messages WHERE request_id LIKE 'pane-%' ORDER BY id").all();
+    expect(rows).toEqual([
+      { request_id: "pane-before", delivered: 1 },
+      { request_id: "pane-after", delivered: 1 },
+      { request_id: "pane-reply", delivered: 1 },
+    ]);
+  } finally {
+    db.close();
+    Bun.spawnSync(["tmux", "-S", socket, "kill-server"]);
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 15000);

@@ -1735,7 +1735,7 @@ const TOOLS = [
   {
     name: "send_to_peer",
     description:
-      "Send a correlated message to one live peer using a selector. Returns request_id for idempotent retries and later get_reply_status checks. " + MESSAGE_ROUTING_HINT,
+      "Send a correlated message to one live peer using a selector. For new messages to a visible seat, use its current unique name or tmux pane selector, resolved at send time; do not cache peer IDs across restarts. Keep correlated replies addressed to the original sender ID. Returns request_id for idempotent retries and later get_reply_status checks. " + MESSAGE_ROUTING_HINT,
     inputSchema: {
       type: "object" as const,
       properties: {

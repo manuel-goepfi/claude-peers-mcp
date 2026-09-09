@@ -107,6 +107,53 @@ describe("app-server Codex thread seat proof", () => {
     expect(retryableCodexSeatProofReason("pane missing")).toBe(true);
   });
 
+  test("recovers when a dead previous PID is replaced by fresh exact-thread proof", async () => {
+    let calls = 0;
+    const result = await waitForCodexAppServerSeatProof(THREAD_ID, async () => {
+      if (++calls === 1) throw new Error('Broker error (/identity-by-thread): 403 {"error":"target rejected: pid 1069979 not alive"}');
+      return proof();
+    }, { delayMs: 0 });
+    expect(result).toEqual({ ok: true, proof: proof() });
+    expect(calls).toBe(2);
+  });
+
+  test("persistent dead PID remains refused within the total deadline", async () => {
+    const reason = 'Broker error (/identity-by-thread): 403 {"error":"target rejected: pid 1069979 not alive"}';
+    let calls = 0;
+    const started = Date.now();
+    const result = await waitForCodexAppServerSeatProof(THREAD_ID, async () => {
+      calls++;
+      throw new Error(reason);
+    }, { totalTimeoutMs: 40, delayMs: 5, attempts: 100 });
+    expect(result).toEqual({ ok: false, reason });
+    expect(calls).toBeGreaterThan(1);
+    expect(calls).toBeLessThan(100);
+    expect(Date.now() - started).toBeLessThan(500);
+  });
+
+  test("dead PID recovery does not accept another thread or retry other ownership refusals", async () => {
+    let calls = 0;
+    const result = await waitForCodexAppServerSeatProof(THREAD_ID, async () => {
+      if (++calls === 1) throw new Error('Broker error (/identity-by-thread): 403 {"error":"target rejected: pid 1069979 not alive"}');
+      return proof({ thread_id: "other-thread" });
+    }, { delayMs: 0 });
+    expect(result).toEqual({ ok: false, reason: "thread mismatch" });
+    expect(calls).toBe(2);
+    for (const reason of [
+      'Broker error (/identity-by-thread): 403 {"error":"target rejected: live owner conflicts"}',
+      'Broker error (/identity-by-thread): 403 {"error":"caller not authorized"}',
+      'Broker error (/other): 403 {"error":"target rejected: pid 1069979 not alive"}',
+      'Broker error (/identity-by-thread): 403 {"error":"target rejected: pid 1069979 not alive; owner conflicts"}',
+    ]) {
+      let attempts = 0;
+      expect(await waitForCodexAppServerSeatProof(THREAD_ID, async () => {
+        attempts++;
+        throw new Error(reason);
+      }, { delayMs: 0 })).toEqual({ ok: false, reason });
+      expect(attempts).toBe(1);
+    }
+  });
+
   test("bounds and retries a broker request that never answers", async () => {
     let calls = 0;
     const result = await waitForCodexAppServerSeatProof(THREAD_ID, async (signal) => {
