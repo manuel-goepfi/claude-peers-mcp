@@ -1759,8 +1759,8 @@ describe("Live broker delivery features", () => {
       from_id: peer.id, to_id: peer.id, text: "adapter-dead surfacing probe",
     });
     expect(sent.recipient?.mcp_transport).toBe("dead");
-    expect(sent.recipient?.warning ?? "").toContain("MCP adapter is not running");
-    expect(sent.recipient?.warning ?? "").toContain("hook mail still delivers");
+    expect(sent.recipient?.warning ?? "").toContain("MCP adapter liveness check failed");
+    expect(sent.recipient?.warning ?? "").toContain("Hook delivery may still work");
   });
 
   test("a PID-dead seat with fresher MCP last_seen than last_hook is not advertised dead", async () => {
@@ -1783,7 +1783,7 @@ describe("Live broker delivery features", () => {
       from_id: peer.id, to_id: peer.id, text: "adapter-live-contact surfacing probe",
     });
     expect(sent.recipient?.mcp_transport).toBe("alive");
-    expect(sent.recipient?.warning ?? "").not.toContain("MCP adapter is not running");
+    expect(sent.recipient?.warning ?? "").not.toContain("MCP adapter liveness check failed");
   });
 
   test("/ack-by-pid: wrong drain_id does not deliver and records a mismatch", async () => {
