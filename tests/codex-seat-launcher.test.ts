@@ -28,6 +28,7 @@ const EXPECTED_CODEX_GLOBAL_OPTIONS = [
   "--search",
   "--strict-config",
   "--version",
+  "--worktree",
   "-C",
   "-V",
   "-a",
@@ -145,6 +146,7 @@ describe("codex-seat launcher", () => {
     const result = Bun.spawnSync([
       LAUNCHER,
       "--strict-config",
+      "--worktree",
       "--enable",
       "hooks",
       "--search",
@@ -167,7 +169,28 @@ describe("codex-seat launcher", () => {
     expect(result.exitCode).toBe(0);
     expect(existsSync(join(state, "app.pid"))).toBe(false);
     expect(readFileSync(join(state, "tui.args"), "utf8")).toBe(
-      '--strict-config\n--enable\nhooks\n--search\n-c\nmodel="test"\nexec\n--json\n',
+      '--strict-config\n--worktree\n--enable\nhooks\n--search\n-c\nmodel="test"\nexec\n--json\n',
+    );
+  });
+
+  test("interactive --worktree preserves the native flag and pane-local seat", () => {
+    const { root, state, fakeCodex } = fixture();
+    const port = freePort();
+    const result = Bun.spawnSync([LAUNCHER, "--worktree"], {
+      env: {
+        PATH: process.env.PATH ?? "",
+        HOME: root,
+        CODEX_HOME: join(root, ".codex"),
+        CLAUDE_PEERS_REAL_CODEX: fakeCodex,
+        CLAUDE_PEERS_CODEX_SEAT_PORT: String(port),
+        FAKE_CODEX_STATE: state,
+      },
+      stdout: "pipe", stderr: "pipe",
+    });
+    expect(result.exitCode).toBe(0);
+    expect(existsSync(join(state, "app.pid"))).toBe(true);
+    expect(readFileSync(join(state, "tui.args"), "utf8")).toBe(
+      `--remote\nws://127.0.0.1:${port}\n--cd\n${process.cwd()}\n--worktree\n`,
     );
   });
 
