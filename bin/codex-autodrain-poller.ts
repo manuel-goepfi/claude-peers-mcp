@@ -105,8 +105,12 @@ export function isHookReceivePath(lane: Lane): boolean {
 export function nudgeText(lane: Lane): string {
   const hookFresh = !lane.last_hook_seen_at
     || Date.now() - Date.parse(lane.last_hook_seen_at) <= 2 * 60 * 1_000;
-  if (isHookReceivePath(lane) && hookFresh) {
-    return "[peer-mail] Process the attached peer messages.";
+  if (isHookReceivePath(lane)) {
+    // Hooks are event-driven: an old timestamp does not mean the wake's
+    // prompt hook will fail to attach and acknowledge the pending batch.
+    return hookFresh
+      ? "[peer-mail] Process the attached peer messages."
+      : "[peer-mail] Process the attached peer messages. Only if none are attached, call check_messages once.";
   }
   const n = lane.unread;
   const noun = n === 1 ? "message" : "messages";

@@ -1441,11 +1441,11 @@ describe("nudge wording branches by receive path", () => {
     expect(t).not.toContain("UNVERIFIABLE");
   });
 
-  test("stale hook evidence falls back to manual-drain wording", () => {
+  test("an idle hook asks for a drain only when no message was attached", () => {
     const lane = { ...laneWith(2), last_hook_seen_at: "2020-01-01T00:00:00.000Z" };
     const t = nudgeText(lane as never);
-    expect(t).toContain("Call check_messages once");
-    expect(t).not.toContain("attached peer messages");
+    expect(t).toBe("[peer-mail] Process the attached peer messages. Only if none are attached, call check_messages once.");
+    expect(t).not.toContain("unread peer");
   });
 
   test("Grok is explicitly allowlisted as a manual-drain client", () => {
