@@ -171,24 +171,43 @@ export function labelAllUnlabeledPanes(
   run: TmuxLabelRunner = runTmux,
   sessionId?: string,
 ): { visited: number; labeled: number; failed: number } {
-  const panes = run(["list-panes", ...(sessionId ? ["-s","-t",sessionId] : ["-a"]), "-F", "#{pane_id}"]);
+  // One server snapshot replaces two tmux commands per already-correct pane.
+  // It is only a read-only filter: candidates still use the authoritative
+  // allocator, which re-reads state under its normal session lock before writes.
+  const panes = run(["list-panes", ...(sessionId ? ["-s","-t",sessionId] : ["-a"]), "-F", SNAPSHOT_FORMAT]);
   if (!panes.ok) return { visited: 0, labeled: 0, failed: 1 };
-  const paneIds = panes.out.split("\n").map((value) => value.trim()).filter(Boolean);
+  const rows = panes.out.split("\n").filter(Boolean);
+  const snapshots = rows.map(parseSnapshot);
+  const claims = new Map<string, number>();
+  const claimKey = (pane: PaneSnapshot, label: string) => JSON.stringify([pane.session, label]);
+  for (const pane of snapshots) {
+    if (!pane) continue;
+    const label = preservedTmuxOperatorLabel(pane.operatorLabel, pane.peerLabel, pane.session);
+    if (label) {
+      const key = claimKey(pane, label);
+      claims.set(key, (claims.get(key) ?? 0) + 1);
+    }
+  }
   let labeled = 0;
   let failed = 0;
-  for (const paneId of paneIds) {
+  for (const [index, row] of rows.entries()) {
+    const pane = snapshots[index];
+    const label = pane && preservedTmuxOperatorLabel(pane.operatorLabel, pane.peerLabel, pane.session);
+    if (pane && label === pane.operatorLabel && label && claims.get(claimKey(pane, label)) === 1) continue;
+    const paneId = row.split("\t")[0]!;
+    if (!/^%[0-9]+$/.test(paneId)) { failed++; continue; }
     const result = ensurePaneOperatorLabel(paneId, run);
     if (result.status === "labeled") labeled++;
     if (result.status === "failed") failed++;
   }
-  return { visited: paneIds.length, labeled, failed };
+  return { visited: rows.length, labeled, failed };
 }
 
 function runTmux(args: string[]): TmuxLabelCommandResult {
   const tmuxBin = process.env.CLAUDE_PEERS_TMUX_BIN ?? "tmux";
   const socket = process.env.CLAUDE_PEERS_TMUX_SOCKET;
   const command = socket ? [tmuxBin, "-S", socket, ...args] : [tmuxBin, ...args];
-  return boundedCommand(command, { operation: "pane-label-tmux" });
+  return boundedCommand(command, { operation: "pane-label-tmux", timeoutMs: 3000 });
 }
 
 export function main(args = process.argv.slice(2)): number {

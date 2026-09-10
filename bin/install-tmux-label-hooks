@@ -77,9 +77,13 @@ fi
 # job output or a nonzero-exit diagnostic to a dead one-shot client. Suppress both
 # output paths and normalize the status so the callback has nothing to print.
 HOOK_COMMAND="run-shell -b \"( env CLAUDE_PEERS_TMUX_SOCKET='$TMUX_SOCKET' CLAUDE_PEERS_TMUX_BIN='$TMUX_BIN' '$TIMEOUT_BIN' -k 1s '$LABEL_TIMEOUT' '$FLOCK_BIN' -w '$LOCK_TIMEOUT' -x '$LABEL_LOCK' '$BUN_BIN' '$LABELER' '#{pane_id}' >>'$LABEL_LOG' 2>&1 || : ) >/dev/null 2>&1\""
+# Submit all three commands through one client handshake on busy servers.
+hook_commands=()
 for hook in $HOOK_NAMES; do
-  tmux_cmd set-hook -g "${hook}[${HOOK_SLOT}]" "$HOOK_COMMAND"
+  if [ "${#hook_commands[@]}" -gt 0 ]; then hook_commands+=( ';' ); fi
+  hook_commands+=( set-hook -g "${hook}[${HOOK_SLOT}]" "$HOOK_COMMAND" )
 done
+tmux_cmd "${hook_commands[@]}"
 
 # Creation hooks cannot repair panes that predate installation (including the
 # zero-turn pane that exposed this gap), so run the same locked allocator once.

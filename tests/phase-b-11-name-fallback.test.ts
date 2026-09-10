@@ -423,11 +423,11 @@ describe("Operator-label fallback — human name first, pane_id metadata last", 
 
     expect(helperSlice).toContain('readPaneOption(paneTarget,"@operator_label")');
     expect(helperSlice).not.toContain('setOption("@operator_label"');
-    expect(helperSlice).toContain('setOption("@peer_id", identity.id)');
-    expect(helperSlice).toContain('setOption("@peer_label", displayLabel)');
-    expect(helperSlice).toContain('setOption("@peer_resolved_name", identity.resolved_name ?? "")');
-    expect(helperSlice).toContain('setOption("@peer_client_type", identity.client_type)');
-    expect(helperSlice).toContain('setOption("@peer_receiver_mode", identity.receiver_mode)');
+    expect(helperSlice).toContain('["@peer_id", identity.id]');
+    expect(helperSlice).toContain('["@peer_label", displayLabel]');
+    expect(helperSlice).toContain('["@peer_resolved_name", identity.resolved_name ?? ""]');
+    expect(helperSlice).toContain('["@peer_client_type", identity.client_type]');
+    expect(helperSlice).toContain('["@peer_receiver_mode", identity.receiver_mode]');
   });
 
   test("broker identity mirror only targets stable pane ids", async () => {

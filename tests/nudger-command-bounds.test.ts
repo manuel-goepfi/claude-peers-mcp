@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { boundedCommand, withCommandBudget } from "../shared/bounded-command.ts";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,20 +7,27 @@ import { join } from "node:path";
 test("a stalled process snapshot returns failure before the watchdog window", () => {
   const root = mkdtempSync(join(tmpdir(), "nudger-stalled-command-"));
   try {
-    const ps = join(root, "ps");
-    writeFileSync(ps, "#!/bin/sh\nexec /bin/sleep 30\n");
-    chmodSync(ps, 0o700);
+    mkdirSync(join(root, "123"));
+    writeFileSync(join(root, "123", "stat"), `123 (fixture) ${["S", "1", ...Array(17).fill("0"), "1"].join(" ")}\n`);
+    // A FIFO with no writer stalls the real child inside its cmdline read.
+    expect(Bun.spawnSync(["mkfifo", join(root, "123", "cmdline")], { stderr: "ignore" }).exitCode).toBe(0);
     const module = new URL("../bin/codex-autodrain-poller.ts", import.meta.url).pathname;
-    const result = Bun.spawnSync(["timeout", "--kill-after=1s", "4s", process.execPath, "-e",
-      `import { takeSnapshot } from ${JSON.stringify(module)}; console.log(takeSnapshot() === null);`], {
-      env: { ...process.env, PATH: `${root}:${process.env.PATH}`, HOME: root },
+    const snapshot = new URL("../shared/process-snapshot.ts", import.meta.url).pathname;
+    const bounded = new URL("../shared/bounded-command.ts", import.meta.url).pathname;
+    const result = Bun.spawnSync(["timeout", "--kill-after=1s", "5s", process.execPath, "-e",
+      `import { takeSnapshot } from ${JSON.stringify(module)};
+       import { readProcessSnapshot } from ${JSON.stringify(snapshot)};
+       import { boundedCommand } from ${JSON.stringify(bounded)};
+       const stalled = () => readProcessSnapshot((command, options) => boundedCommand([...command, ${JSON.stringify(root)}], options), "linux");
+       console.log(takeSnapshot(stalled) === null);`], {
+      env: { ...process.env, HOME: root },
       stdout: "pipe", stderr: "pipe",
     });
     expect(result.exitCode).toBe(0);
     expect(result.stdout.toString().trim()).toBe("true");
     expect(result.stderr.toString()).toContain("command_timeout");
   } finally { rmSync(root, { recursive: true, force: true }); }
-}, 7000);
+}, 8000);
 
 test("an exhausted shared budget prevents subsequent commands from launching", () => {
   const root = mkdtempSync(join(tmpdir(), "nudger-command-budget-"));

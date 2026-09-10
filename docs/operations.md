@@ -114,10 +114,12 @@ OpenCode has no interactive external receive hook in this contract. It registers
 
 ### Nudger supervision
 
-The nudger bounds synchronous process and tmux commands to 1.5 seconds and shares
+The nudger bounds synchronous process and tmux commands to three seconds and shares
 an eight-second command budget across snapshot and wake work. Unprocessed lanes
-rotate into subsequent cycles. Identity reconciliation yields between seats and
-bounds each synchronous mirror to three seconds. Failed inspection leaves mail
+rotate into subsequent cycles. Linux process discovery reads procfs inside a
+timed disposable child; other platforms retain the bounded ps path. Identity
+reconciliation yields between seats and bounds each synchronous mirror to eight
+seconds. Failed inspection leaves mail
 queued; an uncertain submission still consumes its persisted attempt.
 
 The heartbeat records a completed cycle, including failed inspection, rather than
@@ -134,6 +136,10 @@ eight-second execution limit. GNU `timeout` or `gtimeout` is required; missing
 timeout support fails closed. Failed process-manager probes cannot authorize a
 fallback, and replacement requires proving the old fallback process exited.
 The existing 70-second stale threshold and startup grace remain unchanged.
+
+Label backfill inspects the fleet once and skips uniquely owned canonical labels.
+Repair candidates still use fresh reads under the allocator lock. Hook updates
+and the five identity-field writes are batched to reduce tmux client round trips.
 
 The watchdog's active copy is `~/bin/ensure-codex-autodrain`; updating only the
 repository copy does not activate supervision changes. Verify copy hashes and

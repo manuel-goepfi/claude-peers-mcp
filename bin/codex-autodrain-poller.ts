@@ -51,6 +51,7 @@ import { publishBrokerIdentityToTmux } from "../shared/tmux-identity.ts";
 import type { BrokerIdentityForTmux } from "../shared/tmux-identity.ts";
 import { durableSeatKey } from "../shared/seat.ts";
 import { boundedCommand, commandBudgetRemaining, withCommandBudget } from "../shared/bounded-command.ts";
+import { readProcessSnapshot } from "../shared/process-snapshot.ts";
 import { LiveMailboxGroups, liveGroupPrefix, liveMailboxIdsSql } from "../shared/live-mailbox-groups.ts";
 import type { ReconcilePaneThreadResponse, RegisterResponse } from "../shared/types.ts";
 import { isVisibleCodexArgs, singleInteractiveCodexProcess } from "../shared/visible-codex.ts";
@@ -460,7 +461,9 @@ function log(msg: string): void {
 }
 
 function sh(cmd: string[]): { ok: boolean; out: string } {
-  return boundedCommand(cmd, { operation: cmd[0] === "ps" ? "poller-process-snapshot" : "poller-tmux" });
+  return boundedCommand(cmd, {
+    operation: cmd[0] === "ps" ? "poller-process-snapshot" : "poller-tmux", timeoutMs: 3000,
+  });
 }
 
 const ANSI_ESCAPE_RE = /\u001b\[[0-?]*[ -/]*[@-~]/g;
@@ -883,25 +886,18 @@ function paneIsIdle(paneId: string, profile: IdleProfile): boolean {
 }
 
 // One process snapshot per tick, shared across every lane's resolution + ownership
-// check. A `ps -ww` is ~0.5s on a loaded host; doing it per-lane made a 12-lane
-// fan-out tick ~12s (83% of the poll window). Snapshotting once drops the whole
-// tick's resolution cost to a single ps regardless of lane count. Built fresh each
-// tick (cheap relative to the interval) so it never goes stale within a tick.
+// check. Linux scans procfs in a bounded child; other platforms use ps. Built
+// fresh each tick so process discovery costs one scan regardless of lane count.
 export interface TickSnapshot {
   procs: ProcLike[];
   paneByPid: Map<string, number>;          // pane_id → pane_pid (for paneSubtree)
   paneMap: ReturnType<typeof parseTmuxPanes>;
 }
-export function takeSnapshot(): TickSnapshot | null {
-  const psOut = sh(["ps", "-eo", "pid=,ppid=,args="]);
-  if (!psOut.ok) return null;
+export function takeSnapshot(processSnapshot = readProcessSnapshot): TickSnapshot | null {
+  const procs = processSnapshot();
+  if (!procs) return null;
   const paneOut = sh(["tmux", "list-panes", "-a", "-F", "#{pane_pid}\t#{session_name}\t#{window_index}\t#{window_name}\t#{pane_index}\t#{pane_id}\t#{window_panes}"]);
-  if (!psOut.ok || !paneOut.ok) return null;
-  const procs: ProcLike[] = [];
-  for (const line of psOut.out.split("\n")) {
-    const m = line.match(/^\s*(\d+)\s+(\d+)\s+(.*)$/);
-    if (m) procs.push({ pid: Number(m[1]), ppid: Number(m[2]), args: m[3]! });
-  }
+  if (!paneOut.ok) return null;
   const paneMap = parseTmuxPanes(paneOut.out);
   const paneByPid = new Map<string, number>();
   for (const [panePid, info] of paneMap) if (info.pane_id) paneByPid.set(info.pane_id, panePid);
@@ -1128,7 +1124,7 @@ export async function reconcileVisibleCodexSeats(snap: TickSnapshot, deps: Recon
         const bound = deps.boundIdentityForSeat?.(seat);
         if (bound?.kind === "ambiguous") continue;
         if (bound?.kind === "bound") {
-          withCommandBudget(3000, () => publish(bound.identity, seat.tmux));
+          withCommandBudget(8000, () => publish(bound.identity, seat.tmux));
           continue;
         }
         const gitRoot = await git(seat.cwd, ["rev-parse", "--show-toplevel"]);
@@ -1151,7 +1147,7 @@ export async function reconcileVisibleCodexSeats(snap: TickSnapshot, deps: Recon
           discovery_only: true,
           summary: "",
         });
-        withCommandBudget(3000, () => publish(reg, seat.tmux));
+        withCommandBudget(8000, () => publish(reg, seat.tmux));
         const paneId = seat.tmux.pane_id;
         const threadId = paneId ? readThreadId(paneId) : null;
         if (paneId && threadId) {

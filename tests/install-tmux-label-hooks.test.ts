@@ -123,14 +123,14 @@ describe("tmux label hook installation", () => {
       labelLogName: "label logs/label;[literal].log",
     });
     expect(result.code).toBe(0);
-    const hookLine = result.tmux.split("\n").find((line) => line.includes("after-split-window[90]"));
-    if (!hookLine) throw new Error("after-split-window[90] hook was not installed");
-    const payloadMatch = hookLine.match(/run-shell -b \"(.*)\"$/);
+    const hookCall = result.tmuxCalls.find((args) => args.includes("after-split-window[90]"));
+    if (!hookCall) throw new Error("after-split-window[90] hook was not installed");
+    const hookCommand = hookCall[hookCall.indexOf("after-split-window[90]") + 1]!;
+    const payloadMatch = hookCommand.match(/^run-shell -b \"(.*)\"$/);
     if (!payloadMatch?.[1]) throw new Error("installed hook payload was not parseable");
     const payload = payloadMatch[1].replace("#{pane_id}", "%99");
-    const hookCall = result.tmuxCalls.find((args) => args.includes("after-split-window[90]"));
-    expect(hookCall).toHaveLength(6);
-    expect(hookCall?.[5]).toBe(`run-shell -b "${payloadMatch[1]}"`);
+    expect(result.tmuxCalls.filter((args) => args.includes("set-hook"))).toHaveLength(1);
+    expect(hookCall.filter((arg) => arg === ";")).toHaveLength(2);
 
     const proc = Bun.spawn(["/bin/sh", "-c", payload], { stdout: "pipe", stderr: "pipe" });
     const [code, stdout, stderr] = await Promise.all([
