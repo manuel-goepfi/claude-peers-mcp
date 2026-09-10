@@ -135,6 +135,58 @@ async function waitForFile(path: string): Promise<void> {
       const tuiPid = rows[0]!.pid;
       expect(tuiPid).not.toBe(holder.pid);
 
+      // A fresh native pane may sit idle (or wait for MCP startup) longer than
+      // the 90-second adapter timeout before its first hook receipt. Discovery
+      // must retain its proven thread and queued mail throughout that gap.
+      const fixtureDb = new Database(broker.dbPath);
+      const paneToken = (fixtureDb.query("SELECT token FROM peers WHERE id = ?")
+        .get(panePeerId) as { token: string }).token;
+      fixtureDb.run("UPDATE peers SET last_seen = ? WHERE id = ?", [
+        new Date(Date.now() - 120_000).toISOString(), panePeerId,
+      ]);
+      fixtureDb.run("INSERT INTO messages (from_id, to_id, text, sent_at) VALUES (?, ?, ?, ?)",
+        ["startup-sender", panePeerId, "mail before first hook", new Date().toISOString()]);
+      try {
+        const discovery = await fetch(`${broker.url}/list-peers`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-Peer-Token": paneToken },
+          body: JSON.stringify({ id: panePeerId, scope: "machine" }),
+        });
+        expect(discovery.status).toBe(200);
+        const discovered = await discovery.json() as Array<{ id: string }>;
+        expect(discovered.map((peer) => peer.id)).toContain(panePeerId);
+        expect(fixtureDb.query("SELECT thread_id, receiver_mode FROM peers WHERE id = ?")
+          .get(panePeerId)).toEqual({ thread_id: THREAD_A, receiver_mode: "manual-drain" });
+        expect(fixtureDb.query("SELECT delivered FROM messages WHERE to_id = ? AND text = ?")
+          .get(panePeerId, "mail before first hook")).toEqual({ delivered: 0 });
+        // The startup exemption must not keep a headless host, an unbound
+        // discovery row, a reused PID, or a stopped process routable.
+        const original = fixtureDb.query("SELECT pid, tmux_pane_id, thread_id, registered_at FROM peers WHERE id = ?")
+          .get(panePeerId) as { pid: number; tmux_pane_id: string; thread_id: string; registered_at: string };
+        const stopped = Bun.spawn(["sleep", "60"], { stdout: "ignore", stderr: "ignore" });
+        stopped.kill();
+        await stopped.exited;
+        for (const invalid of [
+          { ...original, pid: holder.pid, tmux_pane_id: null },
+          { ...original, thread_id: null },
+          { ...original, registered_at: "2000-01-01T00:00:00.000Z" },
+          { ...original, pid: stopped.pid },
+        ]) {
+          fixtureDb.run("UPDATE peers SET pid = ?, tmux_pane_id = ?, thread_id = ?, registered_at = ? WHERE id = ?",
+            [invalid.pid, invalid.tmux_pane_id, invalid.thread_id, invalid.registered_at, panePeerId]);
+          const rejected = await fetch(`${broker.url}/send-to-peer`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "X-Peer-Token": paneToken },
+            body: JSON.stringify({ from_id: panePeerId, selector: { id: panePeerId }, text: "must not route" }),
+          });
+          expect((await rejected.json() as { ok: boolean }).ok).toBe(false);
+        }
+        fixtureDb.run("UPDATE peers SET pid = ?, tmux_pane_id = ?, thread_id = ?, registered_at = ? WHERE id = ?",
+          [original.pid, original.tmux_pane_id, original.thread_id, original.registered_at, panePeerId]);
+        fixtureDb.run("DELETE FROM messages WHERE to_id = ? AND text = ?",
+          [panePeerId, "mail before first hook"]);
+      } finally { fixtureDb.close(); }
+
       // Reversed production ordering: the relay may bind before SessionStart
       // reaches the shared app-server hook. The later headless registration
       // must adopt the exact pane-bound thread, not mint a second live row.

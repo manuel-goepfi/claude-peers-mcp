@@ -121,6 +121,13 @@ After MCP or hook changes:
 
 Missing or unproven Codex/Gemini hooks intentionally produce `manual-drain`; use `check_messages` until registration and hook heartbeats prove the automatic path. For Codex, automatic registration and drain require a root-session hook whose `session_id` matches the rollout transcript filename. Internal or child hooks that cannot prove that join do not claim mail; the queued batch remains available to `check_messages` or the next proven root hook.
 
+A fresh relay-bound Codex pane can remain idle beyond the 90-second adapter
+timeout before its first hook receipt. The broker retains that binding only
+while it can re-prove its exact native process, pane, TTY, ancestry and process
+generation. This does not mark hook delivery successful or extend the lifetime
+of an unbound discovery row or a paneless account server. Process scans are
+shared within one request or cleanup pass, never across ownership decisions.
+
 ### Shared Codex Desktop relay
 
 Background Codex discovery observes an existing exact PID/pane thread binding

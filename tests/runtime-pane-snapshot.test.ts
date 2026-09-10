@@ -1,5 +1,17 @@
 import { expect, test } from "bun:test";
-import { runtimePaneRow, withRuntimePaneSnapshot } from "../shared/runtime-pane-snapshot.ts";
+import { runtimePaneRow, runtimeProcessStats, withRuntimePaneSnapshot } from "../shared/runtime-pane-snapshot.ts";
+
+test("native proofs share one process scan only within the current request", () => {
+  let reads = 0;
+  const read = () => [{ pid: ++reads, stat: "fixture" }];
+  withRuntimePaneSnapshot(() => {
+    expect(runtimeProcessStats(read)[0]!.pid).toBe(1);
+    expect(runtimeProcessStats(read)[0]!.pid).toBe(1);
+  });
+  withRuntimePaneSnapshot(() => expect(runtimeProcessStats(read)[0]!.pid).toBe(2));
+  expect(runtimeProcessStats(read)[0]!.pid).toBe(3);
+  expect(runtimeProcessStats(read)[0]!.pid).toBe(4);
+});
 
 test("one request shares pane reads but the next sees a changed owner", async () => {
   let reads = 0;

@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 import { ensurePaneOperatorLabel } from "./bin/tmux-label-pane.ts";
-import { withRuntimePaneSnapshot } from "./shared/runtime-pane-snapshot.ts";
+import { runtimeProcessStats, withRuntimePaneSnapshot } from "./shared/runtime-pane-snapshot.ts";
 /**
  * claude-peers broker daemon
  *
@@ -402,7 +402,7 @@ function cleanStalePeers() {
   // rotateBrokerLogIfLarge is already self-guarding (its own try/catch), so it is
   // not re-wrapped here.
   try {
-    liveAndFreshPeers(selectAllPeers.all() as Peer[]);
+    withRuntimePaneSnapshot(() => liveAndFreshPeers(selectAllPeers.all() as Peer[]));
   } catch (e) {
     if (!reapStageWarned) {
       reapStageWarned = true;
@@ -2077,7 +2077,14 @@ function peerIsReapable(peer: Peer, now: number): boolean {
   // the seat keeps it alive, not only the pid this row happens to carry.
   const seatAlive = () => peerSeatAlive(peer);
   if (isHookBackedClientPeer(peer) && seatAlive()) return false;
-  return isReapable(peer, seatAlive, now, PEER_GHOST_AFTER_MS);
+  if (!isReapable(peer, seatAlive, now, PEER_GHOST_AFTER_MS)) return false;
+  // The lifecycle relay binds before the first hook/MCP receipt. That startup
+  // gap can exceed the adapter heartbeat timeout. Re-prove the exact native
+  // owner before retaining it; a pane label or an app-server PID is not enough.
+  if (peer.client_type === "codex" && peer.receiver_mode === "manual-drain"
+    && peer.thread_id && peer.tmux_pane_id && isPidAlive(peer.pid)
+    && nativeCodexKeeper(peer)?.id === peer.id) return false;
+  return true;
 }
 
 // Single source of truth for "is this peer reapable, and if so, what cleanup
@@ -3161,11 +3168,8 @@ function processTableRowsOnTty(tty: string): ProcessInfo[] {
   try { ttyDevice = Number(statSync(target).rdev); }
   catch { return []; }
   const rows: ProcessInfo[] = [];
-  for (const entry of readdirSync("/proc", { withFileTypes: true })) {
-    if (!entry.isDirectory() || !/^\d+$/.test(entry.name)) continue;
-    const pid = Number(entry.name);
+  for (const { pid, stat } of runtimeProcessStats()) {
     try {
-      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
       const fields = stat.slice(stat.lastIndexOf(")") + 2).split(/\s+/);
       const ppid = Number(fields[1]);
       if (!Number.isInteger(ppid) || Number(fields[4]) !== ttyDevice) continue;
