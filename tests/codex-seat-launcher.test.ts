@@ -192,7 +192,7 @@ describe("codex-seat launcher", () => {
     expect(readFileSync(join(state, "tui.args"), "utf8")).toBe(
       `--remote\nws://127.0.0.1:${port}\n--cd\n${process.cwd()}\n--worktree\n`,
     );
-  });
+  }, 15_000); // Includes native process startup and descendant cleanup scans.
 
   test("a bare --remote unix:// passes through with a trade-off warning, never a redirect", () => {
     // The bare form is a DELIBERATE choice of the shared default app-server —

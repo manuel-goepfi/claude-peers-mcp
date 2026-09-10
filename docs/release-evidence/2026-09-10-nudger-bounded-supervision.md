@@ -60,6 +60,14 @@ recorded below when completed.
 These tests prove bounded failure behavior. They do not identify the exact
 historical command that caused the three earlier watchdog restarts.
 
+Final `bun run verify` passed on Bun 1.3.11: typecheck, 1,387 tests across 95
+files with 4,742 assertions and zero failures, followed by clean-install
+register/discover/send/ack smoke for Claude, Codex and Gemini. Tests took 289.81
+seconds in a four-CPU, 3 GiB scope. The final launcher worktree fixture also uses
+a fifteen-second lifecycle deadline after the prior full run exceeded its
+five-second default; its assertions are unchanged. Runtime code is the reviewed
+`5f609d6` repair; the follow-up contains this test deadline and evidence only.
+
 ## Activation and rollback
 
 Expected path: unchanged loopback broker and native hook/drain transport, with
