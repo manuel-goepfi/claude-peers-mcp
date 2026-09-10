@@ -112,6 +112,34 @@ bun bin/install-opencode-mcp.ts --check
 
 OpenCode has no interactive external receive hook in this contract. It registers one stdio adapter per session in `manual-drain` mode, and the tmux poller wakes only a quiescent pane whose boxed composer contains the exact grey vendor placeholder. The wake submits one `check_messages` turn; typed text, permission prompts, loading states, busy panes, and unconfirmed Enter submissions fail closed.
 
+### Nudger supervision
+
+The nudger bounds synchronous process and tmux commands to 1.5 seconds and shares
+an eight-second command budget across snapshot and wake work. Unprocessed lanes
+rotate into subsequent cycles. Identity reconciliation yields between seats and
+bounds each synchronous mirror to three seconds. Failed inspection leaves mail
+queued; an uncertain submission still consumes its persisted attempt.
+
+The heartbeat records a completed cycle, including failed inspection, rather than
+successful delivery. Its `.stage` companion records snapshot, wake or idle with
+the cycle start and elapsed milliseconds. Command timeout diagnostics contain
+operation names and duration, never pane contents or command arguments.
+Both poller and watchdog prefer `CLAUDE_PEERS_AUTODRAIN_HEARTBEAT`, then
+`AUTODRAIN_HEARTBEAT`, then the standard home-directory heartbeat.
+
+The watchdog supervises before running optional label installation. External
+probes default to five seconds, managed restart to twenty seconds, and optional
+installation to ten seconds. Label hooks use a two-second lock wait and an
+eight-second execution limit. GNU `timeout` or `gtimeout` is required; missing
+timeout support fails closed. Failed process-manager probes cannot authorize a
+fallback, and replacement requires proving the old fallback process exited.
+The existing 70-second stale threshold and startup grace remain unchanged.
+
+The watchdog's active copy is `~/bin/ensure-codex-autodrain`; updating only the
+repository copy does not activate supervision changes. Verify copy hashes and
+restart only the nudger after updating its runtime. A fresh correlated native
+receipt remains necessary to prove delivery.
+
 After MCP or hook changes:
 
 1. Restart the affected client session.

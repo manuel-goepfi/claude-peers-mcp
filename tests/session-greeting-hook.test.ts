@@ -25,6 +25,9 @@ import { renderInboundBatch } from "../shared/render.ts";
 import type { Message } from "../shared/types.ts";
 
 const hook = new URL("../hooks/claude-peers-session-greeting.sh", import.meta.url).pathname;
+// Host process discovery plus the hook's three bounded HTTP attempts can
+// exceed Bun's default five seconds before rendering completes.
+const HOOK_TEST_TIMEOUT_MS = 20_000;
 const roots: string[] = [];
 const servers: ReturnType<typeof Bun.serve>[] = [];
 const children: Bun.Subprocess[] = [];
@@ -153,7 +156,7 @@ describe("roster rendering", () => {
     expect(ctx).toContain('<peer name="beta"');
     expect(ctx).not.toContain("ghost");           // stale excluded (90s window)
     expect(ctx).not.toContain('<peer name="me.1"'); // self excluded from roster
-  });
+  }, HOOK_TEST_TIMEOUT_MS);
 
   test("same-named seats render distinguishably, and an empty column cannot shift a later one", async () => {
     // The misroute this fixes: an orchestrator reading the roster saw several
@@ -185,7 +188,7 @@ describe("roster rendering", () => {
     // The pane-less row keeps its summary in the BODY, never in an attribute.
     expect(ctx).toContain(">headless lane</peer>");
     expect(ctx).not.toContain('tmux="headless lane"');
-  });
+  }, HOOK_TEST_TIMEOUT_MS);
 
   test("peer-controlled summary is data: tags stripped, newline cannot forge an extra roster line", async () => {
     const root = mkdtempSync(join(tmpdir(), "greeting-inject-"));
@@ -205,7 +208,7 @@ describe("roster rendering", () => {
     expect(ctx).not.toContain("<do-this>");
     expect(ctx).not.toContain('<peer name="forged-name"'); // newline flattened in SQL, no forged row
     expect(ctx).toContain('count="2"');                     // exactly the two real peers
-  });
+  }, HOOK_TEST_TIMEOUT_MS);
 
   test("truncation notice fires only for cap-hidden rows, not for skipped-empty rows", async () => {
     const root = mkdtempSync(join(tmpdir(), "greeting-cap-"));
@@ -222,7 +225,7 @@ describe("roster rendering", () => {
     const broker = mockBroker(requests, emptyClaim);
     const r = await runHook(root, listeningPort(broker), spawnedPid(anchor), spawnedPid(anchor));
     expect(r.output!.hookSpecificOutput.additionalContext).not.toContain("roster capped");
-  });
+  }, HOOK_TEST_TIMEOUT_MS);
 
   test("missing DB exits 0 with no output", async () => {
     const root = mkdtempSync(join(tmpdir(), "greeting-nodb-"));
@@ -304,7 +307,7 @@ describe("two-phase drain: claim → render → emit → ack", () => {
     expect(ctx).not.toContain("\u007f");
     expect(ctx).toContain('from="empty-peer" sent_at="2026-08-04T08:00:01Z" relayed="false" replyable="false"');
     expect(requests.map((q) => q.path)).toEqual(["/claim-by-pid", "/ack-by-pid"]);
-  });
+  }, HOOK_TEST_TIMEOUT_MS);
 
   test("mail renders into the greeting and acks AFTER emit; a null-field message gets placeholders instead of killing the batch", async () => {
     const root = mkdtempSync(join(tmpdir(), "greeting-drain-"));
@@ -339,7 +342,7 @@ describe("two-phase drain: claim → render → emit → ack", () => {
     expect(ctx).toContain("second message");
     expect(requests.map((q) => q.path)).toEqual(["/claim-by-pid", "/ack-by-pid"]);
     expect(requests[1]?.body).toMatchObject({ drain_id: "drain-7", ids: [1, 2] });
-  });
+  }, HOOK_TEST_TIMEOUT_MS);
 
   test("unparseable claim response → roster still emits, NO ack (claim expires, mail redelivers), loss logged", async () => {
     const root = mkdtempSync(join(tmpdir(), "greeting-badresp-"));
@@ -357,7 +360,7 @@ describe("two-phase drain: claim → render → emit → ack", () => {
     expect(r.output!.hookSpecificOutput.additionalContext).toContain('<peer name="alpha"'); // greeting not sacrificed
     expect(requests.map((q) => q.path)).toEqual(["/claim-by-pid"]); // never acked
     expect(r.drainLog).toContain("unparseable");
-  });
+  }, HOOK_TEST_TIMEOUT_MS);
 
   test("broker unreachable → greeting still emits, nothing claimed or logged as lost", async () => {
     const root = mkdtempSync(join(tmpdir(), "greeting-noborker-"));
@@ -371,5 +374,5 @@ describe("two-phase drain: claim → render → emit → ack", () => {
     const r = await runHook(root, 1, spawnedPid(anchor), spawnedPid(anchor)); // port 1: connect refused
     expect(r.code).toBe(0);
     expect(r.output!.hookSpecificOutput.additionalContext).toContain('<peer name="alpha"');
-  });
+  }, HOOK_TEST_TIMEOUT_MS);
 });

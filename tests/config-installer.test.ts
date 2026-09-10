@@ -66,23 +66,20 @@ describe("configuration installer safety", () => {
     }
   });
 
-  test("refuses a concurrent external edit and preserves the operator bytes", async () => {
+  test("refuses a concurrent external edit and preserves the operator bytes", () => {
     const root = mkdtempSync(join(tmpdir(), "claude-peers-config-race-"));
     try {
       const target = join(root, ".claude", "settings.json");
       mkdirSync(join(root, ".claude"), { mode: 0o700 });
       writeFileSync(target, "{\n  \"theme\": \"before\"\n}\n", { mode: 0o600 });
-      const proc = Bun.spawn(["bun", claudeInstaller, root], {
-        env: { ...process.env, HOME: root, CLAUDE_PEERS_INSTALL_TEST_PAUSE_MS: "250" },
-        stdout: "pipe",
-        stderr: "pipe",
-      });
-      await Bun.sleep(100);
       const operatorBytes = "{\n  \"theme\": \"operator-edit\"\n}\n";
-      writeFileSync(target, operatorBytes, { mode: 0o600 });
-      const [code, stderr] = await Promise.all([proc.exited, new Response(proc.stderr).text()]);
-      expect(code).toBe(1);
-      expect(stderr).toContain("changed while it was being prepared");
+      // The transform runs after the original read and before write validation.
+      // Inject the external edit at that exact boundary; a timed sleep can
+      // otherwise edit before a slow child has even read the original file.
+      expect(() => installJsonConfig(target, (document) => {
+        writeFileSync(target, operatorBytes, { mode: 0o600 });
+        return { ...document, theme: "installer-edit" };
+      })).toThrow("changed while it was being prepared");
       expect(readFileSync(target, "utf8")).toBe(operatorBytes);
       expect(readdirSync(join(root, ".claude")).some((name) => name.includes(".tmp-") || name.includes(".bak-"))).toBe(false);
     } finally {

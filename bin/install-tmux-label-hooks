@@ -22,7 +22,16 @@ else
   TMUX_SOCKET="${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/default"
 fi
 
-tmux_cmd() { "$TMUX_BIN" -S "$TMUX_SOCKET" "$@"; }
+TIMEOUT_BIN="$(command -v timeout || command -v gtimeout || true)"
+[ -n "$TIMEOUT_BIN" ] || { echo "tmux label timeout utility unavailable" >&2; exit 1; }
+# These values are embedded in the hook shell payload; accept positive numbers only.
+LABEL_TIMEOUT="${CLAUDE_PEERS_LABEL_TIMEOUT_S:-8}"
+LOCK_TIMEOUT="${CLAUDE_PEERS_LABEL_LOCK_TIMEOUT_S:-2}"
+for duration in "$LABEL_TIMEOUT" "$LOCK_TIMEOUT"; do
+  [[ "$duration" =~ ^[0-9]+([.][0-9]+)?$ ]] && [[ "$duration" =~ [1-9] ]] || exit 2
+done
+
+tmux_cmd() { "$TIMEOUT_BIN" -k 1s "$LABEL_TIMEOUT" "$TMUX_BIN" -S "$TMUX_SOCKET" "$@"; }
 
 # No server yet is normal during login. ~/.tmux.conf invokes the watchdog again
 # when the server starts, and its call to this installer will then succeed.
@@ -44,7 +53,7 @@ fi
 
 # These paths cross tmux command/format expansion and the shell's quoted argv.
 # Reject bytes that could terminate or expand in any of those layers.
-for hook_value in "$TMUX_SOCKET" "$TMUX_BIN" "$FLOCK_BIN" "$LABEL_LOCK" "$BUN_BIN" "$LABELER" "$LABEL_LOG"; do
+for hook_value in "$TMUX_SOCKET" "$TMUX_BIN" "$FLOCK_BIN" "$LABEL_LOCK" "$BUN_BIN" "$LABELER" "$LABEL_LOG" "$TIMEOUT_BIN"; do
   case "$hook_value" in
     *"'"*|*'"'*|*\\*|*'$'*|*'#'*|*$'\n'*|*$'\r'*)
       echo "tmux label hook path contains unsupported quoting characters" >&2
@@ -67,7 +76,7 @@ fi
 # run-shell -b alone is not sufficient: its completion callback can still print
 # job output or a nonzero-exit diagnostic to a dead one-shot client. Suppress both
 # output paths and normalize the status so the callback has nothing to print.
-HOOK_COMMAND="run-shell -b \"( env CLAUDE_PEERS_TMUX_SOCKET='$TMUX_SOCKET' CLAUDE_PEERS_TMUX_BIN='$TMUX_BIN' '$FLOCK_BIN' -x '$LABEL_LOCK' '$BUN_BIN' '$LABELER' '#{pane_id}' >>'$LABEL_LOG' 2>&1 || : ) >/dev/null 2>&1\""
+HOOK_COMMAND="run-shell -b \"( env CLAUDE_PEERS_TMUX_SOCKET='$TMUX_SOCKET' CLAUDE_PEERS_TMUX_BIN='$TMUX_BIN' '$TIMEOUT_BIN' -k 1s '$LABEL_TIMEOUT' '$FLOCK_BIN' -w '$LOCK_TIMEOUT' -x '$LABEL_LOCK' '$BUN_BIN' '$LABELER' '#{pane_id}' >>'$LABEL_LOG' 2>&1 || : ) >/dev/null 2>&1\""
 for hook in $HOOK_NAMES; do
   tmux_cmd set-hook -g "${hook}[${HOOK_SLOT}]" "$HOOK_COMMAND"
 done
@@ -75,7 +84,7 @@ done
 # Creation hooks cannot repair panes that predate installation (including the
 # zero-turn pane that exposed this gap), so run the same locked allocator once.
 if env CLAUDE_PEERS_TMUX_SOCKET="$TMUX_SOCKET" CLAUDE_PEERS_TMUX_BIN="$TMUX_BIN" \
-  "$FLOCK_BIN" -x "$LABEL_LOCK" "$BUN_BIN" "$LABELER" --all >>"$LABEL_LOG" 2>&1; then
+  "$TIMEOUT_BIN" -k 1s "$LABEL_TIMEOUT" "$FLOCK_BIN" -w "$LOCK_TIMEOUT" -x "$LABEL_LOCK" "$BUN_BIN" "$LABELER" --all >>"$LABEL_LOG" 2>&1; then
   :
 else
   backfill_status=$?

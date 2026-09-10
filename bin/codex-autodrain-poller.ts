@@ -50,6 +50,7 @@ import { dirname, join } from "node:path";
 import { publishBrokerIdentityToTmux } from "../shared/tmux-identity.ts";
 import type { BrokerIdentityForTmux } from "../shared/tmux-identity.ts";
 import { durableSeatKey } from "../shared/seat.ts";
+import { boundedCommand, commandBudgetRemaining, withCommandBudget } from "../shared/bounded-command.ts";
 import { LiveMailboxGroups, liveGroupPrefix, liveMailboxIdsSql } from "../shared/live-mailbox-groups.ts";
 import type { ReconcilePaneThreadResponse, RegisterResponse } from "../shared/types.ts";
 import { isVisibleCodexArgs, singleInteractiveCodexProcess } from "../shared/visible-codex.ts";
@@ -90,7 +91,7 @@ const RECONCILE_CODEX_SEATS = process.env.RECONCILE_CODEX_SEATS !== "0";
 // restarts the poller if this file goes stale — a process that is alive but no
 // longer TICKING (the 'silent for 16h' zombie) passes a bare pgrep check but
 // fails the freshness check. mtime is the signal; the body is human-readable.
-const HEARTBEAT_PATH = process.env.CLAUDE_PEERS_AUTODRAIN_HEARTBEAT ?? `${homedir()}/.claude-peers-autodrain.heartbeat`;
+const HEARTBEAT_PATH = process.env.CLAUDE_PEERS_AUTODRAIN_HEARTBEAT ?? process.env.AUTODRAIN_HEARTBEAT ?? `${homedir()}/.claude-peers-autodrain.heartbeat`;
 const NUDGE_BUDGET_PATH = process.env.CLAUDE_PEERS_NUDGE_BUDGET_FILE ?? `${homedir()}/.claude-peers-nudge-budget.json`;
 // The nudge is typed into the pane as a real user turn. Branch by receive
 // path: hook lanes already have the body in-turn; manual-drain lanes must
@@ -370,6 +371,7 @@ function persistedNudgeBudget(): PersistedNudgeBudget {
 export function loadNudgeBudgetState(path = NUDGE_BUDGET_PATH): boolean {
   nudgeBudgetPersistencePath = path;
   nudgeBudgetPersistenceHealthy = true;
+  nextLaneId = null;
   nudgeAttempts.clear();
   nudgeEpisode.clear();
   lastNudge.clear();
@@ -454,8 +456,7 @@ function log(msg: string): void {
 }
 
 function sh(cmd: string[]): { ok: boolean; out: string } {
-  const p = Bun.spawnSync(cmd);
-  return { ok: p.exitCode === 0, out: new TextDecoder().decode(p.stdout) };
+  return boundedCommand(cmd, { operation: cmd[0] === "ps" ? "poller-process-snapshot" : "poller-tmux" });
 }
 
 const ANSI_ESCAPE_RE = /\u001b\[[0-?]*[ -/]*[@-~]/g;
@@ -889,6 +890,7 @@ export interface TickSnapshot {
 }
 export function takeSnapshot(): TickSnapshot | null {
   const psOut = sh(["ps", "-eo", "pid=,ppid=,args="]);
+  if (!psOut.ok) return null;
   const paneOut = sh(["tmux", "list-panes", "-a", "-F", "#{pane_pid}\t#{session_name}\t#{window_index}\t#{window_name}\t#{pane_index}\t#{pane_id}\t#{window_panes}"]);
   if (!psOut.ok || !paneOut.ok) return null;
   const procs: ProcLike[] = [];
@@ -1105,7 +1107,7 @@ export async function reconcileVisibleCodexSeats(snap: TickSnapshot, deps: Recon
   codexSeatReconcileInFlight = true;
 
   try {
-    const seats = (deps.visibleSeats ?? visibleCodexSeatsFromSnapshot)(snap);
+    const seats = withCommandBudget(3000, () => (deps.visibleSeats ?? visibleCodexSeatsFromSnapshot)(snap));
     const git = deps.gitValue ?? gitValue;
     const post = deps.postBroker ?? postBroker;
     const publish = deps.publishBrokerIdentityToTmux ?? publishBrokerIdentityToTmux;
@@ -1122,7 +1124,7 @@ export async function reconcileVisibleCodexSeats(snap: TickSnapshot, deps: Recon
         const bound = deps.boundIdentityForSeat?.(seat);
         if (bound?.kind === "ambiguous") continue;
         if (bound?.kind === "bound") {
-          publish(bound.identity, seat.tmux);
+          withCommandBudget(3000, () => publish(bound.identity, seat.tmux));
           continue;
         }
         const gitRoot = await git(seat.cwd, ["rev-parse", "--show-toplevel"]);
@@ -1145,7 +1147,7 @@ export async function reconcileVisibleCodexSeats(snap: TickSnapshot, deps: Recon
           discovery_only: true,
           summary: "",
         });
-        publish(reg, seat.tmux);
+        withCommandBudget(3000, () => publish(reg, seat.tmux));
         const paneId = seat.tmux.pane_id;
         const threadId = paneId ? readThreadId(paneId) : null;
         if (paneId && threadId) {
@@ -1158,7 +1160,14 @@ export async function reconcileVisibleCodexSeats(snap: TickSnapshot, deps: Recon
           }, reg.token);
         }
       } catch (e) {
-        log(`codex seat reconcile failed for ${seat.name} pid=${seat.pid} pane=${seat.tmux.pane_id ?? "?"}: ${e instanceof Error ? e.message : String(e)}`);
+        const error = e instanceof Error ? e.message : String(e);
+        if (!error.includes("Codex pane already has a thread binding; discovery must observe it")) {
+          log(`codex seat reconcile failed for ${seat.name} pid=${seat.pid} pane=${seat.tmux.pane_id ?? "?"}: ${error}`);
+        }
+      } finally {
+        // Bound synchronous mirror work per seat and let the heartbeat timer
+        // run between seats, including the already-bound fast path.
+        await Bun.sleep(0);
       }
     }
   } finally {
@@ -1430,7 +1439,7 @@ export function submitPaneText(paneId: string, text: string, clientType: string,
 } = {}): boolean {
   const command = deps.command ?? sh;
   const enterText = deps.enterText ?? enterWakeText;
-  const sleep = deps.sleep ?? ((seconds: string) => { Bun.spawnSync(["sleep", seconds]); });
+  const sleep = deps.sleep ?? ((seconds: string) => { boundedCommand(["sleep", seconds], { operation: "wake-settle" }); });
   const probe = submissionProbe(text);
 
   // Do NOT re-type if a previous attempt is still sitting in the composer.
@@ -1530,6 +1539,8 @@ export function __nudgeAttemptCountForTest(id: string): number | undefined {
 // simultaneous idle lanes. If this warns, lane width has grown past the design
 // envelope and the nudge loop should be made concurrent (see decision-log).
 const TICK_WARN_MS = Math.min(10_000, POLL_INTERVAL_MS * 0.66);
+
+let nextLaneId: string | null = null;
 
 export interface TickDeps {
   nudgeableClients?: string[];
@@ -1649,7 +1660,14 @@ export function tick(db: Database, snapOverride?: TickSnapshot, deps: TickDeps =
   const snap = snapOverride ?? takeSnapshot();
   if (!snap) { log("tick: snapshot (ps/tmux) failed — skipping this tick"); return; }
 
-  for (const lane of lanes) {
+  const startIndex = Math.max(0, lanes.findIndex((lane) => lane.id === nextLaneId));
+  const orderedLanes = [...lanes.slice(startIndex), ...lanes.slice(0, startIndex)];
+  for (let laneIndex = 0; laneIndex < orderedLanes.length; laneIndex++) {
+    if (commandBudgetRemaining() <= 0) break;
+    const lane = orderedLanes[laneIndex]!;
+    // Advance before attempting the lane: one repeatedly slow pane cannot
+    // monopolize the next cycle, including when it exhausts this cycle's budget.
+    nextLaneId = orderedLanes[(laneIndex + 1) % orderedLanes.length]!.id;
     // Per-lane crash isolation: a throw from any check (e.g. pstree missing,
     // tmux gone) must NOT escape the setInterval callback and kill the daemon.
     // Log it and move to the next lane.
@@ -1725,6 +1743,8 @@ export function tick(db: Database, snapOverride?: TickSnapshot, deps: TickDeps =
       // Write-ahead reservation: record the attempt and cooldown before tmux.
       // A service restart or crash after submission can never mint another five
       // attempts for the same broker-authored unread episode.
+      // Do not burn a persisted attempt if the tick cannot start transport.
+      if (commandBudgetRemaining() < 1500) break;
       const reservedAttempts = (nudgeAttempts.get(lane.id) ?? 0) + 1;
       nudgeAttempts.set(lane.id, reservedAttempts);
       lastNudge.set(lane.id, clock());
@@ -1750,16 +1770,16 @@ export function tick(db: Database, snapOverride?: TickSnapshot, deps: TickDeps =
 // Touch the heartbeat file (mtime = "last completed a tick"). Best-effort: a
 // write failure must never break the poll loop, so it is caught and logged once.
 let heartbeatWriteWarned = false;
-export function writeHeartbeat(): void {
+export function writeHeartbeat(path = HEARTBEAT_PATH): void {
   try {
     require("node:fs").writeFileSync(
-      HEARTBEAT_PATH,
+      path,
       `${new Date().toISOString()}\nnudge_budget=${nudgeBudgetHealthStatus()}\n`,
     );
   } catch (e) {
     if (!heartbeatWriteWarned) {
       heartbeatWriteWarned = true;
-      log(`heartbeat write failed (${HEARTBEAT_PATH}): ${e instanceof Error ? e.message : String(e)} — watchdog may false-restart`);
+      log(`heartbeat write failed (${path}): ${e instanceof Error ? e.message : String(e)} — watchdog may false-restart`);
     }
   }
 }
@@ -1769,22 +1789,38 @@ export function writeHeartbeat(): void {
 // liveness signal reflects "the loop is still cycling", and an unexpected tick
 // throw is logged instead of silently stopping the timer.
 function scheduledTick(db: Database): void {
+  let snap: TickSnapshot | null = null;
+  const started = Date.now();
+  const stage = (name: "snapshot" | "wake" | "idle") => {
+    try {
+      require("node:fs").writeFileSync(`${HEARTBEAT_PATH}.stage`, JSON.stringify({
+        stage: name, started_at: new Date(started).toISOString(), elapsed_ms: Date.now() - started,
+      }) + "\n");
+    } catch { /* Heartbeat write reports persistent filesystem failure. */ }
+  };
   try {
-    const snap = takeSnapshot();
-    if (snap) {
-      void reconcileVisibleCodexSeats(snap, {
-        boundIdentityForSeat: (seat) => boundCodexSeatIdentity(db, seat),
-      }).catch((e) => {
-        log(`codex seat reconcile threw: ${e instanceof Error ? e.message : String(e)} (loop continues)`);
-      });
-      tick(db, snap);
-    } else {
-      tick(db);
-    }
+    withCommandBudget(8000, () => {
+      stage("snapshot");
+      snap = takeSnapshot();
+      stage("wake");
+      if (snap) tick(db, snap);
+      else log("tick: snapshot (ps/tmux) failed — skipping this tick");
+    });
   } catch (e) {
     log(`tick threw at top level: ${e instanceof Error ? e.message : String(e)} (loop continues)`);
   } finally {
+    stage("idle");
+    if (Date.now() - started > TICK_WARN_MS) log(`scheduled tick completed elapsed_ms=${Date.now() - started} stage=idle`);
     writeHeartbeat();
+  }
+  // Start async reconciliation outside the tick's AsyncLocalStorage deadline.
+  // Its existing in-flight guard and transport timeouts own its lifetime.
+  if (snap) {
+    void reconcileVisibleCodexSeats(snap, {
+      boundIdentityForSeat: (seat) => boundCodexSeatIdentity(db, seat),
+    }).catch((e) => {
+      log(`codex seat reconcile threw: ${e instanceof Error ? e.message : String(e)} (loop continues)`);
+    });
   }
 }
 

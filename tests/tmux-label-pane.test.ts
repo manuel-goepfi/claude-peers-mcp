@@ -240,3 +240,10 @@ describe("existing ordinal collision repair",()=>{
     }
   });
 });
+
+test("pane disappearance during lock identity lookup is a benign skip", () => {
+  const run: TmuxLabelRunner = (args) => args[0] === "list-panes"
+    ? { ok: true, out: "%999\n" }
+    : { ok: false, out: "" };
+  expect(ensurePaneOperatorLabel("%9", run, "/unused-test-socket")).toEqual({ status: "skipped", reason: "pane-gone" });
+});

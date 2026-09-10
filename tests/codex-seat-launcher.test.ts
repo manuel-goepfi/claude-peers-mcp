@@ -593,12 +593,13 @@ fi
 
       launcher.kill("SIGKILL");
       await launcher.exited;
-      // The watchdog has two bounded 1s TERM grace loops; leave scheduler
-      // headroom when the full suite is competing for CPU without weakening
-      // the assertion that every descendant is gone.
+      // Cleanup includes repeated process-table scans as well as two 1s TERM
+      // grace loops. On a busy host each pgrep can take about a second, so the
+      // former 8s deadline expired before cleanup finished. Keep the assertion
+      // that every descendant actually disappears, with a bounded host budget.
       expect(await waitFor(
         () => [appPid, appChildPid, tuiPid, tuiChildPid, watchdogPid].every((pid) => !isAlive(pid)),
-        8_000,
+        25_000,
       )).toBe(true);
     } finally {
       launcher.kill("SIGKILL");
@@ -620,7 +621,7 @@ fi
         }
       }
     }
-  }, 10_000);
+  }, 35_000);
 
   test("rejects readiness served by a different process on the requested port", async () => {
     const { root, state, fakeCodex } = fixture();

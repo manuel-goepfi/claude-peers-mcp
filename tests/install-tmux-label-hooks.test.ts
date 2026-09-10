@@ -12,6 +12,7 @@ afterEach(() => {
 });
 
 async function runInstaller(options: {
+  heldLock?: boolean;
   serverAlive?: boolean;
   args?: string[];
   labelLogName?: string;
@@ -37,7 +38,7 @@ async function runInstaller(options: {
   const fakeFlock = join(root, "flock");
   const fakeBun = join(root, "bun");
   writeFileSync(fakeTmux, `#!/bin/bash\nprintf '%s\\n' "$*" >> '${tmuxLog}'\n{ printf 'CALL\\0'; printf '%s\\0' "$@"; printf 'END\\0'; } >> '${tmuxArgvLog}'\n[[ "$*" == *list-sessions* ]] && exit ${serverAlive ? 0 : 1}\nexit 0\n`);
-  writeFileSync(fakeFlock, `#!/bin/bash\nprintf '%s\\n' "$*" >> '${flockLog}'\nshift 2\nexec "$@"\n`);
+  writeFileSync(fakeFlock, `#!/bin/bash\nprintf '%s\\n' "$*" >> '${flockLog}'\nshift 4\nexec "$@"\n`);
   writeFileSync(fakeBun, failingPaneLabeler
     ? "#!/bin/bash\n[ \"${2:-}\" = \"--all\" ] && exit 0\nprintf 'labeler stdout\\n'\nprintf 'labeler stderr\\n' >&2\nexit 1\n"
     : failingBackfill
@@ -49,12 +50,18 @@ async function runInstaller(options: {
   mkdirSync(join(root, "home"));
   if (createLabelLogParent) mkdirSync(dirname(labelLog), { recursive: true });
 
+  const lockHolder = options.heldLock ? Bun.spawn(["flock", "-x", join(root, "label.lock"), "bash", "-c", `touch '${root}/locked'; sleep 3`], { stdout: "ignore", stderr: "ignore" }) : null;
+  if (lockHolder) {
+    for (let i = 0; i < 100 && !existsSync(join(root, "locked")); i++) await Bun.sleep(10);
+    if (!existsSync(join(root, "locked"))) throw new Error("fixture lock not acquired");
+  }
   const proc = Bun.spawn(["bash", installer, ...args], {
     env: {
       ...process.env,
       HOME: join(root, "home"),
       CLAUDE_PEERS_TMUX_BIN: fakeTmux,
-      CLAUDE_PEERS_FLOCK_BIN: fakeFlock,
+      CLAUDE_PEERS_FLOCK_BIN: options.heldLock ? Bun.which("flock")! : fakeFlock,
+      CLAUDE_PEERS_LABEL_LOCK_TIMEOUT_S: "0.1",
       CLAUDE_PEERS_BUN_BIN: fakeBun,
       CLAUDE_PEERS_TMUX_LABELER: labeler,
       CLAUDE_PEERS_TMUX_SOCKET: join(root, "tmux.sock"),
@@ -69,6 +76,8 @@ async function runInstaller(options: {
     new Response(proc.stdout).text(),
     new Response(proc.stderr).text(),
   ]);
+  lockHolder?.kill();
+  if (lockHolder) await lockHolder.exited;
   const tmuxArgv = readFileSync(tmuxArgvLog).toString("utf8").split("\0");
   const tmuxCalls: string[][] = [];
   let currentCall: string[] | null = null;
@@ -186,4 +195,12 @@ describe("tmux label hook installation", () => {
       expect(result.tmux).not.toContain("set-hook");
     },
   );
+});
+
+test("held allocation lock has a bounded wait and does not run the allocator", async () => {
+  const started = Date.now();
+  const result = await runInstaller({ heldLock: true });
+  expect(result.code).toBe(1);
+  expect(result.stderr).toContain("backfill failed");
+  expect(Date.now() - started).toBeLessThan(2000);
 });

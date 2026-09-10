@@ -1,4 +1,5 @@
 import { ensurePaneOperatorLabel } from "../bin/tmux-label-pane.ts";
+import { boundedCommand } from "./bounded-command.ts";
 import type { ClientType, ReceiverMode } from "./types.ts";
 import type { TmuxPaneInfo } from "./tmux.ts";
 
@@ -76,12 +77,9 @@ function cleanTmuxOptionValue(value: string | null | undefined): string | null {
 
 function defaultReadPaneOption(target: string, optionName: string): string | null {
   try {
-    const result = Bun.spawnSync(["tmux", "show-options", "-p", "-t", target, "-v", optionName], {
-      stdout: "pipe",
-      stderr: "ignore",
-    });
-    if (result.exitCode !== 0) return null;
-    return cleanTmuxOptionValue(new TextDecoder().decode(result.stdout));
+    const result = boundedCommand(["tmux", "show-options", "-p", "-t", target, "-v", optionName],
+      { operation: "identity-read" });
+    return result.ok ? cleanTmuxOptionValue(result.out) : null;
   } catch {
     return null;
   }
@@ -89,11 +87,8 @@ function defaultReadPaneOption(target: string, optionName: string): string | nul
 
 function defaultSetPaneOption(target: string, optionName: string, value: string): boolean {
   try {
-    const result = Bun.spawnSync(["tmux", "set-option", "-p", "-t", target, optionName, value], {
-      stdout: "ignore",
-      stderr: "ignore",
-    });
-    return result.exitCode === 0;
+    return boundedCommand(["tmux", "set-option", "-p", "-t", target, optionName, value],
+      { operation: "identity-write" }).ok;
   } catch {
     return false;
   }

@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import { boundedCommand } from "../shared/bounded-command.ts";
 import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
@@ -148,17 +149,21 @@ export function ensurePaneOperatorLabel(paneId: string, run: TmuxLabelRunner = r
     if (siblings.ok && ownsPreservedLabel(pane,canonical,siblings.out)) return {status:"preserved",label:canonical};
   }
   const identity = run(["display-message","-p","-t",paneId,"#{socket_path}\t#{pid}\t#{session_id}"]);
-  if (!identity.ok || identity.out.trim().split("\t").length !== 3) return {status:"failed",reason:"lock-identity-unavailable"};
+  if (!identity.ok || identity.out.trim().split("\t").length !== 3) {
+    return panePresence(paneId, run) === "absent"
+      ? {status:"skipped",reason:"pane-gone"}
+      : {status:"failed",reason:"lock-identity-unavailable"};
+  }
   const directory=join(tmpdir(),`claude-peers-pane-labels-${process.getuid?.() ?? "user"}`);
   mkdirSync(directory,{recursive:true,mode:0o700});
   const lock=join(directory,createHash("sha256").update(identity.out.trim()).digest("hex")+".lock");
   // Every writer shares a socket/server/session lock. A timeout fails closed;
   // an unlocked fallback would allow two simultaneously opened panes to claim N.
-  const result=Bun.spawnSync(["flock","-w","5",lock,process.execPath,new URL(import.meta.url).pathname,"--locked-json",paneId],
-    {stdout:"pipe",stderr:"ignore",timeout:8000,
+  const result=boundedCommand(["flock","-F","-w","5",lock,process.execPath,new URL(import.meta.url).pathname,"--locked-json",paneId],
+    {operation:"pane-label-lock",timeoutMs:8000,
       env:lockSocket ? {...process.env,CLAUDE_PEERS_TMUX_SOCKET:lockSocket} : process.env});
-  if (result.exitCode!==0) return {status:"failed",reason:"label-lock-or-write-failed"};
-  try {return JSON.parse(new TextDecoder().decode(result.stdout)) as PaneLabelResult;}
+  if (!result.ok) return {status:"failed",reason:"label-lock-or-write-failed"};
+  try {return JSON.parse(result.out) as PaneLabelResult;}
   catch {return {status:"failed",reason:"invalid-label-result"};}
 }
 
@@ -183,12 +188,7 @@ function runTmux(args: string[]): TmuxLabelCommandResult {
   const tmuxBin = process.env.CLAUDE_PEERS_TMUX_BIN ?? "tmux";
   const socket = process.env.CLAUDE_PEERS_TMUX_SOCKET;
   const command = socket ? [tmuxBin, "-S", socket, ...args] : [tmuxBin, ...args];
-  try {
-    const result = Bun.spawnSync(command, { stdout: "pipe", stderr: "ignore" });
-    return { ok: result.exitCode === 0, out: new TextDecoder().decode(result.stdout) };
-  } catch {
-    return { ok: false, out: "" };
-  }
+  return boundedCommand(command, { operation: "pane-label-tmux" });
 }
 
 export function main(args = process.argv.slice(2)): number {
@@ -208,7 +208,7 @@ export function main(args = process.argv.slice(2)): number {
   if (args.length === 1 && args[0] === "--all") {
     const result = labelAllUnlabeledPanes();
     if (result.failed > 0) {
-      console.error(`tmux pane-label backfill failed for ${result.failed}/${result.visited} pane(s)`);
+      console.error(`${new Date().toISOString()} tmux pane-label backfill failed for ${result.failed}/${result.visited} pane(s)`);
       return 1;
     }
     return 0;
@@ -220,7 +220,7 @@ export function main(args = process.argv.slice(2)): number {
   }
   const result = ensurePaneOperatorLabel(paneId);
   if (result.status === "failed") {
-    console.error(`tmux pane-label failed pane=${paneId} reason=${result.reason}`);
+    console.error(`${new Date().toISOString()} tmux pane-label failed pane=${paneId} reason=${result.reason}`);
     return 1;
   }
   return 0;

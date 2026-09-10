@@ -3255,6 +3255,12 @@ function handleBindCodexPaneThread(body: BindCodexPaneThreadRequest): BindCodexP
   // no other request can interleave before the later registration/reconcile.
   const conflict = codexPaneThreadBindConflict(body.thread_id, pane.pane_id);
   if (conflict) return conflict;
+  // Canonicalize before registration: the later identity mirror also labels the
+  // pane, but cannot repair a raw label already stored as its resolved name.
+  const label = ensurePaneOperatorLabel(pane.pane_id);
+  if (label.status !== "labeled" && label.status !== "preserved") {
+    return { ok: false, status: 503, error: "open pane label unavailable; binding deferred" };
+  }
   // The broker runs with systemd mount-namespace hardening. Linux denies its
   // readlink(/proc/<external-tui>/cwd) even for the same UID, so use tmux's
   // pane-local cwd proof gathered above. Cwd is registration metadata only;
@@ -3263,7 +3269,7 @@ function handleBindCodexPaneThread(body: BindCodexPaneThreadRequest): BindCodexP
   const cwd = pane.pane_current_path;
   const gitRoot = gitValue(cwd, ["rev-parse", "--show-toplevel"]);
   const absoluteGitDir = gitValue(cwd, ["rev-parse", "--absolute-git-dir"]);
-  const name = pane.operator_label ?? `${pane.session}.${pane.window_index}`;
+  const name = label.label;
 
   const registration = handleRegister({
     pid: tui.pid,

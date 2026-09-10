@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startTestBroker, type TestBroker } from "./helpers/test-broker.ts";
@@ -8,12 +8,12 @@ import { startTestBroker, type TestBroker } from "./helpers/test-broker.ts";
 const FIXTURE = new URL("./fixtures/codex-pane-bind-client.ts", import.meta.url).pathname;
 const THREAD_A = "01a003f0-20ec-7ae2-aba4-6c526ab304e9";
 const THREAD_B = "01a003f0-20ec-7ae2-aba4-6c526ab304ea";
-const canUseTmux = Bun.spawnSync(["tmux", "list-sessions"], { stdout: "ignore", stderr: "ignore" }).exitCode === 0;
+const canUseTmux = Bun.which("tmux") !== null;
 
 interface FixtureState {
   broker: TestBroker;
   root: string;
-  session: string;
+  socket: string;
 }
 
 const states: FixtureState[] = [];
@@ -21,7 +21,7 @@ const states: FixtureState[] = [];
 afterEach(async () => {
   while (states.length > 0) {
     const state = states.pop()!;
-    Bun.spawnSync(["tmux", "kill-session", "-t", state.session], { stdout: "ignore", stderr: "ignore" });
+    Bun.spawnSync(["tmux", "-S", state.socket, "kill-server"], { stdout: "ignore", stderr: "ignore" });
     await state.broker.stop();
     rmSync(state.root, { recursive: true, force: true });
   }
@@ -39,9 +39,24 @@ async function waitForFile(path: string): Promise<void> {
 (canUseTmux ? describe : describe.skip)("Codex pane/thread relay binding", () => {
   test("upserts a pane seat, folds a thread-only row, and is idempotent", async () => {
     const root = mkdtempSync(join(tmpdir(), "claude-peers-codex-bind-"));
-    const broker = await startTestBroker({ prefix: "codex-pane-bind" });
+    const socket = join(root, "tmux.sock");
+    const tmuxShimDir = join(root, "tmux-bin");
+    mkdirSync(tmuxShimDir);
+    const tmuxShim = join(tmuxShimDir, "tmux");
+    // Production tmux has asynchronous birth-time label hooks. Keep those
+    // writers out of this fixture and route child/broker inspection here too.
+    writeFileSync(tmuxShim, '#!/bin/sh\nexec "$TEST_REAL_TMUX" -S "$TEST_TMUX_SOCKET" "$@"\n');
+    chmodSync(tmuxShim, 0o755);
+    const privateEnv = {
+      PATH: `${tmuxShimDir}:${process.env.PATH ?? ""}`,
+      TEST_REAL_TMUX: Bun.which("tmux")!,
+      TEST_TMUX_SOCKET: socket,
+      CLAUDE_PEERS_TMUX_BIN: "tmux",
+      CLAUDE_PEERS_TMUX_SOCKET: socket,
+    };
+    const broker = await startTestBroker({ prefix: "codex-pane-bind", env: privateEnv });
     const session = `cp-codex-bind-${process.pid}-${Date.now()}`;
-    states.push({ broker, root, session });
+    states.push({ broker, root, socket });
 
     const holder = Bun.spawn(["sleep", "60"], { stdout: "ignore", stderr: "ignore" });
     try {
@@ -80,12 +95,12 @@ async function waitForFile(path: string): Promise<void> {
       // race against an external set-option cannot mint the window-name fallback.
       const command = `tmux set-option -p -t "$TMUX_PANE" @operator_label bind.test; (cd /; exec "${codexBinary}" 60) & tui=$!; bun "${FIXTURE}" "${broker.port}" "${resultPath}" "${THREAD_A}" "${THREAD_B}" "${THREAD_A}"; while [ ! -f "${mainConflictTrigger}" ]; do sleep 0.05; done; bun "${FIXTURE}" "${broker.port}" "${mainConflictPath}" "${THREAD_B}"; wait "$tui"`;
       const created = Bun.spawnSync([
-        "tmux", "new-session", "-d", "-s", session, "-n", "bind", "-c", root,
+        "tmux", "-S", socket, "-f", "/dev/null", "new-session", "-d", "-s", session, "-n", "bind", "-c", root,
         "bash", "-c", command,
-      ], { stdout: "pipe", stderr: "pipe" });
+      ], { env: { ...process.env, ...privateEnv }, stdout: "pipe", stderr: "pipe" });
       expect(created.exitCode).toBe(0);
       const paneId = new TextDecoder().decode(Bun.spawnSync([
-        "tmux", "list-panes", "-t", session, "-F", "#{pane_id}",
+        "tmux", "-S", socket, "list-panes", "-t", session, "-F", "#{pane_id}",
       ]).stdout).trim();
       expect(paneId).toMatch(/^%\d+$/);
 
@@ -100,7 +115,7 @@ async function waitForFile(path: string): Promise<void> {
       expect(results[2]!.body.id).toBe(results[0]!.body.id);
       const panePeerId = String(results[0]!.body.id);
       const mirrored = new TextDecoder().decode(Bun.spawnSync([
-        "tmux", "display-message", "-p", "-t", paneId,
+        "tmux", "-S", socket, "display-message", "-p", "-t", paneId,
         "#{@peer_id}\t#{@peer_label}\t#{@peer_resolved_name}\t#{@peer_client_type}\t#{@peer_receiver_mode}\t#{@operator_label}",
       ]).stdout).trim().split("\t");
       expect(mirrored).toEqual([
@@ -300,12 +315,12 @@ async function waitForFile(path: string): Promise<void> {
       await Bun.write(shimCodex, "setInterval(() => {}, 60_000);\n");
       const conflictCommand = `node "${shimCodex}" --remote unix:///tmp/relay.sock --cd "${root}" resume "${THREAD_A}" & tui=$!; bun "${FIXTURE}" "${broker.port}" "${conflictPath}" "${THREAD_A}" "${THREAD_B}"; while [ ! -f "${conflictRetryTrigger}" ]; do sleep 0.05; done; bun "${FIXTURE}" "${broker.port}" "${conflictRetryPath}" "${THREAD_A}"; wait "$tui"`;
       const conflictWindow = Bun.spawnSync([
-        "tmux", "new-window", "-d", "-t", session, "-n", "conflict", "-c", root,
+        "tmux", "-S", socket, "new-window", "-d", "-t", session, "-n", "conflict", "-c", root,
         "bash", "-c", conflictCommand,
       ], { stdout: "pipe", stderr: "pipe" });
       expect(conflictWindow.exitCode).toBe(0);
       const conflictPaneId = new TextDecoder().decode(Bun.spawnSync([
-        "tmux", "list-panes", "-t", `${session}:conflict`, "-F", "#{pane_id}",
+        "tmux", "-S", socket, "list-panes", "-t", `${session}:conflict`, "-F", "#{pane_id}",
       ]).stdout).trim();
       expect(conflictPaneId).toMatch(/^%\d+$/);
       await waitForFile(conflictPath);

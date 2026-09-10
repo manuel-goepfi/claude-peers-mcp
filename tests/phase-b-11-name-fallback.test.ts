@@ -443,25 +443,19 @@ describe("Operator-label fallback — human name first, pane_id metadata last", 
     expect(helperSlice).not.toContain("tmuxInfo.session}:${tmuxInfo.window_index");
   });
 
-  function canCreateTmuxSession(): boolean {
-    if (Bun.spawnSync(["tmux", "-V"], { stdout: "ignore", stderr: "ignore" }).exitCode !== 0) return false;
-    const session = `claude-peers-probe-${process.pid}-${Date.now()}`;
-    const created = Bun.spawnSync(["tmux", "new-session", "-d", "-s", session], { stdout: "ignore", stderr: "ignore" });
-    if (created.exitCode !== 0) return false;
-    Bun.spawnSync(["tmux", "kill-session", "-t", session], { stdout: "ignore", stderr: "ignore" });
-    return true;
-  }
-
-  const tmuxAvailable = canCreateTmuxSession();
+  const tmuxAvailable = Bun.which("tmux") !== null;
 
   (tmuxAvailable ? test : test.skip)("broker identity mirror writes peer fields without replacing the pane label", () => {
     const root = mkdtempSync(join(tmpdir(), "claude-peers-mirror-"));
     const socket = join(root, "tmux.sock");
-    const session = `claude-peers-test-${process.pid}-${Date.now()}`;
+    // A matching canonical prefix isolates the mirror preservation contract.
+    const session = "human";
+    const priorBin = process.env.CLAUDE_PEERS_TMUX_BIN;
+    process.env.CLAUDE_PEERS_TMUX_BIN = Bun.which("tmux")!;
     const priorSocket = process.env.CLAUDE_PEERS_TMUX_SOCKET;
     process.env.CLAUDE_PEERS_TMUX_SOCKET = socket;
     const tmux = (...args: string[]) => Bun.spawnSync(["tmux", "-S", socket, ...args], { stdout: "pipe", stderr: "ignore" });
-    const created = tmux("new-session", "-d", "-s", session);
+    const created = tmux("-f", "/dev/null", "new-session", "-d", "-s", session);
     expect(created.exitCode).toBe(0);
 
     try {
@@ -527,11 +521,13 @@ describe("Operator-label fallback — human name first, pane_id metadata last", 
     } finally {
       configurePaneIdentityOwnership(false,null);
       tmux("kill-server");
+      if (priorBin === undefined) delete process.env.CLAUDE_PEERS_TMUX_BIN;
+      else process.env.CLAUDE_PEERS_TMUX_BIN = priorBin;
       if (priorSocket === undefined) delete process.env.CLAUDE_PEERS_TMUX_SOCKET;
       else process.env.CLAUDE_PEERS_TMUX_SOCKET = priorSocket;
       rmSync(root, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 
   test("registration, re-registration, and set_name publish through the same tmux mirror helper", async () => {
     const source = await Bun.file(`${import.meta.dir}/../server.ts`).text();

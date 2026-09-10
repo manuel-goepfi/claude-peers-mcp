@@ -4,12 +4,15 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { startTestBroker } from "./helpers/test-broker.ts";
 
+// Two adapter startups include host process discovery before protocol receipt.
+// Keep the lifecycle deadline separate from the three-second HTTP deadlines.
 test("fresh MCP adapter reconnects and receives and acknowledges a new message", async () => {
   const broker = await startTestBroker({ prefix: "rollout-reconnect" });
   let client: Client | undefined;
   const db = new Database(broker.dbPath, { readonly: true });
   const env = Object.fromEntries(Object.entries({
     ...process.env,
+    HOME: broker.root,
     CLAUDE_PEERS_PORT: String(broker.port),
     CLAUDE_PEERS_DB: broker.dbPath,
     CLAUDE_PEERS_BRIDGE_TOKEN_FILE: broker.tokenPath,
@@ -59,4 +62,4 @@ test("fresh MCP adapter reconnects and receives and acknowledges a new message",
     db.close();
     await broker.stop();
   }
-}, 15000);
+}, 30000);
