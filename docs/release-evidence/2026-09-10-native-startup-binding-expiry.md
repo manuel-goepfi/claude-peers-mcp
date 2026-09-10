@@ -1,5 +1,10 @@
 # Native startup binding expiry repair
 
+Follow-up: the two pre-existing verification failures below were subsequently
+resolved; full verification is green. See
+`2026-09-10-launcher-and-label-verification.md`. The results below retain the
+original repair's validation history.
+
 Manzo authorized implementation following the infra.6 diagnosis. Base commit:
 `a3adf5242983e0e263a015e80175df1306e047bb`. Inherited `bench/peer-fleet.ts`
 diagnostic edits are excluded and preserved. No schema or protocol change.

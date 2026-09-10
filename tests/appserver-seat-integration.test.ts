@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startTestBroker } from "./helpers/test-broker.ts";
@@ -240,19 +240,33 @@ test("Desktop MCP adopts its exact host-owned thread and cannot switch inboxes",
 }, 20_000);
 
 (canUseTmux ? test : test.skip)("SessionStart registers from exact inherited pane proof without a Codex ancestor", async () => {
-  const broker = await startTestBroker({ prefix: "hook-register-pane-proof" });
   const cwd = mkdtempSync(join(tmpdir(), "claude-peers-hook-register-pane-"));
+  const socket = join(cwd, "tmux.sock");
+  const shimDir = mkdtempSync(join(cwd, "bin-"));
+  const shim = join(shimDir, "tmux");
+  // The hook intentionally receives no TMUX value. Keep every unqualified tmux
+  // call on this private server without depending on the operator's config.
+  writeFileSync(shim, '#!/bin/sh\nexec "$TEST_REAL_TMUX" -S "$TEST_TMUX_SOCKET" "$@"\n');
+  chmodSync(shim, 0o755);
+  const privateEnv = {
+    PATH: `${shimDir}:${process.env.PATH ?? ""}`,
+    TEST_REAL_TMUX: Bun.which("tmux")!,
+    TEST_TMUX_SOCKET: socket,
+    CLAUDE_PEERS_TMUX_BIN: "tmux",
+    CLAUDE_PEERS_TMUX_SOCKET: socket,
+  };
+  const broker = await startTestBroker({ prefix: "hook-register-pane-proof", env: privateEnv });
   const session = `cp-hook-pane-${process.pid}-${Date.now()}`;
   try {
     const created = Bun.spawnSync([
-      "tmux", "new-session", "-d", "-s", session, "-c", cwd,
+      "tmux", "-S", socket, "-f", "/dev/null", "new-session", "-d", "-s", session, "-c", cwd,
       "bash", "-c",
       'export CLAUDE_PEER_NAME=stale-launch-name CLAUDE_PEER_TMUX_PANE_ID="$TMUX_PANE"; unset TMUX_PANE; exec -a codex sleep 60',
     ], { stdout: "pipe", stderr: "pipe" });
     expect(created.exitCode).toBe(0);
 
     const pane = new TextDecoder().decode(Bun.spawnSync([
-      "tmux", "list-panes", "-t", session, "-F", "#{pane_id}\t#{pane_pid}\t#{pane_tty}",
+      "tmux", "-S", socket, "list-panes", "-t", session, "-F", "#{pane_id}\t#{pane_pid}\t#{pane_tty}",
     ]).stdout).trim().split("\t");
     const [paneId, panePidText, paneTty] = pane;
     const panePid = Number(panePidText);
@@ -273,7 +287,7 @@ test("Desktop MCP adopts its exact host-owned thread and cannot switch inboxes",
     expect(await Bun.file(`/proc/${panePid}/environ`).text()).toContain(`CLAUDE_PEER_TMUX_PANE_ID=${paneId}\0`);
     expect(new TextDecoder().decode(Bun.spawnSync(["readlink", `/proc/${panePid}/cwd`]).stdout).trim()).toBe(cwd);
     expect(Bun.spawnSync([
-      "tmux", "set-option", "-p", "-t", paneId!, "@operator_label", "infra.9",
+      "tmux", "-S", socket, "set-option", "-p", "-t", paneId!, "@operator_label", "infra.9",
     ]).exitCode).toBe(0);
 
     const threadId = crypto.randomUUID();
@@ -281,6 +295,7 @@ test("Desktop MCP adopts its exact host-owned thread and cannot switch inboxes",
       cwd,
       env: {
         ...process.env,
+        ...privateEnv,
         TMUX: undefined,
         TMUX_PANE: paneId,
         CLAUDE_PEERS_CLIENT_TYPE: "codex",
@@ -311,8 +326,8 @@ test("Desktop MCP adopts its exact host-owned thread and cannot switch inboxes",
     ).get(threadId) as Record<string, unknown> | null;
     db.close();
     expect(row).toEqual({
-      // The stale infra.9 prefix does not reserve a number in this session.
-      name: `${session}.1`,
+      // Session-prefix changes preserve the existing open pane's ordinal.
+      name: `${session}.9`,
       pid: panePid,
       tty: paneTty?.replace(/^\/dev\//, ""),
       thread_id: threadId,
@@ -320,8 +335,10 @@ test("Desktop MCP adopts its exact host-owned thread and cannot switch inboxes",
       tmux_pane_id: paneId,
       seat_key: `pane:${session}:${paneId}`,
     });
+    expect(Bun.spawnSync(["tmux", "-S", socket, "show-options", "-p", "-v", "-t", paneId!, "@operator_label"])
+      .stdout.toString().trim()).toBe(`${session}.9`);
   } finally {
-    Bun.spawnSync(["tmux", "kill-session", "-t", session], { stdout: "ignore", stderr: "ignore" });
+    Bun.spawnSync(["tmux", "-S", socket, "kill-server"], { stdout: "ignore", stderr: "ignore" });
     await broker.stop();
     rmSync(cwd, { recursive: true, force: true });
   }
