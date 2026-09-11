@@ -94,28 +94,18 @@ const RECONCILE_CODEX_SEATS = process.env.RECONCILE_CODEX_SEATS !== "0";
 // fails the freshness check. mtime is the signal; the body is human-readable.
 const HEARTBEAT_PATH = process.env.CLAUDE_PEERS_AUTODRAIN_HEARTBEAT ?? process.env.AUTODRAIN_HEARTBEAT ?? `${homedir()}/.claude-peers-autodrain.heartbeat`;
 const NUDGE_BUDGET_PATH = process.env.CLAUDE_PEERS_NUDGE_BUDGET_FILE ?? `${homedir()}/.claude-peers-nudge-budget.json`;
-// The nudge is typed into the pane as a real user turn. Branch by receive
-// path: hook lanes already have the body in-turn; manual-drain lanes must
-// fetch it. Recovery belongs in poller logs, not in this prompt.
+// Receive paths can change when the nudge starts a native prompt hook.
+// Keep hook classification for transport checks, not wake-content assumptions.
 const HOOK_RECEIVE_MODES = new Set(["claude-channel", "codex-hook", "gemini-hook"]);
 
 export function isHookReceivePath(lane: Lane): boolean {
   return HOOK_RECEIVE_MODES.has(lane.receiver_mode);
 }
 
-export function nudgeText(lane: Lane): string {
-  const hookFresh = !lane.last_hook_seen_at
-    || Date.now() - Date.parse(lane.last_hook_seen_at) <= 2 * 60 * 1_000;
-  if (isHookReceivePath(lane)) {
-    // Hooks are event-driven: an old timestamp does not mean the wake's
-    // prompt hook will fail to attach and acknowledge the pending batch.
-    return hookFresh
-      ? "[peer-mail] Process the attached peer messages."
-      : "[peer-mail] Process the attached peer messages. Only if none are attached, call check_messages once.";
-  }
-  const n = lane.unread;
-  const noun = n === 1 ? "message" : "messages";
-  return `[peer-mail] ${n} unread peer ${noun}. Call check_messages once.`;
+export function nudgeText(_lane: Lane): string {
+  // Receive mode can change when this wake triggers the first native hook.
+  // Queue emptiness after that hook says nothing about the attached batch.
+  return "[peer-mail] Process attached peer messages first. Only if none are attached, call check_messages once. An empty inbox does not cancel an attached message.";
 }
 // Give up nudging a lane after this many consecutive attempts with mail still
 // unread — a lane whose drain hook is broken must NOT be keystroke-bombed
