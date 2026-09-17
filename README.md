@@ -361,3 +361,5 @@ The gate records client versions, installs user-scope MCP and receive-hook confi
 ## License
 
 MIT. Copyright (c) 2026 Louis Arge. See [LICENSE](LICENSE).
+
+Wake submission confirmation compares the before/after transcript evidence. An unchanged historical wake cannot confirm a new attempt; if scrolling removes the evidence, the attempt remains unconfirmed. This does not change the durable retry limit or acknowledge mailbox contents.
