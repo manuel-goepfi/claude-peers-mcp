@@ -17,12 +17,9 @@ command -v jq >/dev/null 2>&1 || exit 0
 # those calls with agent_id; agent_type alone is insufficient because a root
 # session started with `claude --agent` also carries it. Never let a subagent
 # claim the root seat's inbox.
-if [[ "$HOOK_EVENT_NAME" == "PostToolBatch" ]]; then
-  AGENT_ID=$(jq -r 'if (.agent_id | type) == "string" then .agent_id else "" end' 2>/dev/null)
-  [[ -n "$AGENT_ID" ]] && exit 0
-else
-  cat >/dev/null
-fi
+HOOK_INPUT=$(cat)
+AGENT_ID=$(printf '%s' "$HOOK_INPUT" | jq -r 'if (.agent_id | type) == "string" then .agent_id else "" end' 2>/dev/null)
+[[ -n "$AGENT_ID" ]] && exit 0
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
@@ -87,7 +84,7 @@ find_claude_pid() {
 # clear. Try the server pid first (normal case), then the claude pid.
 CLAUDE_PID="${CLAUDE_PEERS_DRAIN_CLAUDE_PID:-$(find_claude_pid)}"
 [[ "$CLAUDE_PID" =~ ^[0-9]+$ ]] || exit 0
-MCP_PID="${CLAUDE_PEERS_DRAIN_MCP_PID:-$(find_mcp_pid)}"
+MCP_PID="${CLAUDE_PEERS_DRAIN_MCP_PID:-$(find_mcp_pid || true)}"
 
 CLAIM_PIDS=()
 [[ "$MCP_PID" =~ ^[0-9]+$ ]] && CLAIM_PIDS+=("$MCP_PID")
@@ -96,12 +93,15 @@ CLAIM_PIDS=()
 
 BROKER_PORT="${CLAUDE_PEERS_PORT:-7899}"
 STATUS=""; RESP=""
-for CLAIM_PID in "${CLAIM_PIDS[@]}"; do
+claim_pid() {
   RAW=$(curl -s -m 2 -w $'\n%{http_code}' -X POST "http://127.0.0.1:${BROKER_PORT}/claim-by-pid" \
     -H 'Content-Type: application/json' \
     -d "{\"pid\":${CLAIM_PID},\"caller_pid\":${CLAUDE_PID},\"client_type\":\"claude\",\"receiver_mode\":\"claude-channel\"}" 2>/dev/null)
   STATUS=$(printf '%s\n' "$RAW" | tail -n1)
   RESP=$(printf '%s' "$RAW" | sed '$d')
+}
+for CLAIM_PID in "${CLAIM_PIDS[@]}"; do
+  claim_pid
   # 404 → no row keyed on this pid, try the next identity. 200 with an EMPTY
   # claim also falls through: with dual rows (server-pid row + hook-registered
   # claude-pid row) the mail can sit on the later identity while the first
@@ -116,6 +116,30 @@ for CLAIM_PID in "${CLAIM_PIDS[@]}"; do
   break
 done
 MCP_PID="$CLAIM_PID"
+
+# A resume can lose its one-shot registration while the old native still owns
+# the conversation. Retry only a missing native row, using this root hook's
+# exact saved-thread input. The existing registrar still refuses live owners,
+# ambiguous threads, and invalid ownership proofs. Never reinterpret 403/409.
+if [[ "$STATUS" == "404" && "$CLAIM_PID" == "$CLAUDE_PID" ]]; then
+  TRANSCRIPT=$(printf '%s' "$HOOK_INPUT" | jq -er '
+    select(type == "object") |
+    select(.session_id | type == "string" and test("^[a-zA-Z0-9-]+$")) |
+    select(.transcript_path | type == "string") |
+    . as $hook |
+    select(.transcript_path | endswith("/" + $hook.session_id + ".jsonl")) |
+    .transcript_path' 2>/dev/null) || TRANSCRIPT=""
+  if [[ -n "$TRANSCRIPT" && -f "$TRANSCRIPT" ]] && command -v timeout >/dev/null 2>&1; then
+    LOG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/logs"
+    mkdir -p "$LOG_DIR" 2>/dev/null
+    # Bound the retry inside the existing ten-second hook budget. Registration
+    # output is diagnostic only; only the normal claim/render path emits mail.
+    if printf '%s' "$HOOK_INPUT" | timeout --kill-after=1s 3s bash "$SCRIPT_DIR/claude-register-peer-session.sh" \
+        >/dev/null 2>>"$LOG_DIR/drain-peer-inbox.log"; then
+      claim_pid
+    fi
+  fi
+fi
 
 if [[ -n "$STATUS" && "$STATUS" != "200" ]]; then
   LOG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/logs"

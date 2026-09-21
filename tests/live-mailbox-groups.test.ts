@@ -206,3 +206,115 @@ while p.poll() is None:
 
   } finally {await client.close();proxy.stop(true);db.close();await broker.stop();tmux("kill-server");rmSync(root,{recursive:true,force:true});rmSync(broker.root,{recursive:true,force:true});}
 },30000);
+
+// Resume the same saved thread in a second real process/pane while its owner
+// still lives. Only normal prompt/tool hook activity may recover the new seat.
+test.skipIf(!Bun.which("tmux")).each(["UserPromptSubmit", "PostToolBatch"])(
+  "%s retries a missing Claude registration only after the old owner exits",
+  async (event) => {
+    const root = mkdtempSync(join(tmpdir(), "claude-resume-retry-"));
+    const socket = join(root, "tmux");
+    const broker = await startTestBroker({ prefix: "claude-resume-retry" });
+    const db = new Database(broker.dbPath, { readonly: true });
+    const thread = "11111111-2222-4333-8444-555555555555";
+    const transcript = join(root, `${thread}.jsonl`);
+    writeFileSync(transcript, JSON.stringify({ sessionId: thread }) + "\n");
+    const register = new URL("../hooks/claude-register-peer-session.sh", import.meta.url).pathname;
+    const drain = new URL("../hooks/claude-drain-peer-inbox.sh", import.meta.url).pathname;
+    const driver = join(root, "driver.py");
+    writeFileSync(driver, `import ctypes,json,os,subprocess,sys,time,urllib.request
+ctypes.CDLL(None).prctl(15,b'claude',0,0,0)
+base=sys.argv[1]
+open(base+'.pid','w').write(str(os.getpid()))
+while True:
+ if os.path.exists(base+'.input'):
+  with open(base+'.input') as f: job=json.load(f)
+  os.unlink(base+'.input')
+  if job['script']=='send-reply':
+   payload=dict(job['input'],caller_pid=os.getpid())
+   req=urllib.request.Request('http://127.0.0.1:'+os.environ['CLAUDE_PEERS_PORT']+'/send-by-pid',data=json.dumps(payload).encode(),headers={'Content-Type':'application/json'})
+   with urllib.request.urlopen(req,timeout=3) as response: result={'code':0,'stdout':response.read().decode(),'stderr':''}
+  else:
+   completed=subprocess.run(['bash',job['script']],input=json.dumps(job['input']),text=True,capture_output=True,timeout=12)
+   result={'code':completed.returncode,'stdout':completed.stdout,'stderr':completed.stderr}
+  with open(base+'.result','w') as f: json.dump(result,f)
+ time.sleep(.02)
+`);
+    const env = { ...process.env, HOME: root, CLAUDE_CONFIG_DIR: join(root, "claude"),
+      CLAUDE_PEERS_PORT: String(broker.port), CLAUDE_PEERS_HOOK_EVENT_NAME: event,
+      CLAUDE_PEERS_DRAIN_CLAUDE_PID: undefined, CLAUDE_PEERS_DRAIN_MCP_PID: undefined,
+      TMUX: undefined, TMUX_PANE: undefined };
+    const tmux = (...args: string[]) => Bun.spawnSync(["tmux", "-S", socket, ...args],
+      { env, stdout: "pipe", stderr: "pipe", timeout: 3000 });
+    const run = async (seat: string, script: string, extra: Record<string, unknown> = {}) => {
+      const base = join(root, seat);
+      rmSync(base + ".result", { force: true });
+      writeFileSync(base + ".input", JSON.stringify({ script, input: {
+        session_id: thread, transcript_path: transcript, hook_event_name: event, ...extra,
+      } }));
+      const deadline = Date.now() + 13000;
+      while (!existsSync(base + ".result") && Date.now() < deadline) await Bun.sleep(25);
+      return JSON.parse(readFileSync(base + ".result", "utf8")) as { code: number; stdout: string; stderr: string };
+    };
+    const call = async (path: string, body: object, token = "") => {
+      const response = await fetch(broker.url + path, { method: "POST",
+        headers: { "Content-Type": "application/json", "X-Peer-Token": token }, body: JSON.stringify(body) });
+      return { status: response.status, body: await response.json() as any };
+    };
+    try {
+      expect(tmux("-f", "/dev/null", "new-session", "-d", "-s", "Retry", "-c", root,
+        "python3", driver, join(root, "old")).exitCode).toBe(0);
+      expect(tmux("new-window", "-d", "-t", "Retry", "-c", root,
+        "python3", driver, join(root, "new")).exitCode).toBe(0);
+      await until(() => existsSync(join(root, "old.pid")) && existsSync(join(root, "new.pid")));
+      const oldPid = Number(readFileSync(join(root, "old.pid"), "utf8"));
+      const newPid = Number(readFileSync(join(root, "new.pid"), "utf8"));
+      expect((await run("old", register)).code).toBe(0);
+      const failedStart = await run("new", register);
+      expect(failedStart.code).toBe(1);
+      expect(failedStart.stderr).toContain("HTTP 409");
+      expect((await run("new", drain)).code).toBe(0);
+      const newPeer = () => db.query("SELECT id,name FROM peers WHERE pid=?").get(newPid) as { id: string; name: string } | null;
+      expect(newPeer()).toBeNull(); // Cannot take ownership from a live native.
+      expect(readFileSync(join(root, "claude/logs/drain-peer-inbox.log"), "utf8")).toContain("HTTP 409");
+      process.kill(oldPid, "SIGTERM");
+      await until(() => !existsSync(`/proc/${oldPid}`));
+      // No identity guessing from missing/mismatched input, or from child hooks.
+      for (const extra of [{ session_id: "" }, { transcript_path: join(root, "other.jsonl") }, { agent_id: "child" }]) {
+        expect((await run("new", drain, extra)).code).toBe(0);
+        expect(newPeer()).toBeNull();
+      }
+      const recovered = await run("new", drain);
+      expect(recovered.code).toBe(0);
+      if (!newPeer()) {
+        const log = join(root, "claude/logs/drain-peer-inbox.log");
+        console.error("Recovery diagnostics:", recovered, existsSync(log) ? readFileSync(log, "utf8") : "no hook log");
+      }
+      expect(newPeer()).not.toBeNull();
+      const peer = newPeer()!;
+      expect(peer.name).toBe("Retry.2");
+      // Registration alone does not pass: send, drain, and verify ACK custody.
+      const sender = await call("/register", { pid: process.pid, cwd: root, name: "sender",
+        client_type: "unknown", receiver_mode: "manual-drain", summary: "" });
+      expect((await call("/send-message", { id: sender.body.id, to_id: peer.id,
+        text: "recovered native inbox", request_id: "retry-proof" }, sender.body.token)).body.ok).toBe(true);
+      const delivered = await run("new", drain);
+      expect(delivered.stdout).toContain("recovered native inbox");
+      expect(db.query("SELECT delivered FROM messages WHERE request_id='retry-proof'").get()).toEqual({ delivered: 1 });
+      expect((await run("new", drain)).stdout).toBe(""); // No duplicate delivery.
+      expect(newPeer()?.id).toBe(peer.id); // Healthy turns do not re-register.
+      const reply = await run("new", "send-reply", { selector: { id: sender.body.id },
+        text: "recovered native reply", request_id: "retry-reply", reply_to_id: "retry-proof" });
+      expect(JSON.parse(reply.stdout).ok).toBe(true);
+      const received = await call("/poll-messages", { id: sender.body.id }, sender.body.token);
+      expect(JSON.stringify(received.body)).toContain("recovered native reply");
+      expect(db.query("SELECT from_id,to_id,reply_to_id FROM messages WHERE request_id='retry-reply'").get())
+        .toEqual({ from_id: peer.id, to_id: sender.body.id, reply_to_id: "retry-proof" });
+    } finally {
+      tmux("kill-server");
+      db.close();
+      await broker.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 45000,
+);

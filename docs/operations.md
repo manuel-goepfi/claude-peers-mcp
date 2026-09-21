@@ -51,6 +51,25 @@ member; companion IDs remain as non-targetable history aliases so pending mail
 and correlated replies are preserved. A process replacement or mismatched proof
 revokes the group instead of transferring it by name or timestamp.
 
+### Claude resume while the old conversation is still open
+
+Close the original Claude process before resuming its saved conversation in a
+new pane. If the two overlap, the startup registration hook refuses the live
+ownership conflict. After the original exits, the next `UserPromptSubmit` or
+`PostToolBatch` inbox hook retries the installed registrar once when the native
+PID has no registration (HTTP 404). The retry requires root hook input with a
+nonempty session ID and an existing transcript whose filename matches that ID.
+It has a three-second deadline and preserves the registrar's live-owner,
+thread, account, and pane checks. Existing 403/409 claim failures are not retried;
+child hooks cannot register or claim the root inbox. Healthy inbox checks do not
+register again. Recovery does not run while a session is idle without hook activity.
+
+This Linux hook change takes effect on the next invocation, without restarting
+the broker or conversation. Retry diagnostics go to
+`$CLAUDE_CONFIG_DIR/logs/drain-peer-inbox.log` (default `$HOME/.claude/logs`).
+Verify a received message and a correlated reply after recovery; a registration
+or queued send is insufficient.
+
 ## Ownership modes
 
 Only one process may own both the configured loopback listener and canonical database. The database owner file is a lifetime lock, not a stale-file convention.
