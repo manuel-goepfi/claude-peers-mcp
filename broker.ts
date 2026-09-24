@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 import { ensurePaneOperatorLabel } from "./bin/tmux-label-pane.ts";
-import { withRuntimePaneSnapshot } from "./shared/runtime-pane-snapshot.ts";
+import { primeRuntimePaneRows, withRuntimePaneSnapshot } from "./shared/runtime-pane-snapshot.ts";
 /**
  * claude-peers broker daemon
  *
@@ -131,7 +131,7 @@ const server = Bun.serve({
   port: PORT,
   hostname: HOSTNAME,
   fetch(request) {
-    return withRuntimePaneSnapshot(() => requestHandler(request));
+    return withRuntimePaneSnapshot(() => requestHandler(request), true);
   },
 });
 if (server.hostname !== HOSTNAME) {
@@ -3812,6 +3812,69 @@ async function readBoundedJsonBody(request: Request): Promise<
   }
 }
 
+const runtimeSockets = new Map<number, { socket: string | null; expires: number }>();
+function runtimeSocketForPid(pid: number): string | null {
+  if (!Number.isSafeInteger(pid) || pid <= 1) return null;
+  const cached = runtimeSockets.get(pid);
+  if (cached && cached.expires > Date.now()) return cached.socket;
+  if (runtimeSockets.size > 2_048) {
+    for (const [key, value] of runtimeSockets) if (value.expires <= Date.now()) runtimeSockets.delete(key);
+  }
+  let socket: string | null = null;
+  try {
+    const env = readFileSync(`/proc/${pid}/environ`, "utf8");
+    const tmux = env.split("\0").find(value => value.startsWith("TMUX="))?.slice(5).match(/^(\/[^,]*),(\d+),(\d+)$/);
+    if (tmux && statSync(tmux[1]!).isSocket() && statSync(tmux[1]!).uid === process.getuid?.()) socket = tmux[1]!;
+  } catch { /* A missing process is not ownership proof. */ }
+  runtimeSockets.set(pid, { socket, expires: Date.now() + 2_000 });
+  return socket;
+}
+
+async function primeLivePaneProofs(body: Record<string, unknown>, path: string): Promise<void> {
+  if (path === "/register-cli" || path === "/metrics") return;
+  const pids = new Set<number>((db.query("SELECT DISTINCT pid FROM peers WHERE seat_key LIKE 'live:%'").all() as Array<{pid:number}>).map(row => row.pid));
+  for (const value of [body.pid, body.caller_pid, body.adapter_pid]) {
+    if (typeof value === "number" && Number.isSafeInteger(value)) pids.add(value);
+  }
+  const sockets = new Set<string>();
+  for (const pid of pids) {
+    const socket = runtimeSocketForPid(pid);
+    if (socket) sockets.add(socket);
+  }
+  await Promise.all([...sockets].map(socket => primeRuntimePaneRows(socket, path === "/register")));
+}
+
+const liveLabels = new Map<string, { label: string | null; expires: number }>();
+const liveLabelReads = new Map<string, Promise<string | null>>();
+async function liveGroupLabel(socket: string, pane: string, runtimeKey: string): Promise<string | null> {
+  const key = `${runtimeKey}:${pane}`;
+  const cached = liveLabels.get(key);
+  if (cached && cached.expires > Date.now()) return cached.label;
+  if (liveLabels.size > 1_024) {
+    for (const [oldKey, value] of liveLabels) if (value.expires <= Date.now()) liveLabels.delete(oldKey);
+  }
+  let pending = liveLabelReads.get(key);
+  if (!pending) {
+    pending = (async () => {
+      const child = Bun.spawn([process.execPath, new URL("./bin/tmux-label-pane.ts", import.meta.url).pathname, "--print", pane], {
+        env: { ...process.env, CLAUDE_PEERS_TMUX_SOCKET: socket }, stdout: "pipe", stderr: "ignore",
+      });
+      const timer = setTimeout(() => child.kill(), 2_000);
+      try {
+        const [output, code] = await Promise.all([new Response(child.stdout).text(), child.exited]);
+        const label = output.trim();
+        return code === 0 && label.length > 0 && label.length <= 128 && !/[\x00-\x1f\x7f]/.test(label) ? label : null;
+      } catch { return null; }
+      finally { clearTimeout(timer); }
+    })();
+    liveLabelReads.set(key, pending);
+    void pending.finally(() => liveLabelReads.delete(key));
+  }
+  const label = await pending;
+  liveLabels.set(key, { label, expires: Date.now() + (label ? 30_000 : 2_000) });
+  return label;
+}
+
 requestHandler = async (req: Request) => {
     const url = new URL(req.url);
     const path = url.pathname;
@@ -3864,6 +3927,8 @@ requestHandler = async (req: Request) => {
     const parsedBody = await readBoundedJsonBody(req);
     if (!parsedBody.ok) return Response.json({ error: parsedBody.error }, { status: parsedBody.status });
     const body = parsedBody.value;
+
+    await primeLivePaneProofs(body, path);
 
     try {
       // /register is the only unauthenticated route — it issues the token.
@@ -4045,13 +4110,10 @@ requestHandler = async (req: Request) => {
             };
             const group=liveGroups.current(auth.id);
             if(group){
-              const label=ensurePaneOperatorLabel(group.proof.pane_id,(args)=>{
-                const result=Bun.spawnSync(["tmux","-S",group.proof.socket_path,...args],{stdout:"pipe",stderr:"ignore",timeout:250});
-                return {ok:result.exitCode===0,out:new TextDecoder().decode(result.stdout).trimEnd()};
-              },group.proof.socket_path);
-              if(label.status==="preserved" || label.status==="labeled"){
-                db.run("UPDATE peers SET name=?,resolved_name=?,tmux_session=? WHERE substr(seat_key,1,69)=?",[label.label,label.label,group.proof.session_name,liveGroupPrefix(group.native.seat_key)!]);
-                response.name=label.label;response.resolved_name=label.label;response.tmux_session=group.proof.session_name;
+              const label=await liveGroupLabel(group.proof.socket_path,group.proof.pane_id,`${group.proof.runtime_key}:${group.proof.session_name}`);
+              if(label){
+                db.run("UPDATE peers SET name=?,resolved_name=?,tmux_session=? WHERE substr(seat_key,1,69)=?",[label,label,group.proof.session_name,liveGroupPrefix(group.native.seat_key)!]);
+                response.name=label;response.resolved_name=label;response.tmux_session=group.proof.session_name;
               }
             }
             // Seat-supersede (one-shot): a newer process took this peer's exact

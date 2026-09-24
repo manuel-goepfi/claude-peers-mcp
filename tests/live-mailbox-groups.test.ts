@@ -146,6 +146,29 @@ while p.poll() is None:
       expect((await call(path,{id:alias.id,name:"Wrong"},alias.token)).status).toBe(403);
     expect((await call("/heartbeat",{id:alias.id},alias.token)).status).toBe(200);
     expect((await call("/claim-by-pid",{pid:adapterPid,caller_pid:process.pid})).status).toBe(403);
+    if (process.env.CLAUDE_PEERS_PROOF_LOAD_TEST === "1") {
+      const timings:number[]=[];
+      const started=Date.now();
+      for(let second=0;second<60;second++){
+        await Bun.sleep(Math.max(0,started+second*1000-Date.now()));
+        const batch=await Promise.all(Array.from({length:5},async()=>{
+          const beatStart=performance.now();
+          const beat=await call("/heartbeat",{id:alias.id},alias.token);
+          timings.push(performance.now()-beatStart);
+          const claimStart=performance.now();
+          const claim=await call("/claim-by-pid",{pid:adapterPid,caller_pid:process.pid});
+          timings.push(performance.now()-claimStart);
+          return [beat.status,claim.status];
+        }));
+        expect(batch.every(([beat,claim])=>beat===200&&claim===403)).toBe(true);
+      }
+      const ordered=timings.sort((a,b)=>a-b);
+      const p95=ordered[Math.ceil(ordered.length*.95)-1]!;
+      console.log(`PROOF LOAD 600 requests/60s p95=${p95.toFixed(1)}ms max=${ordered.at(-1)!.toFixed(1)}ms`);
+      expect(ordered).toHaveLength(600);
+      expect(p95).toBeLessThan(1000);
+      return; // The ordinary fixture run covers later rename and restart behavior.
+    }
     const answer=await call("/send-message",{id:remote.body.id,to_id:alias.id,text:"answer for original request",request_id:"answer",reply_to_id:"before-request"},remote.body.token);
     expect(answer.body.ok).toBe(true);
     const reply=await client.callTool({name:"get_reply_status",arguments:{request_id:"before-request"}});
@@ -205,4 +228,4 @@ while p.poll() is None:
     // Maintained loaded mirror code is separately reported; mailbox ownership is independent.
 
   } finally {await client.close();proxy.stop(true);db.close();await broker.stop();tmux("kill-server");rmSync(root,{recursive:true,force:true});rmSync(broker.root,{recursive:true,force:true});}
-},30000);
+},process.env.CLAUDE_PEERS_PROOF_LOAD_TEST === "1" ? 110000 : 30000);
