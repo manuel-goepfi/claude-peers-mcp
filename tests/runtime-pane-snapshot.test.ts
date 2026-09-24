@@ -27,3 +27,9 @@ test("missing proof stays refused within a request and can recover on the next",
   });
   withRuntimePaneSnapshot(() => expect(runtimePaneRow("socket", "%1", read)).not.toBeNull());
 });
+
+test("broker-mode proof never falls back to a blocking pane command", () => {
+  withRuntimePaneSnapshot(() => {
+    expect(runtimePaneRow("missing-socket", "%1", () => { throw new Error("blocking reader called"); })).toBeNull();
+  }, true);
+});
