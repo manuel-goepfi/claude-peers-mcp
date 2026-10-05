@@ -8,6 +8,8 @@ type Row=Peer & {token:string|null};
 export function liveGroupPrefix(key:string|null|undefined):string|null {
   return typeof key==="string" && /^live:[a-f0-9]{64}:(native|alias):[a-f0-9]{64}$/.test(key) ? key.slice(0,69):null;
 }
+// substr(seat_key,1,69) must stay byte-identical to the expression index
+// idx_peers_live_group (shared/storage.ts), or every mailbox query scans peers.
 export const liveMailboxIdsSql=`SELECT sibling.id FROM peers owner JOIN peers sibling ON sibling.id=owner.id
   OR (substr(owner.seat_key,1,5)='live:' AND substr(owner.seat_key,1,69)=substr(sibling.seat_key,1,69)) WHERE owner.id=?`;
 function groupKey(peer:Row,proof:SeatRuntimeProof):string {
