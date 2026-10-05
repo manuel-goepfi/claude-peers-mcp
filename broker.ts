@@ -697,6 +697,10 @@ const selectAllTargetablePeers = db.prepare(`
   SELECT ${resolutionPeerColumns} FROM peers WHERE non_targetable = 0
 `);
 
+const selectTargetablePeerById = db.prepare(`
+  SELECT ${resolutionPeerColumns} FROM peers WHERE non_targetable = 0 AND id = ?
+`);
+
 const selectTargetablePeerCount = db.prepare(`
   SELECT COUNT(*) AS count FROM peers WHERE non_targetable = 0
 `);
@@ -1250,7 +1254,16 @@ function ttyCompatibleForSamePid(existingValue: string | null | undefined, incom
 }
 
 function selectAvailableMessages(peerId: string): Message[] {
-  return (selectUndelivered.all(peerId, claimCutoffIso()) as Message[]).map(message=>({...message,from_replyable:senderIsReplyable(message.from_id)?1:0}));
+  // A queue often holds several messages from one sender; prove each sender once.
+  const replyable = new Map<string, boolean>();
+  return (selectUndelivered.all(peerId, claimCutoffIso()) as Message[]).map(message=>{
+    let fromReplyable = replyable.get(message.from_id);
+    if (fromReplyable === undefined) {
+      fromReplyable = senderIsReplyable(message.from_id);
+      replyable.set(message.from_id, fromReplyable);
+    }
+    return {...message,from_replyable:fromReplyable?1:0};
+  });
 }
 
 function generateDrainId(peerId: string): string {
@@ -2168,7 +2181,11 @@ const selectSenderReplyable = db.prepare(
   "SELECT non_targetable FROM peers WHERE id = ?",
 );
 
-function senderIsReplyable(fromId:string):boolean {return resolveFreshPeer({id:fromId}).ok;}
+// Replyability needs only the verdict, never stale-id candidates.
+function senderIsReplyable(fromId:string):boolean {
+  if (typeof fromId !== "string" || fromId.length === 0) return false;
+  return resolveFreshPeerById({ id: fromId }, false).ok;
+}
 
 function withSenderReplyWarning(fromId: string, health: RecipientDeliveryHealth): RecipientDeliveryHealth {
   if (senderIsReplyable(fromId)) return health;
@@ -2356,6 +2373,49 @@ function selectorWithoutId(selector: PeerSelector): PeerSelector {
   return rest;
 }
 
+// An id selector can only resolve to that row, and activeOnly() ranks a row
+// only against rows on the same seat. Prove liveness for that seat alone; the
+// whole-table proof runs only to list candidates for a stale id. Sender
+// replyability is checked for every polled message, so a table scan here made
+// each /poll-messages cost one runtime proof per stored row.
+function resolveFreshPeerById(targetSelector: PeerSelector & { id: string }, withCandidates: boolean): ResolvePeerResult {
+  const stored=selectPeerById.get(targetSelector.id) as Peer|null;
+  if(liveGroupPrefix(stored?.seat_key)){
+    const target=liveGroups.target(targetSelector.id);
+    return target && peerMatchesSelector(target,selectorWithoutId(targetSelector))
+      ? {ok:true,peer:target} : {ok:false,code:"STALE_PEER_ID",error:"runtime mailbox group is inactive or selector conflicts"};
+  }
+  const staleById = selectTargetablePeerById.get(targetSelector.id) as Peer | null;
+  if (!staleById) return { ok: false, code: "PEER_NOT_FOUND", error: `Peer ${targetSelector.id} not found` };
+  const allPeers = selectAllTargetablePeers.all() as Peer[];
+  const seatKey = activePeerKey(staleById);
+  const seatPeers = allPeers.filter((p) => activePeerKey(p) === seatKey);
+  const liveIdMatch = activeOnly(livePeersForResolution(seatPeers)).find((p) => p.id === targetSelector.id) ?? null;
+  if (liveIdMatch) {
+    if (peerMatchesSelector(liveIdMatch, targetSelector)) return { ok: true, peer: liveIdMatch };
+    return {
+      ok: false,
+      code: "PEER_NOT_FOUND",
+      error: `Peer ${targetSelector.id} is live but does not match the full target selector`,
+      candidates: [describePeerTarget(liveIdMatch)],
+    };
+  }
+  const supplementalSelector = selectorWithoutId(targetSelector);
+  const hasSupplementalFields = selectorFields(supplementalSelector).length > 0;
+  const candidates = withCandidates
+    ? activeOnly(livePeersForResolution(allPeers))
+      .filter((p) => sameSeatOrName(staleById, p))
+      .filter((p) => !hasSupplementalFields || peerMatchesSelector(p, supplementalSelector))
+      .map(describePeerTarget)
+    : [];
+  return {
+    ok: false,
+    code: "STALE_PEER_ID",
+    error: `Peer ${targetSelector.id} is stale or no longer the active peer for its seat`,
+    candidates,
+  };
+}
+
 function resolveFreshPeer(selector: PeerSelector | undefined): ResolvePeerResult {
   const invalid = selectorValidationFailure(selector);
   if (invalid) return invalid;
@@ -2368,45 +2428,8 @@ function resolveFreshPeer(selector: PeerSelector | undefined): ResolvePeerResult
   // recover their pane but never their session name, so demanding the session made
   // "address the pane you can see" fail for exactly the lanes that needed it.
 
-  const allPeers = selectAllTargetablePeers.all() as Peer[];
-  const staleById = targetSelector.id ? allPeers.find((p) => p.id === targetSelector.id) ?? null : null;
-  const activePeers = activeOnly(livePeersForResolution(allPeers));
-
-  if (targetSelector.id) {
-    const stored=selectPeerById.get(targetSelector.id) as Peer|null;
-    if(liveGroupPrefix(stored?.seat_key)){
-      const target=liveGroups.target(targetSelector.id);
-      return target && peerMatchesSelector(target,selectorWithoutId(targetSelector))
-        ? {ok:true,peer:target} : {ok:false,code:"STALE_PEER_ID",error:"runtime mailbox group is inactive or selector conflicts"};
-    }
-    const liveIdMatch = activePeers.find((p) => p.id === targetSelector.id) ?? null;
-    if (liveIdMatch) {
-      if (peerMatchesSelector(liveIdMatch, targetSelector)) return { ok: true, peer: liveIdMatch };
-      return {
-        ok: false,
-        code: "PEER_NOT_FOUND",
-        error: `Peer ${targetSelector.id} is live but does not match the full target selector`,
-        candidates: [describePeerTarget(liveIdMatch)],
-      };
-    }
-    const supplementalSelector = selectorWithoutId(targetSelector);
-    const hasSupplementalFields = selectorFields(supplementalSelector).length > 0;
-    const candidates = staleById
-      ? activePeers
-        .filter((p) => sameSeatOrName(staleById, p))
-        .filter((p) => !hasSupplementalFields || peerMatchesSelector(p, supplementalSelector))
-        .map(describePeerTarget)
-      : [];
-    if (staleById) {
-      return {
-        ok: false,
-        code: "STALE_PEER_ID",
-        error: `Peer ${targetSelector.id} is stale or no longer the active peer for its seat`,
-        candidates,
-      };
-    }
-    return { ok: false, code: "PEER_NOT_FOUND", error: `Peer ${targetSelector.id} not found` };
-  }
+  if (targetSelector.id) return resolveFreshPeerById({ ...targetSelector, id: targetSelector.id }, true);
+  const activePeers = activeOnly(livePeersForResolution(selectAllTargetablePeers.all() as Peer[]));
 
   const matches = activePeers.filter((p) => peerMatchesSelector(p, targetSelector));
   if (matches.length === 0) {
