@@ -77,7 +77,7 @@ describe("sender replyability is proved per seat", () => {
     });
   }
 
-  async function replyableBySender(targetId: string): Promise<Map<string, number | undefined>> {
+  async function replyableBySender(targetId: string): Promise<Map<string, boolean | number | undefined>> {
     const inbox = await call<{ messages: Message[] }>("/poll-messages", { id: targetId });
     return new Map(inbox.messages.map((m) => [m.from_id, m.from_replyable]));
   }
