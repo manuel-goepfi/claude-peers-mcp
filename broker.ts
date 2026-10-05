@@ -13,6 +13,7 @@ import { primeRuntimePaneRows, runtimeProcessStats, withRuntimePaneSnapshot } fr
 
 import { Database } from "bun:sqlite";
 import { LiveMailboxGroups,liveGroupPrefix,liveMailboxIdsSql } from "./shared/live-mailbox-groups.ts";
+import { seatProcessState } from "./shared/live-runtime-proof.ts";
 import { readFileSync, readdirSync, writeFileSync, renameSync, chmodSync, statSync, existsSync, truncateSync, unlinkSync } from "node:fs";
 import { timingSafeEqual } from "node:crypto";
 // L6: top-level node:fs import (was inline require() in verifyPidUid hot path).
@@ -650,6 +651,13 @@ const updateName = db.prepare(`
 
 const deletePeer = db.prepare(`
   DELETE FROM peers WHERE id = ? AND (seat_key IS NULL OR seat_key NOT LIKE 'live:%')
+`);
+
+// deletePeer never removes a runtime-group row. The reaper retires one only
+// after proving its pinned process ended, and only while the row still carries
+// that exact seat key (a re-pinned row is a different decision).
+const deleteEndedLiveGroupPeer = db.prepare(`
+  DELETE FROM peers WHERE id = ? AND seat_key = ?
 `);
 
 const countUnreadForPeer = db.prepare(`
@@ -2233,43 +2241,82 @@ function recipientHealthFor(peer: Peer): RecipientDeliveryHealth {
   });
 }
 
+// Retire a dead seat's row, or keep it as a recoverable inbox while it still
+// holds mail inside the dead-mail TTL. Always returns false (not an active peer).
+function reapDeadSeat(p: Peer, now: number, remove: (peer: Peer) => void = (peer) => deletePeer.run(peer.id)): false {
+  // Decouple mail-reap from row-reap: a DEAD seat that still holds
+  // undelivered mail is a RECOVERABLE INBOX, not garbage. The rehydrate
+  // path inherits a confirmed-dead seat at ANY age (the deaf-seat fix) and
+  // surfaces that mail to the re-registering session — but only if the mail
+  // still exists. Deleting it here at the 1h mark defeats that recovery
+  // (the bug adversarial review caught). So preserve the row+mail when there
+  // IS pending mail; reap normally (row + buckets) when the inbox is empty,
+  // which still bounds tombstone growth — only seats with unrecovered mail
+  // persist, and they are exactly what we must not silently drop (6154e28).
+  //
+  // BUT only preserve a seat with a VALID last_seen. A malformed/corrupt
+  // timestamp (NaN → reapable-by-age) signals untrustworthy state; preserving
+  // it on pending-mail would leak corrupt tombstones forever. Those reap
+  // normally even with mail (a deliberately narrow exception).
+  const lastSeenValid = Number.isFinite(new Date(p.last_seen).getTime());
+  const pending = lastSeenValid ? (countUndelivered.get(p.id) as { n: number }).n : 0;
+  // Preserve a dead-with-mail seat as a recoverable inbox — but only WITHIN the
+  // TTL. Past DEAD_MAIL_TTL_MS the session has not returned to inherit (24h+);
+  // reap the row + its stranded mail instead of keeping it forever (the leak).
+  const ageMs = now - new Date(p.last_seen).getTime();
+  if (pending > 0 && !deadSeatMailExpired(ageMs, DEAD_MAIL_TTL_MS, REHYDRATE_WINDOW_MS)) {
+    buckets.delete(p.id);   // drop the live SSE bucket; keep row + mail on disk
+    return false;            // still not an active peer — just a retained inbox
+  }
+  remove(p);
+  db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [p.id]);
+  buckets.delete(p.id);
+  return false;
+}
+
+// A runtime mailbox group is pinned to one native process life and never
+// transfers, yet its rows were exempt from reaping: every ended group stayed in
+// the table for good (1,464 of 1,541 rows on the live host, 2026-10-05), and
+// every whole-table scan paid a database read and a procfs read for each one.
+// liveGroups.current() is null both for an ended process and for a transient
+// proof failure (tmux or procfs unavailable), so only a proven end retires a
+// row: ESRCH, or a different incarnation of the pinned process key.
+function endedLiveGroupRow(p: Peer, now: number): boolean {
+  const processKey = p.seat_key?.split(":")[3] ?? null;
+  if (seatProcessState(p.pid, processKey) !== "ended") return false;
+  const lastSeenMs = new Date(p.last_seen).getTime();
+  const ageMs = Number.isNaN(lastSeenMs) ? Infinity : now - lastSeenMs;
+  return ageMs > REHYDRATE_WINDOW_MS;
+}
+
+// The first sweep after deploying ended-group reaping finds the whole backlog
+// (about 1,460 rows on the live host). Retire it a batch per pass so no single
+// pass holds the event loop for long; the rest goes on the next pass.
+const LIVE_GROUP_REAP_BATCH = 250;
+
 function liveAndFreshPeers(peers: Peer[]): Peer[] {
   const now = Date.now();
-  return peers.filter((p) => {
-    if(liveGroupPrefix(p.seat_key))return Boolean(liveGroups.current(p.id));
-    if (peerIsReapable(p, now)) {
-      if (!shouldPermanentlyReapPeer(p, now)) return false;
-      // Decouple mail-reap from row-reap: a DEAD seat that still holds
-      // undelivered mail is a RECOVERABLE INBOX, not garbage. The rehydrate
-      // path inherits a confirmed-dead seat at ANY age (the deaf-seat fix) and
-      // surfaces that mail to the re-registering session — but only if the mail
-      // still exists. Deleting it here at the 1h mark defeats that recovery
-      // (the bug adversarial review caught). So preserve the row+mail when there
-      // IS pending mail; reap normally (row + buckets) when the inbox is empty,
-      // which still bounds tombstone growth — only seats with unrecovered mail
-      // persist, and they are exactly what we must not silently drop (6154e28).
-      //
-      // BUT only preserve a seat with a VALID last_seen. A malformed/corrupt
-      // timestamp (NaN → reapable-by-age) signals untrustworthy state; preserving
-      // it on pending-mail would leak corrupt tombstones forever. Those reap
-      // normally even with mail (a deliberately narrow exception).
-      const lastSeenValid = Number.isFinite(new Date(p.last_seen).getTime());
-      const pending = lastSeenValid ? (countUndelivered.get(p.id) as { n: number }).n : 0;
-      // Preserve a dead-with-mail seat as a recoverable inbox — but only WITHIN the
-      // TTL. Past DEAD_MAIL_TTL_MS the session has not returned to inherit (24h+);
-      // reap the row + its stranded mail instead of keeping it forever (the leak).
-      const ageMs = now - new Date(p.last_seen).getTime();
-      if (pending > 0 && !deadSeatMailExpired(ageMs, DEAD_MAIL_TTL_MS, REHYDRATE_WINDOW_MS)) {
-        buckets.delete(p.id);   // drop the live SSE bucket; keep row + mail on disk
-        return false;            // still not an active peer — just a retained inbox
+  // Decide first, then apply every reap in one transaction: one commit (and
+  // one WAL sync) per pass instead of two per reaped row.
+  const reaps: Array<() => void> = [];
+  let groupReaps = 0;
+  const live = peers.filter((p) => {
+    if(liveGroupPrefix(p.seat_key)){
+      if(liveGroups.current(p.id))return true;
+      if (groupReaps < LIVE_GROUP_REAP_BATCH && endedLiveGroupRow(p, now)) {
+        groupReaps++;
+        reaps.push(() => reapDeadSeat(p, now, (peer) => deleteEndedLiveGroupPeer.run(peer.id, peer.seat_key ?? null)));
       }
-      deletePeer.run(p.id);
-      db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [p.id]);
-      buckets.delete(p.id);
+      return false;
+    }
+    if (peerIsReapable(p, now)) {
+      if (shouldPermanentlyReapPeer(p, now)) reaps.push(() => reapDeadSeat(p, now));
       return false;
     }
     return true;
   });
+  if (reaps.length > 0) db.transaction(() => { for (const reap of reaps) reap(); })();
+  return live;
 }
 
 function livePeersForResolution(peers: Peer[]): Peer[] {
