@@ -11,8 +11,11 @@ positive_int() {
 }
 
 ACTIVE_SECONDS=$(positive_int "${CLAUDE_PEERS_STANDBY_ACTIVE_SECONDS:-3600}" 3600)
-POLL_INTERVAL=$(positive_int "${CLAUDE_PEERS_STANDBY_POLL_INTERVAL_SECONDS:-10}" 10)
-IDLE_INTERVAL=$(positive_int "${CLAUDE_PEERS_STANDBY_IDLE_INTERVAL_SECONDS:-60}" 60)
+# Every idle Claude session runs one watcher, and each tick is a broker claim.
+# 30s/120s keeps a 20+ session fleet near one claim per second in the fast
+# window (2026-10-05: 10s/60s added ~2 claims/s to an already saturated broker).
+POLL_INTERVAL=$(positive_int "${CLAUDE_PEERS_STANDBY_POLL_INTERVAL_SECONDS:-30}" 30)
+IDLE_INTERVAL=$(positive_int "${CLAUDE_PEERS_STANDBY_IDLE_INTERVAL_SECONDS:-120}" 120)
 LOCK_WAIT=$(positive_int "${CLAUDE_PEERS_STANDBY_LOCK_WAIT_SECONDS:-2}" 2)
 BROKER_PORT="${CLAUDE_PEERS_PORT:-7899}"
 FALLBACK_HOME="${HOME:-${TMPDIR:-/tmp}}"

@@ -108,7 +108,7 @@ CODEX_HOME="$HOME/.codex-b" bun bin/install-codex-hook.ts install
 CODEX_HOME="$HOME/.codex-b" bun bin/install-codex-hook.ts --check
 ```
 
-- Claude: `SessionStart` registration, `UserPromptSubmit` drain, `PostToolBatch` drain between tool batches, and a `Stop` `asyncRewake` standby watcher. The watcher polls every 10 seconds for the first hour after activity, then every 60 seconds while the Claude process remains alive; later Stop events refresh the fast window without spawning duplicate watchers.
+- Claude: `SessionStart` registration, `UserPromptSubmit` drain, `PostToolBatch` drain between tool batches, and a `Stop` `asyncRewake` standby watcher. The watcher polls every 30 seconds for the first hour after activity, then every 120 seconds while the Claude process remains alive; later Stop events refresh the fast window without spawning duplicate watchers.
 - Codex: proven root-session hooks register and drain at `SessionStart`, drain at `UserPromptSubmit`, drain after each local `PostToolUse`, and drain at `Stop`. The hook proves the root by matching `session_id` to the rollout transcript filename; transcript-less drains use only the exact thread join and never mint identity. Unproven internal or child hooks leave mail queued for `check_messages` or the next proven root hook.
 
 The post-tool hooks are the supported mid-turn receive path. They inject queued mail before the next model request without typing into a busy pane. A tool-free model call cannot be interrupted and receives mail at its next supported hook boundary.
@@ -292,8 +292,8 @@ History intentionally outlives ephemeral peer rows. Schema version 2 has no mess
 | `CLAUDE_PEERS_ADAPTIVE_POLLING` | `true` | Compatibility observation-poll scheduler; inactive for every current client. |
 | `CLAUDE_CONFIG_DIR` | `$HOME/.claude` | Claude profile directory used by the hook installer and hook logs. |
 | `CLAUDE_PEERS_STANDBY_ACTIVE_SECONDS` | `3600` | Fast standby-poll window after each Claude Stop event. |
-| `CLAUDE_PEERS_STANDBY_POLL_INTERVAL_SECONDS` | `10` | Poll cadence during the fast standby window. |
-| `CLAUDE_PEERS_STANDBY_IDLE_INTERVAL_SECONDS` | `60` | Reduced cadence after the fast window while Claude remains alive. |
+| `CLAUDE_PEERS_STANDBY_POLL_INTERVAL_SECONDS` | `30` | Poll cadence during the fast standby window. |
+| `CLAUDE_PEERS_STANDBY_IDLE_INTERVAL_SECONDS` | `120` | Reduced cadence after the fast window while Claude remains alive. |
 | `CLAUDE_PEERS_STANDBY_LOCK_WAIT_SECONDS` | `2` | Bounded takeover wait for a prior watcher. |
 | `CLAUDE_PEERS_STANDBY_RUNTIME_DIR` | `$XDG_RUNTIME_DIR` or `$HOME/.cache` | Owner-only watcher lock and atomic session state root. |
 | `CLAUDE_PEERS_TMUX_UNCHANGED_WRITE_SUPPRESSION` | `true` | Skip unchanged identity stamps; failed stamps receive three bounded retries. |
