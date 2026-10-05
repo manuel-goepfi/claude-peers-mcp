@@ -76,6 +76,19 @@ function legacyDatabase(path: string): Database {
 }
 
 describe("versioned historical-message migration", () => {
+  test("storage runs WAL with NORMAL sync so commits do not fsync on the event loop", () => {
+    const dir = root();
+    const db = new Database(join(dir, "sync.db"));
+    try {
+      initializeStorage(db, { databasePath: join(dir, "sync.db") });
+      expect((db.query("PRAGMA journal_mode").get() as { journal_mode: string }).journal_mode).toBe("wal");
+      // 1 = NORMAL; SQLite's default of 2 (FULL) syncs the WAL on every commit.
+      expect((db.query("PRAGMA synchronous").get() as { synchronous: number }).synchronous).toBe(1);
+    } finally {
+      db.close();
+    }
+  });
+
   test("sequence high-water calculation stays bounded for million-row histories", () => {
     const ids = Array.from({ length: 1_000_000 }, (_, index) => index + 1);
     expect(maximumSequenceHighWater(5, ids)).toBe(1_000_000);
