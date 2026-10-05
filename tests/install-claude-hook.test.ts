@@ -54,7 +54,7 @@ describe("Claude hook installer", () => {
       const postToolHooks = doc.hooks.PostToolBatch!.flatMap((bucket) => bucket.hooks ?? []);
       const postToolDrain = postToolHooks.find((hook) => hook.command?.includes("claude-drain-peer-inbox.sh"));
       expect(postToolDrain?.command).toContain("CLAUDE_PEERS_HOOK_EVENT_NAME=PostToolBatch");
-      expect(postToolDrain).toMatchObject({ timeout: 10 });
+      expect(postToolDrain).toMatchObject({ timeout: 30 });
       const stopHooks = doc.hooks.Stop!.flatMap((bucket) => bucket.hooks ?? []);
       const standby = stopHooks.find((hook) => hook.command?.includes("claude-standby-watcher.sh"));
       expect(standby).toMatchObject({ async: true, asyncRewake: true, timeout: 2_592_000 });
