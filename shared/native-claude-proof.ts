@@ -15,6 +15,11 @@ const clockTicks = await (async (): Promise<number | null> => {
   } catch { return null; }
 })();
 
+/** CLK_TCK resolved once at startup; null when it could not be read. */
+export function clockTicksPerSecond(): number | null {
+  return clockTicks;
+}
+
 // Read only process metadata, never the environment or terminal contents.
 export function nearestNativeClaude(callerPid: number): { pid: number; bornAt: number; callerBornAt: number } | null {
   if (!Number.isInteger(callerPid) || callerPid <= 1) return null;

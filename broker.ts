@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { ensurePaneOperatorLabel } from "./bin/tmux-label-pane.ts";
 import { primeRuntimePaneRows, withRuntimePaneSnapshot } from "./shared/runtime-pane-snapshot.ts";
+import { clockTicksPerSecond } from "./shared/native-claude-proof.ts";
 /**
  * claude-peers broker daemon
  *
@@ -392,7 +393,20 @@ for (const row of db.query("SELECT id, name, resolved_name FROM peers WHERE name
 // The discard return is intentional — the side effects (DELETE rows, DELETE
 // undelivered messages, bucket cleanup) are what the periodic sweep needs;
 // the returned "live" list is unused here.
-function cleanStalePeers() {
+// Ticks are 30s apart, but an async pane read can outlast one under tmux
+// pressure; never stack sweeps.
+let sweepInFlight = false;
+async function cleanStalePeers() {
+  if (sweepInFlight) return;
+  sweepInFlight = true;
+  try {
+    await sweepStalePeers();
+  } finally {
+    sweepInFlight = false;
+  }
+}
+
+async function sweepStalePeers() {
   // Per-mechanism crash isolation. The three mechanisms below (peer reap /
   // orphan+delivered mail purge / log rotation) are independent — a throw in one
   // must not abort the others on this tick, nor recur into starving them on every
@@ -402,7 +416,15 @@ function cleanStalePeers() {
   // rotateBrokerLogIfLarge is already self-guarding (its own try/catch), so it is
   // not re-wrapped here.
   try {
-    liveAndFreshPeers(selectAllPeers.all() as Peer[]);
+    // Runtime-group proofs read tmux pane rows. Prime them with the same
+    // bounded, coalesced async reads requests use, then prove from that
+    // snapshot: the sweep must never run tmux synchronously on the event loop.
+    // A socket that cannot be read leaves its groups unproven, which is not
+    // proof of death, so nothing is reaped on a tmux failure.
+    await withRuntimePaneSnapshot(async () => {
+      await primeLivePaneProofs({}, "/sweep");
+      liveAndFreshPeers(selectAllPeers.all() as Peer[]);
+    }, true);
   } catch (e) {
     if (!reapStageWarned) {
       reapStageWarned = true;
@@ -1330,7 +1352,7 @@ function nativeCodexKeeper(input: Pick<RegisterRequest,"pid"|"tmux_pane_id"|"cwd
     || !pidWithAncestors(input.pid).includes(pane.pane_pid))return null;
   try {
     const stat=readFileSync(`/proc/${input.pid}/stat`,"utf8");
-    const ticks=Number(Bun.spawnSync(["getconf","CLK_TCK"],{stdout:"pipe",stderr:"ignore"}).stdout.toString().trim());
+    const ticks=clockTicksPerSecond() ?? NaN;
     const boot=Number(readFileSync("/proc/stat","utf8").match(/^btime (\d+)$/m)?.[1]);
     const born=(boot+Number(stat.slice(stat.lastIndexOf(")")+1).trim().split(/\s+/)[19])/ticks)*1000;
     if(!(ticks>0) || !Number.isFinite(born) || !Number.isFinite(Date.parse(keeper.registered_at)) || Date.parse(keeper.registered_at)+1000<born)return null;
