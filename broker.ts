@@ -2236,21 +2236,34 @@ function endedLiveGroupRow(p: Peer, now: number): boolean {
   return ageMs > REHYDRATE_WINDOW_MS;
 }
 
+// The first sweep after deploying ended-group reaping finds the whole backlog
+// (about 1,460 rows on the live host). Retire it a batch per pass so no single
+// pass holds the event loop for long; the rest goes on the next pass.
+const LIVE_GROUP_REAP_BATCH = 250;
+
 function liveAndFreshPeers(peers: Peer[]): Peer[] {
   const now = Date.now();
-  return peers.filter((p) => {
+  // Decide first, then apply every reap in one transaction: one commit (and
+  // one WAL sync) per pass instead of two per reaped row.
+  const reaps: Array<() => void> = [];
+  let groupReaps = 0;
+  const live = peers.filter((p) => {
     if(liveGroupPrefix(p.seat_key)){
       if(liveGroups.current(p.id))return true;
-      return endedLiveGroupRow(p, now)
-        ? reapDeadSeat(p, now, (peer) => deleteEndedLiveGroupPeer.run(peer.id, peer.seat_key ?? null))
-        : false;
+      if (groupReaps < LIVE_GROUP_REAP_BATCH && endedLiveGroupRow(p, now)) {
+        groupReaps++;
+        reaps.push(() => reapDeadSeat(p, now, (peer) => deleteEndedLiveGroupPeer.run(peer.id, peer.seat_key ?? null)));
+      }
+      return false;
     }
     if (peerIsReapable(p, now)) {
-      if (!shouldPermanentlyReapPeer(p, now)) return false;
-      return reapDeadSeat(p, now);
+      if (shouldPermanentlyReapPeer(p, now)) reaps.push(() => reapDeadSeat(p, now));
+      return false;
     }
     return true;
   });
+  if (reaps.length > 0) db.transaction(() => { for (const reap of reaps) reap(); })();
+  return live;
 }
 
 function livePeersForResolution(peers: Peer[]): Peer[] {

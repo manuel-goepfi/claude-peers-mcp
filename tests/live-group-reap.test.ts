@@ -114,4 +114,20 @@ describe("ended runtime mailbox groups are reaped", () => {
     await sweepViaListPeers();
     expect(exists(id)).toBe(true);
   });
+
+  test("a large backlog is retired in bounded batches, one pass at a time", async () => {
+    const ids: string[] = [];
+    db.transaction(() => {
+      for (let i = 0; i < 600; i++) ids.push(insertGroupRow(NEVER_A_PID, hex(32), 2 * HOUR_MS));
+    })();
+    const remaining = () => ids.filter(exists).length;
+    // One pass retires at most one batch (250); rows kept for held mail by the
+    // earlier test also occupy batch slots, so assert bounds, not exact counts.
+    await sweepViaListPeers();
+    const afterFirst = remaining();
+    expect(afterFirst).toBeGreaterThanOrEqual(600 - 250);
+    expect(afterFirst).toBeLessThan(600);
+    for (let pass = 0; pass < 4 && remaining() > 0; pass++) await sweepViaListPeers();
+    expect(remaining()).toBe(0);
+  });
 });
