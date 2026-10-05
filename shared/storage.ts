@@ -607,6 +607,13 @@ function validateCurrentSchema(db: Database): void {
 export function initializeStorage(db: Database, options: InitializeStorageOptions): InitializeStorageResult {
   options.onReadiness?.("starting");
   db.run("PRAGMA journal_mode = WAL");
+  // bun:sqlite commits on the broker's only event-loop thread. The default
+  // synchronous=FULL fsyncs the WAL on every commit, and every claim, ack and
+  // hook heartbeat commits; under host I/O load the broker was sampled waiting
+  // in jbd2_log_wait_commit (2026-10-05). In WAL mode NORMAL keeps the database
+  // consistent across crashes and syncs at checkpoint; a power loss can drop
+  // only the most recent commits, which clients already retry as unacked.
+  db.run("PRAGMA synchronous = NORMAL");
   db.run("PRAGMA busy_timeout = 3000");
   const version = storageUserVersion(db);
   if (version > STORAGE_SCHEMA_VERSION) throw new Error(`database user_version ${version} is newer than supported ${STORAGE_SCHEMA_VERSION}`);
