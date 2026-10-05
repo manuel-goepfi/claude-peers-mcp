@@ -153,7 +153,18 @@ export const storageIndexes = {
   peerReceiverMode: "idx_peers_receiver_mode",
   peerSeatKey: "idx_peers_seat_key",
   peerThreadId: "idx_peers_thread_id",
+  // Expression indexes for the per-request lookups. Thread routes compare
+  // lower(thread_id); runtime-group mailboxes join on the 69-character group
+  // prefix (liveMailboxIdsSql). Without them each claim, ack and queue count
+  // scanned the whole peers table, several times per request.
+  peerThreadLower: "idx_peers_thread_lower",
+  peerLiveGroup: "idx_peers_live_group",
 } as const;
+
+const peerLookupIndexSql = [
+  `CREATE INDEX IF NOT EXISTS ${storageIndexes.peerThreadLower} ON peers(lower(thread_id))`,
+  `CREATE INDEX IF NOT EXISTS ${storageIndexes.peerLiveGroup} ON peers(substr(seat_key, 1, 69))`,
+] as const;
 
 export const storageTriggers = {
   unreadEpisode: "trg_messages_start_unread_episode",
@@ -311,6 +322,7 @@ export function ensureAdditivePeerSchema(db: Database): void {
   ensurePeerColumns(db);
   db.run(`CREATE INDEX IF NOT EXISTS ${storageIndexes.peerSeatKey} ON peers(seat_key)`);
   db.run(`CREATE INDEX IF NOT EXISTS ${storageIndexes.peerThreadId} ON peers(thread_id)`);
+  for (const sql of peerLookupIndexSql) db.run(sql);
   db.run(seatKeyBackfillSql());
   db.run(seatKeyPaneUpgradeSql());
   createTriggers(db);
@@ -345,6 +357,7 @@ function createIndexes(db: Database): void {
   db.run(`CREATE INDEX ${storageIndexes.peerReceiverMode} ON peers(receiver_mode, id)`);
   db.run(`CREATE INDEX ${storageIndexes.peerSeatKey} ON peers(seat_key)`);
   db.run(`CREATE INDEX ${storageIndexes.peerThreadId} ON peers(thread_id)`);
+  for (const sql of peerLookupIndexSql) db.run(sql);
 }
 
 function createTriggers(db: Database): void {
@@ -549,7 +562,8 @@ function migrateLegacy(
     // Peer indexes survive the messages-table rebuild. Rebuild them inside the
     // migration transaction so a current v1 database cannot collide with the
     // final index names and every definition is converged to the v2 contract.
-    for (const index of [storageIndexes.peerReceiverMode, storageIndexes.peerSeatKey, storageIndexes.peerThreadId]) {
+    for (const index of [storageIndexes.peerReceiverMode, storageIndexes.peerSeatKey, storageIndexes.peerThreadId,
+      storageIndexes.peerThreadLower, storageIndexes.peerLiveGroup]) {
       db.run(`DROP INDEX IF EXISTS ${index}`);
     }
     createIndexes(db);
