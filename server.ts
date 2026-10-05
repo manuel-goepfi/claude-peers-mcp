@@ -59,7 +59,7 @@ import {
 } from "./shared/tmux-identity.ts";
 import { frameUntrusted, renderInboundBatch, renderInboundLine } from "./shared/render.ts";
 export { frameUntrusted, renderInboundBatch, renderInboundLine } from "./shared/render.ts";
-import { MCP_SERVER_INSTRUCTIONS, MESSAGE_ROUTING_HINT } from "./shared/peer-authority-policy.ts";
+import { MCP_SERVER_INSTRUCTIONS, MESSAGE_ROUTING_HINT, PEER_COORDINATION_INSTRUCTIONS } from "./shared/peer-instructions.ts";
 import { PEERS_VERSION } from "./shared/version.ts";
 import { brokerIsReady, openOwnerOnlyAppendLog } from "./shared/broker-client.ts";
 import { brokerServiceConfig, installedBrokerServiceIsCurrent } from "./shared/broker-service.ts";
@@ -550,7 +550,7 @@ async function getAbsoluteGitDir(cwd: string): Promise<string | null> {
 function getTty(pid = process.ppid): string | null {
   try {
     if (pid) {
-      const proc = Bun.spawnSync(["ps", "-o", "tty=", "-p", String(pid)]);
+      const proc = Bun.spawnSync(["ps", "-o", "tty=", "-p", String(pid)], { timeout: 2_000 });
       const tty = new TextDecoder().decode(proc.stdout).trim();
       if (tty && tty !== "?" && tty !== "??") {
         return tty;
@@ -658,7 +658,7 @@ export function registrationTtyPid(registerPid: number, clientType: ClientType, 
 
 function processTable(): Map<number, ProcessInfo> {
   try {
-    const proc = Bun.spawnSync(["ps", "-eo", "pid=,ppid=,tty=,comm=,args="]);
+    const proc = Bun.spawnSync(["ps", "-eo", "pid=,ppid=,tty=,comm=,args="], { timeout: 2_000 });
     if (proc.exitCode !== 0) return new Map();
     return parseProcessTableSnapshot(new TextDecoder().decode(proc.stdout));
   } catch (e) {
@@ -809,6 +809,7 @@ function tmuxPaneAlive(paneId: string | undefined): boolean {
     return Bun.spawnSync(tmuxCommand(["display-message", "-p", "-t", paneId, "#{pane_id}"]), {
       stdout: "ignore",
       stderr: "ignore",
+      timeout: 2_000,
     }).exitCode === 0;
   } catch {
     return false;
@@ -1142,7 +1143,7 @@ function tmuxCommand(args: string[]): string[] {
 
 function runTmux(args: string[]): string | null {
   try {
-    const result = Bun.spawnSync(tmuxCommand(args), { stderr: "ignore" });
+    const result = Bun.spawnSync(tmuxCommand(args), { stderr: "ignore", timeout: 2_000 });
     if (result.exitCode !== 0) return null;
     return new TextDecoder().decode(result.stdout).trim();
   } catch {
@@ -1186,6 +1187,7 @@ function setTmuxPaneOption(target: string, optionName: string, value: string): b
     const result = Bun.spawnSync(tmuxCommand(["set-option", "-p", "-t", target, optionName, value]), {
       stdout: "ignore",
       stderr: "ignore",
+      timeout: 2_000,
     });
     return result.exitCode === 0;
   } catch {
@@ -1631,6 +1633,7 @@ async function inspectPeerPane(peerId: string, lineCount = TMUX_CAPTURE_DEFAULT_
   const proc = Bun.spawnSync(tmuxCommand(["capture-pane", "-p", "-t", target, "-S", `-${requestedLines}`]), {
     stdout: "pipe",
     stderr: "pipe",
+    timeout: 2_000,
   });
   if (proc.exitCode !== 0) {
     const stderr = prepareTmuxPaneText(new TextDecoder().decode(proc.stderr), 2048).text.trim();
@@ -1893,7 +1896,7 @@ const TOOLS = [
   {
     name: "check_messages",
     description:
-      "Check for new messages from other peer instances. This is the normal, automatic delivery path for any lane whose receiver_mode is manual-drain: the autodrain poller nudges the pane and the lane calls this. \"Manual\" names the API, not who invokes it — when that poller is running and configured for the client, such lanes receive mail without anyone intervening — but it is not guaranteed, so a lane that has never drained should call this itself. Also a fallback for Claude/Codex/Gemini lanes whose drain hook is missing, has reported an error, or has not run at a recent event boundary.",
+      PEER_COORDINATION_INSTRUCTIONS + " Fetch and acknowledge pending mail for this session. Hook delivery may already have attached messages; process those directly. This tool is the receive path for clients without hooks and a fallback when hook delivery has not run.",
     inputSchema: {
       type: "object" as const,
       properties: {},
@@ -2060,38 +2063,20 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           };
         }
 
-        // Delivery-confirmation: after a short delay, query /message-status
-        // and echo the result. Non-blocking on error — sender still succeeds.
-        let statusLine = "";
-        if (typeof result.id === "number") {
-          await new Promise((r) => setTimeout(r, 2000));
-          try {
-            const s = await brokerFetch<{ ok: boolean; statuses: { id: number; state?: string; delivered: boolean; delivered_at: string | null }[] }>(
-              "/message-status",
-              { id: myId, ids: [result.id] }
-            );
-            const row = s.statuses?.[0];
-            statusLine = messageStatusLine(row, result.target);
-          } catch (e) {
-            // Best-effort confirmation: log to stderr so ops can grep for
-            // repeated failures (auth breakage, broker restart race, etc.).
-            statusLine = " Delivery status unavailable; ask the receiver to check_messages if this handoff is urgent.";
-            log(`message-status probe failed for id=${result.id}: ${errMsg(e)}`);
-          }
-        }
-
-        const pending = await drainPendingMessages();
+        // Return as soon as the broker confirms the durable queue write.
+        // Delivery and inbox reads have their own tools; neither may hold a
+        // sender's tool call open after the message is accepted.
         const tmuxSnapshot = include_tmux_context === true && result.target ? await inspectPeerPane(result.target.id) : null;
         const tmuxText = tmuxSnapshot ? `\n\n${formatTmuxSnapshot(tmuxSnapshot)}` : "";
         return {
-          content: [{ type: "text" as const, text: `Message queued to ${formatPeerTarget(result.target)} request_id=${result.request_id}.${statusLine}${deliveryWarningLine(result.recipient)}${tmuxText}${pending ?? ""}` }],
+          content: [{ type: "text" as const, text: `Message queued to ${formatPeerTarget(result.target)} request_id=${result.request_id}.${deliveryWarningLine(result.recipient)}${tmuxText}` }],
         };
       } catch (e) {
         return {
           content: [
             {
               type: "text" as const,
-              text: `Error sending message: ${e instanceof Error ? e.message : String(e)}`,
+              text: `Send outcome unknown for request_id=${effectiveRequestId}: ${e instanceof Error ? e.message : String(e)}. Retry only with the same request_id.`,
             },
           ],
           isError: true,
@@ -2148,31 +2133,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           };
         }
 
-        let statusLine = "";
-        if (typeof result.id === "number") {
-          await new Promise((r) => setTimeout(r, 2000));
-          try {
-            const s = await brokerFetch<{ ok: boolean; statuses: { id: number; state?: string; delivered: boolean; delivered_at: string | null }[] }>(
-              "/message-status",
-              { id: myId, ids: [result.id] }
-            );
-            const row = s.statuses?.[0];
-            statusLine = messageStatusLine(row, result.target);
-          } catch (e) {
-            statusLine = " Delivery status unavailable; ask the receiver to check_messages if this handoff is urgent.";
-            log(`message-status probe failed for id=${result.id}: ${errMsg(e)}`);
-          }
-        }
-
-        const pending = await drainPendingMessages();
+        // A successful queue write is the send result. Do not wait for
+        // delivery confirmation or drain the sender's inbox on this path.
         const tmuxSnapshot = include_tmux_context === true && result.target ? await inspectPeerPane(result.target.id) : null;
         const tmuxText = tmuxSnapshot ? `\n\n${formatTmuxSnapshot(tmuxSnapshot)}` : "";
         return {
-          content: [{ type: "text" as const, text: `Message queued to ${formatPeerTarget(result.target)} request_id=${result.request_id}.${statusLine}${deliveryWarningLine(result.recipient)}${tmuxText}${pending ?? ""}` }],
+          content: [{ type: "text" as const, text: `Message queued to ${formatPeerTarget(result.target)} request_id=${result.request_id}.${deliveryWarningLine(result.recipient)}${tmuxText}` }],
         };
       } catch (e) {
         return {
-          content: [{ type: "text" as const, text: `Error sending message: ${e instanceof Error ? e.message : String(e)}` }],
+          content: [{ type: "text" as const, text: `Send outcome unknown for request_id=${effectiveRequestId}: ${e instanceof Error ? e.message : String(e)}. Retry only with the same request_id.` }],
           isError: true,
         };
       }

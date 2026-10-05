@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { readFileSync, readlinkSync } from "node:fs";
 import { isClientProcess as sharedIsClientProcess, isCodexAppServerProcess as sharedIsCodexAppServerProcess, parseProcessTableSnapshot, type ProcessInfo } from "../shared/client.ts";
+import { PEER_COORDINATION_INSTRUCTIONS } from "../shared/peer-instructions.ts";
 import { renderInboundBatch } from "../shared/render.ts";
 import type { ClientType, Message, ReceiverMode } from "../shared/types.ts";
 import { findSingleVisibleCodexProcess } from "../shared/visible-codex.ts";
@@ -724,7 +725,7 @@ async function main(): Promise<void> {
   }
 
   const batch = renderInboundBatch(messages);
-  const context = `---\n${messages.length} pending peer message(s):\n\n${batch}`;
+  const context = `${PEER_COORDINATION_INSTRUCTIONS}\n\n---\n${messages.length} pending peer message(s):\n\n${batch}`;
   // Output shape is event-dependent (official Codex hooks contract): Stop
   // ignores additionalContext / plain stdout, but supports decision:"block"
   // with a reason that is fed back to the model — turn-end delivery. All
@@ -732,7 +733,7 @@ async function main(): Promise<void> {
   const output = HOOK_EVENT_NAME === "Stop"
     ? {
       decision: "block",
-      reason: `${messages.length} peer message(s) arrived during this turn. Read and handle them before stopping:\n\n${batch}`,
+      reason: `${PEER_COORDINATION_INSTRUCTIONS}\n\n${messages.length} peer message(s) arrived during this turn. Read and handle them before stopping:\n\n${batch}`,
     }
     : {
       hookSpecificOutput: {

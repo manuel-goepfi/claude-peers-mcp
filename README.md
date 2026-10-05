@@ -35,7 +35,7 @@ A peer row is anchored to a **seat** — the operator-visible place an agent liv
 
 One seat is one row with one id. Several processes legitimately register for the same seat — a Claude session registers its MCP server pid *and*, from the SessionStart hook, its TUI pid — so registration **merges** onto the existing seat instead of minting a second identity: the newest row's id survives, the duplicate's undelivered mail migrates to it, and every registering pid is recorded in `seat_pids`. The seat counts as alive while any of those pids is alive, so an MCP server killed at compact/resume does not make an occupied pane look dead. Merging replaces superseding for co-registrants: nothing is told to step down and no mail is dropped.
 
-Each open tmux pane receives one visible `session.number` name. The number stays
+Each open tmux pane receives one visible `session.number` name. Proven legacy Codex reconnects and heartbeats also repair a stale broker display name to that pane name, preserving the peer ID and mailbox. The number stays
 with that pane while it remains open, even when panes move or layout indexes
 change. Renaming the tmux session changes the prefix and pane numbers. Closing a
 pane releases its number; no permanent seat registry survives the pane.
@@ -326,6 +326,8 @@ CLI commands use a short-lived authenticated, globally non-targetable identity a
 
 `GET /health` is public loopback evidence and exposes only readiness, version, schema version, targetable peer count, and coarse capabilities. Detailed schema/queue/receiver/process/config evidence comes from the same-user doctor. Aggregate runtime metrics use an authenticated route.
 
+`POST /codex-pane-bindings` with `{"caller_pid": <same-user pid>}` (a JSON integer) is a read-only observation route for local dashboards such as T3 Lanes. It returns `{"bindings": [...]}` with only `pid`, `tmux_pane_id`, `thread_id`, and `last_seen` for targetable Codex peers, newest first, at most 500 rows. A row is returned only while its seat is alive (the broker's seat rule: any recorded seat pid alive, or the live-group owner) and its registered pid is still a same-UID Codex client process. It never returns names, tokens, seat pids, or message content. A malformed body or `caller_pid` answers 400, a dead or foreign-UID caller 403, and more than 600 requests per minute for one caller pid 429. `/health` advertises it as `capabilities.observation.codexPaneBindings`.
+
 See [docs/operations.md](docs/operations.md) for startup, migration, rollback, service ownership, and incident procedures.
 
 ## Managed broker service
@@ -346,7 +348,9 @@ bun bin/install-broker-service.ts --uninstall
 
 The AP-063 bridge is a privileged, authenticated history cursor for a same-user observer. Compatibility keeps it enabled by default. Its token grants access to message history; protect it as a secret. Set `CLAUDE_PEERS_BRIDGE_ENABLED=false` for complete removal.
 
-The hook wake poller is separate from core delivery. The binary defaults to disabled; the shipped managed unit opts every supported client into confirmed tmux wake submissions. Native Codex hooks drain during an active turn, while the poller covers mail arriving after the turn is already idle. It re-checks SQLite immediately before transport and never claims or acknowledges mail itself. See [docs/systemd/README.md](docs/systemd/README.md).
+Use `claude-peers` for all agent messaging, including Claude-to-Claude. Keep discussions with the peers involved. For coordination of your assigned work, report to the coordinator named in your assignment. These instructions are carried by tool/startup and automatic receive context; delivered mail has no separate receive-policy block.
+
+The hook wake poller is separate from core delivery. The binary defaults to disabled; the shipped managed unit opts every supported client into confirmed tmux wake submissions. Native Codex hooks drain during an active turn, while the poller covers mail arriving after the turn is already idle. It re-checks SQLite immediately before transport and never claims or acknowledges mail itself. Its notice asks the lane to process attached messages, fetch pending mail with `check_messages` if none are attached, and continue the work. See [docs/systemd/README.md](docs/systemd/README.md).
 
 ## Security model
 

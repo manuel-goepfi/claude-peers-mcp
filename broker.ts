@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 import { ensurePaneOperatorLabel } from "./bin/tmux-label-pane.ts";
-import { runtimeProcessStats, withRuntimePaneSnapshot } from "./shared/runtime-pane-snapshot.ts";
+import { primeRuntimePaneRows, runtimeProcessStats, withRuntimePaneSnapshot } from "./shared/runtime-pane-snapshot.ts";
 /**
  * claude-peers broker daemon
  *
@@ -131,7 +131,7 @@ const server = Bun.serve({
   port: PORT,
   hostname: HOSTNAME,
   fetch(request) {
-    return withRuntimePaneSnapshot(() => requestHandler(request));
+    return withRuntimePaneSnapshot(() => requestHandler(request), true);
   },
 });
 if (server.hostname !== HOSTNAME) {
@@ -242,6 +242,9 @@ const BROKER_CAPABILITIES = {
   },
   metrics: {
     aggregateRuntimeMetrics: runtimeMetrics.enabled,
+  },
+  observation: {
+    codexPaneBindings: true,
   },
 } as const;
 
@@ -786,6 +789,19 @@ const selectIdentityProofByThread = db.prepare(`
   FROM peers
   WHERE non_targetable = 0 AND lower(thread_id) = ?
   ORDER BY last_seen DESC
+`);
+
+// Live Codex pane-to-thread bindings for same-user observers such as T3 Lanes,
+// which otherwise open this database file directly. Token columns stay out;
+// seat columns are read only for the liveness rule and never returned.
+const CODEX_PANE_BINDINGS_LIMIT = 500;
+const selectCodexPaneBindings = db.prepare(`
+  SELECT id, pid, tmux_pane_id, thread_id, seat_key, seat_pids, last_seen
+  FROM peers
+  WHERE client_type = 'codex' AND non_targetable = 0
+    AND tmux_pane_id IS NOT NULL AND thread_id IS NOT NULL
+  ORDER BY last_seen DESC
+  LIMIT ${CODEX_PANE_BINDINGS_LIMIT}
 `);
 
 const claimMessage = db.prepare(`
@@ -1338,6 +1354,17 @@ function nativeCodexKeeper(input: Pick<RegisterRequest,"pid"|"tmux_pane_id"|"cwd
   return keeper;
 }
 
+// Call only after proving the exact native process owns this open pane.
+function canonicalNativeCodexPaneName(peer: Peer): {name:string;resolved_name:string} | null {
+  if (!peer.tmux_pane_id) return null;
+  const label=ensurePaneOperatorLabel(peer.tmux_pane_id);
+  if (label.status!=="preserved" && label.status!=="labeled") return null;
+  if (peer.name!==label.label || peer.resolved_name!==label.label) {
+    updateName.run(label.label,label.label,peer.id);
+  }
+  return {name:label.label,resolved_name:label.label};
+}
+
 function hasAnyMessageHistory(id:string):boolean {
   return Boolean(db.query("SELECT 1 FROM messages WHERE from_id=? OR to_id=? LIMIT 1").get(id,id));
 }
@@ -1359,10 +1386,12 @@ function recoverThreadlessCodex(body:RegisterRequest):RegisterResult|null {
     || peer.cwd!==keeper.cwd || hasAnyMessageHistory(peer.id))) {
     return {ok:false,status:409,error:"Codex duplicate has independent identity or history; automatic replacement refused"};
   }
+  const canonical=canonicalNativeCodexPaneName(keeper);
+  if (!canonical) return {ok:false,status:503,error:"open pane label unavailable; reconnect deferred"};
   // No await: history checks and deletion cannot interleave with incoming mail.
   db.transaction(()=>{for(const duplicate of duplicates)deletePeer.run(duplicate.id);})();
   for(const duplicate of duplicates){buckets.delete(duplicate.id);supersededPeerIds.delete(duplicate.id);}
-  return {ok:true,value:{id:keeper.id,token:keeper.token,name:keeper.name,resolved_name:keeper.resolved_name,
+  return {ok:true,value:{id:keeper.id,token:keeper.token,name:canonical.name,resolved_name:canonical.resolved_name,
     client_type:"codex",receiver_mode:validReceiverMode(keeper.receiver_mode,"codex")}};
 }
 
@@ -3387,6 +3416,64 @@ function handleIdentityByThread(body: { thread_id: string; caller_pid: number })
   };
 }
 
+interface CodexPaneBinding {
+  pid: number;
+  tmux_pane_id: string;
+  thread_id: string;
+  last_seen: string;
+}
+
+/** Is `pid` a live, same-UID Codex client process? EPERM (another UID) is not. */
+function isLiveCodexProcess(pid: number): boolean {
+  if (verifyPidUid(pid) !== null) return false;
+  try {
+    const args = readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0").filter(Boolean).join(" ");
+    const comm = readFileSync(`/proc/${pid}/comm`, "utf8").trim();
+    return isClientProcess({ pid, ppid: 0, comm, args }, "codex");
+  } catch {
+    return false;
+  }
+}
+
+// Read-only observation route. Same caller rule as /identity-by-thread: a live
+// same-UID caller pid; the loopback bind is the transport boundary. The rate
+// check runs first, keyed by the claimed caller pid, so rejected callers are
+// limited too. A row is returned only while its seat is alive (peerSeatAlive)
+// and its registered pid is still a same-UID Codex client process.
+function handleCodexPaneBindings(body: Record<string, unknown>):
+  | { ok: true; value: { bindings: CodexPaneBinding[] } }
+  | { ok: false; status: number; error: string } {
+  const callerPid = body.caller_pid;
+  if (typeof callerPid !== "number" || !Number.isInteger(callerPid) || callerPid <= 1) {
+    return { ok: false, status: 400, error: "invalid caller_pid" };
+  }
+  const limited = rateCheck(`codex-pane-bindings:${callerPid}`, false);
+  if (limited) return { ok: false, status: 429, error: limited };
+  const callerErr = verifyPidUid(callerPid);
+  if (callerErr) return { ok: false, status: 403, error: `caller rejected: ${callerErr}` };
+  const rows = selectCodexPaneBindings.all() as Array<{
+    id: string;
+    pid: number;
+    tmux_pane_id: unknown;
+    thread_id: unknown;
+    seat_key: string | null;
+    seat_pids: string | null;
+    last_seen: string;
+  }>;
+  const bindings: CodexPaneBinding[] = [];
+  for (const row of rows) {
+    if (typeof row.tmux_pane_id !== "string" || typeof row.thread_id !== "string") continue;
+    if (!peerSeatAlive(row) || !isLiveCodexProcess(row.pid)) continue;
+    bindings.push({
+      pid: row.pid,
+      tmux_pane_id: row.tmux_pane_id,
+      thread_id: row.thread_id.toLowerCase(),
+      last_seen: row.last_seen,
+    });
+  }
+  return { ok: true, value: { bindings } };
+}
+
 /**
  * Parent pid from /proc/<pid>/stat, or null.
  *
@@ -3822,6 +3909,69 @@ async function readBoundedJsonBody(request: Request): Promise<
   }
 }
 
+const runtimeSockets = new Map<number, { socket: string | null; expires: number }>();
+function runtimeSocketForPid(pid: number): string | null {
+  if (!Number.isSafeInteger(pid) || pid <= 1) return null;
+  const cached = runtimeSockets.get(pid);
+  if (cached && cached.expires > Date.now()) return cached.socket;
+  if (runtimeSockets.size > 2_048) {
+    for (const [key, value] of runtimeSockets) if (value.expires <= Date.now()) runtimeSockets.delete(key);
+  }
+  let socket: string | null = null;
+  try {
+    const env = readFileSync(`/proc/${pid}/environ`, "utf8");
+    const tmux = env.split("\0").find(value => value.startsWith("TMUX="))?.slice(5).match(/^(\/[^,]*),(\d+),(\d+)$/);
+    if (tmux && statSync(tmux[1]!).isSocket() && statSync(tmux[1]!).uid === process.getuid?.()) socket = tmux[1]!;
+  } catch { /* A missing process is not ownership proof. */ }
+  runtimeSockets.set(pid, { socket, expires: Date.now() + 2_000 });
+  return socket;
+}
+
+async function primeLivePaneProofs(body: Record<string, unknown>, path: string): Promise<void> {
+  if (path === "/register-cli" || path === "/metrics") return;
+  const pids = new Set<number>((db.query("SELECT DISTINCT pid FROM peers WHERE seat_key LIKE 'live:%'").all() as Array<{pid:number}>).map(row => row.pid));
+  for (const value of [body.pid, body.caller_pid, body.adapter_pid]) {
+    if (typeof value === "number" && Number.isSafeInteger(value)) pids.add(value);
+  }
+  const sockets = new Set<string>();
+  for (const pid of pids) {
+    const socket = runtimeSocketForPid(pid);
+    if (socket) sockets.add(socket);
+  }
+  await Promise.all([...sockets].map(socket => primeRuntimePaneRows(socket, path === "/register")));
+}
+
+const liveLabels = new Map<string, { label: string | null; expires: number }>();
+const liveLabelReads = new Map<string, Promise<string | null>>();
+async function liveGroupLabel(socket: string, pane: string, runtimeKey: string): Promise<string | null> {
+  const key = `${runtimeKey}:${pane}`;
+  const cached = liveLabels.get(key);
+  if (cached && cached.expires > Date.now()) return cached.label;
+  if (liveLabels.size > 1_024) {
+    for (const [oldKey, value] of liveLabels) if (value.expires <= Date.now()) liveLabels.delete(oldKey);
+  }
+  let pending = liveLabelReads.get(key);
+  if (!pending) {
+    pending = (async () => {
+      const child = Bun.spawn([process.execPath, new URL("./bin/tmux-label-pane.ts", import.meta.url).pathname, "--print", pane], {
+        env: { ...process.env, CLAUDE_PEERS_TMUX_SOCKET: socket }, stdout: "pipe", stderr: "ignore",
+      });
+      const timer = setTimeout(() => child.kill(), 2_000);
+      try {
+        const [output, code] = await Promise.all([new Response(child.stdout).text(), child.exited]);
+        const label = output.trim();
+        return code === 0 && label.length > 0 && label.length <= 128 && !/[\x00-\x1f\x7f]/.test(label) ? label : null;
+      } catch { return null; }
+      finally { clearTimeout(timer); }
+    })();
+    liveLabelReads.set(key, pending);
+    void pending.finally(() => liveLabelReads.delete(key));
+  }
+  const label = await pending;
+  liveLabels.set(key, { label, expires: Date.now() + (label ? 30_000 : 2_000) });
+  return label;
+}
+
 requestHandler = async (req: Request) => {
     const url = new URL(req.url);
     const path = url.pathname;
@@ -3875,6 +4025,8 @@ requestHandler = async (req: Request) => {
     if (!parsedBody.ok) return Response.json({ error: parsedBody.error }, { status: parsedBody.status });
     const body = parsedBody.value;
 
+    await primeLivePaneProofs(body, path);
+
     try {
       // /register is the only unauthenticated route — it issues the token.
       if (path === "/register") {
@@ -3924,6 +4076,12 @@ requestHandler = async (req: Request) => {
           thread_id: typeof body.thread_id === "string" ? body.thread_id : "",
           caller_pid: Number(body.caller_pid),
         });
+        if (!res.ok) return Response.json({ error: res.error }, { status: res.status });
+        return Response.json(res.value);
+      }
+
+      if (path === "/codex-pane-bindings") {
+        const res = handleCodexPaneBindings(body);
         if (!res.ok) return Response.json({ error: res.error }, { status: res.status });
         return Response.json(res.value);
       }
@@ -4055,15 +4213,14 @@ requestHandler = async (req: Request) => {
             };
             const group=liveGroups.current(auth.id);
             if(group){
-              const label=ensurePaneOperatorLabel(group.proof.pane_id,(args)=>{
-                const result=Bun.spawnSync(["tmux","-S",group.proof.socket_path,...args],{stdout:"pipe",stderr:"ignore",timeout:250});
-                return {ok:result.exitCode===0,out:new TextDecoder().decode(result.stdout).trimEnd()};
-              },group.proof.socket_path);
-              if(label.status==="preserved" || label.status==="labeled"){
-                db.run("UPDATE peers SET name=?,resolved_name=?,tmux_session=? WHERE substr(seat_key,1,69)=?",[label.label,label.label,group.proof.session_name,liveGroupPrefix(group.native.seat_key)!]);
-                response.name=label.label;response.resolved_name=label.label;response.tmux_session=group.proof.session_name;
+              const label=await liveGroupLabel(group.proof.socket_path,group.proof.pane_id,`${group.proof.runtime_key}:${group.proof.session_name}`);
+              if(label){
+                db.run("UPDATE peers SET name=?,resolved_name=?,tmux_session=? WHERE substr(seat_key,1,69)=?",[label,label,group.proof.session_name,liveGroupPrefix(group.native.seat_key)!]);
+                response.name=label;response.resolved_name=label;response.tmux_session=group.proof.session_name;
               }
             }
+            // Legacy Codex name repair runs on proven registration. Keep the
+            // periodic heartbeat free of synchronous tmux/process commands.
             // Seat-supersede (one-shot): a newer process took this peer's exact
             // tmux seat → tell this old server to step down. Cleared on send so the
             // signal fires exactly once; if the old server ignores it (already

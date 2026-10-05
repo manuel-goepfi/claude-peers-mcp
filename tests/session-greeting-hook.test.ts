@@ -301,7 +301,7 @@ describe("two-phase drain: claim → render → emit → ack", () => {
     expect(r.code).toBe(0);
     const ctx = r.output!.hookSpecificOutput.additionalContext;
     expect(ctx).toContain(renderInboundBatch(messages));
-    expect(ctx.match(/<peer-receive-policy source="local-receive-path">/g)).toHaveLength(1);
+    expect(ctx).not.toContain("<peer-receive-policy");
     expect(ctx).not.toContain("\u0000");
     expect(ctx).not.toContain("\u0007");
     expect(ctx).not.toContain("\u007f");
@@ -329,8 +329,7 @@ describe("two-phase drain: claim → render → emit → ack", () => {
     expect(r.code).toBe(0);
     const ctx = r.output!.hookSpecificOutput.additionalContext;
     expect(ctx).toContain("2 peer message(s) were queued");
-    expect(ctx).toContain('<peer-receive-policy source="local-receive-path">');
-    expect(ctx.indexOf("<peer-receive-policy")).toBeLessThan(ctx.indexOf("<peer-message "));
+    expect(ctx).not.toContain('<peer-receive-policy');
     const correlatedMessageTag = ctx.match(/<peer-message from="peer-a"[^>]*>/)?.[0];
     expect(correlatedMessageTag).toContain('sent_at="2026-07-21T10:00:00Z"');
     expect(correlatedMessageTag).toContain('relayed="false"');
