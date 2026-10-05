@@ -575,7 +575,7 @@ describe("reaper controls are WIRED into the broker (source-grep sentinels)", ()
     // single-wrapper rewrite goes RED.
     const tryCount = (body.match(/\btry\s*\{/g) ?? []).length;
     expect(tryCount).toBeGreaterThanOrEqual(2);
-    expect(body).toMatch(/withRuntimePaneSnapshot\(\(\) => liveAndFreshPeers\(selectAllPeers\.all\(\) as Peer\[\]\)\);/);
+    expect(body).toMatch(/liveAndFreshPeers\(selectAllPeers\.all\(\) as Peer\[\]\);/);
     expect(body).toMatch(/reapStageWarned/);
     expect(body).toMatch(/mailPurgeStageWarned/);
   });
