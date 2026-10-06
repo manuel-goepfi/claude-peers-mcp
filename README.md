@@ -35,6 +35,17 @@ A peer row is anchored to a **seat** — the operator-visible place an agent liv
 
 One seat is one row with one id. Several processes legitimately register for the same seat — a Claude session registers its MCP server pid *and*, from the SessionStart hook, its TUI pid — so registration **merges** onto the existing seat instead of minting a second identity: the newest row's id survives, the duplicate's undelivered mail migrates to it, and every registering pid is recorded in `seat_pids`. The seat counts as alive while any of those pids is alive, so an MCP server killed at compact/resume does not make an occupied pane look dead. Merging replaces superseding for co-registrants: nothing is told to step down and no mail is dropped.
 
+Each open tmux pane receives one visible `session.number` name. Proven legacy Codex reconnects and heartbeats also repair a stale broker display name to that pane name, preserving the peer ID and mailbox. The number stays
+with that pane while it remains open, even when panes move or layout indexes
+change. Renaming the tmux session changes the prefix and pane numbers. Closing a
+pane releases its number; no permanent seat registry survives the pane.
+
+Native Claude and its MCP companion may share one runtime-scoped mailbox after
+the hook proves the exact conversation, account, process lifetime, and pane.
+The original peer IDs remain intact for history and correlation. An alias cannot
+be selected as a second seat, inherit a display name, or survive a native
+process replacement without fresh proof.
+
 ## Clean installation
 
 ```bash
@@ -97,7 +108,7 @@ CODEX_HOME="$HOME/.codex-b" bun bin/install-codex-hook.ts install
 CODEX_HOME="$HOME/.codex-b" bun bin/install-codex-hook.ts --check
 ```
 
-- Claude: `SessionStart` registration, `UserPromptSubmit` drain, `PostToolBatch` drain between tool batches, and a `Stop` `asyncRewake` standby watcher. The watcher polls every 10 seconds for the first hour after activity, then every 60 seconds while the Claude process remains alive; later Stop events refresh the fast window without spawning duplicate watchers.
+- Claude: `SessionStart` registration, `UserPromptSubmit` drain, `PostToolBatch` drain between tool batches, and a `Stop` `asyncRewake` standby watcher. The watcher polls every 30 seconds for the first hour after activity, then every 120 seconds while the Claude process remains alive; later Stop events refresh the fast window without spawning duplicate watchers.
 - Codex: proven root-session hooks register and drain at `SessionStart`, drain at `UserPromptSubmit`, drain after each local `PostToolUse`, and drain at `Stop`. The hook proves the root by matching `session_id` to the rollout transcript filename; transcript-less drains use only the exact thread join and never mint identity. Unproven internal or child hooks leave mail queued for `check_messages` or the next proven root hook.
 
 The post-tool hooks are the supported mid-turn receive path. They inject queued mail before the next model request without typing into a busy pane. A tool-free model call cannot be interrupted and receives mail at its next supported hook boundary.
@@ -112,10 +123,37 @@ protocol unchanged. It observes only successful root `thread/start` and
 loopback broker. This path does not depend on pane width, status-line text, or
 cwd uniqueness.
 
-The wrapper requires a verified `TMUX_PANE` for peer binding. Outside tmux it
-still performs the Desktop co-attach, but it deliberately creates no targetable
-peer identity because there is no exact pane proof; use a normal pane-local
-Codex session when non-tmux peer tools are required. The relay creates a 0700
+When an operator installs `~/bin/codexr`, bare `resume` and `resume --all`
+use its `--desktop` indexed picker before starting a relay. An exact selected
+UUID re-enters this shared launcher. Other resume flags keep the native path.
+`CLAUDE_PEERS_CODEX_RESUME_PICKER` overrides that optional executable; set it
+to `native` to retain the native picker. Custom upstream socket overrides
+keep the native path rather than silently changing the selected socket.
+
+Ephemeral `thread/start` helpers are ignored. The native TUI creates these
+for structured background work on the same connection; they must not replace
+the displayed task's peer binding.
+
+Headless shared-server registration hooks use exact thread identity when they
+have no proved inherited pane. The presence of a single visible TUI elsewhere
+on the host is not an identity proof and is never adopted by that hook.
+
+For the standard A/B/C account homes, the launcher also enables automatic
+`[A]`, `[B]`, or `[C]` task-title prefixes. The relay preserves client messages
+and adds a scoped `thread/name/set` request when the displayed task receives a
+descriptive name, including names changed by another UI subscriber. Existing
+names are labeled on resume. Already labeled names do not trigger another
+write. Empty names, other tasks, and ephemeral helpers are ignored. Unknown
+homes or a socket override pointing outside the selected home disable labeling
+rather than guessing an account. There is no polling or model call for labels.
+
+The wrapper requires a verified `TMUX_PANE` for pane binding. Outside tmux it
+still performs the Desktop co-attach without inventing a terminal seat. Desktop
+MCP messaging can use an exact hook-owned thread identity only when its PID
+matches the adapter's independently discovered app-server host, its receiver is
+`codex-hook`, and all terminal/seat fields are null. Such identities are not
+tmux wake targets. Both paths connect to the exact verified account socket,
+including an explicit socket override. The relay creates a 0700
 runtime directory under `$XDG_RUNTIME_DIR` or `/tmp`, a 0600 Unix socket and
 readiness file, and an owner-only log at
 `$CODEX_HOME/logs/codex-shared-relay-<pane>.log`. The wrapper removes its socket
@@ -254,8 +292,8 @@ History intentionally outlives ephemeral peer rows. Schema version 2 has no mess
 | `CLAUDE_PEERS_ADAPTIVE_POLLING` | `true` | Compatibility observation-poll scheduler; inactive for every current client. |
 | `CLAUDE_CONFIG_DIR` | `$HOME/.claude` | Claude profile directory used by the hook installer and hook logs. |
 | `CLAUDE_PEERS_STANDBY_ACTIVE_SECONDS` | `3600` | Fast standby-poll window after each Claude Stop event. |
-| `CLAUDE_PEERS_STANDBY_POLL_INTERVAL_SECONDS` | `10` | Poll cadence during the fast standby window. |
-| `CLAUDE_PEERS_STANDBY_IDLE_INTERVAL_SECONDS` | `60` | Reduced cadence after the fast window while Claude remains alive. |
+| `CLAUDE_PEERS_STANDBY_POLL_INTERVAL_SECONDS` | `30` | Poll cadence during the fast standby window. |
+| `CLAUDE_PEERS_STANDBY_IDLE_INTERVAL_SECONDS` | `120` | Reduced cadence after the fast window while Claude remains alive. |
 | `CLAUDE_PEERS_STANDBY_LOCK_WAIT_SECONDS` | `2` | Bounded takeover wait for a prior watcher. |
 | `CLAUDE_PEERS_STANDBY_RUNTIME_DIR` | `$XDG_RUNTIME_DIR` or `$HOME/.cache` | Owner-only watcher lock and atomic session state root. |
 | `CLAUDE_PEERS_TMUX_UNCHANGED_WRITE_SUPPRESSION` | `true` | Skip unchanged identity stamps; failed stamps receive three bounded retries. |
@@ -288,6 +326,8 @@ CLI commands use a short-lived authenticated, globally non-targetable identity a
 
 `GET /health` is public loopback evidence and exposes only readiness, version, schema version, targetable peer count, and coarse capabilities. Detailed schema/queue/receiver/process/config evidence comes from the same-user doctor. Aggregate runtime metrics use an authenticated route.
 
+`POST /codex-pane-bindings` with `{"caller_pid": <same-user pid>}` (a JSON integer) is a read-only observation route for local dashboards such as T3 Lanes. It returns `{"bindings": [...]}` with only `pid`, `tmux_pane_id`, `thread_id`, and `last_seen` for targetable Codex peers, newest first, at most 500 rows. A row is returned only while its seat is alive (the broker's seat rule: any recorded seat pid alive, or the live-group owner) and its registered pid is still a same-UID Codex client process. It never returns names, tokens, seat pids, or message content. A malformed body or `caller_pid` answers 400, a dead or foreign-UID caller 403, and more than 600 requests per minute for one caller pid 429. `/health` advertises it as `capabilities.observation.codexPaneBindings`.
+
 See [docs/operations.md](docs/operations.md) for startup, migration, rollback, service ownership, and incident procedures.
 
 ## Managed broker service
@@ -308,7 +348,9 @@ bun bin/install-broker-service.ts --uninstall
 
 The AP-063 bridge is a privileged, authenticated history cursor for a same-user observer. Compatibility keeps it enabled by default. Its token grants access to message history; protect it as a secret. Set `CLAUDE_PEERS_BRIDGE_ENABLED=false` for complete removal.
 
-The hook wake poller is separate from core delivery. The binary defaults to disabled; the shipped managed unit opts every supported client into confirmed tmux wake submissions. Native Codex hooks drain during an active turn, while the poller covers mail arriving after the turn is already idle. It re-checks SQLite immediately before transport and never claims or acknowledges mail itself. See [docs/systemd/README.md](docs/systemd/README.md).
+Use `claude-peers` for all agent messaging, including Claude-to-Claude. Keep discussions with the peers involved. For coordination of your assigned work, report to the coordinator named in your assignment. These instructions are carried by tool/startup and automatic receive context; delivered mail has no separate receive-policy block.
+
+The hook wake poller is separate from core delivery. The binary defaults to disabled; the shipped managed unit opts every supported client into confirmed tmux wake submissions. Native Codex hooks drain during an active turn, while the poller covers mail arriving after the turn is already idle. It re-checks SQLite immediately before transport and never claims or acknowledges mail itself. Its notice asks the lane to process attached messages, fetch pending mail with `check_messages` if none are attached, and continue the work. See [docs/systemd/README.md](docs/systemd/README.md).
 
 ## Security model
 
@@ -338,7 +380,22 @@ bun run smoke:install
 bun run verify
 ```
 
-The capacity gate is intentionally long and retains 108 records:
+For the current explicit MCP receive path, run the bounded isolated delivery
+workload (2 to 50 fixture adapters, 1 to 10 rounds):
+
+```bash
+bun bench/delivery-fleet.ts --peers 50 --rounds 3 --output docs/release-evidence/delivery-fleet.json
+```
+
+It checks rendered requests and correlated replies against persisted message
+counts and acknowledgement timestamps. It uses a private broker and database,
+and does not prove native hook delivery or account/pane ownership. Run with an
+external process-group deadline and resource limits on a shared host.
+
+The legacy polling capacity campaign below retains 108 records. It is currently
+unavailable: its fake tmux lacks the required open-pane snapshot, and its polling
+latency gates do not represent the current explicit receive path. Do not use it
+as current capacity or release proof:
 
 ```bash
 bun run benchmark:peers -- --peers 1,10,50 --repetitions 3 --stages baseline,instrumented,tmux-suppressed,adaptive
@@ -362,4 +419,4 @@ The gate records client versions, installs user-scope MCP and receive-hook confi
 
 MIT. Copyright (c) 2026 Louis Arge. See [LICENSE](LICENSE).
 
-Wake submission confirmation compares the before/after transcript evidence. An unchanged historical wake cannot confirm a new attempt; if scrolling removes the evidence, the attempt remains unconfirmed. This does not change the durable retry limit or acknowledge mailbox contents.
+Generic Read/Execute/Follow/Implement TASK.md task titles are replaced by the first descriptive TASK.md heading in the task cwd, retaining the account prefix. Lane headings omit account metadata and date suffixes. Missing or oversized files preserve the original title. Descriptive task names are preserved; task file content is never executed. New relay processes load this behavior.

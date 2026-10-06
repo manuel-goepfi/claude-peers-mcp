@@ -415,3 +415,22 @@ describe("Claude standby watcher", () => {
     expect(statSync(explicitState).mode & 0o777).toBe(0o700);
   }, 4_000);
 });
+
+describe("standby watcher default cadence", () => {
+  // Defaults apply to every new Claude session; explicit env still wins and
+  // the tests above pin 1s cadences that way.
+  const script = Bun.file(watcher).text();
+  const readme = Bun.file(new URL("../README.md", import.meta.url).pathname).text();
+
+  test("polls every 30s in the fast window and every 120s when idle", async () => {
+    const text = await script;
+    expect(text).toContain('POLL_INTERVAL=$(positive_int "${CLAUDE_PEERS_STANDBY_POLL_INTERVAL_SECONDS:-30}" 30)');
+    expect(text).toContain('IDLE_INTERVAL=$(positive_int "${CLAUDE_PEERS_STANDBY_IDLE_INTERVAL_SECONDS:-120}" 120)');
+  });
+
+  test("README documents the same defaults", async () => {
+    const text = await readme;
+    expect(text).toContain("| `CLAUDE_PEERS_STANDBY_POLL_INTERVAL_SECONDS` | `30` |");
+    expect(text).toContain("| `CLAUDE_PEERS_STANDBY_IDLE_INTERVAL_SECONDS` | `120` |");
+  });
+});

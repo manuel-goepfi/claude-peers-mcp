@@ -20,7 +20,7 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { manualDrainRoutingHint, sendStatusHint } from "../server.ts";
+import { hookActivityLabel, manualDrainRoutingHint, receiverLine, sendStatusHint } from "../server.ts";
 import type { SendMessageResponse } from "../shared/types.ts";
 
 type Target = NonNullable<SendMessageResponse["target"]>;
@@ -110,6 +110,45 @@ describe("send status hint for nudge-driven lanes", () => {
       false,
     );
     expect(hint).toContain("hook-enabled");
+  });
+
+  test("an old hook event is reported separately from active peer presence", () => {
+    const old = new Date(Date.now() - 10 * 60_000).toISOString();
+    const lane = target({ receiver_mode: "codex-hook", last_hook_seen_at: old });
+
+    expect(hookActivityLabel(lane)).toContain("hook_event=not_recent");
+    expect(hookActivityLabel(lane)).toContain("does not prove failure");
+
+    const hint = sendStatusHint(lane, false);
+    expect(hint).toContain("receiver presence is active");
+    expect(hint).toContain("if the hook runs");
+    expect(hint).toContain("Hooks are event-driven");
+    expect(hint).not.toContain("hook is stale");
+    expect(hint).not.toContain("may need check_messages");
+  });
+
+  test("hook activity distinguishes recent, not-recent, and not-observed events", () => {
+    expect(hookActivityLabel(target({
+      receiver_mode: "codex-hook",
+      last_hook_seen_at: new Date().toISOString(),
+    }))).toBe("hook_event=recent");
+    expect(hookActivityLabel(target({
+      receiver_mode: "codex-hook",
+      last_hook_seen_at: null,
+    }))).toContain("hook_event=not_observed");
+    expect(hookActivityLabel(target({ receiver_mode: "manual-drain" }))).toBeNull();
+  });
+
+  test("peer discovery presents recorded errors as failure evidence", () => {
+    const line = receiverLine(target({
+      receiver_mode: "codex-hook",
+      last_hook_seen_at: "2020-01-01T00:00:00.000Z",
+      last_drain_error: "claim timeout",
+    }));
+    expect(line).toContain("presence=active");
+    expect(line).toContain("hook_event=not_recent");
+    expect(line).toContain("last_error=claim timeout");
+    expect(line).not.toContain("receiver stale");
   });
 
   test("a reported drain error still wins over the reassurance", () => {

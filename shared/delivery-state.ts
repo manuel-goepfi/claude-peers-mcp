@@ -117,14 +117,14 @@ export function recipientDeliveryHealth(facts: RecipientDrainFacts): RecipientDe
     nudgeable,
     ...(facts.mcpTransport ? { mcp_transport: facts.mcpTransport } : {}),
   };
-  // A dead adapter never changes the drain STATE — receipt still works via
-  // hooks — but the sender must hear it: a reply from that lane is impossible
-  // until its session restarts, and the lane discovers that only mid-handoff.
+  // Adapter liveness is a snapshot, separate from hook receipt and current
+  // tool-call success. Re-registration or reconnect can recover it in place.
   const finish = (health: RecipientDeliveryHealth): RecipientDeliveryHealth => {
     if (facts.mcpTransport !== "dead") return health;
     const note =
-      "Recipient's peers MCP adapter is not running: hook mail still delivers, " +
-      "but its own peers tools (send/find/reply) fail with a closed transport until its session restarts.";
+      "Recipient MCP adapter liveness check failed. Hook delivery may still work; " +
+      "verify a fresh peer tool call and correlated reply. If calls fail, use the client's supported MCP reconnect; " +
+      "this check alone does not establish that a session restart is required.";
     return { ...health, warning: health.warning ? `${health.warning} ${note}` : note };
   };
 

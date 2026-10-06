@@ -1,3 +1,5 @@
+import { ensurePaneOperatorLabel } from "../bin/tmux-label-pane.ts";
+import { boundedCommand } from "./bounded-command.ts";
 import type { ClientType, ReceiverMode } from "./types.ts";
 import type { TmuxPaneInfo } from "./tmux.ts";
 
@@ -75,27 +77,21 @@ function cleanTmuxOptionValue(value: string | null | undefined): string | null {
 
 function defaultReadPaneOption(target: string, optionName: string): string | null {
   try {
-    const result = Bun.spawnSync(["tmux", "show-options", "-p", "-t", target, "-v", optionName], {
-      stdout: "pipe",
-      stderr: "ignore",
-    });
-    if (result.exitCode !== 0) return null;
-    return cleanTmuxOptionValue(new TextDecoder().decode(result.stdout));
+    const result = boundedCommand(["tmux", "show-options", "-p", "-t", target, "-v", optionName],
+      { operation: "identity-read" });
+    return result.ok ? cleanTmuxOptionValue(result.out) : null;
   } catch {
     return null;
   }
 }
 
-function defaultSetPaneOption(target: string, optionName: string, value: string): boolean {
-  try {
-    const result = Bun.spawnSync(["tmux", "set-option", "-p", "-t", target, optionName, value], {
-      stdout: "ignore",
-      stderr: "ignore",
-    });
-    return result.exitCode === 0;
-  } catch {
-    return false;
+function defaultSetPaneOptions(target: string, fields: [string, string][]): boolean {
+  const command = ["tmux"];
+  for (const [optionName, value] of fields) {
+    if (command.length > 1) command.push(";");
+    command.push("set-option", "-p", "-t", target, optionName, value);
   }
+  return boundedCommand(command, { operation: "identity-write", timeoutMs: 3000 }).ok;
 }
 
 export function registrationTmuxPaneId(
@@ -122,25 +118,27 @@ export function publishBrokerIdentityToTmux(
   const paneTarget = brokerIdentityPaneTarget(tmuxInfo, options.env ?? process.env);
   if (!paneTarget) return { ok: true, target: null, failedOptions: [] };
 
-  const displayLabel = identity.name || identity.resolved_name || identity.id;
-  const failedOptions: string[] = [];
-  const setPaneOption = options.setPaneOption ?? defaultSetPaneOption;
-  const setOption = (optionName: string, value: string) => {
-    if (!setPaneOption(paneTarget, optionName, value)) failedOptions.push(optionName);
-  };
-
-  if (options.writeOperatorLabel ?? true) {
-    const readPaneOption = options.readPaneOption ?? defaultReadPaneOption;
-    const existingOperatorLabel = readPaneOption(paneTarget, "@operator_label");
-    if ((options.updateOperatorLabel || !existingOperatorLabel) && displayLabel) {
-      setOption("@operator_label", displayLabel);
-    }
+  // Broker disambiguation is diagnostic. It must never become the pane name.
+  const readPaneOption = options.readPaneOption ?? defaultReadPaneOption;
+  let displayLabel: string | null;
+  if (options.setPaneOption || options.readPaneOption) {
+    displayLabel=cleanTmuxOptionValue(readPaneOption(paneTarget,"@operator_label"));
+  } else {
+    const result=ensurePaneOperatorLabel(paneTarget);
+    displayLabel=result.status==="labeled" || result.status==="preserved" ? result.label : null;
   }
-  setOption("@peer_id", identity.id);
-  setOption("@peer_label", displayLabel);
-  setOption("@peer_resolved_name", identity.resolved_name ?? "");
-  setOption("@peer_client_type", identity.client_type);
-  setOption("@peer_receiver_mode", identity.receiver_mode);
-
+  if (!displayLabel) return {ok:false,target:paneTarget,failedOptions:["@operator_label"]};
+  const fields: [string, string][] = [
+    ["@peer_id", identity.id],
+    ["@peer_label", displayLabel],
+    ["@peer_resolved_name", identity.resolved_name ?? ""],
+    ["@peer_client_type", identity.client_type],
+    ["@peer_receiver_mode", identity.receiver_mode],
+  ];
+  // Production pays for one tmux connection. A failed batch may have applied
+  // a prefix, so every field remains uncertain and must be retried together.
+  const failedOptions = options.setPaneOption
+    ? fields.filter(([name, value]) => !options.setPaneOption!(paneTarget, name, value)).map(([name]) => name)
+    : defaultSetPaneOptions(paneTarget, fields) ? [] : fields.map(([name]) => name);
   return { ok: failedOptions.length === 0, target: paneTarget, failedOptions };
 }

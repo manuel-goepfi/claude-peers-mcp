@@ -103,6 +103,9 @@ export interface RegisterRequest {
   // Hook-only metadata refreshes do not retain the returned token. When true,
   // an existing same-PID row keeps its current token instead of rotating it.
   preserve_token?: boolean;
+  native_claude_companion?: boolean;
+  // Background discovery must never compete with an already thread-bound seat.
+  discovery_only?: boolean;
   summary: string;
 }
 
@@ -192,6 +195,9 @@ export interface HeartbeatRequest {
 }
 
 export interface HeartbeatResponse {
+  name?: string;
+  resolved_name?: string;
+  tmux_session?: string;
   ok: true;
   client_type: ClientType;
   receiver_mode: ReceiverMode;

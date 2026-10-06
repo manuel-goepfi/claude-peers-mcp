@@ -1,0 +1,256 @@
+#!/bin/bash
+# CANONICAL COPY: claude-peers-mcp/bin/ensure-codex-autodrain
+# DEPLOYED TO:    ~/bin/ensure-codex-autodrain — BOTH callers (crontab */2min
+#                 watchdog tick and the ~/.tmux.conf run-shell) invoke the
+#                 DEPLOYED copy, so a repo-only edit changes nothing until
+#                 copied. Keep the two byte-identical: edit here, then cp.
+# ensure-codex-autodrain — idempotently supervise the claude-peers auto-drain
+# poller. A reachable systemd user unit is the primary owner; tmux is a
+# portability fallback only when that unit cannot be resolved.
+#
+# The systemd unit has the tmux binary/socket environment needed by the poller.
+# Its configuration, including NUDGE_CLIENTS, is authoritative whenever the
+# unit is available. The tmux-server fallback keeps the watchdog usable on hosts
+# without a resolvable systemd user unit.
+#
+# Idempotent + WATCHDOG: if a poller is alive AND ticking (fresh heartbeat), do
+# nothing. If a poller is alive but WEDGED (heartbeat stale → alive but no longer
+# ticking, the 'silent for 16h' zombie), kill it so the spawn below restarts it.
+# Safe to call on every tmux reload and from a periodic watchdog tick.
+set -u
+
+# Single-flight (review #5): cron (every 2min) and the .tmux.conf run-shell can
+# fire this script concurrently. Two overlapping runs could each kill+sleep+spawn
+# and race into >1 poller (dedup-on-sight recovers on the next run, but the lock
+# closes the window to zero). Re-exec under a non-blocking flock; a second
+# concurrent run exits immediately rather than queueing. flock is best-effort —
+# if it is unavailable, fall through and run unlocked (dedup-on-sight still
+# bounds the damage).
+LOCK=/tmp/ensure-codex-autodrain.lock
+if [ -z "${_AUTODRAIN_LOCKED:-}" ] && command -v flock >/dev/null 2>&1; then
+  # Re-run self under the lock. NOT `exec` — exec would replace the shell, so
+  # flock's exit-1-on-contention would propagate as this script's exit code (a
+  # spurious cron error). Run in a subshell instead and normalize "lock held"
+  # (flock -n exit 1) to a clean exit 0.
+  _AUTODRAIN_LOCKED=1 flock -n "$LOCK" "$0" "$@"
+  rc=$?
+  [ "$rc" -eq 1 ] && exit 0   # lock held by a concurrent run → clean no-op
+  exit "$rc"
+fi
+export _AUTODRAIN_LOCKED
+
+POLLER=/home/manzo/claude-peers-mcp/bin/codex-autodrain-poller.ts
+LOG="${AUTODRAIN_LOG:-/home/manzo/.claude-peers-codex-autodrain.log}"
+HEARTBEAT="${AUTODRAIN_HEARTBEAT:-/home/manzo/.claude-peers-autodrain.heartbeat}"
+SYSTEMD_UNIT="${AUTODRAIN_SYSTEMD_UNIT:-claude-peers-codex-autodrain.service}"
+
+# Pane names must exist before an agent registers. In particular, a zero-turn
+# Grok pane launches no MCP adapter, so registration cannot stamp its label.
+# This installer is independent of the poller opt-in and runs before the
+# systemd-owner early return. It is idempotent and preserves other tmux hooks.
+TMUX_LABEL_HOOK_INSTALLER="${TMUX_LABEL_HOOK_INSTALLER:-/home/manzo/claude-peers-mcp/bin/install-tmux-label-hooks}"
+if [ -r "$TMUX_LABEL_HOOK_INSTALLER" ]; then
+  if ! bash "$TMUX_LABEL_HOOK_INSTALLER" >/dev/null 2>&1; then
+    echo "$(date -Iseconds) watchdog: tmux pane-label hook install failed" >> "$LOG"
+  fi
+fi
+
+# The user service is the single primary poller owner. Check whether its unit
+# can be resolved before examining the fallback opt-in: an active unit is a
+# clean no-op; an inactive but resolvable unit is restarted. Do NOT start the
+# tmux fallback after a reachable unit fails to restart, because that turns a
+# failed managed service into two competing supervisors on its next recovery.
+#
+# A missing systemctl binary, unreachable user manager, or absent unit reaches
+# the existing tmux fallback below. Capture the command status directly (not
+# through a pipe) so the availability decision is not masked.
+SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-}"
+if [ -z "$SYSTEMCTL_BIN" ]; then
+  SYSTEMCTL_BIN="$(command -v systemctl 2>/dev/null || true)"
+fi
+if [ -n "$SYSTEMCTL_BIN" ]; then
+  # Cron does not inherit the interactive user's D-Bus environment. Supply the
+  # conventional user-runtime socket so `systemctl --user` reaches the manager
+  # instead of falsely treating a live unit as unavailable and spawning tmux.
+  if [ -z "${XDG_RUNTIME_DIR:-}" ]; then
+    XDG_RUNTIME_DIR="/run/user/$(id -u)"
+    export XDG_RUNTIME_DIR
+  fi
+  if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+    DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus"
+    export DBUS_SESSION_BUS_ADDRESS
+  fi
+  SYSTEMD_LOAD_STATE="$("$SYSTEMCTL_BIN" --user show --property=LoadState --value "$SYSTEMD_UNIT" 2>/dev/null)"
+  SYSTEMD_SHOW_STATUS=$?
+  if [ "$SYSTEMD_SHOW_STATUS" -eq 0 ] && [ -n "$SYSTEMD_LOAD_STATE" ] && [ "$SYSTEMD_LOAD_STATE" != "not-found" ]; then
+    if "$SYSTEMCTL_BIN" --user is-active --quiet "$SYSTEMD_UNIT"; then
+      exit 0
+    fi
+    if "$SYSTEMCTL_BIN" --user restart "$SYSTEMD_UNIT"; then
+      exit 0
+    fi
+    echo "$(date -Iseconds) watchdog: systemd unit $SYSTEMD_UNIT is resolvable but restart failed — refusing tmux fallback" >> "$LOG"
+    exit 1
+  fi
+fi
+
+# Match the actual `bun .../codex-autodrain-poller.ts` daemon specifically.
+# Defined ONCE (and before the opt-in gate, which needs it for kill-on-disable)
+# so pgrep and every pkill use the identical pattern (no drift). Anchoring
+# (review #3): require `bun<...>` then the poller `.ts` at END of the command
+# line — so it does NOT match the `bash -c ... exec bun ...` launcher wrapper,
+# a one-shot `bun run <poller> --flag` (trailing flag → not end-anchored), or
+# an unrelated `bun <other>` that merely mentions the path.
+POLLER_MATCH='bun[^ ]* .*/codex-autodrain-poller\.ts$'
+
+# Auto-nudge is disabled by default. Do not start the poller at all unless an
+# operator explicitly opts in — either per invocation via the NUDGE_CLIENTS env
+# var, or persistently via the single-source config file below (one line,
+# comma-separated, e.g. "codex,claude"). A SET env var always wins for this
+# invocation — including set-but-EMPTY, which is an explicit per-invocation
+# OFF that a populated file cannot override. Only when the var is UNSET is the
+# file consulted. The file exists so the opt-in lives in ONE place instead of
+# being duplicated across every caller (crontab line + .tmux.conf run-shell),
+# which drifted. Both paths are whitespace-normalized BEFORE the allowlist
+# check: grep -q anchors bind per-LINE, so an embedded newline in a raw env
+# value would smuggle unvalidated trailing lines past ^...$.
+NUDGE_CLIENTS_FILE="${NUDGE_CLIENTS_FILE:-$HOME/.config/claude-peers/nudge-clients}"
+if [ -z "${NUDGE_CLIENTS+x}" ] && [ -f "$NUDGE_CLIENTS_FILE" ]; then
+  NUDGE_CLIENTS=$(tr -d '[:space:]' < "$NUDGE_CLIENTS_FILE")
+else
+  NUDGE_CLIENTS=$(printf '%s' "${NUDGE_CLIENTS-}" | tr -d '[:space:]')
+fi
+if [ -z "$NUDGE_CLIENTS" ]; then
+  # Idempotent controller: opt-in resolved OFF → ensure NO poller is running.
+  # Without this, clearing the opt-in only prevented future starts while an
+  # already-running poller kept sending background keystrokes until it died.
+  # Side effect (accepted): a poller started with an env-only opt-in survives
+  # at most one cron tick (~2min) unless the file also opts in — the file is
+  # the persistent truth the watchdog converges the system toward.
+  if pgrep -f "$POLLER_MATCH" >/dev/null 2>&1; then
+    echo "$(date -Iseconds) watchdog: opt-in absent/empty — stopping running poller (kill-on-disable)" >> "$LOG"
+    pkill -9 -f "$POLLER_MATCH" 2>/dev/null
+    rm -f "$HEARTBEAT" 2>/dev/null
+  fi
+  exit 0
+fi
+if ! printf '%s' "$NUDGE_CLIENTS" | grep -Eq '^(codex|gemini|claude|cursor|agy|kimi|grok|opencode)(,(codex|gemini|claude|cursor|agy|kimi|grok|opencode))*$'; then
+  echo "$(date -Iseconds) watchdog: invalid NUDGE_CLIENTS=$NUDGE_CLIENTS — refusing to start" >> "$LOG"
+  exit 1
+fi
+
+# tmux reachability when this script runs OUTSIDE an interactive shell (cron, a
+# systemd timer). Two stripped-env traps, both of which produce the generic
+# "server exited unexpectedly" — fixed here so the watchdog reaches the SAME
+# server an interactive session uses (this was the real root of the earlier
+# "systemd/cron can't reach tmux" failures):
+#   1. WRONG BINARY: PATH defaults to /usr/bin (distro tmux 3.4) while the
+#      running server is the locally-built /usr/local/bin/tmux (next-3.7). A 3.4
+#      client cannot handshake a next-3.7 server. Pin the absolute path to the
+#      binary that matches the server. Auto-detect, preferring /usr/local/bin.
+#   2. NO SOCKET CONTEXT: no inherited $TMUX/$TMUX_TMPDIR → pin the default socket.
+: "${TMUX_TMPDIR:=/tmp}"
+TMUX_SOCK="${TMUX_TMPDIR}/tmux-$(id -u)/default"
+TMUX_BIN=/usr/local/bin/tmux
+[ -x "$TMUX_BIN" ] || TMUX_BIN="$(command -v tmux 2>/dev/null)"
+tmux() { "$TMUX_BIN" -S "$TMUX_SOCK" "$@"; }
+# Stale threshold: a healthy poller touches the heartbeat every tick
+# (POLL_INTERVAL_MS, default 15s). Allow ~4 missed ticks before declaring it
+# wedged, so a single slow tick or a brief tmux contention spike doesn't trigger
+# a needless restart.
+STALE_AFTER_S=70
+
+POLLER_PIDS=$(pgrep -f "$POLLER_MATCH" 2>/dev/null)
+POLLER_COUNT=$(printf '%s\n' "$POLLER_PIDS" | grep -c .)
+
+# DEDUP-ON-SIGHT: two pollers both nudge the same lanes → double keystrokes into
+# panes. The spawn path avoids creating dupes, but a dupe arriving by any other
+# route (manual launch, a tmux-reload race) would persist because the freshness
+# check below only needs ONE fresh poller to exit 0. So if >1 exist, collapse to
+# zero unconditionally and respawn exactly one.
+if [ "$POLLER_COUNT" -gt 1 ]; then
+  echo "$(date -Iseconds) watchdog: ${POLLER_COUNT} pollers running — collapsing to one" >> "$LOG"
+  pkill -9 -f "$POLLER_MATCH" 2>/dev/null
+  sleep 1
+  # fall through to spawn exactly one
+elif [ "$POLLER_COUNT" -eq 1 ]; then
+  # Exactly one process. Readiness, not just liveness: is it still TICKING?
+  if [ -f "$HEARTBEAT" ]; then
+    now=$(date +%s)
+    hb=$(stat -c %Y "$HEARTBEAT" 2>/dev/null || echo 0)
+    age=$(( now - hb ))
+    if [ "$age" -le "$STALE_AFTER_S" ]; then
+      exit 0   # alive AND fresh → healthy, nothing to do
+    fi
+    echo "$(date -Iseconds) watchdog: poller alive but heartbeat stale (${age}s > ${STALE_AFTER_S}s) — restarting wedged poller" >> "$LOG"
+    pkill -9 -f "$POLLER_MATCH" 2>/dev/null
+    sleep 1   # let the process exit cleanly
+    # fall through to (re)spawn below
+  else
+    # No heartbeat file yet but a process exists. This is either a freshly-started
+    # poller (heartbeat lands on its first tick) OR an OLD poller predating the
+    # heartbeat feature. Give a fresh start a grace window: if the process is
+    # young, assume it's about to write one; if it's old (no heartbeat ever),
+    # treat it as wedged and restart. Use THE POLLER'S OWN process age as the
+    # proxy — scope the etime query to $POLLER_PIDS (the args-filtered pgrep
+    # result), NOT `-C bun` which matches EVERY bun process on the host: with
+    # other long-lived bun daemons present, `-C bun` always returns a huge oldest
+    # etime, the grace branch never fires, and a healthy young poller gets killed
+    # on every watchdog tick before it can write its first heartbeat.
+    poller_etime=$(ps -o etimes= -p "$POLLER_PIDS" 2>/dev/null | tr -d ' ' | sort -n | tail -1)
+    if [ -n "${poller_etime:-}" ] && [ "$poller_etime" -gt "$STALE_AFTER_S" ]; then
+      echo "$(date -Iseconds) watchdog: poller alive but NO heartbeat after ${poller_etime}s — restarting (pre-heartbeat or wedged)" >> "$LOG"
+      pkill -9 -f "$POLLER_MATCH" 2>/dev/null
+      sleep 1
+      # fall through to respawn
+    else
+      exit 0   # young process — heartbeat imminent, don't churn
+    fi
+  fi
+fi
+
+# Reaching here means we are about to (re)spawn the poller (either none was
+# running, or we just killed a wedged/duplicate one). Remove any stale heartbeat
+# so the fresh poller does NOT inherit the dead poller's mtime — otherwise the
+# next watchdog tick would read an already-stale heartbeat and kill the new
+# poller before its first tick writes a fresh one (restart loop). The grace
+# window (scoped poller etime above) covers the gap until the first heartbeat.
+rm -f "$HEARTBEAT" 2>/dev/null
+
+# Need a live tmux server because the poller captures panes and sends keys through
+# that server. The background child itself does not need a pane or visible window.
+if ! tmux list-sessions >/dev/null 2>&1; then
+  exit 0  # no tmux yet — nothing to attach to; a later reload will catch it
+fi
+
+# Remove legacy visible daemon windows left by the old launcher. Target by
+# session:index so numeric session names are never misparsed as window indexes.
+# Migration shim — delete this block once no pre-2026-07 tmux servers remain
+# (i.e. no window named 'codex-autodrain' exists anywhere).
+tmux list-windows -a -F '#{session_name}:#{window_index}\t#{window_name}' 2>/dev/null \
+  | awk -F '\t' '$2 == "codex-autodrain" { print $1 }' \
+  | while IFS= read -r target; do
+      [ -n "$target" ] && tmux kill-window -t "$target" 2>/dev/null
+    done
+
+# Pin the ABSOLUTE path to bun: cron's PATH does not include ~/.bun/bin, so a
+# bare `bun` would not be found. Auto-detect, preferring ~/.bun/bin. If neither
+# resolves, refuse loudly — an empty BUN_BIN would otherwise spawn
+# `exec env ... '' <poller>` which dies instantly with the failure swallowed
+# by run-shell's 2>/dev/null.
+BUN_BIN=/home/manzo/.bun/bin/bun
+[ -x "$BUN_BIN" ] || BUN_BIN="$(command -v bun 2>/dev/null)"
+if [ -z "$BUN_BIN" ] || [ ! -x "$BUN_BIN" ]; then
+  echo "$(date -Iseconds) watchdog: bun not found (checked ~/.bun/bin and PATH) — cannot spawn poller" >> "$LOG"
+  exit 1
+fi
+
+# tmux run-shell -b inherits the live server/socket context but creates no pane.
+# Pass the opt-in explicitly: run-shell commands execute in the tmux SERVER's
+# environment, so nothing exported by this script (a client-side process) is
+# visible to the spawned command regardless of update-environment (which only
+# governs client→session variable copying on attach).
+tmux run-shell -b \
+  "cd /home/manzo && exec env NUDGE_CLIENTS='$NUDGE_CLIENTS' '$BUN_BIN' '$POLLER' >> '$LOG' 2>&1" 2>/dev/null
+
+exit 0

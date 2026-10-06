@@ -29,6 +29,15 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 
 # Project-scope hook commands contain the local clone path; install them locally.
 .codex/hooks.json
+.codex/hooks.json.bak-*
+
+# Local agent state, linked worktrees, and generated evidence.
+.claude/.review-attestations/
+.claude/hooks/*.log
+.serena/
+.worktrees/
+bench/results/
+bin/*.before-*
 
 # IntelliJ based IDEs
 .idea

@@ -194,6 +194,18 @@ describe("autodrain requires exact currently undelivered mail", () => {
     expect(hasmail!.unread).toBe(1);
     expect(lanes.find((l) => l.id === "other")).toBeUndefined();
   });
+
+  test("Claude remains eligible for broker mail, not merely for having a native session", () => {
+    db.run("INSERT INTO peers (id, pid, name, client_type, receiver_mode) VALUES ('claude-native', 103, 'native-test', 'claude', 'claude-channel')");
+    // Native messaging is outside this database. A registered Claude session
+    // alone must not synthesize a broker wake, even with a hooked receiver.
+    expect(lanesWithUnread(db, ["claude"])).toEqual([]);
+    db.run("INSERT INTO messages (to_id, delivered) VALUES ('claude-native', 0)");
+    expect(lanesWithUnread(db, ["claude"]).map((lane) => lane.id)).toEqual(["claude-native"]);
+    // Once its broker mail is acknowledged, it stops being a candidate.
+    db.run("UPDATE messages SET delivered = 1 WHERE to_id = 'claude-native'");
+    expect(lanesWithUnread(db, ["claude"])).toEqual([]);
+  });
 });
 
 describe("per-pane nudge dedup", () => {

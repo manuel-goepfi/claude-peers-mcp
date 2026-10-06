@@ -16,7 +16,8 @@ function invariant(condition: unknown, message: string): asserts condition {
 async function run(command: string[], options: { cwd: string; home: string }): Promise<{ stdout: string; stderr: string }> {
   const proc = Bun.spawn(command, {
     cwd: options.cwd,
-    env: { ...process.env, HOME: options.home, CODEX_HOME: join(options.home, ".codex") },
+    env: { ...process.env, HOME: options.home, CODEX_HOME: join(options.home, ".codex"),
+      CLAUDE_CONFIG_DIR: join(options.home, ".claude") },
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -48,6 +49,9 @@ async function protocolSmoke(root: string, clone: string): Promise<void> {
     env: {
       ...process.env,
       HOME: root,
+      CODEX_HOME: join(root, ".codex"),
+      CLAUDE_CONFIG_DIR: join(root, ".claude"),
+      CLAUDE_PEERS_TMUX_IDENTITY_MIRROR: "0",
       CLAUDE_PEERS_PORT: String(broker.port),
       CLAUDE_PEERS_DB: broker.dbPath,
       CLAUDE_PEERS_BROKER_LOG: broker.logPath,

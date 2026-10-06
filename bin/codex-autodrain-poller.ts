@@ -48,6 +48,11 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { publishBrokerIdentityToTmux } from "../shared/tmux-identity.ts";
+import type { BrokerIdentityForTmux } from "../shared/tmux-identity.ts";
+import { durableSeatKey } from "../shared/seat.ts";
+import { boundedCommand, commandBudgetRemaining, withCommandBudget } from "../shared/bounded-command.ts";
+import { readProcessSnapshot } from "../shared/process-snapshot.ts";
+import { LiveMailboxGroups, liveGroupPrefix, liveMailboxIdsSql } from "../shared/live-mailbox-groups.ts";
 import type { ReconcilePaneThreadResponse, RegisterResponse } from "../shared/types.ts";
 import { isVisibleCodexArgs, singleInteractiveCodexProcess } from "../shared/visible-codex.ts";
 import {
@@ -87,26 +92,20 @@ const RECONCILE_CODEX_SEATS = process.env.RECONCILE_CODEX_SEATS !== "0";
 // restarts the poller if this file goes stale — a process that is alive but no
 // longer TICKING (the 'silent for 16h' zombie) passes a bare pgrep check but
 // fails the freshness check. mtime is the signal; the body is human-readable.
-const HEARTBEAT_PATH = process.env.CLAUDE_PEERS_AUTODRAIN_HEARTBEAT ?? `${homedir()}/.claude-peers-autodrain.heartbeat`;
+const HEARTBEAT_PATH = process.env.CLAUDE_PEERS_AUTODRAIN_HEARTBEAT ?? process.env.AUTODRAIN_HEARTBEAT ?? `${homedir()}/.claude-peers-autodrain.heartbeat`;
 const NUDGE_BUDGET_PATH = process.env.CLAUDE_PEERS_NUDGE_BUDGET_FILE ?? `${homedir()}/.claude-peers-nudge-budget.json`;
-// The nudge is typed into the pane as a real user turn. Branch by receive
-// path: hook lanes already have the body in-turn; manual-drain lanes must
-// fetch it. Recovery belongs in poller logs, not in this prompt.
+// Receive paths can change when the nudge starts a native prompt hook.
+// Keep hook classification for transport checks, not wake-content assumptions.
 const HOOK_RECEIVE_MODES = new Set(["claude-channel", "codex-hook", "gemini-hook"]);
 
 export function isHookReceivePath(lane: Lane): boolean {
   return HOOK_RECEIVE_MODES.has(lane.receiver_mode);
 }
 
-export function nudgeText(lane: Lane): string {
-  const hookFresh = !lane.last_hook_seen_at
-    || Date.now() - Date.parse(lane.last_hook_seen_at) <= 2 * 60 * 1_000;
-  if (isHookReceivePath(lane) && hookFresh) {
-    return "[peer-mail] Process the attached peer messages.";
-  }
-  const n = lane.unread;
-  const noun = n === 1 ? "message" : "messages";
-  return `[peer-mail] ${n} unread peer ${noun}. Call check_messages once.`;
+export function nudgeText(_lane: Lane): string {
+  // Receive mode can change when this wake triggers the first native hook.
+  // Queue emptiness after that hook says nothing about the attached batch.
+  return "[peer-mail] Process the attached peer messages. If none are attached, fetch pending mail with check_messages. Continue the work.";
 }
 // Give up nudging a lane after this many consecutive attempts with mail still
 // unread — a lane whose drain hook is broken must NOT be keystroke-bombed
@@ -185,7 +184,8 @@ const CODEX_BUSY = [
 // universal "esc to interrupt" hint, and the "· N tokens" in-flight status row.
 const CLAUDE_BUSY = [
   /esc to interrupt/i,
-  /\(\d+s\s*·/,
+  /\((?:\d+h\s*)?(?:\d+m\s*)?\d+s\s*·/,
+  /Press up to edit queued messages/i,
   /·\s*[\d.]+k?\s*tokens/i,
   /\b(Esc to interrupt|Running…|Working…)/i,
   ...CONFIRMATION_BUSY,
@@ -366,6 +366,7 @@ function persistedNudgeBudget(): PersistedNudgeBudget {
 export function loadNudgeBudgetState(path = NUDGE_BUDGET_PATH): boolean {
   nudgeBudgetPersistencePath = path;
   nudgeBudgetPersistenceHealthy = true;
+  nextLaneId = null;
   nudgeAttempts.clear();
   nudgeEpisode.clear();
   lastNudge.clear();
@@ -450,8 +451,9 @@ function log(msg: string): void {
 }
 
 function sh(cmd: string[]): { ok: boolean; out: string } {
-  const p = Bun.spawnSync(cmd);
-  return { ok: p.exitCode === 0, out: new TextDecoder().decode(p.stdout) };
+  return boundedCommand(cmd, {
+    operation: cmd[0] === "ps" ? "poller-process-snapshot" : "poller-tmux", timeoutMs: 3000,
+  });
 }
 
 const ANSI_ESCAPE_RE = /\u001b\[[0-?]*[ -/]*[@-~]/g;
@@ -632,7 +634,14 @@ export function parseNudgeClients(raw: string | undefined = process.env.NUDGE_CL
   return [...new Set(picked)];
 }
 const NUDGEABLE_CLIENTS = parseNudgeClients();
-export function lanesWithUnread(db: Database, nudgeableClients: string[] = NUDGEABLE_CLIENTS): Lane[] {
+function currentNativeMailbox(db: Database, id: string): boolean {
+  const current = new LiveMailboxGroups(db).current(id);
+  return current?.native.id === id;
+}
+const correlatedMailboxIdsSql = liveMailboxIdsSql.replace("owner.id=?", "owner.id=p.id");
+
+export function lanesWithUnread(db: Database, nudgeableClients: string[] = NUDGEABLE_CLIENTS,
+  nativeIsCurrent: (id: string) => boolean = id => currentNativeMailbox(db,id)): Lane[] {
   // No nudgeable client types → nothing to nudge. Return empty WITHOUT building a
   // `WHERE ... IN ()` (invalid SQL in SQLite) — and the tick() caller short-circuits
   // before this on the same condition, so this is just a defensive second guard.
@@ -641,16 +650,16 @@ export function lanesWithUnread(db: Database, nudgeableClients: string[] = NUDGE
   // Candidate selection is fail-closed: only an exact peer/message join over a
   // currently undelivered row can produce a lane. Hook state, pane visibility,
   // and delivered history are never substitutes for real pending mail.
-  return db.query(`
+  return (db.query(`
     SELECT p.id, p.name, p.pid, p.client_type, p.tmux_pane_id, p.thread_id,
            p.seat_key, p.receiver_mode, p.last_hook_seen_at, p.unread_episode,
            COUNT(m.id) AS unread
     FROM peers p
-    JOIN messages m ON m.to_id = p.id AND m.delivered = 0
+    JOIN messages m ON m.to_id IN (${correlatedMailboxIdsSql}) AND m.delivered = 0
     WHERE p.client_type IN (${placeholders})
     GROUP BY p.id
     HAVING unread > 0
-  `).all(...nudgeableClients) as Lane[];
+  `).all(...nudgeableClients) as Lane[]).filter(lane => !liveGroupPrefix(lane.seat_key) || nativeIsCurrent(lane.id));
 }
 
 /**
@@ -660,11 +669,14 @@ export function lanesWithUnread(db: Database, nudgeableClients: string[] = NUDGE
  * hook to drain the mailbox in between. The initial Lane count is therefore
  * evidence for scheduling only; it must never authorize a later keystroke.
  */
-export function pendingUnreadForPeer(db: Database, peerId: string): number {
+export function pendingUnreadForPeer(db: Database, peerId: string,
+  nativeIsCurrent: (id: string) => boolean = id => currentNativeMailbox(db,id)): number {
+  const peer = db.query("SELECT seat_key FROM peers WHERE id=?").get(peerId) as {seat_key: string|null}|null;
+  if (liveGroupPrefix(peer?.seat_key) && !nativeIsCurrent(peerId)) return 0;
   const row = db.query(`
     SELECT COUNT(*) AS unread
     FROM messages
-    WHERE to_id = ? AND delivered = 0
+    WHERE to_id IN (${liveMailboxIdsSql}) AND delivered = 0
   `).get(peerId) as { unread?: number } | null;
   const unread = Number(row?.unread ?? 0);
   return Number.isFinite(unread) && unread > 0 ? unread : 0;
@@ -864,24 +876,18 @@ function paneIsIdle(paneId: string, profile: IdleProfile): boolean {
 }
 
 // One process snapshot per tick, shared across every lane's resolution + ownership
-// check. A `ps -ww` is ~0.5s on a loaded host; doing it per-lane made a 12-lane
-// fan-out tick ~12s (83% of the poll window). Snapshotting once drops the whole
-// tick's resolution cost to a single ps regardless of lane count. Built fresh each
-// tick (cheap relative to the interval) so it never goes stale within a tick.
+// check. Linux scans procfs in a bounded child; other platforms use ps. Built
+// fresh each tick so process discovery costs one scan regardless of lane count.
 export interface TickSnapshot {
   procs: ProcLike[];
   paneByPid: Map<string, number>;          // pane_id → pane_pid (for paneSubtree)
   paneMap: ReturnType<typeof parseTmuxPanes>;
 }
-export function takeSnapshot(): TickSnapshot | null {
-  const psOut = sh(["ps", "-eo", "pid=,ppid=,args="]);
+export function takeSnapshot(processSnapshot = readProcessSnapshot): TickSnapshot | null {
+  const procs = processSnapshot();
+  if (!procs) return null;
   const paneOut = sh(["tmux", "list-panes", "-a", "-F", "#{pane_pid}\t#{session_name}\t#{window_index}\t#{window_name}\t#{pane_index}\t#{pane_id}\t#{window_panes}"]);
-  if (!psOut.ok || !paneOut.ok) return null;
-  const procs: ProcLike[] = [];
-  for (const line of psOut.out.split("\n")) {
-    const m = line.match(/^\s*(\d+)\s+(\d+)\s+(.*)$/);
-    if (m) procs.push({ pid: Number(m[1]), ppid: Number(m[2]), args: m[3]! });
-  }
+  if (!paneOut.ok) return null;
   const paneMap = parseTmuxPanes(paneOut.out);
   const paneByPid = new Map<string, number>();
   for (const [panePid, info] of paneMap) if (info.pane_id) paneByPid.set(info.pane_id, panePid);
@@ -1040,6 +1046,28 @@ let codexSeatReconcileInFlight = false;
 type PostBrokerFn = typeof postBroker;
 type PublishIdentityFn = typeof publishBrokerIdentityToTmux;
 
+export type BoundCodexSeatIdentity =
+  | { kind: "absent" }
+  | { kind: "ambiguous" }
+  | { kind: "bound"; identity: BrokerIdentityForTmux };
+
+/** Discovery reads routing metadata only; it must not obtain a peer token. */
+export function boundCodexSeatIdentity(db: Database, seat: VisibleCodexSeat): BoundCodexSeatIdentity {
+  const rows = db.query(`SELECT id, name, resolved_name, client_type, receiver_mode,
+      cwd, tmux_session, tmux_pane_id, seat_key FROM peers
+    WHERE pid = ? AND tmux_pane_id = ? AND client_type = 'codex'
+      AND thread_id IS NOT NULL AND length(thread_id) > 0`)
+    .all(seat.pid, seat.tmux.pane_id ?? null) as Array<BrokerIdentityForTmux & {
+      cwd: string; tmux_session: string | null; tmux_pane_id: string; seat_key: string | null;
+    }>;
+  if (rows.length === 0) return { kind: "absent" };
+  const row = rows[0]!;
+  if (rows.length !== 1 || row.cwd !== seat.cwd || row.tmux_session !== seat.tmux.session
+    || row.seat_key !== durableSeatKey(row)) return { kind: "ambiguous" };
+  const { id, name, resolved_name, client_type, receiver_mode } = row;
+  return { kind: "bound", identity: { id, name, resolved_name, client_type, receiver_mode } };
+}
+
 export interface ReconcileVisibleCodexSeatsDeps {
   enabled?: boolean;
   dryRun?: boolean;
@@ -1051,6 +1079,7 @@ export interface ReconcileVisibleCodexSeatsDeps {
   publishBrokerIdentityToTmux?: PublishIdentityFn;
   threadIdForPane?: (paneId: string) => string | null;
   callerPid?: number;
+  boundIdentityForSeat?: (seat: VisibleCodexSeat) => BoundCodexSeatIdentity;
 }
 
 export function __resetCodexSeatReconcileStateForTest(): void {
@@ -1068,7 +1097,7 @@ export async function reconcileVisibleCodexSeats(snap: TickSnapshot, deps: Recon
   codexSeatReconcileInFlight = true;
 
   try {
-    const seats = (deps.visibleSeats ?? visibleCodexSeatsFromSnapshot)(snap);
+    const seats = withCommandBudget(3000, () => (deps.visibleSeats ?? visibleCodexSeatsFromSnapshot)(snap));
     const git = deps.gitValue ?? gitValue;
     const post = deps.postBroker ?? postBroker;
     const publish = deps.publishBrokerIdentityToTmux ?? publishBrokerIdentityToTmux;
@@ -1080,6 +1109,12 @@ export async function reconcileVisibleCodexSeats(snap: TickSnapshot, deps: Recon
       try {
         if (deps.dryRun ?? DRY_RUN) {
           log(`DRY_RUN would reconcile codex seat ${seat.name} pid=${seat.pid} pane=${seat.tmux.pane_id ?? "?"}`);
+          continue;
+        }
+        const bound = deps.boundIdentityForSeat?.(seat);
+        if (bound?.kind === "ambiguous") continue;
+        if (bound?.kind === "bound") {
+          withCommandBudget(8000, () => publish(bound.identity, seat.tmux));
           continue;
         }
         const gitRoot = await git(seat.cwd, ["rev-parse", "--show-toplevel"]);
@@ -1099,9 +1134,10 @@ export async function reconcileVisibleCodexSeats(snap: TickSnapshot, deps: Recon
           client_type: "codex",
           receiver_mode: "manual-drain",
           preserve_token: true,
+          discovery_only: true,
           summary: "",
         });
-        publish(reg, seat.tmux);
+        withCommandBudget(8000, () => publish(reg, seat.tmux));
         const paneId = seat.tmux.pane_id;
         const threadId = paneId ? readThreadId(paneId) : null;
         if (paneId && threadId) {
@@ -1114,7 +1150,14 @@ export async function reconcileVisibleCodexSeats(snap: TickSnapshot, deps: Recon
           }, reg.token);
         }
       } catch (e) {
-        log(`codex seat reconcile failed for ${seat.name} pid=${seat.pid} pane=${seat.tmux.pane_id ?? "?"}: ${e instanceof Error ? e.message : String(e)}`);
+        const error = e instanceof Error ? e.message : String(e);
+        if (!error.includes("Codex pane already has a thread binding; discovery must observe it")) {
+          log(`codex seat reconcile failed for ${seat.name} pid=${seat.pid} pane=${seat.tmux.pane_id ?? "?"}: ${error}`);
+        }
+      } finally {
+        // Bound synchronous mirror work per seat and let the heartbeat timer
+        // run between seats, including the already-bound fast path.
+        await Bun.sleep(0);
       }
     }
   } finally {
@@ -1395,27 +1438,39 @@ export function composerStillHolds(capture: string, probe: string): boolean {
  * false and do not count the wake. Mail remains untouched in the broker because
  * this poller has no claim or acknowledgement capability.
  */
-function submitPaneText(paneId: string, text: string, clientType: string): boolean {
+export function submitPaneText(paneId: string, text: string, clientType: string, deps: {
+  command?: typeof sh;
+  enterText?: typeof enterWakeText;
+  sleep?: (seconds: string) => void;
+} = {}): boolean {
+  const command = deps.command ?? sh;
+  const enterText = deps.enterText ?? enterWakeText;
+  const sleep = deps.sleep ?? ((seconds: string) => { boundedCommand(["sleep", seconds], { operation: "wake-settle" }); });
   const probe = submissionProbe(text);
 
   // Do NOT re-type if a previous attempt is still sitting in the composer.
   // Confirmed submission means an unconfirmed batch is retried next tick, and
   // re-sending ~8KB each time would stack burst after burst into a composer that
   // is already failing to submit. Re-Enter the text that is already there.
-  const before = sh(["tmux", "capture-pane", "-p", "-t", paneId]);
+  const before = command(["tmux", "capture-pane", "-p", "-e", "-t", paneId]);
   if (!before.ok) return false;
+  const profile = profileFor(clientType);
+  if (profile.busy.some((pattern) => pattern.test(stripAnsi(before.out)))) return false;
   const alreadyHeld = composerStillHolds(before.out, probe);
-  if (!alreadyHeld && !enterWakeText(paneId, text, clientType)) return false;
+  // Ownership/idle discovery preceded budget persistence. Revalidate the
+  // newest capture before writing: the operator or a hook may have acted.
+  if (!alreadyHeld && !paneTextIsIdle(before.out, profile)) return false;
+  if (!alreadyHeld && !enterText(paneId, text, clientType)) return false;
 
   // Settle longer than the TUI's paste-burst window before submitting.
-  Bun.spawnSync(["sleep", SUBMIT_SETTLE_S]);
-  if (!sh(["tmux", "send-keys", "-t", paneId, "Enter"]).ok) return false;
+  sleep(SUBMIT_SETTLE_S);
+  if (!command(["tmux", "send-keys", "-t", paneId, "Enter"]).ok) return false;
 
   // Poll rather than sleep once: submission latency varies with what the TUI is
   // doing, and a fixed wait either wastes time or reports a false failure.
   for (let attempt = 0; attempt < SUBMIT_CONFIRM_ATTEMPTS; attempt++) {
-    Bun.spawnSync(["sleep", SUBMIT_CONFIRM_INTERVAL_S]);
-    const capture = sh(["tmux", "capture-pane", "-p", "-t", paneId]);
+    sleep(SUBMIT_CONFIRM_INTERVAL_S);
+    const capture = command(["tmux", "capture-pane", "-p", "-t", paneId]);
     if (!capture.ok) return false; // pane vanished — cannot claim delivery
     if (freshSubmissionObserved(before.out, capture.out, probe)) return true;
   }
@@ -1491,6 +1546,8 @@ export function __nudgeAttemptCountForTest(id: string): number | undefined {
 // envelope and the nudge loop should be made concurrent (see decision-log).
 const TICK_WARN_MS = Math.min(10_000, POLL_INTERVAL_MS * 0.66);
 
+let nextLaneId: string | null = null;
+
 export interface TickDeps {
   nudgeableClients?: string[];
   isPidAlive?: (pid: number) => boolean;
@@ -1535,6 +1592,9 @@ export function tick(db: Database, snapOverride?: TickSnapshot, deps: TickDeps =
       SELECT DISTINCT to_id AS id
       FROM messages
       WHERE delivered = 0
+      UNION SELECT p.id FROM peers p WHERE EXISTS (
+        SELECT 1 FROM messages WHERE delivered=0 AND to_id IN (${correlatedMailboxIdsSql})
+      )
     `).all() as Array<{ id: string }>).map(({ id }) => id));
     const budgetIds = new Set([
       ...nudgeAttempts.keys(),
@@ -1606,7 +1666,14 @@ export function tick(db: Database, snapOverride?: TickSnapshot, deps: TickDeps =
   const snap = snapOverride ?? takeSnapshot();
   if (!snap) { log("tick: snapshot (ps/tmux) failed — skipping this tick"); return; }
 
-  for (const lane of lanes) {
+  const startIndex = Math.max(0, lanes.findIndex((lane) => lane.id === nextLaneId));
+  const orderedLanes = [...lanes.slice(startIndex), ...lanes.slice(0, startIndex)];
+  for (let laneIndex = 0; laneIndex < orderedLanes.length; laneIndex++) {
+    if (commandBudgetRemaining() <= 0) break;
+    const lane = orderedLanes[laneIndex]!;
+    // Advance before attempting the lane: one repeatedly slow pane cannot
+    // monopolize the next cycle, including when it exhausts this cycle's budget.
+    nextLaneId = orderedLanes[(laneIndex + 1) % orderedLanes.length]!.id;
     // Per-lane crash isolation: a throw from any check (e.g. pstree missing,
     // tmux gone) must NOT escape the setInterval callback and kill the daemon.
     // Log it and move to the next lane.
@@ -1682,6 +1749,8 @@ export function tick(db: Database, snapOverride?: TickSnapshot, deps: TickDeps =
       // Write-ahead reservation: record the attempt and cooldown before tmux.
       // A service restart or crash after submission can never mint another five
       // attempts for the same broker-authored unread episode.
+      // Do not burn a persisted attempt if the tick cannot start transport.
+      if (commandBudgetRemaining() < 1500) break;
       const reservedAttempts = (nudgeAttempts.get(lane.id) ?? 0) + 1;
       nudgeAttempts.set(lane.id, reservedAttempts);
       lastNudge.set(lane.id, clock());
@@ -1707,16 +1776,16 @@ export function tick(db: Database, snapOverride?: TickSnapshot, deps: TickDeps =
 // Touch the heartbeat file (mtime = "last completed a tick"). Best-effort: a
 // write failure must never break the poll loop, so it is caught and logged once.
 let heartbeatWriteWarned = false;
-export function writeHeartbeat(): void {
+export function writeHeartbeat(path = HEARTBEAT_PATH): void {
   try {
     require("node:fs").writeFileSync(
-      HEARTBEAT_PATH,
+      path,
       `${new Date().toISOString()}\nnudge_budget=${nudgeBudgetHealthStatus()}\n`,
     );
   } catch (e) {
     if (!heartbeatWriteWarned) {
       heartbeatWriteWarned = true;
-      log(`heartbeat write failed (${HEARTBEAT_PATH}): ${e instanceof Error ? e.message : String(e)} — watchdog may false-restart`);
+      log(`heartbeat write failed (${path}): ${e instanceof Error ? e.message : String(e)} — watchdog may false-restart`);
     }
   }
 }
@@ -1726,20 +1795,38 @@ export function writeHeartbeat(): void {
 // liveness signal reflects "the loop is still cycling", and an unexpected tick
 // throw is logged instead of silently stopping the timer.
 function scheduledTick(db: Database): void {
+  let snap: TickSnapshot | null = null;
+  const started = Date.now();
+  const stage = (name: "snapshot" | "wake" | "idle") => {
+    try {
+      require("node:fs").writeFileSync(`${HEARTBEAT_PATH}.stage`, JSON.stringify({
+        stage: name, started_at: new Date(started).toISOString(), elapsed_ms: Date.now() - started,
+      }) + "\n");
+    } catch { /* Heartbeat write reports persistent filesystem failure. */ }
+  };
   try {
-    const snap = takeSnapshot();
-    if (snap) {
-      void reconcileVisibleCodexSeats(snap).catch((e) => {
-        log(`codex seat reconcile threw: ${e instanceof Error ? e.message : String(e)} (loop continues)`);
-      });
-      tick(db, snap);
-    } else {
-      tick(db);
-    }
+    withCommandBudget(8000, () => {
+      stage("snapshot");
+      snap = takeSnapshot();
+      stage("wake");
+      if (snap) tick(db, snap);
+      else log("tick: snapshot (ps/tmux) failed — skipping this tick");
+    });
   } catch (e) {
     log(`tick threw at top level: ${e instanceof Error ? e.message : String(e)} (loop continues)`);
   } finally {
+    stage("idle");
+    if (Date.now() - started > TICK_WARN_MS) log(`scheduled tick completed elapsed_ms=${Date.now() - started} stage=idle`);
     writeHeartbeat();
+  }
+  // Start async reconciliation outside the tick's AsyncLocalStorage deadline.
+  // Its existing in-flight guard and transport timeouts own its lifetime.
+  if (snap) {
+    void reconcileVisibleCodexSeats(snap, {
+      boundIdentityForSeat: (seat) => boundCodexSeatIdentity(db, seat),
+    }).catch((e) => {
+      log(`codex seat reconcile threw: ${e instanceof Error ? e.message : String(e)} (loop continues)`);
+    });
   }
 }
 

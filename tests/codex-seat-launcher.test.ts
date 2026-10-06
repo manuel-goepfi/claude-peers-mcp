@@ -28,6 +28,7 @@ const EXPECTED_CODEX_GLOBAL_OPTIONS = [
   "--search",
   "--strict-config",
   "--version",
+  "--worktree",
   "-C",
   "-V",
   "-a",
@@ -145,6 +146,7 @@ describe("codex-seat launcher", () => {
     const result = Bun.spawnSync([
       LAUNCHER,
       "--strict-config",
+      "--worktree",
       "--enable",
       "hooks",
       "--search",
@@ -167,9 +169,30 @@ describe("codex-seat launcher", () => {
     expect(result.exitCode).toBe(0);
     expect(existsSync(join(state, "app.pid"))).toBe(false);
     expect(readFileSync(join(state, "tui.args"), "utf8")).toBe(
-      '--strict-config\n--enable\nhooks\n--search\n-c\nmodel="test"\nexec\n--json\n',
+      '--strict-config\n--worktree\n--enable\nhooks\n--search\n-c\nmodel="test"\nexec\n--json\n',
     );
   });
+
+  test("interactive --worktree preserves the native flag and pane-local seat", () => {
+    const { root, state, fakeCodex } = fixture();
+    const port = freePort();
+    const result = Bun.spawnSync([LAUNCHER, "--worktree"], {
+      env: {
+        PATH: process.env.PATH ?? "",
+        HOME: root,
+        CODEX_HOME: join(root, ".codex"),
+        CLAUDE_PEERS_REAL_CODEX: fakeCodex,
+        CLAUDE_PEERS_CODEX_SEAT_PORT: String(port),
+        FAKE_CODEX_STATE: state,
+      },
+      stdout: "pipe", stderr: "pipe",
+    });
+    expect(result.exitCode).toBe(0);
+    expect(existsSync(join(state, "app.pid"))).toBe(true);
+    expect(readFileSync(join(state, "tui.args"), "utf8")).toBe(
+      `--remote\nws://127.0.0.1:${port}\n--cd\n${process.cwd()}\n--worktree\n`,
+    );
+  }, 15_000); // Includes native process startup and descendant cleanup scans.
 
   test("a bare --remote unix:// passes through with a trade-off warning, never a redirect", () => {
     // The bare form is a DELIBERATE choice of the shared default app-server —
@@ -570,12 +593,13 @@ fi
 
       launcher.kill("SIGKILL");
       await launcher.exited;
-      // The watchdog has two bounded 1s TERM grace loops; leave scheduler
-      // headroom when the full suite is competing for CPU without weakening
-      // the assertion that every descendant is gone.
+      // Cleanup includes repeated process-table scans as well as two 1s TERM
+      // grace loops. On a busy host each pgrep can take about a second, so the
+      // former 8s deadline expired before cleanup finished. Keep the assertion
+      // that every descendant actually disappears, with a bounded host budget.
       expect(await waitFor(
         () => [appPid, appChildPid, tuiPid, tuiChildPid, watchdogPid].every((pid) => !isAlive(pid)),
-        8_000,
+        25_000,
       )).toBe(true);
     } finally {
       launcher.kill("SIGKILL");
@@ -597,7 +621,7 @@ fi
         }
       }
     }
-  }, 10_000);
+  }, 35_000);
 
   test("rejects readiness served by a different process on the requested port", async () => {
     const { root, state, fakeCodex } = fixture();

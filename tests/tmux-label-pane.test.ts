@@ -168,9 +168,9 @@ describe("tmux birth-time operator labels", () => {
     });
   });
 
-  test("a deliberate one-pane window name is donated while generic grok is not", () => {
+  test("window names never replace automatic pane ordinals", () => {
     const named = fakeTmux({ snapshot: "%10\treview\t0\tREVIEW-1996\t1\t\t\n" });
-    expect(ensurePaneOperatorLabel("%10", named.run)).toEqual({ status: "labeled", label: "REVIEW-1996" });
+    expect(ensurePaneOperatorLabel("%10", named.run)).toEqual({ status: "labeled", label: "review.1" });
 
     const generic = fakeTmux({ snapshot: "%11\tinfra\t4\tgrok\t1\t\t\n" });
     expect(ensurePaneOperatorLabel("%11", generic.run)).toEqual({ status: "labeled", label: "infra.1" });
@@ -180,7 +180,7 @@ describe("tmux birth-time operator labels", () => {
     const calls: string[][] = [];
     const run: TmuxLabelRunner = (args) => {
       calls.push(args);
-      if (args[0] === "list-panes" && args.includes("#{pane_id}")) return { ok: true, out: "%1\n%2\n" };
+      if (args[0] === "list-panes" && args.includes("-a")) return { ok: true, out: "%1\tinfra\t1\tgrok\t2\tinfra.1\tinfra.1\n%2\tinfra\t2\tgrok\t2\t\t\n" };
       if (args[0] === "display-message" && args.includes("%1")) {
         return { ok: true, out: "%1\tinfra\t1\tgrok\t2\tinfra.1\tinfra.1\n" };
       }
@@ -199,7 +199,7 @@ describe("tmux birth-time operator labels", () => {
   test("install-time backfill tolerates a pane disappearing after enumeration", () => {
     let allPaneQueries = 0;
     const run: TmuxLabelRunner = (args) => {
-      if (args[0] === "list-panes" && args.includes("#{pane_id}")) {
+      if (args[0] === "list-panes" && args.includes("-a")) {
         allPaneQueries++;
         return { ok: true, out: allPaneQueries === 1 ? "%9\n" : "" };
       }
@@ -220,4 +220,69 @@ describe("tmux birth-time operator labels", () => {
 
     expect(labelAllUnlabeledPanes(run)).toEqual({ visited: 1, labeled: 0, failed: 1 });
   });
+});
+
+describe("existing ordinal collision repair",()=>{
+  test("current-prefix owner keeps its ordinal ahead of an older-prefix claimant",()=>{
+    const siblings="%9\tmarketing.1\t\n%10\tC5 Marketing.1\t\n%11\tC5 Marketing.4\t";
+    const old=fakeTmux({snapshot:"%9\tC5 Marketing\t0\tbash\t3\tmarketing.1\t\n",siblings});
+    const current=fakeTmux({snapshot:"%10\tC5 Marketing\t1\tbash\t3\tC5 Marketing.1\t\n",siblings});
+    expect(ensurePaneOperatorLabel("%9",old.run)).toEqual({status:"labeled",label:"C5 Marketing.5"});
+    expect(ensurePaneOperatorLabel("%10",current.run)).toEqual({status:"preserved",label:"C5 Marketing.1"});
+  });
+  test("equal legacy or canonical contenders use numeric pane IDs, never list order",()=>{
+    for(const prefix of ["old","Current"]) {
+      const siblings=`%10\t${prefix}.1\t\n%9\t${prefix}.1\t`;
+      const winner=fakeTmux({snapshot:`%9\tCurrent\t1\tbash\t2\t${prefix}.1\t\n`,siblings});
+      const loser=fakeTmux({snapshot:`%10\tCurrent\t0\tbash\t2\t${prefix}.1\t\n`,siblings});
+      expect(ensurePaneOperatorLabel("%10",loser.run)).toEqual({status:"labeled",label:"Current.2"});
+      expect(ensurePaneOperatorLabel("%9",winner.run)).toEqual({status:prefix==="Current"?"preserved":"labeled",label:"Current.1"});
+    }
+  });
+});
+
+test("pane disappearance during lock identity lookup is a benign skip", () => {
+  const run: TmuxLabelRunner = (args) => args[0] === "list-panes"
+    ? { ok: true, out: "%999\n" }
+    : { ok: false, out: "" };
+  expect(ensurePaneOperatorLabel("%9", run, "/unused-test-socket")).toEqual({ status: "skipped", reason: "pane-gone" });
+});
+
+test("backfill skips 100 unique canonical panes with one tmux snapshot", () => {
+  const calls: string[][] = [];
+  const run: TmuxLabelRunner = (args) => {
+    calls.push(args);
+    return { ok: true, out: Array.from({ length: 100 }, (_, i) =>
+      `%${i}\tinfra\t${i}\tbash\t100\tinfra.${i + 1}\t`).join("\n") };
+  };
+  expect(labelAllUnlabeledPanes(run)).toEqual({ visited: 100, labeled: 0, failed: 0 });
+  expect(calls).toHaveLength(1);
+  expect(calls[0]![0]).toBe("list-panes");
+});
+
+test("bulk filter keeps cross-session labels and repairs duplicate and legacy claims", () => {
+  const rows = new Map([
+    ["%1", ["infra", "infra.1"]], ["%2", ["infra", "infra.1"]],
+    ["%3", ["infra", "old.3"]], ["%4", ["other", "other.1"]],
+    ["%5", ["infra", ""]], ["%6", ["infra", "invalid-label"]],
+  ]);
+  const writes: string[] = [];
+  const snapshot = (id: string) => { const [session, label] = rows.get(id)!;
+    return `${id}\t${session}\t1\tbash\t5\t${label}\t`; };
+  const run: TmuxLabelRunner = (args) => {
+    if (args[0] === "list-panes" && args.includes("-a")) return { ok: true, out: [...rows.keys()].map(snapshot).join("\n") };
+    if (args[0] === "display-message") return { ok: true, out: snapshot(args[args.indexOf("-t") + 1]!) };
+    if (args[0] === "list-panes") return { ok: true, out: [...rows].filter(([, r]) => r[0] === args[args.indexOf("-t") + 1]).map(([id, r]) => `${id}\t${r[1]}\t`).join("\n") };
+    if (args[0] === "set-option") {
+      const id = args[args.indexOf("-t") + 1]!;
+      rows.get(id)![1] = args.at(-1)!; writes.push(id);
+      return { ok: true, out: "" };
+    }
+    return { ok: false, out: "" };
+  };
+  expect(labelAllUnlabeledPanes(run)).toEqual({ visited: 6, labeled: 4, failed: 0 });
+  expect(rows.get("%1")![1]).toBe("infra.1");
+  expect(rows.get("%4")![1]).toBe("other.1");
+  expect(writes.sort()).toEqual(["%2", "%3", "%5", "%6"]);
+  expect(new Set([...rows].filter(([, r]) => r[0] === "infra").map(([, r]) => r[1])).size).toBe(5);
 });

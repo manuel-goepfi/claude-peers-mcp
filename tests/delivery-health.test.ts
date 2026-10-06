@@ -136,8 +136,8 @@ describe("mcp_transport surfacing", () => {
     expect(health.mcp_transport).toBe("dead");
     // Drain state is unchanged — receipt still works via hooks.
     expect(health.state).toBe("healthy");
-    expect(health.warning).toContain("MCP adapter is not running");
-    expect(health.warning).toContain("hook mail still delivers");
+    expect(health.warning).toContain("MCP adapter liveness check failed");
+    expect(health.warning).toContain("Hook delivery may still work");
   });
 
   test("a dead adapter appends to an existing drain warning instead of replacing it", () => {
@@ -149,7 +149,7 @@ describe("mcp_transport surfacing", () => {
     });
     expect(health.state).toBe("undrained");
     expect(health.warning).toContain("Treat this as undelivered");
-    expect(health.warning).toContain("MCP adapter is not running");
+    expect(health.warning).toContain("MCP adapter liveness check failed");
   });
 });
 

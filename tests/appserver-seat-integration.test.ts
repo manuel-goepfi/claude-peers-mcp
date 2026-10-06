@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startTestBroker } from "./helpers/test-broker.ts";
@@ -17,6 +17,85 @@ function appServerFixtureCommand(targetScript: string): string {
 }
 
 const canUseTmux = Bun.spawnSync(["tmux", "list-sessions"], { stdout: "ignore", stderr: "ignore" }).exitCode === 0;
+
+test("Desktop MCP adopts its exact host-owned thread and cannot switch inboxes", async () => {
+  const broker = await startTestBroker({ prefix: "desktop-thread-proof" });
+  const cwd = mkdtempSync(join(tmpdir(), "claude-peers-desktop-proof-"));
+  const thread = crypto.randomUUID();
+  const app = Bun.spawn(["bash", "-c", appServerFixtureCommand(SERVER_SCRIPT)], {
+    cwd, env: { ...process.env, TMUX: undefined, TMUX_PANE: undefined,
+      CLAUDE_PEER_NAME: undefined, MCP_PROBE_THREAD_ID: undefined,
+      CLAUDE_PEERS_PORT: String(broker.port), CLAUDE_PEERS_DB: broker.dbPath,
+      CLAUDE_PEERS_BRIDGE_TOKEN_FILE: broker.tokenPath, CLAUDE_PEERS_TMUX_IDENTITY_MIRROR: "0",
+      CLAUDE_PEERS_TEST_APP_SERVER_MODULE: APP_SERVER_FIXTURE,
+      CLAUDE_PEERS_TEST_APP_SERVER_CHILD_CWD: cwd },
+    stdin: "pipe", stdout: "pipe", stderr: "pipe",
+  });
+  const stderr = new Response(app.stderr).text();
+  const reader = app.stdout.getReader();
+  let buffered = "";
+  const responseFor = async (id: number): Promise<any> => {
+    while (true) {
+      const newline = buffered.indexOf("\n");
+      if (newline >= 0) {
+        const line = buffered.slice(0, newline); buffered = buffered.slice(newline + 1);
+        if (!line.trim()) continue;
+        const message = JSON.parse(line);
+        if (message.id === id) return message;
+      } else {
+        const chunk = await reader.read();
+        if (chunk.done) throw new Error("Desktop fixture closed before tool response");
+        buffered += new TextDecoder().decode(chunk.value);
+      }
+    }
+  };
+  const frame = (value: object) => app.stdin.write(JSON.stringify({ jsonrpc: "2.0", ...value }) + "\n");
+  const request = async (path: string, body: object, token?: string) => {
+    const result = await fetch(broker.url + path, { method: "POST",
+      headers: { "Content-Type": "application/json", ...(token ? { "X-Peer-Token": token } : {}) },
+      body: JSON.stringify(body) });
+    if (!result.ok) throw new Error(`fixture ${path}: ${result.status} ${await result.text()}`);
+    return await result.json() as any;
+  };
+  try {
+    const base = { cwd, git_root: null, tty: null, tmux_session: null,
+      tmux_window_index: null, tmux_window_name: null, tmux_pane_id: null, summary: "" };
+    const receiver = await request("/register", { ...base, pid: app.pid, name: "desktop-proof",
+      client_type: "codex", receiver_mode: "codex-hook", thread_id: thread });
+    await request("/hook-heartbeat-by-thread", { thread_id: thread, caller_pid: process.pid,
+      client_type: "codex", receiver_mode: "codex-hook" });
+    frame({ id: 1, method: "initialize", params: { protocolVersion: "2024-11-05",
+      capabilities: {}, clientInfo: { name: "desktop-proof", version: "1" } } });
+    await responseFor(1);
+    frame({ method: "notifications/initialized" });
+    frame({ id: 2, method: "tools/call", params: { name: "whoami", arguments: {}, _meta: { threadId: thread } } });
+    const self = await responseFor(2);
+    expect(self.result.isError).not.toBe(true);
+    expect(JSON.stringify(self.result)).toContain(receiver.id);
+    const sender = await request("/register", { ...base, pid: process.pid, name: "sender-proof", client_type: "claude" });
+    const marker = `desktop-receipt-${crypto.randomUUID()}`;
+    await request("/send-message", { from_id: sender.id, to_id: receiver.id, text: marker }, sender.token);
+    frame({ id: 3, method: "tools/call", params: { name: "check_messages", arguments: {}, _meta: { threadId: thread } } });
+    expect(JSON.stringify((await responseFor(3)).result)).toContain(marker);
+    frame({ id: 4, method: "tools/call", params: { name: "check_messages", arguments: {}, _meta: { threadId: thread } } });
+    expect(JSON.stringify((await responseFor(4)).result)).not.toContain(marker);
+    frame({ id: 5, method: "tools/call", params: { name: "whoami", arguments: {}, _meta: { threadId: crypto.randomUUID() } } });
+    expect((await responseFor(5)).result.isError).toBe(true);
+    const db = new Database(broker.dbPath, { readonly: true });
+    try {
+      expect(db.query("SELECT id, tmux_pane_id, seat_key FROM peers WHERE thread_id = ?").all(thread))
+        .toEqual([{ id: receiver.id, tmux_pane_id: null, seat_key: null }]);
+      expect(db.query("SELECT delivered FROM messages WHERE to_id = ? AND text = ?").get(receiver.id, marker))
+        .toEqual({ delivered: 1 });
+    } finally { db.close(); }
+  } finally {
+    app.stdin.end();
+    const timer = setTimeout(() => app.kill(), 3000);
+    await app.exited; clearTimeout(timer);
+    reader.releaseLock(); await stderr;
+    await broker.stop(); rmSync(cwd, { recursive: true, force: true });
+  }
+}, 20_000);
 
 (canUseTmux ? test : test.skip)("a pane-local app-server registers the exact Codex lane when the cwd is shared", async () => {
   const broker = await startTestBroker({ prefix: "appserver-register-pane" });
@@ -90,7 +169,7 @@ const canUseTmux = Bun.spawnSync(["tmux", "list-sessions"], { stdout: "ignore", 
     ).all() as Array<Record<string, unknown>>;
     db.close();
     expect(rows).toEqual([{
-      name: "orch.5",
+      name: `${currentSession}.1`,
       pid: currentPid,
       tty: currentTty,
       thread_id: threadId,
@@ -161,19 +240,33 @@ const canUseTmux = Bun.spawnSync(["tmux", "list-sessions"], { stdout: "ignore", 
 }, 20_000);
 
 (canUseTmux ? test : test.skip)("SessionStart registers from exact inherited pane proof without a Codex ancestor", async () => {
-  const broker = await startTestBroker({ prefix: "hook-register-pane-proof" });
   const cwd = mkdtempSync(join(tmpdir(), "claude-peers-hook-register-pane-"));
+  const socket = join(cwd, "tmux.sock");
+  const shimDir = mkdtempSync(join(cwd, "bin-"));
+  const shim = join(shimDir, "tmux");
+  // The hook intentionally receives no TMUX value. Keep every unqualified tmux
+  // call on this private server without depending on the operator's config.
+  writeFileSync(shim, '#!/bin/sh\nexec "$TEST_REAL_TMUX" -S "$TEST_TMUX_SOCKET" "$@"\n');
+  chmodSync(shim, 0o755);
+  const privateEnv = {
+    PATH: `${shimDir}:${process.env.PATH ?? ""}`,
+    TEST_REAL_TMUX: Bun.which("tmux")!,
+    TEST_TMUX_SOCKET: socket,
+    CLAUDE_PEERS_TMUX_BIN: "tmux",
+    CLAUDE_PEERS_TMUX_SOCKET: socket,
+  };
+  const broker = await startTestBroker({ prefix: "hook-register-pane-proof", env: privateEnv });
   const session = `cp-hook-pane-${process.pid}-${Date.now()}`;
   try {
     const created = Bun.spawnSync([
-      "tmux", "new-session", "-d", "-s", session, "-c", cwd,
+      "tmux", "-S", socket, "-f", "/dev/null", "new-session", "-d", "-s", session, "-c", cwd,
       "bash", "-c",
       'export CLAUDE_PEER_NAME=stale-launch-name CLAUDE_PEER_TMUX_PANE_ID="$TMUX_PANE"; unset TMUX_PANE; exec -a codex sleep 60',
     ], { stdout: "pipe", stderr: "pipe" });
     expect(created.exitCode).toBe(0);
 
     const pane = new TextDecoder().decode(Bun.spawnSync([
-      "tmux", "list-panes", "-t", session, "-F", "#{pane_id}\t#{pane_pid}\t#{pane_tty}",
+      "tmux", "-S", socket, "list-panes", "-t", session, "-F", "#{pane_id}\t#{pane_pid}\t#{pane_tty}",
     ]).stdout).trim().split("\t");
     const [paneId, panePidText, paneTty] = pane;
     const panePid = Number(panePidText);
@@ -194,7 +287,7 @@ const canUseTmux = Bun.spawnSync(["tmux", "list-sessions"], { stdout: "ignore", 
     expect(await Bun.file(`/proc/${panePid}/environ`).text()).toContain(`CLAUDE_PEER_TMUX_PANE_ID=${paneId}\0`);
     expect(new TextDecoder().decode(Bun.spawnSync(["readlink", `/proc/${panePid}/cwd`]).stdout).trim()).toBe(cwd);
     expect(Bun.spawnSync([
-      "tmux", "set-option", "-p", "-t", paneId!, "@operator_label", "infra.9",
+      "tmux", "-S", socket, "set-option", "-p", "-t", paneId!, "@operator_label", "infra.9",
     ]).exitCode).toBe(0);
 
     const threadId = crypto.randomUUID();
@@ -202,6 +295,7 @@ const canUseTmux = Bun.spawnSync(["tmux", "list-sessions"], { stdout: "ignore", 
       cwd,
       env: {
         ...process.env,
+        ...privateEnv,
         TMUX: undefined,
         TMUX_PANE: paneId,
         CLAUDE_PEERS_CLIENT_TYPE: "codex",
@@ -232,7 +326,8 @@ const canUseTmux = Bun.spawnSync(["tmux", "list-sessions"], { stdout: "ignore", 
     ).get(threadId) as Record<string, unknown> | null;
     db.close();
     expect(row).toEqual({
-      name: "infra.9",
+      // Session-prefix changes preserve the existing open pane's ordinal.
+      name: `${session}.9`,
       pid: panePid,
       tty: paneTty?.replace(/^\/dev\//, ""),
       thread_id: threadId,
@@ -240,8 +335,10 @@ const canUseTmux = Bun.spawnSync(["tmux", "list-sessions"], { stdout: "ignore", 
       tmux_pane_id: paneId,
       seat_key: `pane:${session}:${paneId}`,
     });
+    expect(Bun.spawnSync(["tmux", "-S", socket, "show-options", "-p", "-v", "-t", paneId!, "@operator_label"])
+      .stdout.toString().trim()).toBe(`${session}.9`);
   } finally {
-    Bun.spawnSync(["tmux", "kill-session", "-t", session], { stdout: "ignore", stderr: "ignore" });
+    Bun.spawnSync(["tmux", "-S", socket, "kill-server"], { stdout: "ignore", stderr: "ignore" });
     await broker.stop();
     rmSync(cwd, { recursive: true, force: true });
   }

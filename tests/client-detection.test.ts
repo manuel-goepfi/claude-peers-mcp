@@ -1,9 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { inheritedCodexHookSeat } from "../hooks/register-peer-session.ts";
 import { isClientProcess, isCodexAppServerProcess } from "../shared/client.ts";
 import { findClientPidFromTable, findHookPeerPidsFromTable, findMcpPidFromTable } from "../hooks/codex-drain-peer-inbox.ts";
 import { codexDrainRootDecision, codexHookRootDegradedReason, codexHookRootRefusalReason, codexHookSessionDiagnostic, peerName, publishBrokerIdentityToTmux, readPaneLabel, registrationTmuxPaneId, sessionIdFromHookInput, tmuxIdentityMirrorEnabled } from "../hooks/register-peer-session.ts";
-import { detectClientFromProcessChain, findBgSpareAncestor, initialReceiverMode, type ProcessInfo } from "../shared/client.ts";
+import { detectClientFromProcessChain, findBgSpareAncestor, initialReceiverMode, parseProcessTableSnapshot, type ProcessInfo } from "../shared/client.ts";
 import { findNearestVisibleCodexProcessByStart, findVisibleCodexProcessByPaneId, isInteractiveNativeCodex, singleInteractiveCodexProcess } from "../shared/visible-codex.ts";
 import { findCodexAppServerAncestor, findVisibleCodexSession, mcpThreadIdFromRequestMeta, priorCodexPaneSeatReleased, registrationCwd, registrationCwdResult, registrationTtyPid, selectCodexManualDrainPid, selectInboxClaimIdentity, shouldDisableBackgroundPolling, shouldUnregisterPeerOnShutdown, unresolvedAppServerToolDiagnostic } from "../server.ts";
 
@@ -11,15 +14,37 @@ function table(rows: ProcessInfo[]): Map<number, ProcessInfo> {
   return new Map(rows.map((row) => [row.pid, row]));
 }
 
-function canCreateTmuxSession(): boolean {
-  const session = `claude-peers-probe-${process.pid}-${Date.now()}`;
-  const created = Bun.spawnSync(["tmux", "new-session", "-d", "-s", session], { stdout: "ignore", stderr: "ignore" });
-  if (created.exitCode !== 0) return false;
-  Bun.spawnSync(["tmux", "kill-session", "-t", session], { stdout: "ignore", stderr: "ignore" });
-  return true;
-}
 
 describe("client detection", () => {
+  test("headless shared-server hook cannot adopt the sole unrelated visible TUI", () => {
+    const processes = table([
+      { pid: 200, ppid: 1, tty: "pts/10", comm: "codex", args: "codex resume" },
+    ]);
+    const readers = {
+      cwdOf: () => "/repo",
+      environOf: () => ({ TMUX_PANE: "%22", CLAUDE_PEER_NAME: "other-task" }),
+    };
+    expect(inheritedCodexHookSeat(processes, undefined, readers)).toBeNull();
+    expect(inheritedCodexHookSeat(processes, "%99", readers)).toBeNull();
+    expect(inheritedCodexHookSeat(processes, "%22", readers)?.pid).toBe(200);
+  });
+  test("parses TTY and argv from one process-table snapshot", () => {
+    const processes = parseProcessTableSnapshot([
+      "200 1 pts/10 codex codex --remote ws://127.0.0.1:4000 --cd /repo",
+      "201 1 ? bun bun /repo/server.ts",
+    ].join("\n"));
+
+    expect(processes.get(200)).toEqual({
+      pid: 200,
+      ppid: 1,
+      tty: "pts/10",
+      comm: "codex",
+      args: "codex --remote ws://127.0.0.1:4000 --cd /repo",
+    });
+    expect(processes.get(201)?.tty).toBeNull();
+    expect(processes.get(201)?.args).toBe("bun /repo/server.ts");
+  });
+
   test("explicit override wins", () => {
     const processes = table([{ pid: 10, ppid: 1, comm: "bash", args: "bash" }]);
     expect(detectClientFromProcessChain(10, processes, { CLAUDE_PEERS_CLIENT_TYPE: "codex" })).toBe("codex");
@@ -331,6 +356,38 @@ describe("client detection", () => {
       .toBeNull();
   });
 
+  test("pane lookup reuses snapshot TTY data without spawning a probe per Codex candidate", () => {
+    const processes = new Map<number, ProcessInfo>([
+      [200, { pid: 200, ppid: 1, tty: "pts/10", comm: "codex", args: "codex resume" }],
+      [201, { pid: 201, ppid: 1, tty: "pts/11", comm: "codex", args: "codex resume" }],
+    ]);
+    let ttyProbeCount = 0;
+    let cwdReadCount = 0;
+    let environmentReadCount = 0;
+    const visible = findVisibleCodexProcessByPaneId(processes, null, "%2432", {
+      paneTtyHint: "/dev/pts/11",
+      getTty: () => {
+        ttyProbeCount += 1;
+        return null;
+      },
+      cwdOf: () => {
+        cwdReadCount += 1;
+        return "/home/manzo/Clause5";
+      },
+      environOf: (pid) => {
+        environmentReadCount += 1;
+        return pid === 201
+          ? { CLAUDE_PEER_NAME: "infra.12", TMUX_PANE: "%2432" }
+          : { CLAUDE_PEER_NAME: "infra.11", TMUX_PANE: "%2404" };
+      },
+    });
+
+    expect(visible).toMatchObject({ pid: 201, tty: "pts/11" });
+    expect(ttyProbeCount).toBe(0);
+    expect(cwdReadCount).toBe(1);
+    expect(environmentReadCount).toBe(1);
+  });
+
   test("collapses a Node launcher and its native Codex child into one pane-local session", () => {
     const processes = new Map<number, ProcessInfo>([
       [200, {
@@ -484,7 +541,7 @@ describe("client detection", () => {
     }, "orch.5")).toBe("orch.5");
     expect(peerName("claude", 201, { session: "infra", pane_id: "%312" }, {
       CLAUDE_PEER_NAME: "infra.2",
-    }, "infra.3")).toBe("infra.2");
+    }, "infra.3")).toBe("infra.3");
   });
 
   test("Claude hook names ignore pane_index and keep a sticky pane label", () => {
@@ -503,7 +560,7 @@ describe("client detection", () => {
       reads++;
       return reads === 1
         ? { ok: false, peerResolvedName: null, operatorLabel: null }
-        : { ok: true, peerResolvedName: "orch.5", operatorLabel: "stale-human" };
+        : { ok: true, peerResolvedName: "stale-broker.8", operatorLabel: "orch.5" };
     });
 
     expect(label).toBe("orch.5");
@@ -853,29 +910,47 @@ describe("client detection", () => {
     expect(pids).toBeNull();
   });
 
-  (canCreateTmuxSession() ? test : test.skip)("register hook mirrors broker identity into tmux peer fields without changing operator label", () => {
+  (Bun.which("tmux") ? test : test.skip)("register hook mirrors broker identity into tmux peer fields without changing operator label", () => {
+    const root = mkdtempSync(join(tmpdir(), "claude-peers-register-mirror-"));
+    const socket = join(root, "tmux.sock");
+    const priorPath = process.env.PATH;
+    const realTmux = Bun.which("tmux")!;
+    const shim = join(root, "tmux");
+    writeFileSync(shim, '#!/bin/sh\nexec "' + realTmux + '" -S "' + socket + '" "$@"\n');
+    chmodSync(shim, 0o755);
+    const publishMirror = (...args: Parameters<typeof publishBrokerIdentityToTmux>) => {
+      const child = Bun.spawnSync([process.execPath, "-e",
+        'import { publishBrokerIdentityToTmux } from ' + JSON.stringify(new URL("../hooks/register-peer-session.ts", import.meta.url).pathname) +
+        '; console.log(JSON.stringify(publishBrokerIdentityToTmux(...JSON.parse(process.argv[1]))));', JSON.stringify(args)], {
+        env: { ...process.env, PATH: `${root}:${priorPath ?? ""}`,
+          CLAUDE_PEERS_TMUX_BIN: realTmux, CLAUDE_PEERS_TMUX_SOCKET: socket },
+        stdout: "pipe", stderr: "pipe",
+      });
+      expect(child.exitCode).toBe(0);
+      return JSON.parse(child.stdout.toString()) as ReturnType<typeof publishBrokerIdentityToTmux>;
+    };
     const session = `claude-peers-register-hook-${process.pid}-${Date.now()}`;
-    const created = Bun.spawnSync(["tmux", "new-session", "-d", "-s", session], { stdout: "ignore", stderr: "ignore" });
+    const created = Bun.spawnSync(["tmux", "-S", socket, "-f", "/dev/null", "new-session", "-d", "-s", session], { stdout: "ignore", stderr: "ignore" });
     expect(created.exitCode).toBe(0);
 
     try {
-      const paneIdResult = Bun.spawnSync(["tmux", "display-message", "-p", "-t", `${session}:0.0`, "#{pane_id}"], {
+      const paneIdResult = Bun.spawnSync(["tmux", "-S", socket, "display-message", "-p", "-t", `${session}:0.0`, "#{pane_id}"], {
         stdout: "pipe",
         stderr: "ignore",
       });
       const paneId = new TextDecoder().decode(paneIdResult.stdout).trim();
       expect(paneId).toMatch(/^%/);
 
-      Bun.spawnSync(["tmux", "set-option", "-p", "-t", paneId, "@operator_label", "human.pr"], {
+      Bun.spawnSync(["tmux", "-S", socket, "set-option", "-p", "-t", paneId, "@operator_label", `${session}.4`], {
         stdout: "ignore",
         stderr: "ignore",
       });
-      Bun.spawnSync(["tmux", "set-option", "-p", "-t", paneId, "@peer_id", "stale-peer"], {
+      Bun.spawnSync(["tmux", "-S", socket, "set-option", "-p", "-t", paneId, "@peer_id", "stale-peer"], {
         stdout: "ignore",
         stderr: "ignore",
       });
 
-      const result = publishBrokerIdentityToTmux({
+      const result = publishMirror({
         id: "fresh-peer",
         name: "pr.1",
         resolved_name: "pr.1",
@@ -889,7 +964,7 @@ describe("client detection", () => {
       }, {}, { CLAUDE_PEERS_TMUX_IDENTITY_MIRROR: "1" });
 
       const readOption = (name: string): string => {
-        const result = Bun.spawnSync(["tmux", "show-options", "-p", "-t", paneId, "-v", name], {
+        const result = Bun.spawnSync(["tmux", "-S", socket, "show-options", "-p", "-t", paneId, "-v", name], {
           stdout: "pipe",
           stderr: "ignore",
         });
@@ -898,9 +973,9 @@ describe("client detection", () => {
 
       expect(result.ok).toBe(true);
       expect(result.target).toBe(paneId);
-      expect(readOption("@operator_label")).toBe("human.pr");
+      expect(readOption("@operator_label")).toBe(`${session}.4`);
       expect(readOption("@peer_id")).toBe("fresh-peer");
-      expect(readOption("@peer_label")).toBe("pr.1");
+      expect(readOption("@peer_label")).toBe(`${session}.4`);
       expect(readOption("@peer_resolved_name")).toBe("pr.1");
       expect(readOption("@peer_client_type")).toBe("codex");
       expect(readOption("@peer_receiver_mode")).toBe("codex-hook");
@@ -914,7 +989,7 @@ describe("client detection", () => {
       ];
       const beforeDisabledPublish = Object.fromEntries(writableOptions.map((option) => [option, readOption(option)]));
 
-      const skipped = publishBrokerIdentityToTmux({
+      const skipped = publishMirror({
         id: "must-not-write",
         name: "test-leak",
         resolved_name: "test-leak",
@@ -933,9 +1008,10 @@ describe("client detection", () => {
       expect(skipped).toEqual({ ok: true, target: null, failedOptions: [], skipped: true });
       expect(Object.fromEntries(writableOptions.map((option) => [option, readOption(option)]))).toEqual(beforeDisabledPublish);
     } finally {
-      Bun.spawnSync(["tmux", "kill-session", "-t", session], { stdout: "ignore", stderr: "ignore" });
+      Bun.spawnSync(["tmux", "-S", socket, "kill-server"], { stdout: "ignore", stderr: "ignore" });
+      rmSync(root, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 
   test("register hook mirror opt-out accepts every supported false spelling", () => {
     for (const value of ["0", "false", "no", "off", " FALSE "]) {

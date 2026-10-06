@@ -18,6 +18,7 @@ import {
   unknownReceiverPurgeSql,
   type StorageBackupManifest,
 } from "../shared/storage.ts";
+import { liveMailboxIdsSql } from "../shared/live-mailbox-groups.ts";
 
 const roots: string[] = [];
 const brokerScript = new URL("../broker.ts", import.meta.url).pathname;
@@ -76,6 +77,19 @@ function legacyDatabase(path: string): Database {
 }
 
 describe("versioned historical-message migration", () => {
+  test("storage runs WAL with NORMAL sync so commits do not fsync on the event loop", () => {
+    const dir = root();
+    const db = new Database(join(dir, "sync.db"));
+    try {
+      initializeStorage(db, { databasePath: join(dir, "sync.db") });
+      expect((db.query("PRAGMA journal_mode").get() as { journal_mode: string }).journal_mode).toBe("wal");
+      // 1 = NORMAL; SQLite's default of 2 (FULL) syncs the WAL on every commit.
+      expect((db.query("PRAGMA synchronous").get() as { synchronous: number }).synchronous).toBe(1);
+    } finally {
+      db.close();
+    }
+  });
+
   test("sequence high-water calculation stays bounded for million-row histories", () => {
     const ids = Array.from({ length: 1_000_000 }, (_, index) => index + 1);
     expect(maximumSequenceHighWater(5, ids)).toBe(1_000_000);
@@ -511,6 +525,48 @@ describe("retention and index contracts", () => {
     expect(db.run(retentionPurgeSql(), ["2025"]).changes).toBe(1);
     expect((db.query("SELECT text FROM messages").get() as { text: string }).text).toBe("keep");
     db.close();
+  });
+
+  test("thread and runtime-group lookups use their expression indexes", () => {
+    const db = new Database(":memory:");
+    initializeStorage(db, { databasePath: ":memory:" });
+    // selectPeersByThread / selectIdentityProofByThread in broker.ts.
+    expect(explainUsesIndex(
+      db,
+      "SELECT * FROM peers WHERE non_targetable = 0 AND lower(thread_id) = ? ORDER BY last_seen DESC",
+      ["thread"],
+      storageIndexes.peerThreadLower,
+    )).toBe(true);
+    // Every mailbox count, claim and queue read embeds liveMailboxIdsSql.
+    expect(explainUsesIndex(db, liveMailboxIdsSql, ["peer"], storageIndexes.peerLiveGroup)).toBe(true);
+    expect(explainUsesIndex(
+      db,
+      `SELECT COUNT(*) FROM messages WHERE to_id IN (${liveMailboxIdsSql}) AND delivered = 0`,
+      ["peer"],
+      storageIndexes.peerLiveGroup,
+    )).toBe(true);
+    const plan = (db.query(`EXPLAIN QUERY PLAN ${liveMailboxIdsSql}`).all("peer") as Array<{ detail: string }>).map((row) => row.detail);
+    expect(plan.some((detail) => /^SCAN sibling/.test(detail))).toBe(false);
+    db.close();
+  });
+
+  test("a current database gains the lookup indexes additively on startup", () => {
+    const dir = root();
+    const path = join(dir, "additive.db");
+    const first = new Database(path);
+    initializeStorage(first, { databasePath: path });
+    first.run(`DROP INDEX ${storageIndexes.peerThreadLower}`);
+    first.run(`DROP INDEX ${storageIndexes.peerLiveGroup}`);
+    first.close();
+    const reopened = new Database(path);
+    try {
+      expect(initializeStorage(reopened, { databasePath: path }).migrated).toBe(false);
+      const names = new Set((reopened.query("SELECT name FROM sqlite_master WHERE type='index'").all() as Array<{ name: string }>).map((row) => row.name));
+      expect(names.has(storageIndexes.peerThreadLower)).toBe(true);
+      expect(names.has(storageIndexes.peerLiveGroup)).toBe(true);
+    } finally {
+      reopened.close();
+    }
   });
 
   test("query plans use the dedicated storage indexes", () => {

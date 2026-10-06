@@ -17,16 +17,34 @@ command -v jq >/dev/null 2>&1 || exit 0
 # those calls with agent_id; agent_type alone is insufficient because a root
 # session started with `claude --agent` also carries it. Never let a subagent
 # claim the root seat's inbox.
-if [[ "$HOOK_EVENT_NAME" == "PostToolBatch" ]]; then
-  AGENT_ID=$(jq -r 'if (.agent_id | type) == "string" then .agent_id else "" end' 2>/dev/null)
-  [[ -n "$AGENT_ID" ]] && exit 0
-else
-  cat >/dev/null
-fi
+HOOK_INPUT=$(cat)
+AGENT_ID=$(printf '%s' "$HOOK_INPUT" | jq -r 'if (.agent_id | type) == "string" then .agent_id else "" end' 2>/dev/null)
+[[ -n "$AGENT_ID" ]] && exit 0
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
 SERVER_PATH="$ROOT/server.ts"
+
+# Single-process lookups. Read /proc directly where it exists: a `ps` fork per
+# ancestor step is measurable on a loaded host with thousands of processes.
+proc_comm() {
+  if [[ -r "/proc/$1/comm" ]]; then cat "/proc/$1/comm" 2>/dev/null
+  else ps -p "$1" -o comm= 2>/dev/null; fi
+}
+proc_ppid() {
+  local stat
+  if stat=$(cat "/proc/$1/stat" 2>/dev/null); then
+    stat="${stat##*) }"   # drop "pid (comm) "; comm may itself contain spaces
+    set -- $stat
+    printf '%s\n' "$2"
+  else
+    ps -p "$1" -o ppid= 2>/dev/null | tr -d ' '
+  fi
+}
+proc_args() {
+  if [[ -r "/proc/$1/cmdline" ]]; then tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null
+  else ps -p "$1" -o args= 2>/dev/null; fi
+}
 
 child_server_pid() {
   ps -ewwo pid=,ppid=,args= 2>/dev/null | awk -v parent="$1" -v server="$SERVER_PATH" \
@@ -41,7 +59,7 @@ resolve_bun_pid() {
   local cand="$1" depth child
   for depth in 1 2 3; do
     [[ -z "$cand" ]] && return 1
-    if [[ "$(ps -p "$cand" -o comm= 2>/dev/null)" == "bun" ]]; then
+    if [[ "$(proc_comm "$cand")" == "bun" ]]; then
       echo "$cand"; return 0
     fi
     child=$(pgrep -P "$cand" -f 'claude-peers-mcp/server\.ts' 2>/dev/null | head -1)
@@ -56,12 +74,12 @@ find_mcp_pid() {
   if [[ -n "$try" ]] && try=$(resolve_bun_pid "$try"); then printf '%s\n' "$try"; return 0; fi
   walk="$PPID"
   for _ in 1 2 3 4 5; do
-    comm=$(ps -p "$walk" -o comm= 2>/dev/null)
+    comm=$(proc_comm "$walk")
     if [[ "$comm" == "claude" ]]; then
       try=$(child_server_pid "$walk")
       if [[ -n "$try" ]] && try=$(resolve_bun_pid "$try"); then printf '%s\n' "$try"; return 0; fi
     fi
-    walk=$(ps -p "$walk" -o ppid= 2>/dev/null | tr -d ' ')
+    walk=$(proc_ppid "$walk")
     [[ -z "$walk" || "$walk" == "1" || "$walk" == "0" ]] && return 1
   done
   return 1
@@ -70,9 +88,9 @@ find_mcp_pid() {
 find_claude_pid() {
   local walk="$PPID" comm
   for _ in 1 2 3 4 5; do
-    comm=$(ps -p "$walk" -o comm= 2>/dev/null)
+    comm=$(proc_comm "$walk")
     if [[ "$comm" == "claude" ]]; then printf '%s\n' "$walk"; return 0; fi
-    walk=$(ps -p "$walk" -o ppid= 2>/dev/null | tr -d ' ')
+    walk=$(proc_ppid "$walk")
     [[ -z "$walk" || "$walk" == "1" || "$walk" == "0" ]] && break
   done
   printf '%s\n' "$$"
@@ -87,7 +105,39 @@ find_claude_pid() {
 # clear. Try the server pid first (normal case), then the claude pid.
 CLAUDE_PID="${CLAUDE_PEERS_DRAIN_CLAUDE_PID:-$(find_claude_pid)}"
 [[ "$CLAUDE_PID" =~ ^[0-9]+$ ]] || exit 0
-MCP_PID="${CLAUDE_PEERS_DRAIN_MCP_PID:-$(find_mcp_pid)}"
+
+# find_mcp_pid scans the whole process table; this hook fires before every
+# prompt and after every tool batch. Cache the resolved server pid per claude
+# pid and revalidate it each run (still bun, still this server, still a
+# descendant of this claude) so pid reuse or a respawned server re-resolves.
+DRAIN_CACHE_DIR="${XDG_RUNTIME_DIR:-/tmp}/claude-peers-drain-$(id -u)"
+cached_mcp_pid() {
+  local pid walk
+  pid=$(cat "$DRAIN_CACHE_DIR/$CLAUDE_PID" 2>/dev/null) || return 1
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  [[ "$(proc_comm "$pid")" == "bun" ]] || return 1
+  [[ "$(proc_args "$pid")" == *"$SERVER_PATH"* ]] || return 1
+  walk="$pid"
+  for _ in 1 2 3; do
+    walk=$(proc_ppid "$walk")
+    [[ "$walk" == "$CLAUDE_PID" ]] && { printf '%s\n' "$pid"; return 0; }
+    [[ "$walk" =~ ^[0-9]+$ && "$walk" -gt 1 ]] || return 1
+  done
+  return 1
+}
+cache_mcp_pid() {
+  [[ "$CLAUDE_PID" != "$$" ]] || return 0
+  mkdir -p -m 700 "$DRAIN_CACHE_DIR" 2>/dev/null && [[ -O "$DRAIN_CACHE_DIR" ]] || return 0
+  printf '%s\n' "$1" > "$DRAIN_CACHE_DIR/$CLAUDE_PID" 2>/dev/null || true
+}
+MCP_PID="${CLAUDE_PEERS_DRAIN_MCP_PID:-}"
+if [[ -z "$MCP_PID" ]]; then
+  MCP_PID=$(cached_mcp_pid || true)
+  if [[ -z "$MCP_PID" ]]; then
+    MCP_PID=$(find_mcp_pid || true)
+    [[ "$MCP_PID" =~ ^[0-9]+$ ]] && cache_mcp_pid "$MCP_PID"
+  fi
+fi
 
 CLAIM_PIDS=()
 [[ "$MCP_PID" =~ ^[0-9]+$ ]] && CLAIM_PIDS+=("$MCP_PID")
@@ -96,12 +146,15 @@ CLAIM_PIDS=()
 
 BROKER_PORT="${CLAUDE_PEERS_PORT:-7899}"
 STATUS=""; RESP=""
-for CLAIM_PID in "${CLAIM_PIDS[@]}"; do
+claim_pid() {
   RAW=$(curl -s -m 2 -w $'\n%{http_code}' -X POST "http://127.0.0.1:${BROKER_PORT}/claim-by-pid" \
     -H 'Content-Type: application/json' \
     -d "{\"pid\":${CLAIM_PID},\"caller_pid\":${CLAUDE_PID},\"client_type\":\"claude\",\"receiver_mode\":\"claude-channel\"}" 2>/dev/null)
   STATUS=$(printf '%s\n' "$RAW" | tail -n1)
   RESP=$(printf '%s' "$RAW" | sed '$d')
+}
+for CLAIM_PID in "${CLAIM_PIDS[@]}"; do
+  claim_pid
   # 404 → no row keyed on this pid, try the next identity. 200 with an EMPTY
   # claim also falls through: with dual rows (server-pid row + hook-registered
   # claude-pid row) the mail can sit on the later identity while the first
@@ -116,6 +169,30 @@ for CLAIM_PID in "${CLAIM_PIDS[@]}"; do
   break
 done
 MCP_PID="$CLAIM_PID"
+
+# A resume can lose its one-shot registration while the old native still owns
+# the conversation. Retry only a missing native row, using this root hook's
+# exact saved-thread input. The existing registrar still refuses live owners,
+# ambiguous threads, and invalid ownership proofs. Never reinterpret 403/409.
+if [[ "$STATUS" == "404" && "$CLAIM_PID" == "$CLAUDE_PID" ]]; then
+  TRANSCRIPT=$(printf '%s' "$HOOK_INPUT" | jq -er '
+    select(type == "object") |
+    select(.session_id | type == "string" and test("^[a-zA-Z0-9-]+$")) |
+    select(.transcript_path | type == "string") |
+    . as $hook |
+    select(.transcript_path | endswith("/" + $hook.session_id + ".jsonl")) |
+    .transcript_path' 2>/dev/null) || TRANSCRIPT=""
+  if [[ -n "$TRANSCRIPT" && -f "$TRANSCRIPT" ]] && command -v timeout >/dev/null 2>&1; then
+    LOG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/logs"
+    mkdir -p "$LOG_DIR" 2>/dev/null
+    # Bound the retry inside the existing ten-second hook budget. Registration
+    # output is diagnostic only; only the normal claim/render path emits mail.
+    if printf '%s' "$HOOK_INPUT" | timeout --kill-after=1s 3s bash "$SCRIPT_DIR/claude-register-peer-session.sh" \
+        >/dev/null 2>>"$LOG_DIR/drain-peer-inbox.log"; then
+      claim_pid
+    fi
+  fi
+fi
 
 if [[ -n "$STATUS" && "$STATUS" != "200" ]]; then
   LOG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/logs"

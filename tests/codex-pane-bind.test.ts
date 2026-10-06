@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startTestBroker, type TestBroker } from "./helpers/test-broker.ts";
@@ -8,12 +8,12 @@ import { startTestBroker, type TestBroker } from "./helpers/test-broker.ts";
 const FIXTURE = new URL("./fixtures/codex-pane-bind-client.ts", import.meta.url).pathname;
 const THREAD_A = "01a003f0-20ec-7ae2-aba4-6c526ab304e9";
 const THREAD_B = "01a003f0-20ec-7ae2-aba4-6c526ab304ea";
-const canUseTmux = Bun.spawnSync(["tmux", "list-sessions"], { stdout: "ignore", stderr: "ignore" }).exitCode === 0;
+const canUseTmux = Bun.which("tmux") !== null;
 
 interface FixtureState {
   broker: TestBroker;
   root: string;
-  session: string;
+  socket: string;
 }
 
 const states: FixtureState[] = [];
@@ -21,7 +21,7 @@ const states: FixtureState[] = [];
 afterEach(async () => {
   while (states.length > 0) {
     const state = states.pop()!;
-    Bun.spawnSync(["tmux", "kill-session", "-t", state.session], { stdout: "ignore", stderr: "ignore" });
+    Bun.spawnSync(["tmux", "-S", state.socket, "kill-server"], { stdout: "ignore", stderr: "ignore" });
     await state.broker.stop();
     rmSync(state.root, { recursive: true, force: true });
   }
@@ -39,9 +39,24 @@ async function waitForFile(path: string): Promise<void> {
 (canUseTmux ? describe : describe.skip)("Codex pane/thread relay binding", () => {
   test("upserts a pane seat, folds a thread-only row, and is idempotent", async () => {
     const root = mkdtempSync(join(tmpdir(), "claude-peers-codex-bind-"));
-    const broker = await startTestBroker({ prefix: "codex-pane-bind" });
+    const socket = join(root, "tmux.sock");
+    const tmuxShimDir = join(root, "tmux-bin");
+    mkdirSync(tmuxShimDir);
+    const tmuxShim = join(tmuxShimDir, "tmux");
+    // Production tmux has asynchronous birth-time label hooks. Keep those
+    // writers out of this fixture and route child/broker inspection here too.
+    writeFileSync(tmuxShim, '#!/bin/sh\nexec "$TEST_REAL_TMUX" -S "$TEST_TMUX_SOCKET" "$@"\n');
+    chmodSync(tmuxShim, 0o755);
+    const privateEnv = {
+      PATH: `${tmuxShimDir}:${process.env.PATH ?? ""}`,
+      TEST_REAL_TMUX: Bun.which("tmux")!,
+      TEST_TMUX_SOCKET: socket,
+      CLAUDE_PEERS_TMUX_BIN: "tmux",
+      CLAUDE_PEERS_TMUX_SOCKET: socket,
+    };
+    const broker = await startTestBroker({ prefix: "codex-pane-bind", env: privateEnv });
     const session = `cp-codex-bind-${process.pid}-${Date.now()}`;
-    states.push({ broker, root, session });
+    states.push({ broker, root, socket });
 
     const holder = Bun.spawn(["sleep", "60"], { stdout: "ignore", stderr: "ignore" });
     try {
@@ -76,19 +91,18 @@ async function waitForFile(path: string): Promise<void> {
       // Deliberately give the native process a different /proc cwd. Production
       // broker hardening cannot read that magic link; binding must use the
       // tmux-proven pane path instead.
-      const command = `(cd /; exec "${codexBinary}" 60) & tui=$!; bun "${FIXTURE}" "${broker.port}" "${resultPath}" "${THREAD_A}" "${THREAD_B}" "${THREAD_A}"; while [ ! -f "${mainConflictTrigger}" ]; do sleep 0.05; done; bun "${FIXTURE}" "${broker.port}" "${mainConflictPath}" "${THREAD_B}"; wait "$tui"`;
+      // Set @operator_label inside the pane before the bind client runs so the
+      // race against an external set-option cannot mint the window-name fallback.
+      const command = `tmux set-option -p -t "$TMUX_PANE" @operator_label bind.test; (cd /; exec "${codexBinary}" 60) & tui=$!; bun "${FIXTURE}" "${broker.port}" "${resultPath}" "${THREAD_A}" "${THREAD_B}" "${THREAD_A}"; while [ ! -f "${mainConflictTrigger}" ]; do sleep 0.05; done; bun "${FIXTURE}" "${broker.port}" "${mainConflictPath}" "${THREAD_B}"; wait "$tui"`;
       const created = Bun.spawnSync([
-        "tmux", "new-session", "-d", "-s", session, "-n", "bind", "-c", root,
+        "tmux", "-S", socket, "-f", "/dev/null", "new-session", "-d", "-s", session, "-n", "bind", "-c", root,
         "bash", "-c", command,
-      ], { stdout: "pipe", stderr: "pipe" });
+      ], { env: { ...process.env, ...privateEnv }, stdout: "pipe", stderr: "pipe" });
       expect(created.exitCode).toBe(0);
       const paneId = new TextDecoder().decode(Bun.spawnSync([
-        "tmux", "list-panes", "-t", session, "-F", "#{pane_id}",
+        "tmux", "-S", socket, "list-panes", "-t", session, "-F", "#{pane_id}",
       ]).stdout).trim();
       expect(paneId).toMatch(/^%\d+$/);
-      expect(Bun.spawnSync([
-        "tmux", "set-option", "-p", "-t", paneId, "@operator_label", "bind.test",
-      ]).exitCode).toBe(0);
 
       await waitForFile(resultPath);
       const results = JSON.parse(readFileSync(resultPath, "utf8")) as Array<{
@@ -101,16 +115,16 @@ async function waitForFile(path: string): Promise<void> {
       expect(results[2]!.body.id).toBe(results[0]!.body.id);
       const panePeerId = String(results[0]!.body.id);
       const mirrored = new TextDecoder().decode(Bun.spawnSync([
-        "tmux", "display-message", "-p", "-t", paneId,
+        "tmux", "-S", socket, "display-message", "-p", "-t", paneId,
         "#{@peer_id}\t#{@peer_label}\t#{@peer_resolved_name}\t#{@peer_client_type}\t#{@peer_receiver_mode}\t#{@operator_label}",
       ]).stdout).trim().split("\t");
       expect(mirrored).toEqual([
         String(results[0]!.body.id),
-        "bind.test",
-        "bind.test",
+        `${session}.1`,
+        `${session}.1`,
         "codex",
         "manual-drain",
-        "bind.test",
+        `${session}.1`,
       ]);
 
       const db = new Database(broker.dbPath, { readonly: true });
@@ -128,13 +142,105 @@ async function waitForFile(path: string): Promise<void> {
       expect(rows).toHaveLength(1);
       expect(rows[0]).toMatchObject({
         cwd: root,
-        name: "bind.test",
+        name: `${session}.1`,
         client_type: "codex",
         tmux_pane_id: paneId,
         thread_id: THREAD_A,
       });
       const tuiPid = rows[0]!.pid;
       expect(tuiPid).not.toBe(holder.pid);
+
+      // A fresh native pane may sit idle (or wait for MCP startup) longer than
+      // the 90-second adapter timeout before its first hook receipt. Discovery
+      // must retain its proven thread and queued mail throughout that gap.
+      const fixtureDb = new Database(broker.dbPath);
+      const paneToken = (fixtureDb.query("SELECT token FROM peers WHERE id = ?")
+        .get(panePeerId) as { token: string }).token;
+      fixtureDb.run("INSERT INTO messages (from_id, to_id, text, sent_at) VALUES (?, ?, ?, ?)",
+        ["startup-sender", panePeerId, "mail before first hook", new Date().toISOString()]);
+      // Regression: a native pane retains .1 but an old broker diagnostic
+      // advertises .2, which now belongs to a different live session.
+      const sibling=await fetch(`${broker.url}/register`, {
+        method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({pid:process.pid,cwd:root,git_root:null,tty:null,
+          name:`${session}.2`,client_type:"claude",receiver_mode:"manual-drain",summary:""}),
+      });
+      expect(sibling.status).toBe(200);
+      const siblingPeer=await sibling.json() as {id:string;token:string};
+      const heartbeat=()=>fetch(`${broker.url}/heartbeat`, {
+        method:"POST",headers:{"Content-Type":"application/json","X-Peer-Token":paneToken},
+        body:JSON.stringify({id:panePeerId,client_type:"codex",receiver_mode:"manual-drain"}),
+      });
+      fixtureDb.run("UPDATE peers SET resolved_name=?,tmux_pane_id=? WHERE id=?",
+        [`${session}.2`,"%999999",panePeerId]);
+      const unproven=await heartbeat();
+      expect(unproven.status).toBe(200);
+      expect((await unproven.json() as {name?:string}).name).toBeUndefined();
+      expect(fixtureDb.query("SELECT resolved_name FROM peers WHERE id=?").get(panePeerId))
+        .toEqual({resolved_name:`${session}.2`});
+      fixtureDb.run("UPDATE peers SET tmux_pane_id=? WHERE id=?",[paneId,panePeerId]);
+      const repaired=await heartbeat();
+      expect(repaired.status).toBe(200);
+      expect(await repaired.json()).toMatchObject({name:`${session}.1`,resolved_name:`${session}.1`});
+      expect(fixtureDb.query("SELECT id,name,resolved_name,thread_id FROM peers WHERE id=?").get(panePeerId))
+        .toEqual({id:panePeerId,name:`${session}.1`,resolved_name:`${session}.1`,thread_id:THREAD_A});
+      expect(fixtureDb.query("SELECT name,resolved_name FROM peers WHERE id=?").get(siblingPeer.id))
+        .toEqual({name:`${session}.2`,resolved_name:`${session}.2`});
+      expect(fixtureDb.query("SELECT delivered FROM messages WHERE to_id=? AND text=?")
+        .get(panePeerId,"mail before first hook")).toEqual({delivered:0});
+      // Same-pane reconnect must also repair a persisted stale resolved name.
+      fixtureDb.run("UPDATE peers SET resolved_name=? WHERE id=?",[`${session}.2`,panePeerId]);
+      const refreshed=await fetch(`${broker.url}/register`,{
+        method:"POST",headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({pid:tuiPid,cwd:root,git_root:null,tty:(fixtureDb.query("SELECT tty FROM peers WHERE id=?").get(panePeerId) as {tty:string}).tty,
+          tmux_pane_id:paneId,client_type:"codex",receiver_mode:"manual-drain",name:`${session}.1`,summary:""}),
+      });
+      expect(refreshed.status).toBe(200);
+      expect(await refreshed.json()).toMatchObject({id:panePeerId,name:`${session}.1`,resolved_name:`${session}.1`});
+      await fetch(`${broker.url}/unregister`,{method:"POST",headers:{"Content-Type":"application/json","X-Peer-Token":siblingPeer.token},body:JSON.stringify({id:siblingPeer.id})});
+      fixtureDb.run("UPDATE peers SET last_seen = ? WHERE id = ?", [
+        new Date(Date.now() - 120_000).toISOString(), panePeerId,
+      ]);
+      try {
+        const discovery = await fetch(`${broker.url}/list-peers`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-Peer-Token": paneToken },
+          body: JSON.stringify({ id: panePeerId, scope: "machine" }),
+        });
+        expect(discovery.status).toBe(200);
+        const discovered = await discovery.json() as Array<{ id: string }>;
+        expect(discovered.map((peer) => peer.id)).toContain(panePeerId);
+        expect(fixtureDb.query("SELECT thread_id, receiver_mode FROM peers WHERE id = ?")
+          .get(panePeerId)).toEqual({ thread_id: THREAD_A, receiver_mode: "manual-drain" });
+        expect(fixtureDb.query("SELECT delivered FROM messages WHERE to_id = ? AND text = ?")
+          .get(panePeerId, "mail before first hook")).toEqual({ delivered: 0 });
+        // The startup exemption must not keep a headless host, an unbound
+        // discovery row, a reused PID, or a stopped process routable.
+        const original = fixtureDb.query("SELECT pid, tmux_pane_id, thread_id, registered_at FROM peers WHERE id = ?")
+          .get(panePeerId) as { pid: number; tmux_pane_id: string; thread_id: string; registered_at: string };
+        const stopped = Bun.spawn(["sleep", "60"], { stdout: "ignore", stderr: "ignore" });
+        stopped.kill();
+        await stopped.exited;
+        for (const invalid of [
+          { ...original, pid: holder.pid, tmux_pane_id: null },
+          { ...original, thread_id: null },
+          { ...original, registered_at: "2000-01-01T00:00:00.000Z" },
+          { ...original, pid: stopped.pid },
+        ]) {
+          fixtureDb.run("UPDATE peers SET pid = ?, tmux_pane_id = ?, thread_id = ?, registered_at = ? WHERE id = ?",
+            [invalid.pid, invalid.tmux_pane_id, invalid.thread_id, invalid.registered_at, panePeerId]);
+          const rejected = await fetch(`${broker.url}/send-to-peer`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "X-Peer-Token": paneToken },
+            body: JSON.stringify({ from_id: panePeerId, selector: { id: panePeerId }, text: "must not route" }),
+          });
+          expect((await rejected.json() as { ok: boolean }).ok).toBe(false);
+        }
+        fixtureDb.run("UPDATE peers SET pid = ?, tmux_pane_id = ?, thread_id = ?, registered_at = ? WHERE id = ?",
+          [original.pid, original.tmux_pane_id, original.thread_id, original.registered_at, panePeerId]);
+        fixtureDb.run("DELETE FROM messages WHERE to_id = ? AND text = ?",
+          [panePeerId, "mail before first hook"]);
+      } finally { fixtureDb.close(); }
 
       // Reversed production ordering: the relay may bind before SessionStart
       // reaches the shared app-server hook. The later headless registration
@@ -168,7 +274,7 @@ async function waitForFile(path: string): Promise<void> {
       };
       expect(hookRegistration).toMatchObject({
         id: results[0]!.body.id,
-        name: "bind.test",
+        name: `${session}.1`,
         receiver_mode: "manual-drain",
       });
       const hookHeartbeat = await fetch(`${broker.url}/hook-heartbeat-by-thread`, {
@@ -217,7 +323,7 @@ async function waitForFile(path: string): Promise<void> {
       expect(afterHookRows[0]).toMatchObject({
         id: results[0]!.body.id,
         pid: tuiPid,
-        name: "bind.test",
+        name: `${session}.1`,
         tmux_pane_id: paneId,
         thread_id: THREAD_A,
         receiver_mode: "codex-hook",
@@ -249,12 +355,12 @@ async function waitForFile(path: string): Promise<void> {
       await Bun.write(shimCodex, "setInterval(() => {}, 60_000);\n");
       const conflictCommand = `node "${shimCodex}" --remote unix:///tmp/relay.sock --cd "${root}" resume "${THREAD_A}" & tui=$!; bun "${FIXTURE}" "${broker.port}" "${conflictPath}" "${THREAD_A}" "${THREAD_B}"; while [ ! -f "${conflictRetryTrigger}" ]; do sleep 0.05; done; bun "${FIXTURE}" "${broker.port}" "${conflictRetryPath}" "${THREAD_A}"; wait "$tui"`;
       const conflictWindow = Bun.spawnSync([
-        "tmux", "new-window", "-d", "-t", session, "-n", "conflict", "-c", root,
+        "tmux", "-S", socket, "new-window", "-d", "-t", session, "-n", "conflict", "-c", root,
         "bash", "-c", conflictCommand,
       ], { stdout: "pipe", stderr: "pipe" });
       expect(conflictWindow.exitCode).toBe(0);
       const conflictPaneId = new TextDecoder().decode(Bun.spawnSync([
-        "tmux", "list-panes", "-t", `${session}:conflict`, "-F", "#{pane_id}",
+        "tmux", "-S", socket, "list-panes", "-t", `${session}:conflict`, "-F", "#{pane_id}",
       ]).stdout).trim();
       expect(conflictPaneId).toMatch(/^%\d+$/);
       await waitForFile(conflictPath);
@@ -263,9 +369,18 @@ async function waitForFile(path: string): Promise<void> {
         body: Record<string, unknown>;
       }>;
       expect(conflictResults).toHaveLength(2);
-      expect(conflictResults.map((result) => result.status)).toEqual([409, 200]);
-      expect(conflictResults[0]!.body.error).toBe("thread is already bound to another live pane");
-      expect(conflictResults[1]!.body.thread_id).toBe(THREAD_B);
+      // Latest explicit resume wins: conflict pane absorbs THREAD_A (and its mail).
+      expect(conflictResults[0]!.status).toBe(200);
+      expect(conflictResults[0]!.body).toMatchObject({
+        ok: true,
+        thread_id: THREAD_A,
+      });
+      const conflictPeerId = String(conflictResults[0]!.body.id);
+      expect(conflictResults[1]!.status).toBe(200);
+      expect(conflictResults[1]!.body).toMatchObject({
+        id: conflictPeerId,
+        thread_id: THREAD_B,
+      });
 
       await Bun.write(mainConflictTrigger, "bind\n");
       await waitForFile(mainConflictPath);
@@ -274,17 +389,32 @@ async function waitForFile(path: string): Promise<void> {
         body: Record<string, unknown>;
       }>;
       expect(mainConflictResults).toHaveLength(1);
-      expect(mainConflictResults[0]!.status).toBe(409);
-      expect(mainConflictResults[0]!.body.error).toBe("thread is already bound to another live pane");
+      expect(mainConflictResults[0]!.status).toBe(200);
+      expect(mainConflictResults[0]!.body).toMatchObject({
+        thread_id: THREAD_B,
+      });
+      const mainPeerId = String(mainConflictResults[0]!.body.id);
 
       const preservedDb = new Database(broker.dbPath, { readonly: true });
       const preserved = preservedDb.query(`
         SELECT lower(thread_id) AS thread_id, unread_episode,
-               (SELECT COUNT(*) FROM messages WHERE to_id = peers.id AND delivered = 0) AS queued
+               (SELECT COUNT(*) FROM messages WHERE to_id = peers.id AND delivered = 0) AS queued,
+               tmux_pane_id
         FROM peers WHERE id = ?
-      `).get(panePeerId) as { thread_id: string; unread_episode: number; queued: number };
+      `).get(mainPeerId) as { thread_id: string; unread_episode: number; queued: number; tmux_pane_id: string };
+      const goneConflict = preservedDb.query("SELECT id FROM peers WHERE id = ?").get(conflictPeerId);
+      const goneOriginal = preservedDb.query("SELECT id FROM peers WHERE id = ?").get(panePeerId);
       preservedDb.close();
-      expect(preserved).toEqual({ thread_id: THREAD_A, unread_episode: 7, queued: 1 });
+      expect(preserved).toEqual({
+        thread_id: THREAD_B,
+        // Episode is per peer row: fold bumps the empty destination once when
+        // mail arrives; it does not copy the prior owner's episode counter.
+        unread_episode: 1,
+        queued: 1,
+        tmux_pane_id: paneId,
+      });
+      expect(goneConflict).toBeNull();
+      expect(goneOriginal).toBeNull();
 
       const outside = await fetch(`${broker.url}/bind-codex-pane-thread`, {
         method: "POST",

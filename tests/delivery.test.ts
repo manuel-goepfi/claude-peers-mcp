@@ -1759,8 +1759,8 @@ describe("Live broker delivery features", () => {
       from_id: peer.id, to_id: peer.id, text: "adapter-dead surfacing probe",
     });
     expect(sent.recipient?.mcp_transport).toBe("dead");
-    expect(sent.recipient?.warning ?? "").toContain("MCP adapter is not running");
-    expect(sent.recipient?.warning ?? "").toContain("hook mail still delivers");
+    expect(sent.recipient?.warning ?? "").toContain("MCP adapter liveness check failed");
+    expect(sent.recipient?.warning ?? "").toContain("Hook delivery may still work");
   });
 
   test("a PID-dead seat with fresher MCP last_seen than last_hook is not advertised dead", async () => {
@@ -1783,7 +1783,7 @@ describe("Live broker delivery features", () => {
       from_id: peer.id, to_id: peer.id, text: "adapter-live-contact surfacing probe",
     });
     expect(sent.recipient?.mcp_transport).toBe("alive");
-    expect(sent.recipient?.warning ?? "").not.toContain("MCP adapter is not running");
+    expect(sent.recipient?.warning ?? "").not.toContain("MCP adapter liveness check failed");
   });
 
   test("/ack-by-pid: wrong drain_id does not deliver and records a mismatch", async () => {
@@ -2674,7 +2674,7 @@ describe("Live broker delivery features", () => {
     };
     expect(json.hookSpecificOutput.hookEventName).toBe("UserPromptSubmit");
     expect(json.hookSpecificOutput.additionalContext).toContain("hook-visible");
-    expect(json.hookSpecificOutput.additionalContext).toContain('<peer-receive-policy source="local-receive-path">');
+    expect(json.hookSpecificOutput.additionalContext).not.toContain('<peer-receive-policy');
     expect(json.hookSpecificOutput.additionalContext).toContain("<peer-message");
     expect(json.suppressOutput).toBeUndefined();
 
@@ -2786,7 +2786,7 @@ describe("Live broker delivery features", () => {
     // stdout; turn-end delivery must use decision:"block" + reason.
     expect(json.decision).toBe("block");
     expect(json.reason).toContain("stop-hook-visible");
-    expect(json.reason).toContain('<peer-receive-policy source="local-receive-path">');
+    expect(json.reason).not.toContain('<peer-receive-policy');
     expect(json.reason).toContain("<peer-message");
     expect(json.hookSpecificOutput).toBeUndefined();
 
@@ -2885,7 +2885,7 @@ describe("Live broker delivery features", () => {
     const json = JSON.parse(stdout) as { hookSpecificOutput: { hookEventName: string; additionalContext: string } };
     expect(json.hookSpecificOutput.hookEventName).toBe("SessionStart");
     expect(json.hookSpecificOutput.additionalContext).toContain("race-visible");
-    expect(json.hookSpecificOutput.additionalContext).toContain('<peer-receive-policy source="local-receive-path">');
+    expect(json.hookSpecificOutput.additionalContext).not.toContain('<peer-receive-policy');
 
     const status = await brokerFetch<{ statuses: { delivered: boolean }[] }>(
       "/message-status", { id: peer.id, ids: [send.id] }
@@ -2927,7 +2927,7 @@ describe("Live broker delivery features", () => {
     };
     expect(json.hookSpecificOutput.hookEventName).toBe("BeforeAgent");
     expect(json.hookSpecificOutput.additionalContext).toContain("gemini-hook-visible");
-    expect(json.hookSpecificOutput.additionalContext).toContain('<peer-receive-policy source="local-receive-path">');
+    expect(json.hookSpecificOutput.additionalContext).not.toContain('<peer-receive-policy');
     expect(json.hookSpecificOutput.additionalContext).toContain("<peer-message");
     expect(json.suppressOutput).toBeUndefined();
 

@@ -6,11 +6,9 @@
  * quoted opaque ids at the operator instead of names, and the operator could not
  * tell which lane a message referred to.
  *
- * Two causes, both here:
- *   1. `tmux list-panes -t <session>` returns only the ACTIVE WINDOW's panes (1 on
- *      the live session; 27 with -s). Every lane was told no labels were taken.
- *   2. Even unique, `<session>.<n>` is an ordinal the operator must map back to a
- *      task. Their window names already say REVIEW-1996, MECH-DRAIN, TERRA-ISSUES.
+ * Allocation must inspect every window in the session using list-panes -s.
+ * Manzo's current naming contract is session.number for each open pane;
+ * window task titles remain separate from the pane's routable name.
  */
 
 import { describe, expect, test } from "bun:test";
@@ -45,8 +43,8 @@ describe("isOperatorChosenWindowName", () => {
 });
 
 describe("chooseOperatorLabel", () => {
-  test("prefers the operator's window name over an ordinal", () => {
-    expect(chooseOperatorLabel("C5_lanes", "1", [], "REVIEW-1996", 1)).toBe("REVIEW-1996");
+  test("keeps task window titles separate from session-number pane names", () => {
+    expect(chooseOperatorLabel("C5_lanes", "1", [], "REVIEW-1996", 1)).toBe("C5_lanes.1");
   });
 
   test("does not donate one shared window name to one of several panes", () => {
@@ -98,9 +96,11 @@ describe("chooseOperatorLabel", () => {
 });
 
 describe("preservedTmuxOperatorLabel", () => {
-  test("keeps every non-empty pane-scoped operator label verbatim", () => {
-    expect(preservedTmuxOperatorLabel("traffic.1.3", "traffic.9", "traffic")).toBe("traffic.1.3");
-    expect(preservedTmuxOperatorLabel("human.pr", null, "traffic")).toBe("human.pr");
+  test("keeps the open pane ordinal while following its current session prefix", () => {
+    expect(preservedTmuxOperatorLabel("traffic.1.3", "traffic.9", "traffic")).toBe("traffic.3");
+    expect(preservedTmuxOperatorLabel("traffic.1.3", null, "traffic.1")).toBe("traffic.1.3");
+    expect(preservedTmuxOperatorLabel("Old Name.3", null, "New Name")).toBe("New Name.3");
+    expect(preservedTmuxOperatorLabel("human.pr", null, "traffic")).toBeNull();
   });
 
   test("promotes only a recognized legacy peer label", () => {

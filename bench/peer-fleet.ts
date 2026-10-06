@@ -269,7 +269,9 @@ async function startAdapters(options: {
       stderr: "pipe",
     });
     let buffered = "";
+    let startupDiagnostics = "";
     transport.stderr?.on("data", (chunk: Buffer) => {
+      startupDiagnostics = (startupDiagnostics + chunk.toString("utf8")).slice(-4000);
       buffered += chunk.toString("utf8");
       while (buffered.includes("\n")) {
         const newline = buffered.indexOf("\n");
@@ -285,7 +287,12 @@ async function startAdapters(options: {
         }
       }
     });
-    await client.connect(transport);
+    try {
+      await client.connect(transport);
+    } catch (error) {
+      await client.close();
+      throw new Error(`benchmark adapter ${index} startup failed: ${error instanceof Error ? error.message : String(error)}\n${startupDiagnostics}`);
+    }
     return { client, transport };
   }));
   const handles = results.flatMap((result) => result.status === "fulfilled" ? [result.value] : []);

@@ -11,6 +11,8 @@
  * i.e. a dim placeholder = empty input = nudgeable.
  */
 import { describe, test, expect } from "bun:test";
+import { Database } from "bun:sqlite";
+import { boundCodexSeatIdentity } from "../bin/codex-autodrain-poller.ts";
 import { paneTextIsIdle, everyVisibleCharIsDim, profileFor } from "../bin/codex-autodrain-poller.ts";
 
 const ESC = "\x1b";
@@ -329,6 +331,10 @@ function claudeIdleCapture(afterGlyph: string): string {
 }
 
 describe("paneTextIsIdle — claude profile", () => {
+  test("SKIP: long-running Claude turn and queued messages are not idle", () => {
+    expect(paneTextIsIdle(`✽ Brewing… (14m 11s · ↓ 43.0k tokens)\n${claudeIdleCapture("")}`, CLAUDE)).toBe(false);
+    expect(paneTextIsIdle(`❯ Press up to edit queued messages\n${claudeIdleCapture("")}`, CLAUDE)).toBe(false);
+  });
   test("NUDGE: idle ❯ prompt, empty input", () => {
     expect(paneTextIsIdle(claudeIdleCapture(""), CLAUDE)).toBe(true);
   });
@@ -590,23 +596,18 @@ describe("paneSubtree (snapshot walk, no pstree fork)", () => {
 // REGRESSION (review #2): the poller must write its heartbeat at STARTUP, not
 // only at end-of-tick — a slow first tick must not look like a wedge to the
 // watchdog. This proves writeHeartbeat actually creates the file with a fresh
-// ISO timestamp. (HEARTBEAT_PATH is module-level; this test imports the module
-// AFTER setting the env override so the path points at a tmp file.)
+// ISO timestamp. The explicit path keeps the live watchdog heartbeat untouched.
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { writeHeartbeat } from "../bin/codex-autodrain-poller.ts";
-import { readFileSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync, existsSync } from "node:fs";
 
 describe("writeHeartbeat", () => {
-  // The module already read CLAUDE_PEERS_AUTODRAIN_HEARTBEAT at import time. The
-  // test harness sets it before any import below via the env at file scope is
-  // not reliable post-import, so assert against the resolved default path the
-  // running poller uses, then clean up. We only assert the WRITE happens + is a
-  // parseable recent ISO timestamp (the behavior the fix guarantees).
-  test("writes a fresh ISO-8601 timestamp to the heartbeat path", () => {
+  test("writes a fresh ISO-8601 timestamp to an isolated heartbeat path", () => {
+    const root = mkdtempSync(join(tmpdir(), "poller-heartbeat-"));
+    const path = join(root, "heartbeat");
     const before = Date.now();
-    writeHeartbeat();
-    // Resolve the same default path the module uses.
-    const path = process.env.CLAUDE_PEERS_AUTODRAIN_HEARTBEAT
-      ?? `${process.env.HOME}/.claude-peers-autodrain.heartbeat`;
+    writeHeartbeat(path);
     expect(existsSync(path)).toBe(true);
     const body = readFileSync(path, "utf8").trim();
     const [timestamp, health] = body.split("\n");
@@ -614,6 +615,7 @@ describe("writeHeartbeat", () => {
     expect(Number.isNaN(ts)).toBe(false);          // a valid timestamp
     expect(ts).toBeGreaterThanOrEqual(before - 1000); // freshly written
     expect(health).toMatch(/^nudge_budget=(ready|degraded)$/);
+    rmSync(root, { recursive: true, force: true });
   });
 });
 
@@ -1031,6 +1033,60 @@ function registerResponse(name = "pr.1"): RegisterResponse {
 }
 
 describe("reconcileVisibleCodexSeats", () => {
+  test("database lookup selects the exact bound seat, never a threadless duplicate or ambiguous owner", () => {
+    const db = new Database(":memory:");
+    try {
+      db.run(`CREATE TABLE peers (id TEXT, name TEXT, resolved_name TEXT, client_type TEXT,
+        receiver_mode TEXT, cwd TEXT, tmux_session TEXT, tmux_pane_id TEXT, seat_key TEXT,
+        pid INTEGER, thread_id TEXT)`);
+      const seat = visibleSeat();
+      expect(boundCodexSeatIdentity(db, seat)).toEqual({ kind: "absent" });
+      db.run(`INSERT INTO peers VALUES ('bound','pr.1','pr.1','codex','codex-hook',
+        '/repo','pr','%200','pane:pr:%200',200,'thread-one')`);
+      db.run(`INSERT INTO peers VALUES ('ghost','pr.1','pr.2','codex','manual-drain',
+        '/repo','pr','%200','pane:pr:%200',200,NULL)`);
+      expect(boundCodexSeatIdentity(db, seat)).toEqual({ kind: "bound", identity: {
+        id: "bound", name: "pr.1", resolved_name: "pr.1", client_type: "codex", receiver_mode: "codex-hook",
+      } });
+      expect(boundCodexSeatIdentity(db, { ...seat, cwd: "/different" })).toEqual({ kind: "ambiguous" });
+      db.run("UPDATE peers SET thread_id = 'thread-two' WHERE id = 'ghost'");
+      expect(boundCodexSeatIdentity(db, seat)).toEqual({ kind: "ambiguous" });
+    } finally { db.close(); }
+  });
+
+  test("discovery mirrors the verified identity without registering a threadless competitor", async () => {
+    __resetCodexSeatReconcileStateForTest();
+    const identity = { ...registerResponse(), id: "verified", receiver_mode: "codex-hook" as const };
+    const published: string[] = [];
+    let registrations = 0;
+    await reconcileVisibleCodexSeats(emptySeatSnap(), {
+      now: () => 50_000, visibleSeats: () => [visibleSeat()],
+      boundIdentityForSeat: () => ({ kind: "bound", identity }),
+      gitValue: async () => null,
+      postBroker: async () => { registrations++; return registerResponse() as any; },
+      publishBrokerIdentityToTmux: (value) => {
+        published.push(value.id); return { ok: true, target: "%200", failedOptions: [] };
+      },
+    });
+    expect(registrations).toBe(0);
+    expect(published).toEqual(["verified"]);
+  });
+
+  test("ambiguous existing ownership never creates or advertises a discovery row", async () => {
+    __resetCodexSeatReconcileStateForTest();
+    let sideEffects = 0;
+    await reconcileVisibleCodexSeats(emptySeatSnap(), {
+      now: () => 50_000, visibleSeats: () => [visibleSeat()],
+      boundIdentityForSeat: () => ({ kind: "ambiguous" }),
+      gitValue: async () => null,
+      postBroker: async () => { sideEffects++; return registerResponse() as any; },
+      publishBrokerIdentityToTmux: () => {
+        sideEffects++; return { ok: true, target: "%200", failedOptions: [] };
+      },
+    });
+    expect(sideEffects).toBe(0);
+  });
+
   test("registers a visible seat without fabricating hook health", async () => {
     __resetCodexSeatReconcileStateForTest();
     const posts: Array<{ path: string; body: any }> = [];
@@ -1339,9 +1395,9 @@ describe("nudge suppression when there is nothing to deliver", () => {
 });
 
 describe("nudge wording is a compact queue notification", () => {
-  test("manual-drain states the count and pluralises", () => {
-    expect(nudgeText(cursorLane(1) as never)).toContain("1 unread peer message");
-    expect(nudgeText(cursorLane(3) as never)).toContain("3 unread peer messages");
+  test("manual-drain avoids a queue count that can be consumed before the wake", () => {
+    expect(nudgeText(cursorLane(1) as never)).not.toContain("unread peer");
+    expect(nudgeText(cursorLane(3) as never)).not.toContain("unread peer");
   });
   test("stays short enough to scan as a wake-up notice", () => {
     expect(nudgeText(laneWith(2) as never).length).toBeLessThanOrEqual(180);
@@ -1361,15 +1417,23 @@ describe("nudge wording is a compact queue notification", () => {
   });
 });
 
-describe("nudge wording branches by receive path", () => {
+describe("nudge wording is safe across receive-path changes", () => {
+  test("a first-prompt hook upgrade cannot turn its attached brief into an empty-inbox conclusion", () => {
+    const startup = { ...laneWith(1), receiver_mode: "manual-drain", last_hook_seen_at: null };
+    const text = nudgeText(startup as never);
+    expect(text).toContain("Process the attached peer messages.");
+    expect(text).toContain("If none are attached, fetch pending mail with check_messages.");
+    expect(text).toContain("Continue the work.");
+    expect(text).toBe(nudgeText({ ...startup, receiver_mode: "codex-hook" } as never));
+  });
   test.each([
     ["claude", { ...laneWith(2), client_type: "claude", receiver_mode: "claude-channel" }],
     ["hook-backed codex", laneWith(2)],
     ["gemini", { ...laneWith(2), client_type: "gemini", receiver_mode: "gemini-hook" }],
-  ])("%s hook wake names the attached body only", (_label, lane) => {
+  ])("%s hook wake prioritizes the attached body", (_label, lane) => {
     const t = nudgeText(lane as never);
-    expect(t).toBe("[peer-mail] Process the attached peer messages.");
-    expect(t).not.toContain("check_messages");
+    expect(t).toBe("[peer-mail] Process the attached peer messages. If none are attached, fetch pending mail with check_messages. Continue the work.");
+    expect(t).toContain("If none are attached, fetch pending mail with check_messages.");
     expect(t).not.toContain("authority");
   });
 
@@ -1377,19 +1441,19 @@ describe("nudge wording branches by receive path", () => {
     ["manual codex", { ...laneWith(2), thread_id: null, receiver_mode: "manual-drain" }],
     ["cursor", cursorLane(2)],
     ["kimi", { ...cursorLane(1), client_type: "kimi" }],
-  ])("%s manual-drain wake asks for one check_messages", (_label, lane) => {
+  ])("%s manual-drain wake checks attachments before requesting a drain", (_label, lane) => {
     const t = nudgeText(lane as never);
-    expect(t).toContain("Call check_messages once");
-    expect(t).not.toContain("Process the attached");
+    expect(t).toContain("If none are attached, fetch pending mail with check_messages.");
+    expect(t).toContain("Process the attached peer messages.");
     expect(t).not.toContain("Transport closed");
     expect(t).not.toContain("UNVERIFIABLE");
   });
 
-  test("stale hook evidence falls back to manual-drain wording", () => {
+  test("an idle hook asks for a drain only when no message was attached", () => {
     const lane = { ...laneWith(2), last_hook_seen_at: "2020-01-01T00:00:00.000Z" };
     const t = nudgeText(lane as never);
-    expect(t).toContain("Call check_messages once");
-    expect(t).not.toContain("attached peer messages");
+    expect(t).toBe("[peer-mail] Process the attached peer messages. If none are attached, fetch pending mail with check_messages. Continue the work.");
+    expect(t).not.toContain("unread peer");
   });
 
   test("Grok is explicitly allowlisted as a manual-drain client", () => {
@@ -1430,8 +1494,8 @@ describe("Codex wake-only delivery", () => {
 
     expect(result).toBe("submitted");
     expect(submissions).toEqual([{ paneId: "%42", text: nudgeText(lane as never) }]);
-    expect(submissions[0]!.text).toBe("[peer-mail] Process the attached peer messages.");
-    expect(submissions[0]!.text).not.toContain("check_messages");
+    expect(submissions[0]!.text).toBe("[peer-mail] Process the attached peer messages. If none are attached, fetch pending mail with check_messages. Continue the work.");
+    expect(submissions[0]!.text).toContain("If none are attached, fetch pending mail with check_messages.");
     expect(submissions[0]!.text).not.toMatch(/<peer-message\s/);
   });
 

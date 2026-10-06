@@ -20,6 +20,7 @@
  */
 
 import { describe, expect, test } from "bun:test";
+import { withCommandBudget } from "../shared/bounded-command.ts";
 import { Database } from "bun:sqlite";
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -535,9 +536,8 @@ describe("the shipped poller is wake-only", () => {
     writeFileSync(corruptPath, "", { mode: 0o600 });
     expect(loadNudgeBudgetState(corruptPath)).toBe(false);
     expect(nudgeBudgetHealthStatus()).toBe("degraded");
-    writeHeartbeat();
-    const heartbeatPath = process.env.CLAUDE_PEERS_AUTODRAIN_HEARTBEAT
-      ?? `${process.env.HOME}/.claude-peers-autodrain.heartbeat`;
+    const heartbeatPath = join(root, "heartbeat");
+    writeHeartbeat(heartbeatPath);
     expect(readFileSync(heartbeatPath, "utf8")).toContain("nudge_budget=degraded");
 
     const db = new Database(":memory:");
@@ -707,4 +707,50 @@ describe("the shipped poller is wake-only", () => {
     expect(__nudgeAttemptCountForTest("refill-seat")).toBe(1);
     db.close();
   });
+});
+
+test("an exhausted lane budget spends no attempt and resumes at the next lane", () => {
+  __resetNudgeBudgetStateForTest();
+  const db = new Database(":memory:");
+  db.run(`CREATE TABLE peers (
+    id TEXT PRIMARY KEY, name TEXT, pid INTEGER NOT NULL, client_type TEXT NOT NULL,
+    tmux_pane_id TEXT, thread_id TEXT, seat_key TEXT, receiver_mode TEXT,
+    last_hook_seen_at TEXT, last_drain_at TEXT, unread_episode INTEGER NOT NULL DEFAULT 0
+  )`);
+  db.run("CREATE TABLE messages (id INTEGER PRIMARY KEY, to_id TEXT NOT NULL, sent_at TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0, delivered_at TEXT)");
+  for (const [id, pid, pane] of [["budget-first", 910001, "%8101"], ["budget-next", 910002, "%8102"]] as const) {
+    db.run("INSERT INTO peers VALUES (?, ?, ?, 'codex', ?, 'thread', ?, 'codex-hook', NULL, NULL, 1)", [id, id, pid, pane, `pane:infra:${pane}`]);
+    db.run("INSERT INTO messages (to_id, sent_at) VALUES (?, '2026-09-10T00:00:00Z')", [id]);
+  }
+  const snap: TickSnapshot = {
+    procs: [910001, 910002].map(pid => ({ pid, ppid: 1, args: "codex resume" })),
+    paneByPid: new Map([["%8101", 910001], ["%8102", 910002]]),
+    paneMap: new Map([910001, 910002].map((pid, i) => [pid, {
+      session: "infra", window_index: "1", window_name: "test", pane_index: String(i), pane_id: `%${8101 + i}`,
+    }])),
+  };
+  const visited: string[] = [];
+  const submitted: string[] = [];
+  const deps = {
+    nudgeableClients: ["codex"], isPidAlive: () => true, paneIsInCopyMode: () => false,
+    paneIsIdle: (pane: string) => { visited.push(pane); return true; },
+    nudgeLane: (lane: Lane) => { submitted.push(lane.id); return "submitted" as const; },
+  };
+  try {
+    withCommandBudget(50, () => tick(db, snap, { ...deps,
+      paneIsIdle: (pane) => { visited.push(pane); Bun.sleepSync(60); return true; },
+    }));
+    expect(visited).toHaveLength(1);
+    expect(submitted).toEqual([]);
+    expect(__nudgeAttemptCountForTest("budget-first") ?? 0).toBe(0);
+    expect(__nudgeAttemptCountForTest("budget-next") ?? 0).toBe(0);
+    const first = visited[0];
+    visited.length = 0;
+    withCommandBudget(8000, () => tick(db, snap, deps));
+    expect(visited[0]).not.toBe(first);
+    expect(submitted).toHaveLength(2);
+  } finally {
+    db.close();
+    __resetNudgeBudgetStateForTest();
+  }
 });

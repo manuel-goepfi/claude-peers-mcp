@@ -19,7 +19,7 @@
  * removed ⇔ validation passed.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -31,6 +31,15 @@ afterEach(() => {
 });
 
 interface RunOpts {
+  stalledInstaller?: boolean;
+  pkillStatus?: number;
+  stalledPkill?: boolean;
+  survivesKill?: boolean;
+  duplicatePollers?: boolean;
+  stalledSystemctl?: boolean;
+  probeFailure?: { stage: "show" | "is-active"; status: number };
+  heartbeatAgeSeconds?: number;
+  serviceAgeSeconds?: number;
   env?: Record<string, string>;      // extra env (e.g. NUDGE_CLIENTS)
   file?: string | null;              // nudge-clients file content (null = absent)
   pollerRunning?: boolean;           // pgrep stub reports a live poller
@@ -52,26 +61,34 @@ async function runWatchdog(opts: RunOpts = {}) {
   const labelHookLog = join(root, "tmux-label-hook.log");
   const labelHookInstaller = join(root, "install-tmux-label-hooks");
   const pgrepExit = opts.pollerRunning ? 0 : 1;
-  const pgrepOut = opts.pollerRunning ? "echo 99999" : ":";
+  const pgrepOut = opts.pollerRunning ? (opts.duplicatePollers ? "printf '99999\\n99998\\n'" : "echo 99999") : ":";
   const systemd = opts.systemd ?? { managerAvailable: false };
   const unitInstalled = systemd.managerAvailable && systemd.unitInstalled !== false;
   const showExit = systemd.managerAvailable ? 0 : 1;
   const loadState = unitInstalled ? "loaded" : "not-found";
   const activeExit = unitInstalled && systemd.active ? 0 : 3;
   const restartExit = unitInstalled && systemd.restartSucceeds !== false ? 0 : 1;
-  writeFileSync(join(shim, "pgrep"), `#!/bin/bash\n${pgrepOut}\nexit ${pgrepExit}\n`);
-  writeFileSync(join(shim, "pkill"), `#!/bin/bash\necho "pkill $@" >> '${pkillLog}'\nexit 0\n`);
+  writeFileSync(join(shim, "pgrep"), `#!/bin/bash\n${opts.survivesKill ? ":" : `[ -f '${pkillLog}' ] && exit 1`}\n${pgrepOut}\nexit ${pgrepExit}\n`);
+  writeFileSync(join(shim, "pkill"), `#!/bin/bash\necho "pkill $@" >> '${pkillLog}'\n${opts.stalledPkill ? "sleep 1" : ":"}\nexit ${opts.pkillStatus ?? 0}\n`);
   writeFileSync(join(shim, "systemctl"), `#!/bin/bash
 echo "$*" >> '${systemctlLog}'
 printf 'XDG_RUNTIME_DIR=%s DBUS_SESSION_BUS_ADDRESS=%s\\n' "\${XDG_RUNTIME_DIR-}" "\${DBUS_SESSION_BUS_ADDRESS-}" >> '${systemctlLog}'
+${opts.stalledSystemctl ? "sleep 1" : ":"}
+${opts.probeFailure ? `[[ "$2" == "${opts.probeFailure.stage}" ]] && exit ${opts.probeFailure.status}` : ":"}
 case "$2" in
-  show) printf '%s\\n' '${loadState}'; exit ${showExit} ;;
+  show)
+    if [[ "$*" == *ActiveEnterTimestamp* ]]; then
+      echo '${new Date(Date.now() - (opts.serviceAgeSeconds ?? 300) * 1000).toISOString()}'
+    else
+      printf '%s\\n' '${loadState}'
+    fi
+    exit ${showExit} ;;
   is-active) exit ${activeExit} ;;
   restart) exit ${restartExit} ;;
   *) exit 1 ;;
 esac
 `);
-  writeFileSync(labelHookInstaller, `#!/bin/bash\necho called >> '${labelHookLog}'\nexit 0\n`);
+  writeFileSync(labelHookInstaller, `#!/bin/bash\necho called >> '${labelHookLog}'\ncat '${systemctlLog}' >> '${labelHookLog}'\n${opts.stalledInstaller ? 'sleep 1' : ':'}\nexit 0\n`);
   chmodSync(join(shim, "pgrep"), 0o755);
   chmodSync(join(shim, "pkill"), 0o755);
   chmodSync(join(shim, "systemctl"), 0o755);
@@ -81,6 +98,10 @@ esac
   const log = join(root, "watchdog.log");
   const heartbeat = join(root, "heartbeat");
   writeFileSync(heartbeat, "seed");
+  if (opts.heartbeatAgeSeconds !== undefined) {
+    const then = new Date(Date.now() - opts.heartbeatAgeSeconds * 1000);
+    utimesSync(heartbeat, then, then);
+  }
   const tmuxTmp = join(root, "tmux-empty");
   mkdirSync(tmuxTmp);
   const child = Bun.spawn(["bash", script], {
@@ -110,6 +131,21 @@ esac
 }
 
 describe("systemd supervision takes precedence over the tmux fallback", () => {
+  test("newly started unit gets grace despite an old heartbeat", async () => {
+    const r = await runWatchdog({ heartbeatAgeSeconds: 300, serviceAgeSeconds: 1,
+      systemd: { managerAvailable: true, active: true } });
+    expect(r.code).toBe(0);
+    expect(r.systemctl).not.toContain("--user restart");
+  });
+  test("an active but stale poller is restarted through its owner", async () => {
+    const r = await runWatchdog({
+      heartbeatAgeSeconds: 300,
+      systemd: { managerAvailable: true, active: true },
+    });
+    expect(r.code).toBe(0);
+    expect(r.systemctl).toContain("--user restart claude-peers-codex-autodrain.service");
+    expect(r.pkills).toBe("");
+  });
   test("active unit returns before the fallback opt-in gate (planted regression guard)", async () => {
     const uid = process.getuid?.();
     if (uid === undefined) throw new Error("systemd supervision test requires a Unix uid");
@@ -124,7 +160,7 @@ describe("systemd supervision takes precedence over the tmux fallback", () => {
     expect(r.systemctl).toContain(`XDG_RUNTIME_DIR=/run/user/${uid}`);
     expect(r.systemctl).toContain(`DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${uid}/bus`);
     expect(r.systemctl).not.toContain("restart");
-    expect(r.labelHookInstalls).toBe("called\n");
+    expect(r.labelHookInstalls).toContain("called\n");
   });
 
   test("inactive reachable unit is restarted without falling through to tmux", async () => {
@@ -234,3 +270,55 @@ describe("kill-on-disable: resolved OFF converges a running poller to stopped", 
     expect(r.log).not.toContain("kill-on-disable");
   });
 });
+
+test("supervises before bounding a stalled optional installer", async () => {
+  const r = await runWatchdog({ stalledInstaller: true, heartbeatAgeSeconds: 300,
+    systemd: { managerAvailable: true, active: true },
+    env: { AUTODRAIN_LABEL_INSTALL_TIMEOUT_S: "0.1" } });
+  expect(r.code).toBe(0);
+  expect(r.labelHookInstalls).toContain("--user restart");
+  expect(r.log).toContain("stage=label-install status=124");
+  expect(r.log).toContain("heartbeat_age_s=");
+});
+
+test("a timed-out manager probe fails closed without tmux fallback", async () => {
+  const r = await runWatchdog({ stalledSystemctl: true, file: "codex",
+    env: { AUTODRAIN_COMMAND_TIMEOUT_S: "0.1" } });
+  expect(r.code).toBe(1);
+  expect(r.gatePassed).toBe(false);
+  expect(r.log).toContain("stage=systemd-load status=124");
+});
+
+for (const duplicatePollers of [false, true]) {
+  for (const failure of ["timeout", "error", "survivor"] as const) {
+    test(`fallback refuses respawn after ${failure}, duplicates=${duplicatePollers}`, async () => {
+      const r = await runWatchdog({ file: "codex", pollerRunning: true,
+        duplicatePollers, heartbeatAgeSeconds: 300,
+        stalledPkill: failure === "timeout", pkillStatus: failure === "error" ? 2 : 0,
+        survivesKill: failure === "survivor",
+        env: { AUTODRAIN_COMMAND_TIMEOUT_S: "0.1" } });
+      expect(r.code).toBe(1);
+      expect(r.gatePassed).toBe(false);
+      expect(r.log).toContain("refusing duplicate spawn");
+    });
+  }
+}
+
+test("fallback permits respawn only after the old process disappears", async () => {
+  const r = await runWatchdog({ file: "codex", pollerRunning: true, heartbeatAgeSeconds: 300 });
+  expect(r.code).toBe(0);
+  expect(r.gatePassed).toBe(true);
+});
+
+for (const stage of ["show", "is-active"] as const) {
+  for (const status of [125, 126, 127]) {
+    test(`supervision fails closed for ${stage} wrapper status ${status}`, async () => {
+      const r = await runWatchdog({ file: "codex", probeFailure: { stage, status },
+        systemd: { managerAvailable: true, active: true } });
+      expect(r.code).toBe(1);
+      expect(r.gatePassed).toBe(false);
+      expect(r.systemctl).not.toContain("--user restart");
+      expect(r.log).toContain(`stage=systemd-${stage === "show" ? "load" : "active"} status=${status}`);
+    });
+  }
+}

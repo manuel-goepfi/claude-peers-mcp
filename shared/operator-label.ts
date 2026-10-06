@@ -61,7 +61,7 @@ export function chooseOperatorLabel(
   const used = new Set<string>();
   let highestOrdinal = 0;
   for (const label of usedLabels) {
-    const base = stripResolvedNameSuffix(label.trim());
+    const base = preservedTmuxOperatorLabel(label, null, session);
     if (!base) continue;
     used.add(base);
     if (base.startsWith(`${session}.`)) {
@@ -71,15 +71,6 @@ export function chooseOperatorLabel(
         highestOrdinal = Math.max(highestOrdinal, ordinal);
       }
     }
-  }
-
-  // The operator's own window name wins when they chose one. It is the label on the
-  // border, the thing they say out loud, and the thing already meaningful to them —
-  // "REVIEW-1996" rather than "C5_lanes.7", which they would still have to map back
-  // to a task. Falls through when the name is taken or generic.
-  if (windowPanes === 1 && isOperatorChosenWindowName(windowName, session)) {
-    const candidate = windowName!.trim();
-    if (!used.has(candidate)) return candidate;
   }
 
   // Pane indexes are display positions: splitting or closing panes renumbers
@@ -93,16 +84,10 @@ export function preservedTmuxOperatorLabel(
   peerLabel: string | null,
   session: string,
 ): string | null {
-  // @operator_label is pane-scoped and explicitly sticky. Once present, keep it
-  // even if it predates today's session.N shape; re-deriving a non-empty label
-  // makes a surviving pane change identity when layouts or naming rules change.
-  const explicit = cleanTmuxOptionValue(operatorLabel);
-  if (explicit) return explicit;
-
-  // @peer_label is broker-owned legacy state, so retain only a recognized human
-  // label and remove the broker's numeric collision suffix before promoting it.
-  const legacy = cleanTmuxOptionValue(peerLabel);
-  return isHumanOperatorLabel(legacy, session)
-    ? stripResolvedNameSuffix(legacy.trim())
-    : null;
+  // The ordinal belongs to the open pane; the prefix follows its current session.
+  // No name history or closed-pane reservation survives the pane itself.
+  const label = cleanTmuxOptionValue(operatorLabel) ?? cleanTmuxOptionValue(peerLabel);
+  const match = label && stripResolvedNameSuffix(label).match(/^.+\.([1-9][0-9]*)$/);
+  if (!match || !Number.isSafeInteger(Number(match[1]))) return null;
+  return `${session}.${Number(match[1])}`;
 }

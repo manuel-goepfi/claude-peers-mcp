@@ -215,28 +215,28 @@ describe("codex nudge text", () => {
     { unread: n, client_type: client, receiver_mode: "manual-drain" } as never
   );
 
-  test("hook lanes are told only to process the attached body", () => {
+  test("hook lanes prioritize attachments with a conditional fallback", () => {
     for (const text of [
       nudgeText(hook("codex", "codex-hook")),
       nudgeText(hook("claude", "claude-channel")),
       nudgeText(hook("gemini", "gemini-hook")),
     ]) {
-      expect(text).toBe("[peer-mail] Process the attached peer messages.");
-      expect(text).not.toContain("check_messages");
+      expect(text).toBe("[peer-mail] Process the attached peer messages. If none are attached, fetch pending mail with check_messages. Continue the work.");
+      expect(text).toContain("If none are attached, fetch pending mail with check_messages.");
       expect(text).not.toContain("Transport closed");
       expect(text).not.toContain("UNVERIFIABLE");
       expect(text).not.toContain("<peer-message");
     }
   });
 
-  test("manual-drain lanes are told to call check_messages once", () => {
+  test("manual-drain lanes fetch pending mail when no attachments are present", () => {
     expect(nudgeText(manual(1, "cursor"))).toBe(
-      "[peer-mail] 1 unread peer message. Call check_messages once.",
+      "[peer-mail] Process the attached peer messages. If none are attached, fetch pending mail with check_messages. Continue the work.",
     );
     expect(nudgeText(manual(2, "kimi"))).toBe(
-      "[peer-mail] 2 unread peer messages. Call check_messages once.",
+      "[peer-mail] Process the attached peer messages. If none are attached, fetch pending mail with check_messages. Continue the work.",
     );
-    expect(nudgeText(manual(1, "codex"))).toContain("Call check_messages once");
+    expect(nudgeText(manual(1, "codex"))).toContain("If none are attached, fetch pending mail with check_messages.");
   });
 
   test("does not repeat authority policy in the wake-up notice", () => {

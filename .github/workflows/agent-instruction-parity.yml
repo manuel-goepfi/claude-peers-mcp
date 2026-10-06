@@ -1,0 +1,42 @@
+name: Agent instruction parity
+
+on:
+  pull_request:
+    paths:
+      - CLAUDE.md
+      - AGENTS.md
+      - .github/workflows/agent-instruction-parity.yml
+  push:
+    branches: [main]
+    paths:
+      - CLAUDE.md
+      - AGENTS.md
+      - .github/workflows/agent-instruction-parity.yml
+
+permissions:
+  contents: read
+
+jobs:
+  parity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify physical copies and budget
+        shell: bash
+        run: |
+          begin='<!-- BEGIN MANZO COMMON RULES -->'
+          end='<!-- END MANZO COMMON RULES -->'
+          test "$(grep -Fxc "$begin" CLAUDE.md)" -eq 1
+          test "$(grep -Fxc "$end" CLAUDE.md)" -eq 1
+          test "$(grep -Fxc "$begin" AGENTS.md)" -eq 1
+          test "$(grep -Fxc "$end" AGENTS.md)" -eq 1
+          claude_common=$(mktemp)
+          agents_common=$(mktemp)
+          trap 'rm -f "$claude_common" "$agents_common"' EXIT
+          awk -v begin="$begin" -v end="$end" '$0 == begin { copy=1 } copy { print } $0 == end { exit }' CLAUDE.md > "$claude_common"
+          awk -v begin="$begin" -v end="$end" '$0 == begin { copy=1 } copy { print } $0 == end { exit }' AGENTS.md > "$agents_common"
+          cmp -s "$claude_common" "$agents_common"
+          test "$(( $(wc -c < CLAUDE.md) - $(wc -c < "$claude_common") ))" -le 1024
+          test "$(( $(wc -c < AGENTS.md) - $(wc -c < "$agents_common") ))" -le 1024
+          test "$(wc -c < CLAUDE.md)" -le 28000
+          test "$(wc -c < AGENTS.md)" -le 28000
