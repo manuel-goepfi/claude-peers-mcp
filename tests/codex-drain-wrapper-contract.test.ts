@@ -136,3 +136,93 @@ describe("stdout discipline — Codex must never see a partial payload", () => {
     expect(r.stdout).toBe("");
   });
 });
+
+/**
+ * PostToolUse throttle (2026-10-06): every Codex tool call started bash + bun,
+ * ~14% of all host process launches. A thread now drains on PostToolUse at most
+ * once per CLAUDE_PEERS_CODEX_POSTTOOL_MIN_INTERVAL_SECONDS; turn boundaries are
+ * never throttled.
+ */
+describe("PostToolUse drain throttle", () => {
+  const COUNTER_STUB = (counter: string) =>
+    `const t = await Bun.stdin.text();\n` +
+    `require("node:fs").appendFileSync(${JSON.stringify(counter)}, JSON.stringify(t) + "\\n");\n` +
+    `console.log("{}");\n`;
+
+  function setup() {
+    const root = mkdtempSync(join(tmpdir(), "codex-drain-throttle-"));
+    mkdirSync(join(root, "hooks"), { recursive: true });
+    const counter = join(root, "calls.log");
+    writeFileSync(join(root, "hooks", "codex-drain-peer-inbox.ts"), COUNTER_STUB(counter));
+    return { root, counter, stamps: join(root, "stamps") };
+  }
+  function fire(s: ReturnType<typeof setup>, event: string, payload: string, interval = "15") {
+    return Bun.spawnSync(["bash", WRAPPER], {
+      env: {
+        ...process.env,
+        CLAUDE_PEERS_ROOT: s.root,
+        CODEX_HOME: join(s.root, "codexhome"),
+        CLAUDE_PEERS_HOOK_EVENT_NAME: event,
+        CLAUDE_PEERS_DRAIN_THROTTLE_DIR: s.stamps,
+        CLAUDE_PEERS_CODEX_POSTTOOL_MIN_INTERVAL_SECONDS: interval,
+      },
+      stdin: new TextEncoder().encode(payload),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+  }
+  const calls = (s: ReturnType<typeof setup>) =>
+    existsSync(s.counter) ? readFileSync(s.counter, "utf8").trim().split("\n").filter(Boolean) : [];
+  const P = (sid: string) => JSON.stringify({ session_id: sid, hook_event_name: "PostToolUse" });
+
+  test("a second PostToolUse in the same thread within the window does not start bun", () => {
+    const s = setup();
+    expect(fire(s, "PostToolUse", P("thread-a")).exitCode).toBe(0);
+    expect(fire(s, "PostToolUse", P("thread-a")).exitCode).toBe(0);
+    expect(calls(s).length).toBe(1);
+  });
+
+  test("the .ts still receives the exact hook payload on stdin", () => {
+    const s = setup();
+    fire(s, "PostToolUse", P("thread-a"));
+    expect(JSON.parse(JSON.parse(calls(s)[0]).trim()).session_id).toBe("thread-a");
+  });
+
+  test("threads are throttled independently", () => {
+    const s = setup();
+    fire(s, "PostToolUse", P("thread-a"));
+    fire(s, "PostToolUse", P("thread-b"));
+    expect(calls(s).length).toBe(2);
+  });
+
+  test("Stop and UserPromptSubmit are never throttled", () => {
+    const s = setup();
+    fire(s, "PostToolUse", P("thread-a"));
+    fire(s, "Stop", P("thread-a"));
+    fire(s, "UserPromptSubmit", P("thread-a"));
+    fire(s, "Stop", P("thread-a"));
+    expect(calls(s).length).toBe(4);
+  });
+
+  test("an interval of 0 disables the throttle", () => {
+    const s = setup();
+    fire(s, "PostToolUse", P("thread-a"), "0");
+    fire(s, "PostToolUse", P("thread-a"), "0");
+    expect(calls(s).length).toBe(2);
+  });
+
+  test("a payload without session_id is never throttled", () => {
+    const s = setup();
+    fire(s, "PostToolUse", "{}");
+    fire(s, "PostToolUse", "{}");
+    expect(calls(s).length).toBe(2);
+  });
+
+  test("an expired stamp lets the next PostToolUse drain", () => {
+    const s = setup();
+    fire(s, "PostToolUse", P("thread-a"));
+    writeFileSync(join(s.stamps, "thread-a"), "1\n");
+    fire(s, "PostToolUse", P("thread-a"));
+    expect(calls(s).length).toBe(2);
+  });
+});

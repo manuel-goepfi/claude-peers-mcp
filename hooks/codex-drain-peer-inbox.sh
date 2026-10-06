@@ -43,7 +43,40 @@ if [[ ! -f "$SCRIPT" ]]; then
   exit 0
 fi
 
+# PostToolUse throttle (measured 2026-10-06: Codex hooks were ~14% of all
+# process launches on the host, bursting a bun drain to 400%+ CPU, because
+# every tool call of every Codex thread started bash + bun). A thread drains on
+# PostToolUse at most once per CLAUDE_PEERS_CODEX_POSTTOOL_MIN_INTERVAL_SECONDS
+# (default 15), keyed by the payload's session_id (the thread id). SessionStart,
+# UserPromptSubmit and Stop are never throttled, so mail still lands at every
+# turn boundary; PostToolUse is only the extra mid-turn chance. The check uses
+# bash builtins only. No session_id, or an unreadable stamp: no throttle.
+PAYLOAD=""
+if [[ "$EVENT" == PostToolUse ]]; then
+  IFS= read -r -d '' -t 2 PAYLOAD || true
+  MIN="${CLAUDE_PEERS_CODEX_POSTTOOL_MIN_INTERVAL_SECONDS:-15}"
+  if [[ "$MIN" =~ ^[0-9]+$ && "$MIN" -gt 0 \
+        && "$PAYLOAD" =~ \"session_id\"[[:space:]]*:[[:space:]]*\"([A-Za-z0-9._:-]{1,128})\" ]]; then
+    STAMP_DIR="${CLAUDE_PEERS_DRAIN_THROTTLE_DIR:-${XDG_RUNTIME_DIR:-/tmp}/claude-peers-codex-drain}"
+    STAMP="$STAMP_DIR/${BASH_REMATCH[1]}"
+    printf -v NOW '%(%s)T' -1
+    LAST=0
+    [[ -r "$STAMP" ]] && { read -r LAST < "$STAMP" || LAST=0; }
+    [[ "$LAST" =~ ^[0-9]+$ ]] || LAST=0
+    if (( NOW - LAST < MIN )); then
+      exit 0
+    fi
+    # shellcheck disable=SC2174  # only the leaf needs 0700
+    [[ -d "$STAMP_DIR" ]] || mkdir -p -m 700 "$STAMP_DIR" 2>/dev/null
+    printf '%s\n' "$NOW" > "$STAMP" 2>/dev/null
+  fi
+fi
+
 OUT=$(mktemp 2>/dev/null) || exit 0
+if [[ "$EVENT" == PostToolUse ]]; then
+  # stdin was consumed above; hand the same payload to the .ts.
+  if [[ -n "$PAYLOAD" ]]; then exec 0<<<"$PAYLOAD"; else exec 0</dev/null; fi
+fi
 if bun "$SCRIPT" >"$OUT" 2>>"$LOG"; then
   cat "$OUT"
 else
