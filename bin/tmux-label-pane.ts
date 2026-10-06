@@ -9,6 +9,14 @@ import {
   cleanTmuxOptionValue,
   preservedTmuxOperatorLabel,
 } from "../shared/operator-label.ts";
+import {
+  PANE_SEAT_FORMAT,
+  SEAT_NAME_OPTION,
+  cleanSeatName,
+  describeSeatHolder,
+  parsePaneSeatRows,
+  seatNameHolder,
+} from "../shared/seat-name.ts";
 
 export interface TmuxLabelCommandResult {
   ok: boolean;
@@ -69,10 +77,14 @@ function parseSnapshot(raw: string): PaneSnapshot | null {
 function usedOperatorLabels(raw: string, currentPaneId: string): string[] {
   const labels: string[] = [];
   for (const line of raw.split("\n")) {
-    const [paneId, operatorLabel, peerLabel] = line.split("\t");
+    const [paneId, operatorLabel, peerLabel, seatName] = line.split("\t");
     if (!paneId || paneId === currentPaneId) continue;
     const label = cleanTmuxOptionValue(operatorLabel) ?? cleanTmuxOptionValue(peerLabel);
     if (label) labels.push(label);
+    // An explicit seat name in the ordinal shape (a role label) is taken too:
+    // the next auto label must be allocated above it, never onto it.
+    const seat = cleanTmuxOptionValue(seatName);
+    if (seat) labels.push(seat);
   }
   return labels;
 }
@@ -92,7 +104,7 @@ function ownsPreservedLabel(pane: PaneSnapshot, label: string, siblings: string)
 }
 
 function siblingLabels(pane: PaneSnapshot, run: TmuxLabelRunner): TmuxLabelCommandResult {
-  return run(["list-panes","-s","-t",pane.session,"-F","#{pane_id}\t#{@operator_label}\t#{@peer_label}"]);
+  return run(["list-panes","-s","-t",pane.session,"-F",`#{pane_id}\t#{@operator_label}\t#{@peer_label}\t#{${SEAT_NAME_OPTION}}`]);
 }
 
 function panePresence(paneId: string, run: TmuxLabelRunner): "present" | "absent" | "unknown" {
@@ -167,6 +179,78 @@ export function ensurePaneOperatorLabel(paneId: string, run: TmuxLabelRunner = r
   catch {return {status:"failed",reason:"invalid-label-result"};}
 }
 
+export type SeatNameClaimResult =
+  | { status: "claimed"; name: string }
+  | { status: "released" }
+  | { status: "refused"; holder: string }
+  | { status: "failed"; reason: string };
+
+/** The explicit seat name stamped on a pane, or null when it has none. */
+export function readPaneSeatName(paneId: string, run: TmuxLabelRunner = runTmux): string | null {
+  const result = run(["show-options", "-p", "-t", paneId, "-v", SEAT_NAME_OPTION]);
+  return result.ok ? cleanSeatName(result.out) : null;
+}
+
+/** Which other pane already answers to `name`? Read-only; null when free. */
+export function paneSeatNameHolder(paneId: string, name: string, run: TmuxLabelRunner = runTmux): string | null | { failed: string } {
+  const panes = run(["list-panes", "-a", "-F", PANE_SEAT_FORMAT]);
+  if (!panes.ok) return { failed: "pane-list-failed" };
+  const holder = seatNameHolder(parsePaneSeatRows(panes.out), paneId, name);
+  return holder ? describeSeatHolder(holder) : null;
+}
+
+/** The name this pane's seat answers to: explicit seat name, else the auto label. */
+export function resolvePaneSeatName(paneId: string, run: TmuxLabelRunner = runTmux, lockSocket?: string): PaneLabelResult {
+  const explicit = readPaneSeatName(paneId, run);
+  if (explicit) return { status: "preserved", label: explicit };
+  return ensurePaneOperatorLabel(paneId, run, lockSocket);
+}
+
+function claimPaneSeatNameUnlocked(paneId: string, name: string, run: TmuxLabelRunner): SeatNameClaimResult {
+  if (name === "") {
+    // Releasing returns the pane to its auto label. Unsetting an unset option
+    // still exits 0, so a failure here is a real one.
+    return run(["set-option", "-p", "-t", paneId, "-u", SEAT_NAME_OPTION]).ok
+      ? { status: "released" }
+      : { status: "failed", reason: "seat-name-unset-failed" };
+  }
+  const cleaned = cleanSeatName(name);
+  if (!cleaned || cleaned !== name.trim()) return { status: "failed", reason: "invalid-seat-name" };
+  const panes = run(["list-panes", "-a", "-F", PANE_SEAT_FORMAT]);
+  if (!panes.ok) return { status: "failed", reason: "pane-list-failed" };
+  const rows = parsePaneSeatRows(panes.out);
+  if (!rows.some((row) => row.paneId === paneId)) return { status: "failed", reason: "pane-gone" };
+  const holder = seatNameHolder(rows, paneId, cleaned);
+  if (holder) return { status: "refused", holder: describeSeatHolder(holder) };
+  return run(["set-option", "-p", "-t", paneId, SEAT_NAME_OPTION, cleaned]).ok
+    ? { status: "claimed", name: cleaned }
+    : { status: "failed", reason: "seat-name-write-failed" };
+}
+
+/**
+ * Stamp an explicit seat name on a pane, refusing a name another pane answers
+ * to. An empty name releases the pane back to its auto label.
+ *
+ * Names are unique across the whole tmux server, not per session, so the lock
+ * is server-wide: two launchers claiming one role label at the same moment must
+ * not both win.
+ */
+export function claimPaneSeatName(paneId: string, name: string, run: TmuxLabelRunner = runTmux, lockSocket?: string): SeatNameClaimResult {
+  if (run !== runTmux && !lockSocket) return claimPaneSeatNameUnlocked(paneId, name, run);
+  const identity = run(["display-message", "-p", "-t", paneId, "#{socket_path}\t#{pid}"]);
+  if (!identity.ok || identity.out.trim().split("\t").length !== 2) {
+    return { status: "failed", reason: panePresence(paneId, run) === "absent" ? "pane-gone" : "lock-identity-unavailable" };
+  }
+  const directory = join(tmpdir(), `claude-peers-pane-labels-${process.getuid?.() ?? "user"}`);
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const lock = join(directory, createHash("sha256").update(`seat-names\0${identity.out.trim()}`).digest("hex") + ".lock");
+  const result = boundedCommand(["flock", "-F", "-w", "5", lock, process.execPath, new URL(import.meta.url).pathname, "--claim-seat-name-locked-json", paneId, name],
+    { operation: "seat-name-lock", timeoutMs: 8000,
+      env: lockSocket ? { ...process.env, CLAUDE_PEERS_TMUX_SOCKET: lockSocket } : process.env });
+  try { return JSON.parse(result.out) as SeatNameClaimResult; }
+  catch { return { status: "failed", reason: result.ok ? "invalid-claim-result" : "seat-name-lock-or-write-failed" }; }
+}
+
 export function labelAllUnlabeledPanes(
   run: TmuxLabelRunner = runTmux,
   sessionId?: string,
@@ -218,6 +302,30 @@ export function main(args = process.argv.slice(2)): number {
   }
   if (args.length===2 && args[0]==="--print" && /^%[0-9]+$/.test(args[1]!)) {
     const result=ensurePaneOperatorLabel(args[1]!);
+    if (result.status==="labeled" || result.status==="preserved") {console.log(result.label);return 0;}
+    return 1;
+  }
+  if (args.length===3 && args[0]==="--claim-seat-name-locked-json" && /^%[0-9]+$/.test(args[1]!)) {
+    // Always exit 0: boundedCommand discards stdout on a non-zero exit, and a
+    // refusal must reach the caller with its holder intact.
+    console.log(JSON.stringify(claimPaneSeatNameUnlocked(args[1]!,args[2]!,runTmux)));
+    return 0;
+  }
+  // Launchers: `--claim-seat-name <pane> <name>` stamps an explicit name (empty
+  // releases it). Exit 3 means another pane answers to the name; the holder is
+  // printed so the operator can see which seat to rename first.
+  if (args.length===3 && args[0]==="--claim-seat-name" && /^%[0-9]+$/.test(args[1]!)) {
+    const result=claimPaneSeatName(args[1]!,args[2]!);
+    if (result.status==="claimed") {console.log(result.name);return 0;}
+    if (result.status==="released") return 0;
+    if (result.status==="refused") {console.error(`seat name "${args[2]}" is already held by ${result.holder}`);return 3;}
+    console.error(`seat name claim failed pane=${args[1]} reason=${result.reason}`);
+    return 1;
+  }
+  // `--print-seat <pane>`: the name the pane's seat answers to (explicit seat
+  // name first, else the auto label). `--print` stays the auto label only.
+  if (args.length===2 && args[0]==="--print-seat" && /^%[0-9]+$/.test(args[1]!)) {
+    const result=resolvePaneSeatName(args[1]!);
     if (result.status==="labeled" || result.status==="preserved") {console.log(result.label);return 0;}
     return 1;
   }

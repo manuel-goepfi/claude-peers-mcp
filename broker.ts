@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { ensurePaneOperatorLabel } from "./bin/tmux-label-pane.ts";
+import { ensurePaneOperatorLabel, readPaneSeatName } from "./bin/tmux-label-pane.ts";
 import { primeRuntimePaneRows, runtimeProcessStats, withRuntimePaneSnapshot } from "./shared/runtime-pane-snapshot.ts";
 import { clockTicksPerSecond } from "./shared/native-claude-proof.ts";
 /**
@@ -1390,7 +1390,7 @@ function handleLiveGroupRegistration(body:RegisterRequest):RegisterResult|null {
       if(body.client_type!=="claude"||!body.thread_id||!body.adapter_pid)throw new Error("invalid native companion request");
       const bound=liveGroups.bind(body.adapter_pid,body.pid,body.thread_id);
       return {ok:true,value:{id:bound.native.id,token:bound.native.token!,name:bound.native.name,resolved_name:bound.native.resolved_name,
-        client_type:"claude",receiver_mode:validReceiverMode(bound.native.receiver_mode,"claude")}};
+        client_type:"claude",receiver_mode:validReceiverMode(bound.native.receiver_mode,"claude"),name_explicit:explicitNames.has(bound.native.id)}};
     }
     const rows=db.query("SELECT * FROM peers WHERE pid=? AND seat_key LIKE 'live:%'").all(body.pid) as Peer[];
     if(!rows.length)return null;
@@ -1404,7 +1404,7 @@ function handleLiveGroupRegistration(body:RegisterRequest):RegisterResult|null {
     if(!current || (body.thread_id??null)!==(current.peer.thread_id??null) || body.client_type!==current.peer.client_type)throw new Error("runtime group refresh proof changed");
     db.run("UPDATE peers SET last_seen=? WHERE id=?",[new Date().toISOString(),current.peer.id]);
     return {ok:true,value:{id:current.peer.id,token:current.peer.token!,name:current.native.name,resolved_name:current.native.resolved_name,
-      client_type:"claude",receiver_mode:validReceiverMode(current.peer.receiver_mode,"claude")}};
+      client_type:"claude",receiver_mode:validReceiverMode(current.peer.receiver_mode,"claude"),name_explicit:explicitNames.has(current.native.id)}};
   }catch(error){return {ok:false,status:409,error:error instanceof Error?error.message:"runtime mailbox grouping refused"};}
 }
 
@@ -1435,6 +1435,18 @@ function nativeCodexKeeper(input: Pick<RegisterRequest,"pid"|"tmux_pane_id"|"cwd
 // Call only after proving the exact native process owns this open pane.
 function canonicalNativeCodexPaneName(peer: Peer): {name:string;resolved_name:string} | null {
   if (!peer.tmux_pane_id) return null;
+  // An explicit seat name (pinned here, or only on the pane after a broker
+  // restart or a launcher claim) outranks the auto label.
+  const pinned=explicitNames.get(peer.id) ?? readPaneSeatName(peer.tmux_pane_id);
+  if (pinned) {
+    explicitNames.set(peer.id,pinned);
+    if (peer.name!==pinned) {
+      const resolved=disambiguateName(pinned,peer.id,peer.tmux_window_name) ?? pinned;
+      updateName.run(pinned,resolved,peer.id);
+      return {name:pinned,resolved_name:resolved};
+    }
+    return {name:pinned,resolved_name:peer.resolved_name ?? pinned};
+  }
   const label=ensurePaneOperatorLabel(peer.tmux_pane_id);
   if (label.status!=="preserved" && label.status!=="labeled") return null;
   if (peer.name!==label.label || peer.resolved_name!==label.label) {
@@ -1470,7 +1482,7 @@ function recoverThreadlessCodex(body:RegisterRequest):RegisterResult|null {
   db.transaction(()=>{for(const duplicate of duplicates)deletePeer.run(duplicate.id);})();
   for(const duplicate of duplicates){buckets.delete(duplicate.id);supersededPeerIds.delete(duplicate.id);}
   return {ok:true,value:{id:keeper.id,token:keeper.token,name:canonical.name,resolved_name:canonical.resolved_name,
-    client_type:"codex",receiver_mode:validReceiverMode(keeper.receiver_mode,"codex")}};
+    client_type:"codex",receiver_mode:validReceiverMode(keeper.receiver_mode,"codex"),name_explicit:explicitNames.has(keeper.id)}};
 }
 
 function handleRegister(body: RegisterRequest): RegisterResult {
@@ -1838,7 +1850,13 @@ function handleRegister(body: RegisterRequest): RegisterResult {
 
   // Runtime-name de-dupe: keep the operator-facing name unchanged, but assign
   // a broker-unique resolved_name for diagnostics and exact process identity.
-  const requestedName = adoptedThreadSeat ? adoptedThreadSeat.name : (body.name ?? null);
+  // An explicit name (the pane's @peer_seat_name, or a launcher's -n) pins the
+  // seat's name; a plain re-registration carrying the pane's auto label never
+  // replaces a pinned one.
+  if (!adoptedThreadSeat && body.name_explicit === true && typeof body.name === "string" && body.name.length > 0) {
+    explicitNames.set(id, body.name);
+  }
+  const requestedName = adoptedThreadSeat ? adoptedThreadSeat.name : (explicitNames.get(id) ?? body.name ?? null);
   const finalName = adoptedThreadSeat
     ? adoptedThreadSeat.resolved_name
     : disambiguateName(requestedName, id, body.tmux_window_name);
@@ -1969,7 +1987,7 @@ function handleRegister(body: RegisterRequest): RegisterResult {
     console.error(`[broker] /register DB write failed for pid=${body.pid} name="${requestedName ?? ""}":`, e);
     return { ok: false, status: 500, error: "registration persistence failed" };
   }
-  return { ok: true, value: { id, token: issuedToken, name: requestedName, resolved_name: finalName, client_type: clientType, receiver_mode: receiverMode } };
+  return { ok: true, value: { id, token: issuedToken, name: requestedName, resolved_name: finalName, client_type: clientType, receiver_mode: receiverMode, name_explicit: explicitNames.has(id) } };
 }
 
 function handleHeartbeat(body: HeartbeatRequest): void {
@@ -1995,18 +2013,81 @@ function handleSetSummary(body: SetSummaryRequest): void {
   updateSummary.run(body.summary, body.id);
 }
 
+// Names a seat was given ON PURPOSE (set_name, rename-lane, or a registration
+// that carries an explicit launcher/pane seat name), keyed by peer id.
+//
+// Every automatic path (the live-group heartbeat, the adapter's canonical
+// re-sync, and hook re-registration) re-derives a name from the pane's AUTO
+// label. Before this map existed each of them silently wrote that label back
+// over an explicit rename within one heartbeat, so `set_name` reported success
+// while `whoami` kept the launch-order label. An explicit name outranks every
+// automatic one until the seat is explicitly renamed or cleared. The pane's
+// @peer_seat_name option carries the same name across broker restarts.
+const explicitNames = new Map<string, string>();
+
+function forgetCachedPaneLabel(paneId: string | null | undefined): void {
+  if (!paneId) return;
+  for (const key of liveLabels.keys()) if (key.endsWith(`:${paneId}`)) liveLabels.delete(key);
+}
+
+// The live seat (other than `selfId` and its own runtime group) that already
+// answers to `name`, by operator name or by resolved name.
+function liveNameHolder(name: string, selfId: string): Peer | null {
+  const self = selectPeerById.get(selfId) as Peer | null;
+  const selfGroup = liveGroupPrefix(self?.seat_key);
+  const rows = db.query(
+    "SELECT * FROM peers WHERE non_targetable = 0 AND id != ? AND (name = ? OR resolved_name = ?)"
+  ).all(selfId, name, name) as Peer[];
+  return rows.find((row) =>
+    peerSeatAlive(row) && !supersededPeerIds.has(row.id) && !(selfGroup && liveGroupPrefix(row.seat_key) === selfGroup)
+  ) ?? null;
+}
+
+type SetNameResult =
+  | { ok: true; name: string | null; resolved_name: string | null; explicit: boolean }
+  | { ok: false; holder: Peer };
+
 // Returns the actual stored name so the caller (server.ts /set-name dispatch)
 // can report it back to the peer — otherwise a peer that asked for "obs" but
 // got "obs#2" never learns its real handle.
-function handleSetName(body: SetNameRequest): { name: string | null; resolved_name: string | null } {
+//
+// explicit: the name was chosen on purpose and must outlive automatic re-syncs.
+// strict:   refuse a name another live seat answers to instead of suffixing it.
+//           A suffixed rename looks successful while routing by the requested
+//           name still reaches the OTHER seat, which is how a coordinator's
+//           packets landed on a reviewer.
+function handleSetName(body: SetNameRequest, options: { explicit?: boolean; strict?: boolean } = {}): SetNameResult {
+  const pinned = explicitNames.get(body.id);
+  if (!options.explicit && pinned !== undefined) {
+    // An automatic re-sync (an adapter's heartbeat pushing the pane's auto
+    // label) never overrides an explicit name. Report what is stored so the
+    // caller converges on it instead of believing its own label won.
+    const row = selectPeerById.get(body.id) as Peer | null;
+    return { ok: true, name: row?.name ?? pinned, resolved_name: row?.resolved_name ?? row?.name ?? pinned, explicit: true };
+  }
   // Empty string clears the name (stored as NULL for join-friendliness
   // with list_peers output which treats null as "unnamed").
   const desired = body.name.length > 0 ? body.name : null;
+  if (desired && options.strict) {
+    const holder = liveNameHolder(desired, body.id);
+    if (holder) return { ok: false, holder };
+  }
   // set-name has no tmux context in its payload → window-suffix unavailable here;
   // disambiguateName falls back to "#N" (an explicit rename rarely collides anyway).
   const final = disambiguateName(desired, body.id, null);
   updateName.run(desired, final, body.id);
-  return { name: desired, resolved_name: final };
+  if (options.explicit) {
+    if (desired) explicitNames.set(body.id, desired);
+    else explicitNames.delete(body.id);
+    forgetCachedPaneLabel((selectPeerById.get(body.id) as Peer | null)?.tmux_pane_id);
+  }
+  return { ok: true, name: desired, resolved_name: final, explicit: explicitNames.has(body.id) };
+}
+
+function nameHeldError(name: string, holder: Peer): string {
+  const where = holder.tmux_pane_id ? `, tmux ${holder.tmux_session ?? "?"}:${holder.tmux_pane_id}` : "";
+  return `name "${name}" is held by live peer ${holder.id} (name "${holder.name ?? ""}", resolved "${holder.resolved_name ?? ""}"${where}, pid ${holder.pid}); `
+    + "the holder must rename or release it first";
 }
 
 // Auto-suffix on name collision. If another LIVE peer already holds `rawName`
@@ -3448,7 +3529,9 @@ function handleBindCodexPaneThread(body: BindCodexPaneThreadRequest): BindCodexP
   const cwd = pane.pane_current_path;
   const gitRoot = gitValue(cwd, ["rev-parse", "--show-toplevel"]);
   const absoluteGitDir = gitValue(cwd, ["rev-parse", "--absolute-git-dir"]);
-  const name = label.label;
+  // An explicit seat name on the pane outranks its auto label.
+  const seatName = readPaneSeatName(pane.pane_id);
+  const name = seatName ?? label.label;
 
   // This bind is fresh proof that a live pane (pane shell ancestry, TTY, and a
   // single native Codex TUI) drives the thread again: lift a pane-closed gate
@@ -3463,6 +3546,7 @@ function handleBindCodexPaneThread(body: BindCodexPaneThreadRequest): BindCodexP
     absolute_git_dir: absoluteGitDir,
     tty: pane.pane_tty,
     name,
+    name_explicit: seatName !== null,
     tmux_session: pane.session,
     tmux_window_index: pane.window_index,
     tmux_window_name: pane.window_name,
@@ -3821,7 +3905,7 @@ function seatFromCallerAncestry(
  * send_to_peer matches AND what the tmux pane border renders, so naming a lane
  * makes the label on screen the label that routes.
  */
-function handleSetNameByPid(body: Record<string, unknown>): { ok: boolean; status?: number; error?: string; id?: string; name?: string | null; resolved_name?: string | null; previous_name?: string | null } {
+function handleSetNameByPid(body: Record<string, unknown>): { ok: boolean; status?: number; error?: string; holder?: PeerTarget; id?: string; name?: string | null; resolved_name?: string | null; previous_name?: string | null } {
   const callerPid = Number(body.caller_pid);
   if (!Number.isInteger(callerPid) || callerPid <= 1) return { ok: false, status: 400, error: "invalid caller_pid" };
   const callerErr = verifyPidUid(callerPid);
@@ -3835,7 +3919,14 @@ function handleSetNameByPid(body: Record<string, unknown>): { ok: boolean; statu
   const seat = resolved.seat;
 
   const previous = seat.name;
-  const result = handleSetName({ id: seat.id, name: desired });
+  // An operator rename is explicit (it must survive re-syncs), so it is also
+  // strict: a suffixed pin would leave two live seats answering to one
+  // operator name for good, the misrouting set_name already refuses.
+  const result = handleSetName({ id: seat.id, name: desired }, { explicit: true, strict: true });
+  if (!result.ok) {
+    console.error(`[broker] set-name-by-pid refused: ${seat.id} requested "${desired}" held by ${result.holder.id}`);
+    return { ok: false, status: 409, error: nameHeldError(desired, result.holder), holder: describePeerTarget(result.holder) };
+  }
   console.error(`[broker] set-name-by-pid: ${seat.id} "${previous ?? ""}" -> "${result.name ?? ""}" (resolved ${result.resolved_name ?? ""})`);
   return { ok: true, id: seat.id, name: result.name, resolved_name: result.resolved_name, previous_name: previous };
 }
@@ -4259,7 +4350,7 @@ async function liveGroupLabel(socket: string, pane: string, runtimeKey: string):
   let pending = liveLabelReads.get(key);
   if (!pending) {
     pending = (async () => {
-      const child = Bun.spawn([process.execPath, new URL("./bin/tmux-label-pane.ts", import.meta.url).pathname, "--print", pane], {
+      const child = Bun.spawn([process.execPath, new URL("./bin/tmux-label-pane.ts", import.meta.url).pathname, "--print-seat", pane], {
         env: { ...process.env, CLAUDE_PEERS_TMUX_SOCKET: socket }, stdout: "pipe", stderr: "ignore",
       });
       const timer = setTimeout(() => child.kill(), 2_000);
@@ -4430,7 +4521,7 @@ requestHandler = async (req: Request) => {
 
       if (path === "/set-name-by-pid") {
         const res = handleSetNameByPid(body as Record<string, unknown>);
-        if (!res.ok) return Response.json({ error: res.error }, { status: res.status ?? 400 });
+        if (!res.ok) return Response.json({ error: res.error, holder: res.holder }, { status: res.status ?? 400 });
         return Response.json(res);
       }
 
@@ -4548,7 +4639,10 @@ requestHandler = async (req: Request) => {
             };
             const group=liveGroups.current(auth.id);
             if(group){
-              const label=await liveGroupLabel(group.proof.socket_path,group.proof.pane_id,`${group.proof.runtime_key}:${group.proof.session_name}`);
+              // An explicit name wins over the pane label; the pane read itself
+              // prefers @peer_seat_name, so a restarted broker converges too.
+              const label=explicitNames.get(group.native.id)
+                ?? await liveGroupLabel(group.proof.socket_path,group.proof.pane_id,`${group.proof.runtime_key}:${group.proof.session_name}`);
               if(label){
                 db.run("UPDATE peers SET name=?,resolved_name=?,tmux_session=? WHERE substr(seat_key,1,69)=?",[label,label,group.proof.session_name,liveGroupPrefix(group.native.seat_key)!]);
                 response.name=label;response.resolved_name=label;response.tmux_session=group.proof.session_name;
@@ -4583,8 +4677,16 @@ requestHandler = async (req: Request) => {
           }
           // Return the operator-facing stored name. Runtime dedup is exposed
           // separately as resolved_name via /register and /list-peers.
-          const stored = handleSetName({ id: auth.id, name });
-          return Response.json({ ok: true, name: stored.name, resolved_name: stored.resolved_name });
+          // `explicit: true` is the set_name tool: the name is pinned against
+          // automatic re-syncs and a live holder is refused by name, not suffixed.
+          const explicit = body.explicit === true;
+          const stored = handleSetName({ id: auth.id, name }, { explicit, strict: explicit });
+          if (!stored.ok) {
+            console.error(`[broker] set-name refused: ${auth.id} requested "${name}" held by ${stored.holder.id}`);
+            return Response.json({ error: nameHeldError(name, stored.holder), holder: describePeerTarget(stored.holder) }, { status: 409 });
+          }
+          if (explicit) console.error(`[broker] set-name explicit: ${auth.id} -> "${stored.name ?? ""}" (resolved ${stored.resolved_name ?? ""})`);
+          return Response.json({ ok: true, name: stored.name, resolved_name: stored.resolved_name, name_explicit: stored.explicit });
         }
         case "/list-peers":
           // Pass body through as-is; server.ts sets exclude_id explicitly when

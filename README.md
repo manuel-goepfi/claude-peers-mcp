@@ -313,7 +313,7 @@ Start two client sessions and ask one to call `list_peers`, then send with `send
 | `inspect_peer_pane` | Explicitly capture 1–200 lines from a peer pane, read-only, capped at 8 KiB. Does not claim or ack the caller's inbox. |
 | `broadcast_message` | Fan out to a bounded tmux/repo/name scope. At least one filter is required and filters combine with AND. |
 | `set_summary` | Set an explicit operator/agent summary visible to peers. There is no LLM or API-key auto-summary dependency. |
-| `set_name` | Set or clear the human-facing seat name; broker resolution remains unique. |
+| `set_name` | Set or clear the seat's explicit name; it outranks the pane auto label and survives re-registration, and a name another live seat holds is refused with the holder named. |
 | `find_peer` | Filter by exact name, name substring, tmux session, or tmux presence. |
 | `check_messages` | Explicitly poll and acknowledge messages rendered into the tool result. Required fallback without an active receive hook. |
 | `whoami` | Return this adapter's broker identity, client/receiver mode, working directory, repository, and mirror status. |

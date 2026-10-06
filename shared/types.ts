@@ -93,6 +93,10 @@ export interface RegisterRequest {
   tty: string | null;
   // Operator-facing seat label. This is stable for humans and is NOT deduped.
   name: string | null;
+  // True when `name` was chosen on purpose (the pane's @peer_seat_name or a
+  // launcher's explicit name) rather than derived from the pane's auto label.
+  // An explicit name pins the seat; a later auto-label registration keeps it.
+  name_explicit?: boolean;
   tmux_session: string | null;
   tmux_window_index: string | null;
   tmux_window_name: string | null;
@@ -121,6 +125,9 @@ export interface RegisterResponse {
   resolved_name: string | null;
   client_type: ClientType;
   receiver_mode: ReceiverMode;
+  // True when the broker holds an explicit name for this seat. Adapters stop
+  // re-syncing the pane's auto label over it.
+  name_explicit?: boolean;
 }
 
 // PID-authenticated bridge between the visible Codex pane row and the exact

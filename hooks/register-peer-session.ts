@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { ensurePaneOperatorLabel } from "../bin/tmux-label-pane.ts";
+import { ensurePaneOperatorLabel, readPaneSeatName } from "../bin/tmux-label-pane.ts";
 import { closeSync, existsSync, readFileSync, readlinkSync, statSync } from "node:fs";
 import { isClientProcess as sharedIsClientProcess, isCodexAppServerProcess, parseProcessTableSnapshot, type ProcessInfo } from "../shared/client.ts";
 import {
@@ -46,6 +46,7 @@ interface RegisterMetadata {
   absolute_git_dir: string | null;
   tty: string | null;
   name: string;
+  name_explicit?: boolean;
   tmux: TmuxPaneInfo | null;
   identity_env: Record<string, string | undefined>;
 }
@@ -467,17 +468,19 @@ export function readPaneLabel(
 function readUsedOperatorLabels(session: string, currentPaneId: string): string[] {
   try {
     const result = Bun.spawnSync([
-      "tmux", "list-panes", "-s", "-t", session, "-F", "#{pane_id}\t#{@operator_label}\t#{@peer_label}",
+      "tmux", "list-panes", "-s", "-t", session, "-F", "#{pane_id}\t#{@operator_label}\t#{@peer_label}\t#{@peer_seat_name}",
     ], { stdout: "pipe", stderr: "ignore" });
     if (result.exitCode !== 0) return [];
     const out = new TextDecoder().decode(result.stdout).trim();
     if (!out) return [];
     const labels: string[] = [];
     for (const line of out.split("\n")) {
-      const [paneId, operatorLabel, peerLabel] = line.split("\t");
+      const [paneId, operatorLabel, peerLabel, seatName] = line.split("\t");
       if (!paneId || paneId === currentPaneId) continue;
       const label = cleanTmuxOptionValue(operatorLabel ?? null) ?? cleanTmuxOptionValue(peerLabel ?? null);
       if (label) labels.push(label);
+      const seat = cleanTmuxOptionValue(seatName ?? null);
+      if (seat) labels.push(seat);
     }
     return labels;
   } catch {
@@ -570,7 +573,11 @@ async function metadata(threadId: string | null = null): Promise<RegisterMetadat
   if (canonical && canonical.status!=="labeled" && canonical.status!=="preserved") {
     log("Open pane label unavailable; registration deferred"); return null;
   }
-  const name=peerName(CLIENT_TYPE,pid,tmux,identityEnv,canonical && "label" in canonical ? canonical.label : null);
+  // An explicit seat name (set_name, rename-lane, or a launcher's -n) outranks
+  // the pane's launch-order auto label. Without this, every hook re-sync wrote
+  // the auto label back over the name the seat was given.
+  const seatName=tmux?.pane_id ? readPaneSeatName(tmux.pane_id) : null;
+  const name=seatName ?? peerName(CLIENT_TYPE,pid,tmux,identityEnv,canonical && "label" in canonical ? canonical.label : null);
   return {
     pid,
     cwd,
@@ -578,6 +585,7 @@ async function metadata(threadId: string | null = null): Promise<RegisterMetadat
     absolute_git_dir: await getAbsoluteGitDir(cwd),
     tty: table.get(pid)?.tty ?? getTty(pid),
     name,
+    name_explicit: seatName !== null,
     tmux,
     identity_env: identityEnv,
   };
@@ -699,6 +707,7 @@ export async function runRegistration(rawHookInput?: string): Promise<void> {
       absolute_git_dir: meta.absolute_git_dir,
       tty: meta.tty,
       name: meta.name,
+      name_explicit: meta.name_explicit === true,
       tmux_session: meta.tmux?.session ?? null,
       tmux_window_index: meta.tmux?.window_index ?? null,
       tmux_window_name: meta.tmux?.window_name ?? null,
