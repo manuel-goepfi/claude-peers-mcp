@@ -179,17 +179,19 @@ async function waitForFile(path: string): Promise<void> {
       expect(fixtureDb.query("SELECT resolved_name FROM peers WHERE id=?").get(panePeerId))
         .toEqual({resolved_name:`${session}.2`});
       fixtureDb.run("UPDATE peers SET tmux_pane_id=? WHERE id=?",[paneId,panePeerId]);
-      const repaired=await heartbeat();
-      expect(repaired.status).toBe(200);
-      expect(await repaired.json()).toMatchObject({name:`${session}.1`,resolved_name:`${session}.1`});
-      expect(fixtureDb.query("SELECT id,name,resolved_name,thread_id FROM peers WHERE id=?").get(panePeerId))
-        .toEqual({id:panePeerId,name:`${session}.1`,resolved_name:`${session}.1`,thread_id:THREAD_A});
+      // The periodic heartbeat stays free of synchronous tmux/process work
+      // (broker.ts /heartbeat), so even with the pane proof restored it must
+      // neither rename this seat nor touch the sibling or the queued mail.
+      const proven=await heartbeat();
+      expect(proven.status).toBe(200);
+      expect((await proven.json() as {name?:string}).name).toBeUndefined();
+      expect(fixtureDb.query("SELECT id,resolved_name,thread_id FROM peers WHERE id=?").get(panePeerId))
+        .toEqual({id:panePeerId,resolved_name:`${session}.2`,thread_id:THREAD_A});
       expect(fixtureDb.query("SELECT name,resolved_name FROM peers WHERE id=?").get(siblingPeer.id))
         .toEqual({name:`${session}.2`,resolved_name:`${session}.2`});
       expect(fixtureDb.query("SELECT delivered FROM messages WHERE to_id=? AND text=?")
         .get(panePeerId,"mail before first hook")).toEqual({delivered:0});
-      // Same-pane reconnect must also repair a persisted stale resolved name.
-      fixtureDb.run("UPDATE peers SET resolved_name=? WHERE id=?",[`${session}.2`,panePeerId]);
+      // Legacy name repair runs on proven same-pane registration instead.
       const refreshed=await fetch(`${broker.url}/register`,{
         method:"POST",headers:{"Content-Type":"application/json"},
         body:JSON.stringify({pid:tuiPid,cwd:root,git_root:null,tty:(fixtureDb.query("SELECT tty FROM peers WHERE id=?").get(panePeerId) as {tty:string}).tty,
@@ -197,6 +199,8 @@ async function waitForFile(path: string): Promise<void> {
       });
       expect(refreshed.status).toBe(200);
       expect(await refreshed.json()).toMatchObject({id:panePeerId,name:`${session}.1`,resolved_name:`${session}.1`});
+      expect(fixtureDb.query("SELECT id,name,resolved_name,thread_id FROM peers WHERE id=?").get(panePeerId))
+        .toEqual({id:panePeerId,name:`${session}.1`,resolved_name:`${session}.1`,thread_id:THREAD_A});
       await fetch(`${broker.url}/unregister`,{method:"POST",headers:{"Content-Type":"application/json","X-Peer-Token":siblingPeer.token},body:JSON.stringify({id:siblingPeer.id})});
       fixtureDb.run("UPDATE peers SET last_seen = ? WHERE id = ?", [
         new Date(Date.now() - 120_000).toISOString(), panePeerId,
