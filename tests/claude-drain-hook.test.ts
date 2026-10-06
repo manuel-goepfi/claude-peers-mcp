@@ -17,6 +17,18 @@ afterEach(() => {
 });
 
 describe("Claude prompt drain hook", () => {
+  // Policy first-delivery state is per receiving peer id; isolate it per test so
+  // the full-policy assertions do not depend on test order.
+  let policyStateDir = "";
+  beforeEach(() => {
+    policyStateDir = mkdtempSync(join(tmpdir(), "claude-peers-policy-state-"));
+    process.env.CLAUDE_PEERS_STATE_DIR = policyStateDir;
+  });
+  afterEach(() => {
+    delete process.env.CLAUDE_PEERS_STATE_DIR;
+    rmSync(policyStateDir, { recursive: true, force: true });
+  });
+
   test.each([
     ["UserPromptSubmit", undefined, {}],
     ["PostToolBatch", "PostToolBatch", { agent_type: "reviewer" }],

@@ -69,11 +69,11 @@ export function canonicalHooks(client: HookClient, repoRoot: string): CanonicalH
     },
     {
       event: "UserPromptSubmit", scriptMarker: "claude-drain-peer-inbox.sh", legacyMarkers: [".claude/hooks/drain-peer-inbox.sh"],
-      entry: { name: "claude-peers-claude-inbox", type: "command", command: drain, timeout: 10, statusMessage: "Checking peer inbox" },
+      entry: { name: "claude-peers-claude-inbox", type: "command", command: drain, timeout: 30, statusMessage: "Checking peer inbox" },
     },
     {
       event: "PostToolBatch", scriptMarker: "CLAUDE_PEERS_HOOK_EVENT_NAME=PostToolBatch",
-      entry: { name: "claude-peers-claude-post-tool-drain", type: "command", command: `CLAUDE_PEERS_HOOK_EVENT_NAME=PostToolBatch ${drain}`, timeout: 10, statusMessage: "Checking peer inbox between tool batches" },
+      entry: { name: "claude-peers-claude-post-tool-drain", type: "command", command: `CLAUDE_PEERS_HOOK_EVENT_NAME=PostToolBatch ${drain}`, timeout: 30, statusMessage: "Checking peer inbox between tool batches" },
     },
     {
       event: "Stop", scriptMarker: "claude-standby-watcher.sh", legacyMarkers: ["claude-peers-standby-watcher.sh"],
