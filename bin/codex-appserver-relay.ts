@@ -186,6 +186,18 @@ export function openCodexUpstreamWebSocket(socketPath: string): WebSocketType {
   });
 }
 
+/**
+ * The thread this pane most recently proved it drives (last successful bind).
+ * On relay shutdown (pane closed, TUI exited) the broker gates peer mail for
+ * exactly this thread: the thread itself lives on in the shared app-server and
+ * must not be woken headless by queued mail. A later proven bind lifts it.
+ */
+let lastBoundThreadId: string | null = null;
+
+export function relayLastBoundThreadId(): string | null {
+  return lastBoundThreadId;
+}
+
 export async function bindPaneThread(options: RelayOptions, threadId: string,
   isCurrent: () => boolean,
   deps: { request?: (url: string, init: RequestInit) => Promise<Response>; delay?: typeof sleep } = {},
@@ -201,11 +213,15 @@ export async function bindPaneThread(options: RelayOptions, threadId: string,
           caller_pid: process.pid,
           tmux_pane_id: options.paneId,
           thread_id: threadId,
+          // Recorded per thread so bin/codex-thread-stop can address this exact
+          // thread on this exact shared app-server.
+          app_server_socket: options.upstreamSocketPath,
         }),
         signal: AbortSignal.timeout(3_000),
       });
       if (response.ok) {
         const result = await response.json() as BindCodexPaneThreadResponse;
+        lastBoundThreadId = threadId;
         console.error(`[codex-relay] bound pane=${options.paneId} thread=t${suffix} peer=${result.id} folded=${result.folded}`);
         return true;
       }
@@ -223,8 +239,36 @@ export async function bindPaneThread(options: RelayOptions, threadId: string,
   return false;
 }
 
+/** Best-effort, bounded: a pane-closed gate must never delay pane teardown. */
+export async function gateClosedPaneThread(
+  options: Pick<RelayOptions, "paneId" | "brokerPort">,
+  threadId: string | null,
+  deps: { request?: (url: string, init: RequestInit) => Promise<Response> } = {},
+): Promise<boolean> {
+  if (!threadId) return false;
+  try {
+    const response = await (deps.request ?? fetch)(`http://127.0.0.1:${options.brokerPort}/codex-thread-gate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        caller_pid: process.pid,
+        tmux_pane_id: options.paneId,
+        thread_id: threadId,
+        gate: "pane-closed",
+      }),
+      signal: AbortSignal.timeout(1_500),
+    });
+    const text = (await response.text()).slice(0, 240);
+    console.error(`[codex-relay] pane-closed gate pane=${options.paneId} thread=t${threadId.slice(-8)} status=${response.status} ${text}`);
+    return response.ok;
+  } catch (error) {
+    console.error(`[codex-relay] pane-closed gate failed pane=${options.paneId}: ${error instanceof Error ? error.message : String(error)}`);
+    return false;
+  }
+}
+
 export function retryableCodexPaneBindFailure(status: number, responseText: string): boolean {
-  if (status === 400 || status === 403) return false;
+  if (status === 400 || status === 403 || status === 410) return false;
   if (status !== 409) return true;
   // A resume response can race the native TUI process-table snapshot by a few
   // milliseconds. Retry only that local discovery state. A live-thread owner
@@ -334,10 +378,13 @@ export async function runCodexAppserverRelay(options: RelayOptions): Promise<voi
     try { unlinkSync(options.socketPath); } catch {}
     try { unlinkSync(options.readyPath); } catch {}
   };
+  let shuttingDown = false;
   const shutdown = (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     console.error(`[codex-relay] shutdown signal=${signal}`);
     cleanup();
-    process.exit(0);
+    void gateClosedPaneThread(options, lastBoundThreadId).finally(() => process.exit(0));
   };
   process.once("SIGINT", () => shutdown("SIGINT"));
   process.once("SIGTERM", () => shutdown("SIGTERM"));

@@ -640,6 +640,20 @@ function currentNativeMailbox(db: Database, id: string): boolean {
 }
 const correlatedMailboxIdsSql = liveMailboxIdsSql.replace("owner.id=?", "owner.id=p.id");
 
+// A non-targetable row is never woken: CLI identities, live-group aliases, and
+// Codex threads gated by pane close or bin/codex-thread-stop. Every broker
+// database since storage v2 has the column (validateCurrentSchema requires it);
+// the probe only keeps reduced-schema fixture databases readable.
+const nonTargetableColumn = new WeakMap<Database, boolean>();
+function hasNonTargetableColumn(db: Database): boolean {
+  let known = nonTargetableColumn.get(db);
+  if (known === undefined) {
+    known = (db.query("PRAGMA table_info(peers)").all() as Array<{ name: string }>).some((column) => column.name === "non_targetable");
+    nonTargetableColumn.set(db, known);
+  }
+  return known;
+}
+
 export function lanesWithUnread(db: Database, nudgeableClients: string[] = NUDGEABLE_CLIENTS,
   nativeIsCurrent: (id: string) => boolean = id => currentNativeMailbox(db,id)): Lane[] {
   // No nudgeable client types → nothing to nudge. Return empty WITHOUT building a
@@ -656,7 +670,8 @@ export function lanesWithUnread(db: Database, nudgeableClients: string[] = NUDGE
            COUNT(m.id) AS unread
     FROM peers p
     JOIN messages m ON m.to_id IN (${correlatedMailboxIdsSql}) AND m.delivered = 0
-    WHERE p.client_type IN (${placeholders})
+    WHERE p.client_type IN (${placeholders})${hasNonTargetableColumn(db) ? `
+      AND p.non_targetable = 0` : ""}
     GROUP BY p.id
     HAVING unread > 0
   `).all(...nudgeableClients) as Lane[]).filter(lane => !liveGroupPrefix(lane.seat_key) || nativeIsCurrent(lane.id));

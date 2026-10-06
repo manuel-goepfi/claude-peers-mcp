@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Stop ONE Codex lane thread on a shared Codex app-server (see codex-thread-stop.ts).
+# Runs under Node like the relay: the installed `ws` package provides the
+# ws+unix transport the app-server control socket speaks.
+set -euo pipefail
+SELF="$(readlink -f "$0")"
+ROOT="$(cd -- "$(dirname -- "$SELF")/.." && pwd -P)"
+exec node --experimental-strip-types --disable-warning=ExperimentalWarning \
+  "$ROOT/bin/codex-thread-stop.ts" "$@"

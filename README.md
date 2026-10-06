@@ -182,6 +182,112 @@ Correct configurations are byte- and mtime-stable no-ops. A material edit create
 
 After hook or MCP changes, restart the client session. Codex hook files are trust-sensitive: open `/hooks` and confirm the changed configuration before expecting automatic drain.
 
+### Closing a Codex lane
+
+A shared seat runs the lane as a thread inside the account's shared app-server.
+Closing the tmux pane ends the TUI and the relay, not the thread. A loaded
+thread can keep running headless, and its hooks could previously claim queued
+peer mail and turn it into more work. Stop the thread first, then close the
+pane:
+
+```bash
+bin/codex-thread-stop --pane %28803 --dry-run   # show the plan, change nothing
+bin/codex-thread-stop --pane %28803             # stop exactly that thread
+tmux kill-pane -t %28803                        # only then close the pane
+```
+
+`--thread UUID` selects a thread directly (for example a task the pane drove
+before `/new`). `--socket PATH` names the app-server socket when the binding
+predates socket recording; it must agree with any recorded socket.
+
+What it does, in order:
+
+1. Reads the binding the relay published (`/codex-thread-binding`): the
+   pane's current thread and the app-server socket the relay forwarded to.
+   It refuses when the pane maps to more than one thread, when no socket is
+   known, or when `--socket` contradicts the record.
+2. Connects to that socket and proves the endpoint is a Codex app-server
+   (`initialize`). It refuses if the socket is unreachable. It then reads the
+   thread's own status with `thread/read` and `thread/loaded/list`, and
+   refuses if the server answers for a different thread id.
+3. Sets the intermediate `stopping` gate in the broker (`/codex-thread-gate`)
+   before touching the turn, so peer mail is already held.
+4. Sends `turn/interrupt` for each in-progress turn listed by
+   `thread/turns/list`, then `thread/archive` for that thread only. The
+   server is never restarted and no other thread is addressed.
+5. Verifies with `thread/read` and `thread/loaded/list` that the thread is
+   no longer loaded. Only then does it raise the gate to the permanent
+   `stopped`. `--dry-run` sends only read-only status calls.
+
+A thread that the chosen server does not have loaded is not assumed dead.
+This matters because the socket may be wrong: there is one app-server per
+account, and a binding made before the deploy has no recorded socket. The tool
+marks such a thread `stopped` only when it can prove the thread is absent from
+`thread/loaded/list` on every known app-server socket. Known sockets are every
+socket a relay has recorded, plus the account homes' control sockets
+(`~/.codex*/app-server-control/app-server-control.sock`), or
+`CLAUDE_PEERS_CODEX_APP_SERVER_SOCKETS` (colon-separated) when that is set. It
+refuses, changing nothing, in these cases:
+
+- the thread is loaded on another server (the message names that socket);
+- any known server is unreachable;
+- `--socket` is not a known app-server socket.
+
+Exit codes: `0` stopped (or dry run), `3` already gone (proven absent
+everywhere, or already stopped), `2` refused (nothing changed), `1` acted but
+did not finish, `64` usage. Method names come from the installed Codex CLI's
+generated app-server protocol (`codex app-server generate-ts`, 0.160.1).
+
+Failed or partial stop. If the interrupt, archive, verification or final
+broker write fails, the gate stays at `stopping`. Mail stays held, the thread
+is not labelled stopped, and a pane bind cannot reopen it. Either rerun the
+same `codex-thread-stop` command to retry (a `stopping` thread is still the
+pane's target), or undo the stop.
+
+Recovering from a stop:
+
+```bash
+bin/codex-thread-stop --unstop --thread UUID --dry-run
+bin/codex-thread-stop --unstop --thread UUID                      # thread must be loaded again
+bin/codex-thread-stop --unstop --thread UUID --operator-override  # lift it anyway
+```
+
+`--unstop` lifts a `stopping` or `stopped` gate only in two cases: the thread
+is loaded again on its recorded app-server (or the `--socket` you name), and
+that server answers for the same thread id; or you pass
+`--operator-override`. The broker then makes the thread's peer rows
+targetable again, so its queued mail is deliverable. It also writes a row to
+`codex_thread_gate_audit` with the proof and the restored peer ids. Every gate
+change (stop, lifted pane-closed, unstop) is recorded in that table. Nothing
+else ever lowers a `stopping` or `stopped` gate.
+
+Mail gating. A gate makes every Codex row bound to the thread non-targetable
+and records those peer ids. While any gate is set:
+
+- `/claim-by-thread`, `/ack-by-thread`, `/hook-heartbeat-by-thread` and
+  `/identity-by-thread` answer `410`. The drain hook treats that as terminal:
+  no delivery and no self-registration.
+- `/poll-messages`, `/poll-by-pid` and `/claim-by-pid` return no mail.
+- `/register` and `/reconcile-pane-thread` for that thread answer `410`.
+- New sends to the gated ids fail as not found.
+- The autodrain poller never wakes a non-targetable row.
+
+Queued mail is not moved or acknowledged. It stays queued under the gated ids
+until normal dead-seat retention removes it.
+
+The relay also applies a softer `pane-closed` gate when it shuts down (pane
+closed or TUI exited), for the thread its pane last bound. Only a later proven
+relay bind of the same thread (an explicit resume in a live pane) lifts
+`pane-closed`. Gates only rise (`pane-closed` < `stopping` < `stopped`), so a
+pane-closed notice never weakens a stop.
+
+Deployment status: this ships in the repository only. The live clone moves
+through `bin/deploy-live` after merge, which restarts the broker for the new
+routes, gates and the `codex_thread_controls` table. Running relays keep their
+old code until their `codex-shared-seat` pane is relaunched; until then they
+record no app-server socket and send no pane-closed gate, so use `--socket`
+for panes bound before the deploy.
+
 ### Verify the installation
 
 ```bash

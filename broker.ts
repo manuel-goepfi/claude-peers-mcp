@@ -15,6 +15,21 @@ import { clockTicksPerSecond } from "./shared/native-claude-proof.ts";
 import { Database } from "bun:sqlite";
 import { LiveMailboxGroups,liveGroupPrefix,liveMailboxIdsSql } from "./shared/live-mailbox-groups.ts";
 import { seatProcessState } from "./shared/live-runtime-proof.ts";
+import {
+  applyCodexThreadGate,
+  codexPeerDeliveryGated,
+  codexThreadBindingLookup,
+  codexThreadGate,
+  CODEX_THREAD_CONTROL_RETENTION_MS,
+  ensureCodexThreadControlTable,
+  liftPaneClosedGate,
+  purgeCodexThreadControls,
+  recordCodexThreadBinding,
+  recordedAppServerSockets,
+  unstopCodexThread,
+  validAppServerSocket,
+  type CodexThreadGate,
+} from "./shared/codex-thread-control.ts";
 import { readFileSync, readdirSync, writeFileSync, renameSync, chmodSync, statSync, existsSync, truncateSync, unlinkSync } from "node:fs";
 import { timingSafeEqual } from "node:crypto";
 // L6: top-level node:fs import (was inline require() in verifyPidUid hot path).
@@ -251,6 +266,11 @@ const BROKER_CAPABILITIES = {
   observation: {
     codexPaneBindings: true,
   },
+  codex: {
+    // /codex-thread-binding + /codex-thread-gate (bin/codex-thread-stop) and
+    // the relay's app_server_socket bind field / pane-closed gate.
+    threadControl: true,
+  },
 } as const;
 
 // --- S7: ghost reaping ---
@@ -372,6 +392,8 @@ try {
   process.exit(2);
 }
 chmodSync(DB_PATH, 0o600);
+// Additive side table (not part of the versioned peers/messages snapshot).
+ensureCodexThreadControlTable(db);
 
 // One-time compatibility backfill for rows written before name/resolved_name
 // split. Old brokers stored broker-deduped values like codex.2#4 directly in
@@ -476,6 +498,7 @@ async function sweepStalePeers() {
     if (expiredUndeliv.changes > 0) {
       console.error(`[broker] stale-undelivered TTL: dropped ${expiredUndeliv.changes} undelivered message(s) older than ${STALE_UNDELIVERED_TTL_MS}ms`);
     }
+    purgeCodexThreadControls(db, new Date(Date.now() - CODEX_THREAD_CONTROL_RETENTION_MS).toISOString());
   } catch (e) {
     if (!mailPurgeStageWarned) {
       mailPurgeStageWarned = true;
@@ -1491,6 +1514,11 @@ function handleRegister(body: RegisterRequest): RegisterResult {
     if (utf8Bytes(body.thread_id) > 128) {
       return { ok: false, status: 413, error: "thread_id exceeds 128 bytes" };
     }
+    // A gated Codex thread (pane closed, or stopped by codex-thread-stop) must
+    // not mint a fresh targetable row: that is exactly how a closed lane's
+    // headless thread re-acquired its queued mail. Hooks treat 410 as terminal.
+    const gate = codexThreadGate(db, body.thread_id);
+    if (gate) return { ok: false, status: 410, error: codexThreadGatedError(gate) };
   }
 
   const reconnect=recoverThreadlessCodex(body);if(reconnect)return reconnect;
@@ -1761,9 +1789,12 @@ function handleRegister(body: RegisterRequest): RegisterResult {
   // placeholders against positional args, which silently randomized an
   // SQL CASE version of this ranking.
   const bodyThreadId = body.thread_id ?? null;
-  const existing = existingRows.find((row) => (row.thread_id ?? null) === bodyThreadId)
-    ?? existingRows.find((row) => (row.thread_id ?? null) === null || bodyThreadId === null)
-    ?? existingRows[0]
+  // A gated row keeps its queued mail but is never refreshed back into service
+  // by a same-pid registration (for example a new task in the same TUI).
+  const refreshableRows = existingRows.filter((row) => !codexPeerDeliveryGated(db, row.id));
+  const existing = refreshableRows.find((row) => (row.thread_id ?? null) === bodyThreadId)
+    ?? refreshableRows.find((row) => (row.thread_id ?? null) === null || bodyThreadId === null)
+    ?? refreshableRows[0]
     ?? null;
   const existingClientType = validClientType(existing?.client_type);
   const clientType = requestedClientType === "unknown" && existingClientType !== "unknown" ? existingClientType : requestedClientType;
@@ -2969,6 +3000,9 @@ function freshClaudeHookForLegacyPoll(peerId: string): { mode: "claude-channel";
 }
 
 function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
+  // The MCP server inside a gated thread still holds its token. Its queued mail
+  // stays queued; it is never handed to a stopped or pane-closed thread.
+  if (codexPeerDeliveryGated(db, body.id)) return { messages: [] };
   const messages = selectAvailableMessages(body.id);
   const now = Date.now();
   for (const message of messages) runtimeMetrics.recordQueueToBuffer(message.id, message.sent_at, now);
@@ -3170,6 +3204,8 @@ function handleReconcilePaneThread(body: ReconcilePaneThreadRequest): ReconcileP
   if (targetErr) return { ok: false, status: 403, error: `target rejected: ${targetErr}` };
 
   const normalizedThreadId = body.thread_id.toLowerCase();
+  const gate = codexThreadGate(db, normalizedThreadId);
+  if (gate) return { ok: false, status: 410, error: codexThreadGatedError(gate) };
   const foldedIds: string[] = [];
   let migrated = 0;
 
@@ -3366,8 +3402,18 @@ function handleBindCodexPaneThread(body: BindCodexPaneThreadRequest): BindCodexP
   if (typeof body.thread_id !== "string" || !THREAD_UUID_RE.test(body.thread_id)) {
     return { ok: false, status: 400, error: "invalid thread_id" };
   }
+  if (body.app_server_socket !== undefined && body.app_server_socket !== null
+    && !validAppServerSocket(body.app_server_socket)) {
+    return { ok: false, status: 400, error: "invalid app_server_socket" };
+  }
   const callerErr = verifyPidUid(body.caller_pid);
   if (callerErr) return { ok: false, status: 403, error: `caller rejected: ${callerErr}` };
+  // A stopped (or mid-stop) thread is never re-bound, even from a live pane:
+  // only `codex-thread-stop --unstop` (audited) returns it to service.
+  const bindGate = codexThreadGate(db, body.thread_id);
+  if (bindGate === "stopped" || bindGate === "stopping") {
+    return { ok: false, status: 410, error: codexThreadGatedError(bindGate) };
+  }
   const limited = rateCheck(CODEX_BIND_RATE_KEY, false);
   if (limited) return { ok: false, status: 429, error: limited };
   const pane = tmuxPaneBindProof(body.tmux_pane_id);
@@ -3404,6 +3450,12 @@ function handleBindCodexPaneThread(body: BindCodexPaneThreadRequest): BindCodexP
   const absoluteGitDir = gitValue(cwd, ["rev-parse", "--absolute-git-dir"]);
   const name = label.label;
 
+  // This bind is fresh proof that a live pane (pane shell ancestry, TTY, and a
+  // single native Codex TUI) drives the thread again: lift a pane-closed gate
+  // so the thread fold below can carry the gated rows' queued mail here.
+  const restored = liftPaneClosedGate(db, body.thread_id);
+  if (restored > 0) console.error(`[broker] codex pane-closed gate lifted thread=${body.thread_id.slice(-8)} pane=${pane.pane_id} restored=${restored}`);
+
   const registration = handleRegister({
     pid: tui.pid,
     cwd,
@@ -3431,6 +3483,12 @@ function handleBindCodexPaneThread(body: BindCodexPaneThreadRequest): BindCodexP
     thread_id: body.thread_id,
   });
   if (!reconciled.ok) return reconciled;
+  recordCodexThreadBinding(db, {
+    threadId: body.thread_id,
+    paneId: pane.pane_id,
+    appServerSocket: typeof body.app_server_socket === "string" ? body.app_server_socket : null,
+    nowIso: new Date().toISOString(),
+  });
 
   // This route can be the first and only exact pane registrar: shared app-server
   // hooks are headless, so waiting for one of them to mirror the row leaves a
@@ -3457,6 +3515,107 @@ function handleBindCodexPaneThread(body: BindCodexPaneThreadRequest): BindCodexP
   return reconciled;
 }
 
+function codexThreadGatedError(gate: CodexThreadGate): string {
+  if (gate === "stopped") return "codex thread stopped: peer mail delivery is gated";
+  if (gate === "stopping") return "codex thread stop in progress or incomplete: peer mail delivery is gated";
+  return "codex thread pane closed: peer mail delivery is gated until a live pane re-binds it";
+}
+
+function codexControlCaller(body: Record<string, unknown>, bucket: string):
+  | { ok: true; callerPid: number }
+  | { ok: false; status: number; error: string } {
+  const callerPid = body.caller_pid;
+  if (typeof callerPid !== "number" || !Number.isInteger(callerPid) || callerPid <= 1) {
+    return { ok: false, status: 400, error: "invalid caller_pid" };
+  }
+  const limited = rateCheck(`${bucket}:${callerPid}`, false);
+  if (limited) return { ok: false, status: 429, error: limited };
+  const callerErr = verifyPidUid(callerPid);
+  if (callerErr) return { ok: false, status: 403, error: `caller rejected: ${callerErr}` };
+  return { ok: true, callerPid };
+}
+
+function handleCodexThreadBinding(body: Record<string, unknown>):
+  | { ok: true; value: ReturnType<typeof codexThreadBindingLookup> & { peers: Array<{ alive: boolean }>; known_sockets: string[] } }
+  | { ok: false; status: number; error: string } {
+  const caller = codexControlCaller(body, "codex-thread-binding");
+  if (!caller.ok) return caller;
+  const paneId = typeof body.tmux_pane_id === "string" ? body.tmux_pane_id : undefined;
+  const threadId = typeof body.thread_id === "string" ? body.thread_id : undefined;
+  if ((paneId === undefined) === (threadId === undefined)) {
+    return { ok: false, status: 400, error: "exactly one of tmux_pane_id or thread_id is required" };
+  }
+  if (paneId !== undefined && !/^%\d+$/.test(paneId)) return { ok: false, status: 400, error: "invalid tmux_pane_id" };
+  if (threadId !== undefined && !THREAD_UUID_RE.test(threadId)) return { ok: false, status: 400, error: "invalid thread_id" };
+  const lookup = codexThreadBindingLookup(db, { paneId, threadId });
+  return {
+    ok: true,
+    value: {
+      controls: lookup.controls,
+      // Tokens and seat columns never leave the broker; liveness is advisory.
+      peers: lookup.peers.map((peer) => ({ ...peer, alive: isPidAlive(peer.pid) })),
+      // Every socket any relay recorded: input to codex-thread-stop's proof
+      // that an unknown thread is absent from every app-server, not just one.
+      known_sockets: recordedAppServerSockets(db),
+    },
+  };
+}
+
+function handleCodexThreadUnstopRoute(body: Record<string, unknown>):
+  | { ok: true; value: { ok: true; thread_id: string; from_gate: CodexThreadGate; restored_peer_ids: string[]; queued: number } }
+  | { ok: false; status: number; error: string } {
+  const caller = codexControlCaller(body, "codex-thread-unstop");
+  if (!caller.ok) return caller;
+  if (typeof body.thread_id !== "string" || !THREAD_UUID_RE.test(body.thread_id)) {
+    return { ok: false, status: 400, error: "invalid thread_id" };
+  }
+  if (body.proof !== "loaded-on-app-server" && body.proof !== "operator-override") {
+    return { ok: false, status: 400, error: "proof must be loaded-on-app-server or operator-override" };
+  }
+  const threadId = body.thread_id.toLowerCase();
+  const result = unstopCodexThread(db, { threadId, proof: body.proof, callerPid: caller.callerPid, nowIso: new Date().toISOString() });
+  if (!result.ok) return { ok: false, status: 409, error: result.error };
+  console.error(`[broker] codex thread UNSTOP thread=${threadId.slice(-8)} from=${result.from_gate} proof=${body.proof} restored=${result.restored_peer_ids.length} queued=${result.queued} caller=${caller.callerPid}`);
+  return { ok: true, value: { ok: true, thread_id: threadId, from_gate: result.from_gate, restored_peer_ids: result.restored_peer_ids, queued: result.queued } };
+}
+
+function handleCodexThreadGateRoute(body: Record<string, unknown>):
+  | { ok: true; value: { ok: true; applied: boolean; thread_id: string; gate: CodexThreadGate | null; gated_peer_ids: string[]; queued: number; reason?: string } }
+  | { ok: false; status: number; error: string } {
+  const caller = codexControlCaller(body, "codex-thread-gate");
+  if (!caller.ok) return caller;
+  if (typeof body.thread_id !== "string" || !THREAD_UUID_RE.test(body.thread_id)) {
+    return { ok: false, status: 400, error: "invalid thread_id" };
+  }
+  if (body.gate !== "stopped" && body.gate !== "stopping" && body.gate !== "pane-closed") {
+    return { ok: false, status: 400, error: "gate must be stopping, stopped or pane-closed" };
+  }
+  const paneId = typeof body.tmux_pane_id === "string" && /^%\d+$/.test(body.tmux_pane_id) ? body.tmux_pane_id : null;
+  const threadId = body.thread_id.toLowerCase();
+  if (body.gate === "pane-closed") {
+    // A relay shutting down may only gate the thread its own pane currently
+    // drives. If the task was resumed in another pane, that pane owns it now.
+    const lookup = codexThreadBindingLookup(db, { threadId }).controls[0];
+    if (!paneId || !lookup || lookup.tmux_pane_id !== paneId || lookup.superseded_at) {
+      return {
+        ok: true,
+        value: { ok: true, applied: false, thread_id: threadId, gate: lookup?.gate ?? null, gated_peer_ids: [], queued: 0, reason: "pane does not currently own this thread" },
+      };
+    }
+  }
+  const applied = applyCodexThreadGate(db, {
+    threadId,
+    gate: body.gate,
+    paneId,
+    nowIso: new Date().toISOString(),
+    appServerSocket: validAppServerSocket(body.app_server_socket) ? body.app_server_socket : null,
+    callerPid: caller.callerPid,
+  });
+  for (const id of applied.gated_peer_ids) buckets.delete(id);
+  console.error(`[broker] codex thread gate=${applied.gate} thread=${threadId.slice(-8)} pane=${paneId ?? "-"} peers=${applied.gated_peer_ids.length} queued=${applied.queued} caller=${caller.callerPid}`);
+  return { ok: true, value: { ok: true, applied: true, thread_id: threadId, ...applied } };
+}
+
 type ThreadIdentityProofResult =
   | { ok: true; value: ThreadIdentityProofResponse }
   | { ok: false; status: number; error: string };
@@ -3475,6 +3634,11 @@ function resolveLiveThreadIdentity(threadId: string):
   }
 
   const normalizedThreadId = threadId.toLowerCase();
+  // Every by-thread route (claim, ack, hook heartbeat, MCP identity) resolves
+  // here. A gated thread answers 410, which the drain hook does not treat as
+  // "peer not found", so it neither delivers nor self-registers.
+  const gate = codexThreadGate(db, normalizedThreadId);
+  if (gate) return { ok: false, status: 410, error: codexThreadGatedError(gate) };
   const matches = (selectIdentityProofByThread.all(normalizedThreadId) as ThreadIdentityRow[])
     .filter((row) => { const full=selectPeerById.get(row.id) as Peer|null; return Boolean(full && peerSeatAlive(full)); });
   if (matches.length === 0) return { ok: false, status: 404, error: "peer not found" };
@@ -3800,6 +3964,7 @@ function handleClaimByThread(body: ClaimByThreadRequest): ClaimByPidResponse {
 function handleClaimWithAuth(body: Omit<ClaimByPidRequest, "pid">, auth: { ok: true; id: string }): ClaimByPidResponse {
   const limited = rateCheck(auth.id, false);
   if (limited) return { ok: false, status: 429, error: limited };
+  if (codexPeerDeliveryGated(db, auth.id)) return { ok: false, status: 410, error: codexThreadGatedError("stopped") };
   const { clientType, receiverMode } = hookMetadata(auth.id, body);
 
   const limitRaw = Number(body.limit ?? CLAIM_MAX_MESSAGES);
@@ -3965,6 +4130,7 @@ function handlePollByPid(body: { pid: number; caller_pid: number }): {
   }
   const limited = rateCheck(auth.id, false);
   if (limited) return { ok: false, status: 429, error: limited };
+  if (codexPeerDeliveryGated(db, auth.id)) return { ok: true, peer_id: auth.id, messages: [], acked: 0 };
 
   // Atomically fetch + mark delivered + log latency (matches handleAckMessages).
   // Concurrent-drain safety: the SELECT happens before the transaction begins,
@@ -4236,7 +4402,28 @@ requestHandler = async (req: Request) => {
           caller_pid: Number(body.caller_pid),
           tmux_pane_id: typeof body.tmux_pane_id === "string" ? body.tmux_pane_id : "",
           thread_id: typeof body.thread_id === "string" ? body.thread_id : "",
+          app_server_socket: body.app_server_socket as string | undefined,
         });
+        if (!res.ok) return Response.json({ error: res.error }, { status: res.status });
+        return Response.json(res.value);
+      }
+
+      // bin/codex-thread-stop lookup and the gate it (and the relay, on pane
+      // close) applies. Same caller rule as /codex-pane-bindings: a live
+      // same-UID caller pid on the loopback transport. Gating only ever
+      // REMOVES delivery, and `stopped` is terminal.
+      if (path === "/codex-thread-binding") {
+        const res = handleCodexThreadBinding(body);
+        if (!res.ok) return Response.json({ error: res.error }, { status: res.status });
+        return Response.json(res.value);
+      }
+      if (path === "/codex-thread-gate") {
+        const res = handleCodexThreadGateRoute(body);
+        if (!res.ok) return Response.json({ error: res.error }, { status: res.status });
+        return Response.json(res.value);
+      }
+      if (path === "/codex-thread-unstop") {
+        const res = handleCodexThreadUnstopRoute(body);
         if (!res.ok) return Response.json({ error: res.error }, { status: res.status });
         return Response.json(res.value);
       }
