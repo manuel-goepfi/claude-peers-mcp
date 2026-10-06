@@ -40,10 +40,15 @@ describe("Codex shared-app-server relay observation", () => {
     const relaySocket = join(root, "relay.sock");
     const readyPath = join(root, "ready");
     const bindRequests: Array<Record<string, unknown>> = [];
+    const gateRequests: Array<Record<string, unknown>> = [];
     const broker = Bun.serve({
       hostname: "127.0.0.1",
       port: 0,
       async fetch(request) {
+        if (new URL(request.url).pathname === "/codex-thread-gate") {
+          gateRequests.push(await request.json() as Record<string, unknown>);
+          return Response.json({ ok: true, applied: true });
+        }
         if (new URL(request.url).pathname !== "/bind-codex-pane-thread") {
           return new Response("not found", { status: 404 });
         }
@@ -175,6 +180,7 @@ client.on("error", (error) => {
         caller_pid: relay.pid,
         tmux_pane_id: "%4242",
         thread_id: THREAD,
+        app_server_socket: upstreamSocket,
       });
       expect(bindRequests[1]).toEqual(bindRequests[0]);
       // A fresh client resumes the same task after its broker binding was
@@ -189,6 +195,19 @@ client.on("error", (error) => {
       while (Date.now() < rebindDeadline && bindRequests.length < 3) await Bun.sleep(25);
       expect(bindRequests).toHaveLength(3);
       expect(bindRequests[2]).toEqual(bindRequests[0]);
+      // Pane close (the seat's cleanup TERMs the relay): gate the pane's
+      // thread before exit so queued mail cannot wake it headless.
+      expect(gateRequests).toEqual([]);
+      const relayPid = relay.pid;
+      relay.kill("SIGTERM");
+      await relay.exited;
+      relay = null;
+      expect(gateRequests).toEqual([{
+        caller_pid: relayPid,
+        tmux_pane_id: "%4242",
+        thread_id: THREAD,
+        gate: "pane-closed",
+      }]);
     } finally {
       if (relay) {
         relay.kill("SIGTERM");
@@ -288,6 +307,7 @@ client.on("error", (error) => {
       '{"error":"thread is already bound to another live pane"}',
     )).toBe(false);
     expect(retryableCodexPaneBindFailure(403, '{"error":"caller rejected"}')).toBe(false);
+    expect(retryableCodexPaneBindFailure(410, '{"error":"codex thread stopped: peer mail delivery is gated"}')).toBe(false);
     expect(retryableCodexPaneBindFailure(404, '{"error":"tmux pane not found"}')).toBe(true);
   });
 });

@@ -12,6 +12,7 @@ for (const threadId of threadIds) {
       caller_pid: process.pid,
       tmux_pane_id: process.env.TMUX_PANE,
       thread_id: threadId,
+      ...(process.env.APP_SERVER_SOCKET ? { app_server_socket: process.env.APP_SERVER_SOCKET } : {}),
     }),
   });
   results.push({ status: response.status, body: await response.json() });
