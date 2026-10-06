@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+# deploy-live — move the live clone forward to the published branch, and only
+# that way.
+#
+# WHY: the live clone is what the broker, hooks and adapters run from. Changes
+# hand-applied to it (and later bulk-committed as "commit live working tree")
+# left PRs open against a merged deploy branch while their code was already in
+# main (2026-10-06: seven stale PRs; a further hand edit landed the same day).
+# This script is the only supported way to change the live clone:
+#   - it refuses a dirty tree, naming files that already match the target so
+#     an identical hand edit can be dropped with `git checkout --`;
+#   - it moves only by fast-forward of <remote>/<branch>;
+#   - it restarts the managed broker only when broker-side code changed, waits
+#     for /health ready, and returns the clone to the old commit if it is not;
+#   - it prints the exact rollback and logs every deploy.
+#
+# Usage: bin/deploy-live [--dry-run] [--remote NAME] [--branch NAME]
+# Environment (tests): CLAUDE_PEERS_DEPLOY_SYSTEMCTL, CLAUDE_PEERS_DEPLOY_BUN,
+# CLAUDE_PEERS_DEPLOY_HEALTH_URL, CLAUDE_PEERS_DEPLOY_LOG,
+# CLAUDE_PEERS_DEPLOY_READY_SECONDS.
+set -euo pipefail
+
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+DRY_RUN=0
+REMOTE=""
+BRANCH="main"
+UNIT="claude-peers-broker.service"
+SYSTEMCTL="${CLAUDE_PEERS_DEPLOY_SYSTEMCTL:-systemctl}"
+BUN="${CLAUDE_PEERS_DEPLOY_BUN:-bun}"
+HEALTH_URL="${CLAUDE_PEERS_DEPLOY_HEALTH_URL:-http://127.0.0.1:${CLAUDE_PEERS_PORT:-7899}/health}"
+LOG="${CLAUDE_PEERS_DEPLOY_LOG:-${XDG_STATE_HOME:-$HOME/.local/state}/claude-peers/deploys.log}"
+READY_SECONDS="${CLAUDE_PEERS_DEPLOY_READY_SECONDS:-30}"
+
+while (($#)); do
+  case "$1" in
+    --dry-run) DRY_RUN=1 ;;
+    --remote) REMOTE="${2:?--remote needs a name}"; shift ;;
+    --branch) BRANCH="${2:?--branch needs a name}"; shift ;;
+    -h|--help) sed -n '2,19p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "deploy-live: unknown argument: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+die() { echo "deploy-live: $*" >&2; exit 1; }
+git_() { git -C "$ROOT" "$@"; }
+
+# The remote that publishes this fork, unless one is named.
+if [[ -z "$REMOTE" ]]; then
+  REMOTE=$(git_ remote -v | awk '$3 == "(fetch)" && $2 ~ /manuel-goepfi\/claude-peers-mcp(\.git)?$/ { print $1; exit }')
+  [[ -n "$REMOTE" ]] || REMOTE=origin
+fi
+
+CURRENT=$(git_ symbolic-ref --quiet --short HEAD) || die "detached HEAD; check out $BRANCH first"
+[[ "$CURRENT" == "$BRANCH" ]] || die "on branch $CURRENT, not $BRANCH; the live clone tracks $BRANCH only"
+
+git_ fetch --quiet "$REMOTE" "$BRANCH" || die "fetch $REMOTE $BRANCH failed"
+OLD=$(git_ rev-parse HEAD)
+NEW=$(git_ rev-parse "$REMOTE/$BRANCH")
+
+DIRTY=$(git_ status --porcelain --untracked-files=no)
+if [[ -n "$DIRTY" ]]; then
+  {
+    echo "deploy-live: refusing: the live clone has local changes. Ship them through a PR to $BRANCH."
+    while IFS= read -r line; do
+      path="${line:3}"
+      if [[ -f "$ROOT/$path" ]] && git_ cat-file -e "$NEW:$path" 2>/dev/null \
+         && cmp -s "$ROOT/$path" <(git_ show "$NEW:$path"); then
+        echo "  $path  (identical to $REMOTE/$BRANCH; drop with: git -C $ROOT checkout -- $path)"
+      else
+        echo "  $path"
+      fi
+    done <<<"$DIRTY"
+  } >&2
+  exit 1
+fi
+
+if [[ "$OLD" == "$NEW" ]]; then
+  echo "deploy-live: already at $REMOTE/$BRANCH ($(git_ rev-parse --short HEAD))"
+  exit 0
+fi
+git_ merge-base --is-ancestor "$OLD" "$NEW" || die "$REMOTE/$BRANCH is not a fast-forward of HEAD; refusing"
+
+CHANGED=$(git_ diff --name-only "$OLD" "$NEW")
+needs_broker=0; needs_deps=0; touches_adapter=0; touches_hook_config=0
+while IFS= read -r f; do
+  case "$f" in broker.ts|shared/*) needs_broker=1 ;; esac
+  case "$f" in package.json|bun.lock) needs_deps=1; needs_broker=1 ;; esac
+  case "$f" in server.ts|shared/*) touches_adapter=1 ;; esac
+  case "$f" in shared/hook-config.ts) touches_hook_config=1 ;; esac
+done <<<"$CHANGED"
+
+managed=0
+if [[ "$needs_broker" == 1 ]] && "$SYSTEMCTL" --user is-active --quiet "$UNIT" 2>/dev/null; then managed=1; fi
+
+short_old=$(git_ rev-parse --short "$OLD"); short_new=$(git_ rev-parse --short "$NEW")
+echo "deploy-live: $short_old -> $short_new ($(wc -l <<<"$CHANGED" | tr -d ' ') files)"
+restart_plan=no
+if [[ "$managed" == 1 ]]; then restart_plan=yes
+elif [[ "$needs_broker" == 1 ]]; then restart_plan="needed, but $UNIT is not active"; fi
+deps_plan=unchanged
+if [[ "$needs_deps" == 1 ]]; then deps_plan="bun install --frozen-lockfile"; fi
+ROLLBACK="git -C $ROOT reset --keep $short_old"
+if [[ "$managed" == 1 ]]; then ROLLBACK+=" && $SYSTEMCTL --user restart $UNIT"; fi
+echo "  broker restart: $restart_plan"
+echo "  dependencies:   $deps_plan"
+echo "  rollback:       $ROLLBACK"
+if [[ "$DRY_RUN" == 1 ]]; then
+  echo "deploy-live: dry run, nothing changed"
+  exit 0
+fi
+
+wait_ready() {
+  local i
+  for ((i = 0; i < READY_SECONDS; i++)); do
+    curl -s -m 3 "$HEALTH_URL" 2>/dev/null | grep -q '"ready":true' && return 0
+    sleep 1
+  done
+  return 1
+}
+
+git_ merge --ff-only --quiet "$NEW"
+if [[ "$needs_deps" == 1 ]]; then
+  (cd "$ROOT" && "$BUN" install --frozen-lockfile) || { git_ reset --keep "$OLD"; die "bun install failed; returned to $short_old"; }
+fi
+status=ok
+if [[ "$managed" == 1 ]]; then
+  "$SYSTEMCTL" --user restart "$UNIT"
+  if ! wait_ready; then
+    git_ reset --keep "$OLD"
+    "$SYSTEMCTL" --user restart "$UNIT" || true
+    status="rolled-back"
+  fi
+fi
+
+mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
+printf '%s %s %s..%s broker_restart=%s status=%s\n' "$(date -Iseconds)" "$BRANCH" "$short_old" "$short_new" "$managed" "$status" >>"$LOG" 2>/dev/null || true
+
+[[ "$status" == ok ]] || die "broker did not report ready within ${READY_SECONDS}s; returned to $short_old and restarted it"
+echo "deploy-live: now at $short_new"
+if [[ "$touches_adapter" == 1 ]]; then echo "  note: running MCP adapters keep their old code until each client session restarts"; fi
+if [[ "$touches_hook_config" == 1 ]]; then echo "  note: canonical hooks changed; run the hook installers with --check for each profile"; fi
+exit 0
