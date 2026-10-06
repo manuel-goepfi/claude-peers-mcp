@@ -185,7 +185,7 @@ describe("PostToolUse drain throttle", () => {
   test("the .ts still receives the exact hook payload on stdin", () => {
     const s = setup();
     fire(s, "PostToolUse", P("thread-a"));
-    expect(JSON.parse(JSON.parse(calls(s)[0]).trim()).session_id).toBe("thread-a");
+    expect(JSON.parse(JSON.parse(calls(s)[0] ?? "\"{}\"").trim()).session_id).toBe("thread-a");
   });
 
   test("threads are throttled independently", () => {
