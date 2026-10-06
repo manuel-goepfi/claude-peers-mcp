@@ -25,9 +25,14 @@ test.skipIf(!Bun.which("tmux"))("empty native Codex duplicate unregisters and th
     expect(db.query("SELECT id FROM peers WHERE id='duplicate'").get()).toBeNull();
     expect((await call("/heartbeat",{id:"duplicate"},"duplicate-token")).status).toBe(401);
     const reconnect={...registration,thread_id:null,receiver_mode:"manual-drain",name:"stale.9"};
+    // Threadless recovery keeps the keeper's identity and canonicalizes its
+    // name to the proven open pane's operator label (broker.ts
+    // canonicalNativeCodexPaneName), not the caller's stale name.
+    const paneLabel=`${session}.1`;
     for(let i=0;i<3;i++) {
       const recovered=await call("/register",reconnect);
-      expect(recovered.status).toBe(200);expect(recovered.body).toMatchObject({id:keeper.body.id,token:keeper.body.token,name:keeper.body.name,receiver_mode:keeper.body.receiver_mode});
+      expect(recovered.status).toBe(200);expect(recovered.body).toMatchObject({id:keeper.body.id,token:keeper.body.token,name:paneLabel,resolved_name:paneLabel,receiver_mode:keeper.body.receiver_mode});
+      expect(db.query("SELECT name,resolved_name FROM peers WHERE id=?").get(keeper.body.id)).toEqual({name:paneLabel,resolved_name:paneLabel});
       expect((await call("/heartbeat",{id:keeper.body.id},keeper.body.token)).status).toBe(200);
     }
     expect(db.query("SELECT COUNT(*) AS n FROM peers WHERE pid=?").get(Number(pid))).toEqual({n:1});

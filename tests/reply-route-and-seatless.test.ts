@@ -12,6 +12,7 @@ import { startTestBroker, type TestBroker } from "./helpers/test-broker.ts";
 import { nudgeText } from "../bin/codex-autodrain-poller.ts";
 import { isHostedWithoutSeat } from "../hooks/codex-drain-peer-inbox.ts";
 import { renderInboundBatch } from "../shared/render.ts";
+import { MCP_SERVER_INSTRUCTIONS } from "../shared/peer-instructions.ts";
 import type { Message } from "../shared/types.ts";
 
 describe("sender reply-route honesty", () => {
@@ -82,7 +83,11 @@ describe("sender reply-route honesty", () => {
     const rendered = renderInboundBatch(inbox.messages);
     expect(rendered).toContain(`from="${cli.id}"`);
     expect(rendered).toContain('replyable="false"');
-    expect(rendered).toContain("correlation-only and cannot receive");
+    expect(rendered).not.toContain('replyable="true"');
+    // Delivered batches carry no receive-policy block; the meaning of
+    // replyable="false" lives in the MCP startup instructions.
+    expect(rendered).not.toContain("<peer-receive-policy");
+    expect(MCP_SERVER_INSTRUCTIONS).toContain('replyable="false" means the ID is correlation-only');
   });
 
   test("a still-registered send-only identity is also non-replyable", async () => {
