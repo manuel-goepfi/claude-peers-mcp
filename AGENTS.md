@@ -22,6 +22,7 @@ This repository is the maintained Manzo downstream for same-user peer discovery 
 
 - Use `bun run typecheck`, `bun test`, `bun run smoke:install`, and `bun run verify` for ordinary validation. The capacity benchmark and authenticated release-host smoke are conditional, expensive gates; the client smoke must report blocked unless its isolated host/account is explicitly armed.
 - Use `bun:sqlite`; do not introduce an ORM. Use `Bun.serve`; do not introduce a web framework. The documented Codex relay is the only `node:http` exception.
+- The live deployment clone moves only through `bin/deploy-live` (fast-forward of the published `main`). Never hand-edit it or commit from it; ship every change as a PR to `main`.
 - Keep the public runtime inventory in `README.md`, operational procedures in `docs/operations.md`, and their contract tests synchronized.
 - Do not restore an LLM or API-key summary dependency. Peers set summaries explicitly with `set_summary`.
 <!-- END MANZO COMMON RULES -->

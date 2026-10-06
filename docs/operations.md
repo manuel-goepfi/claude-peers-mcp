@@ -303,6 +303,17 @@ event-driven, so an old event timestamp alone does not prove success or failure.
 `last_error` is direct failure evidence. Use `check_messages` as an urgent
 fallback when queued mail must not wait for the next event boundary.
 
+## Deploying the live clone
+
+The clone that the managed broker, hooks and adapters run from changes only through `bin/deploy-live`:
+
+```bash
+bin/deploy-live --dry-run
+bin/deploy-live
+```
+
+It refuses a dirty tree (naming any file that already matches the target, so an identical hand edit can be dropped with `git checkout --`), refuses any branch but `main`, and moves only by fast-forward of the published `main`. When `broker.ts`, `shared/`, `package.json` or `bun.lock` changed, it runs `bun install --frozen-lockfile` if needed, restarts the active `claude-peers-broker.service`, and waits for `/health` to report ready. If the broker does not become ready it returns the clone to the previous commit and restarts the unit again. Hook-only changes take effect on the next hook invocation without a restart. Every run prints its rollback command and appends a line to `$XDG_STATE_HOME/claude-peers/deploys.log`. Running adapters keep their old code until each client session restarts. A schema-changing release still follows the upgrade order below.
+
 ## Upgrade order
 
 Upgrade the broker before its adapters because the broker owns schema compatibility:
