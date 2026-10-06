@@ -143,6 +143,21 @@ describe("explicit seat names at the broker", () => {
     expect(resync.json.name).toBe("Orch.200");
   });
 
+  test("a rename-lane rename (/set-name-by-pid) is pinned against auto-label re-registration", async () => {
+    const proc = Bun.spawn(["bash", "-c", "sleep 60 & echo $! ; wait"], { stdout: "pipe", stderr: "ignore" });
+    children.add(proc);
+    const reader = (proc.stdout as ReadableStream<Uint8Array>).getReader();
+    const { value } = await reader.read();
+    reader.releaseLock();
+    const childPid = Number(new TextDecoder().decode(value).trim());
+    const seat = await register(proc.pid!, "Orch.210", "%9181");
+    const renamed = await call<Named>("/set-name-by-pid", { caller_pid: childPid, name: "Orch.212" });
+    expect(renamed.status).toBe(200);
+    const again = await register(proc.pid!, "Orch.210", "%9181", { preserve_token: true });
+    expect(again.json.id).toBe(seat.json.id);
+    expect(again.json.name).toBe("Orch.212");
+  });
+
   test("a non-explicit set-name keeps the legacy suffix behaviour", async () => {
     await register(spawnHolder().pid!, "legacy-held", "%9171");
     const seat = await register(spawnHolder().pid!, "legacy-other", "%9172");

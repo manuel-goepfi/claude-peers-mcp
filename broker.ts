@@ -1975,8 +1975,8 @@ function handleSetSummary(body: SetSummaryRequest): void {
 // Names a seat was given ON PURPOSE (set_name, rename-lane, or a registration
 // that carries an explicit launcher/pane seat name), keyed by peer id.
 //
-// Every automatic path — the live-group heartbeat, the adapter's canonical
-// re-sync, and hook re-registration — re-derives a name from the pane's AUTO
+// Every automatic path (the live-group heartbeat, the adapter's canonical
+// re-sync, and hook re-registration) re-derives a name from the pane's AUTO
 // label. Before this map existed each of them silently wrote that label back
 // over an explicit rename within one heartbeat, so `set_name` reported success
 // while `whoami` kept the launch-order label. An explicit name outranks every
