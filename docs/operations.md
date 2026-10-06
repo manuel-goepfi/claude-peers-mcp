@@ -52,7 +52,7 @@ releases it), and the broker pins it so heartbeats, hook re-registration and
 adapter re-syncs never write the auto label back. `--print-seat <pane>` prints the
 name a pane's seat answers to; `--print` stays the auto label. A name another live
 seat or pane already answers to is refused with the holder named (claim exit 3,
-`set_name` HTTP 409) instead of being suffixed. Control seats whose role labels
+`set_name` and `rename-lane` HTTP 409) instead of being suffixed. Control seats whose role labels
 share the `session.number` shape must be launched with an explicit name.
 
 Native Claude mailbox grouping is limited to one independently proven runtime,

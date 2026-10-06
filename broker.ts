@@ -3741,7 +3741,7 @@ function seatFromCallerAncestry(
  * send_to_peer matches AND what the tmux pane border renders, so naming a lane
  * makes the label on screen the label that routes.
  */
-function handleSetNameByPid(body: Record<string, unknown>): { ok: boolean; status?: number; error?: string; id?: string; name?: string | null; resolved_name?: string | null; previous_name?: string | null } {
+function handleSetNameByPid(body: Record<string, unknown>): { ok: boolean; status?: number; error?: string; holder?: PeerTarget; id?: string; name?: string | null; resolved_name?: string | null; previous_name?: string | null } {
   const callerPid = Number(body.caller_pid);
   if (!Number.isInteger(callerPid) || callerPid <= 1) return { ok: false, status: 400, error: "invalid caller_pid" };
   const callerErr = verifyPidUid(callerPid);
@@ -3755,11 +3755,14 @@ function handleSetNameByPid(body: Record<string, unknown>): { ok: boolean; statu
   const seat = resolved.seat;
 
   const previous = seat.name;
-  // An operator rename is explicit (it must survive re-syncs) but keeps this
-  // route's documented contract of suffixing a collision instead of refusing.
-  const result = handleSetName({ id: seat.id, name: desired }, { explicit: true });
-  // Not strict, so a holder never refuses here; the guard narrows the type.
-  if (!result.ok) return { ok: false, status: 409, error: nameHeldError(desired, result.holder) };
+  // An operator rename is explicit (it must survive re-syncs), so it is also
+  // strict: a suffixed pin would leave two live seats answering to one
+  // operator name for good, the misrouting set_name already refuses.
+  const result = handleSetName({ id: seat.id, name: desired }, { explicit: true, strict: true });
+  if (!result.ok) {
+    console.error(`[broker] set-name-by-pid refused: ${seat.id} requested "${desired}" held by ${result.holder.id}`);
+    return { ok: false, status: 409, error: nameHeldError(desired, result.holder), holder: describePeerTarget(result.holder) };
+  }
   console.error(`[broker] set-name-by-pid: ${seat.id} "${previous ?? ""}" -> "${result.name ?? ""}" (resolved ${result.resolved_name ?? ""})`);
   return { ok: true, id: seat.id, name: result.name, resolved_name: result.resolved_name, previous_name: previous };
 }
@@ -4331,7 +4334,7 @@ requestHandler = async (req: Request) => {
 
       if (path === "/set-name-by-pid") {
         const res = handleSetNameByPid(body as Record<string, unknown>);
-        if (!res.ok) return Response.json({ error: res.error }, { status: res.status ?? 400 });
+        if (!res.ok) return Response.json({ error: res.error, holder: res.holder }, { status: res.status ?? 400 });
         return Response.json(res);
       }
 

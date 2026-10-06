@@ -25,6 +25,8 @@
  *         bun bin/rename-lane.ts --show
  */
 
+import { claimPaneSeatName, paneSeatNameHolder } from "./tmux-label-pane.ts";
+
 const BROKER_PORT = process.env.CLAUDE_PEERS_PORT ?? "7899";
 const BROKER = `http://127.0.0.1:${BROKER_PORT}`;
 
@@ -75,6 +77,17 @@ async function main(): Promise<number> {
     return 0;
   }
 
+  // A name is unique across the tmux server, as in the set_name tool: refuse one
+  // another pane already answers to before touching the broker, naming that pane.
+  // This also covers a holder the broker does not know yet (after a restart).
+  if (pane && arg.trim()) {
+    const holder = paneSeatNameHolder(pane, arg.trim());
+    if (typeof holder === "string") {
+      console.error(`rename refused: "${arg.trim()}" is already held by ${holder}; that seat must rename or release it first`);
+      return 1;
+    }
+  }
+
   // The broker derives WHICH seat from our process ancestry, so this renames the
   // lane this command runs inside and nothing else.
   const { status, json } = await post<NameResult>("/set-name-by-pid", {
@@ -84,7 +97,7 @@ async function main(): Promise<number> {
   if (status !== 200 || json.ok !== true) {
     console.error(`rename failed (HTTP ${status}): ${json.error ?? "unknown error"}`);
     if (status === 404) console.error("  → this process is not inside a registered peer seat");
-    if (status === 409) console.error("  → ancestry matches more than one seat; the seat rows need to collapse first");
+    if (status === 409 && !json.error?.includes("is held by")) console.error("  → ancestry matches more than one seat; the seat rows need to collapse first");
     return 1;
   }
 
@@ -109,12 +122,16 @@ async function main(): Promise<number> {
     ["@peer_label", applied],
     ["@peer_resolved_name", routable],
     ["@operator_label", applied],
-    // The explicit seat name is what registration and heartbeats re-read; the
-    // auto-label allocator may rewrite @operator_label, but never this.
-    ["@peer_seat_name", applied],
   ] as const) {
     if (!tmux(["set-option", "-p", "-t", pane, option, value]).ok) failures.push(option);
   }
+  // The explicit seat name is what registration and heartbeats re-read; the
+  // auto-label allocator may rewrite @operator_label, but never this. Stamp it
+  // through the server-wide claim so a pane that took the name since the check
+  // above keeps it alone.
+  const claim = claimPaneSeatName(pane, applied);
+  if (claim.status === "refused") console.error(`warning: pane seat name not stamped: held by ${claim.holder}`);
+  else if (claim.status === "failed") failures.push(`@peer_seat_name (${claim.reason})`);
 
   console.log(`tmux window: ${applied}`);
   console.log(`border:      ${routable}`);
