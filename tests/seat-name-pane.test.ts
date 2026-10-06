@@ -153,6 +153,14 @@ test.skipIf(!Bun.which("tmux") || !Bun.which("flock"))("CLI on a scratch tmux se
     // Release returns print-seat to the auto label.
     expect(cli("--claim-seat-name", second, "").code).toBe(0);
     expect(cli("--print-seat", second).out).toBe("Orch.2");
+
+    // The auto-labeller never hands out a role name a pane claimed explicitly:
+    // with Orch.3 claimed, a new pane must not become Orch.3 (it allocates above
+    // every taken ordinal, explicit names included).
+    expect(cli("--claim-seat-name", second, "Orch.3").code).toBe(0);
+    tmux(["split-window", "-d", "-t", "Orch", "sleep", "120"]);
+    const third = tmux(["list-panes", "-s", "-t", "Orch", "-F", "#{pane_id}"]).split("\n").find((id) => id !== first && id !== second)!;
+    expect(cli("--print", third).out).toBe("Orch.8");
   } finally {
     Bun.spawnSync(["tmux", "-S", socket, "kill-server"], { stdout: "ignore", stderr: "ignore" });
     rmSync(root, { recursive: true, force: true });

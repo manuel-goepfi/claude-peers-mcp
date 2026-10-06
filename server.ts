@@ -1398,15 +1398,17 @@ function readUsedOperatorLabels(session: string, currentPaneId: string): string[
   // told "none", and independently chose <session>.<pane_index> — which is how
   // SIXTEEN lanes all ended up named C5_lanes.1, distinguishable only by the
   // #suffix bolted on afterwards.
-  const out = runTmux(["list-panes", "-s", "-t", session, "-F", "#{pane_id}\t#{@operator_label}\t#{@peer_label}"]);
+  const out = runTmux(["list-panes", "-s", "-t", session, "-F", `#{pane_id}\t#{@operator_label}\t#{@peer_label}\t#{${SEAT_NAME_OPTION}}`]);
   if (!out) return [];
 
   const labels: string[] = [];
   for (const line of out.split("\n")) {
-    const [paneId, operatorLabel, peerLabel] = line.split("\t");
+    const [paneId, operatorLabel, peerLabel, seatName] = line.split("\t");
     if (!paneId || paneId === currentPaneId) continue;
     const label = cleanTmuxOptionValue(operatorLabel ?? null) ?? cleanTmuxOptionValue(peerLabel ?? null);
     if (label) labels.push(label);
+    const seat = cleanTmuxOptionValue(seatName ?? null);
+    if (seat) labels.push(seat);
   }
   return labels;
 }
@@ -2381,9 +2383,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         recordTmuxMirrorResult("set_name", mirror);
         const pending = await drainPendingMessages();
         const tmuxWarning = mirror.ok ? "" : `\nWarning: tmux label update partially failed for ${mirror.failedOptions.join(", ")}.`;
-        const resolvedNote = myResolvedName && myResolvedName !== myOperatorName ? ` (resolved "${myResolvedName}")` : "";
+        // Report the broker's answer, not module state: a heartbeat computed
+        // before the rename can land while this call is still awaiting.
+        const resolvedNote = res.resolved_name && res.resolved_name !== res.name ? ` (resolved "${res.resolved_name}")` : "";
         return {
-          content: [{ type: "text" as const, text: `Name updated: "${myOperatorName ?? ""}"${resolvedNote}${seatWarning}${tmuxWarning}${pending ?? ""}` }],
+          content: [{ type: "text" as const, text: `Name updated: "${res.name ?? ""}"${resolvedNote}${seatWarning}${tmuxWarning}${pending ?? ""}` }],
         };
       } catch (e) {
         const message = e instanceof Error ? e.message : String(e);
@@ -2793,7 +2797,14 @@ async function main() {
     tty = proof.tty;
     peerName = proof.name ?? peerName;
   };
-  const buildRegisterPayload = () => ({
+  // The pane's explicit seat name can change under this adapter (rename-lane,
+  // a relaunch with -n). Re-read it before every registration so a 401
+  // re-register never re-pins a stale name over a newer one.
+  const buildRegisterPayload = () => {
+    if (!isSubagent && !nestedChildClient) myExplicitName = readTmuxSeatName(tmuxInfo) ?? myExplicitName;
+    return buildRegisterBody();
+  };
+  const buildRegisterBody = () => ({
     pid: myRegisterPid,
     adapter_pid: process.pid,
     native_claude_companion: nativeClaudeCompanion,

@@ -1412,8 +1412,18 @@ function nativeCodexKeeper(input: Pick<RegisterRequest,"pid"|"tmux_pane_id"|"cwd
 // Call only after proving the exact native process owns this open pane.
 function canonicalNativeCodexPaneName(peer: Peer): {name:string;resolved_name:string} | null {
   if (!peer.tmux_pane_id) return null;
-  const pinned=explicitNames.get(peer.id);
-  if (pinned) return {name:peer.name ?? pinned,resolved_name:peer.resolved_name ?? peer.name ?? pinned};
+  // An explicit seat name (pinned here, or only on the pane after a broker
+  // restart or a launcher claim) outranks the auto label.
+  const pinned=explicitNames.get(peer.id) ?? readPaneSeatName(peer.tmux_pane_id);
+  if (pinned) {
+    explicitNames.set(peer.id,pinned);
+    if (peer.name!==pinned) {
+      const resolved=disambiguateName(pinned,peer.id,peer.tmux_window_name) ?? pinned;
+      updateName.run(pinned,resolved,peer.id);
+      return {name:pinned,resolved_name:resolved};
+    }
+    return {name:pinned,resolved_name:peer.resolved_name ?? pinned};
+  }
   const label=ensurePaneOperatorLabel(peer.tmux_pane_id);
   if (label.status!=="preserved" && label.status!=="labeled") return null;
   if (peer.name!==label.label || peer.resolved_name!==label.label) {
@@ -1449,7 +1459,7 @@ function recoverThreadlessCodex(body:RegisterRequest):RegisterResult|null {
   db.transaction(()=>{for(const duplicate of duplicates)deletePeer.run(duplicate.id);})();
   for(const duplicate of duplicates){buckets.delete(duplicate.id);supersededPeerIds.delete(duplicate.id);}
   return {ok:true,value:{id:keeper.id,token:keeper.token,name:canonical.name,resolved_name:canonical.resolved_name,
-    client_type:"codex",receiver_mode:validReceiverMode(keeper.receiver_mode,"codex")}};
+    client_type:"codex",receiver_mode:validReceiverMode(keeper.receiver_mode,"codex"),name_explicit:explicitNames.has(keeper.id)}};
 }
 
 function handleRegister(body: RegisterRequest): RegisterResult {
@@ -3748,6 +3758,7 @@ function handleSetNameByPid(body: Record<string, unknown>): { ok: boolean; statu
   // An operator rename is explicit (it must survive re-syncs) but keeps this
   // route's documented contract of suffixing a collision instead of refusing.
   const result = handleSetName({ id: seat.id, name: desired }, { explicit: true });
+  // Not strict, so a holder never refuses here; the guard narrows the type.
   if (!result.ok) return { ok: false, status: 409, error: nameHeldError(desired, result.holder) };
   console.error(`[broker] set-name-by-pid: ${seat.id} "${previous ?? ""}" -> "${result.name ?? ""}" (resolved ${result.resolved_name ?? ""})`);
   return { ok: true, id: seat.id, name: result.name, resolved_name: result.resolved_name, previous_name: previous };

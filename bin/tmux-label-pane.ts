@@ -77,10 +77,14 @@ function parseSnapshot(raw: string): PaneSnapshot | null {
 function usedOperatorLabels(raw: string, currentPaneId: string): string[] {
   const labels: string[] = [];
   for (const line of raw.split("\n")) {
-    const [paneId, operatorLabel, peerLabel] = line.split("\t");
+    const [paneId, operatorLabel, peerLabel, seatName] = line.split("\t");
     if (!paneId || paneId === currentPaneId) continue;
     const label = cleanTmuxOptionValue(operatorLabel) ?? cleanTmuxOptionValue(peerLabel);
     if (label) labels.push(label);
+    // An explicit seat name in the ordinal shape (a role label) is taken too:
+    // the next auto label must be allocated above it, never onto it.
+    const seat = cleanTmuxOptionValue(seatName);
+    if (seat) labels.push(seat);
   }
   return labels;
 }
@@ -100,7 +104,7 @@ function ownsPreservedLabel(pane: PaneSnapshot, label: string, siblings: string)
 }
 
 function siblingLabels(pane: PaneSnapshot, run: TmuxLabelRunner): TmuxLabelCommandResult {
-  return run(["list-panes","-s","-t",pane.session,"-F","#{pane_id}\t#{@operator_label}\t#{@peer_label}"]);
+  return run(["list-panes","-s","-t",pane.session,"-F",`#{pane_id}\t#{@operator_label}\t#{@peer_label}\t#{${SEAT_NAME_OPTION}}`]);
 }
 
 function panePresence(paneId: string, run: TmuxLabelRunner): "present" | "absent" | "unknown" {

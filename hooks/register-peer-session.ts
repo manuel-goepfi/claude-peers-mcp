@@ -468,17 +468,19 @@ export function readPaneLabel(
 function readUsedOperatorLabels(session: string, currentPaneId: string): string[] {
   try {
     const result = Bun.spawnSync([
-      "tmux", "list-panes", "-s", "-t", session, "-F", "#{pane_id}\t#{@operator_label}\t#{@peer_label}",
+      "tmux", "list-panes", "-s", "-t", session, "-F", "#{pane_id}\t#{@operator_label}\t#{@peer_label}\t#{@peer_seat_name}",
     ], { stdout: "pipe", stderr: "ignore" });
     if (result.exitCode !== 0) return [];
     const out = new TextDecoder().decode(result.stdout).trim();
     if (!out) return [];
     const labels: string[] = [];
     for (const line of out.split("\n")) {
-      const [paneId, operatorLabel, peerLabel] = line.split("\t");
+      const [paneId, operatorLabel, peerLabel, seatName] = line.split("\t");
       if (!paneId || paneId === currentPaneId) continue;
       const label = cleanTmuxOptionValue(operatorLabel ?? null) ?? cleanTmuxOptionValue(peerLabel ?? null);
       if (label) labels.push(label);
+      const seat = cleanTmuxOptionValue(seatName ?? null);
+      if (seat) labels.push(seat);
     }
     return labels;
   } catch {
