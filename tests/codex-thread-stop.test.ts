@@ -28,9 +28,11 @@ const SOCKET = "/run/user/1000/codex-test/app-server-control.sock";
 const CLI = new URL("../bin/codex-thread-stop.ts", import.meta.url).pathname;
 const FAKE = new URL("./fixtures/fake-codex-app-server.ts", import.meta.url).pathname;
 
-function fakeConnect(fake: FakeCodexAppServer, connects: string[] = []): (socket: string) => Promise<RpcConnection> {
+function fakeConnect(servers: FakeCodexAppServer | Record<string, FakeCodexAppServer>, connects: string[] = []): (socket: string) => Promise<RpcConnection> {
   return async (socket) => {
     connects.push(socket);
+    const fake = servers instanceof FakeCodexAppServer ? servers : servers[socket];
+    if (!fake) throw new Error(`connect ENOENT ${socket}`);
     let listener: ((text: string) => void) | null = null;
     return jsonRpcConnection({
       send(text) {
@@ -47,12 +49,14 @@ function fakeConnect(fake: FakeCodexAppServer, connects: string[] = []): (socket
 }
 
 function recordingBroker(lookup: BindingLookup) {
-  const gates: Array<{ threadId: string; paneId: string | null }> = [];
+  const gates: Array<{ threadId: string; gate: string; paneId: string | null }> = [];
+  const unstops: Array<{ threadId: string; proof: string }> = [];
   const api: BrokerApi = {
     async lookup() { return lookup; },
-    async gate(threadId, paneId) { gates.push({ threadId, paneId }); return { gated_peer_ids: ["peer-lane"], queued: 1 }; },
+    async gate(threadId, gate, paneId) { gates.push({ threadId, gate, paneId }); return { gated_peer_ids: ["peer-lane"], queued: 1, gate }; },
+    async unstop(threadId, proof) { unstops.push({ threadId, proof }); return { restored_peer_ids: ["peer-lane"], queued: 1, from_gate: "stopped" }; },
   };
-  return { api, gates };
+  return { api, gates, unstops };
 }
 
 function laneLookup(): BindingLookup {
@@ -74,7 +78,12 @@ function sharedServer(overrides: Record<string, FakeThread> = {}): FakeCodexAppS
   });
 }
 
-const quiet = { out: () => {}, err: () => {}, settleMs: 500, pollMs: 1 };
+const quiet = {
+  out: () => {}, err: () => {}, settleMs: 500, pollMs: 1,
+  // Never enumerate the host's real app-server sockets from a test.
+  knownSockets: () => [SOCKET],
+  canonical: (path: string) => path,
+};
 
 describe("codex-thread-stop against a shared app-server", () => {
   test("--pane interrupts and archives exactly that thread, after gating its mail", async () => {
@@ -86,7 +95,11 @@ describe("codex-thread-stop against a shared app-server", () => {
       { ...quiet, out: (line) => lines.push(line), broker: broker.api, connect: fakeConnect(fake) },
     );
     expect(code).toBe(EXIT.stopped);
-    expect(broker.gates).toEqual([{ threadId: T_LANE, paneId: "%28803" }]);
+    // Intermediate gate before the turn is touched; permanent only after verification.
+    expect(broker.gates).toEqual([
+      { threadId: T_LANE, gate: "stopping", paneId: "%28803" },
+      { threadId: T_LANE, gate: "stopped", paneId: "%28803" },
+    ]);
     const interrupt = fake.calls.findIndex((call) => call.method === "turn/interrupt");
     const archive = fake.calls.findIndex((call) => call.method === "thread/archive");
     expect(interrupt).toBeGreaterThan(-1);
@@ -158,8 +171,8 @@ describe("codex-thread-stop against a shared app-server", () => {
       { paneId: "%28803", dryRun: false, brokerPort: 7899 },
       { ...quiet, broker: broker.api, connect: fakeConnect(fake) },
     )).toBe(EXIT.gone);
-    // Mail is still gated: a ghost registration must not get the queue.
-    expect(broker.gates).toHaveLength(1);
+    // Proven absent from every known app-server: permanently gated.
+    expect(broker.gates.map((gate) => gate.gate)).toEqual(["stopped"]);
     expect(fake.mutatingCalls()).toEqual([]);
 
     const unloaded = sharedServer({ [T_LANE]: { status: "notLoaded", archived: true } });
@@ -196,17 +209,19 @@ describe("codex-thread-stop against a shared app-server", () => {
       if (JSON.parse(text).method === "thread/archive") { fake.threads.get(T_LANE)!.archived = false; fake.threads.get(T_LANE)!.status = "idle"; }
       return frames;
     };
+    const broker = recordingBroker(laneLookup());
     expect(await runCodexThreadStop(
       { paneId: "%28803", dryRun: false, brokerPort: 7899 },
-      { ...quiet, broker: recordingBroker(laneLookup()).api, connect: fakeConnect(fake) },
+      { ...quiet, broker: broker.api, connect: fakeConnect(fake) },
     )).toBe(EXIT.failed);
+    expect(broker.gates.map((gate) => gate.gate)).toEqual(["stopping"]);
   });
 
   test("a silent app-server is a failure, never 'already gone'", async () => {
     const broker = recordingBroker(laneLookup());
     const silent: RpcConnection = {
       async request(method) {
-        return method === "initialize" ? { result: {} } : { error: { code: -32001, message: `${method} timed out after 1ms` } };
+        return method === "initialize" ? { result: { userAgent: "fake" } } : { error: { code: -32001, message: `${method} timed out after 1ms` } };
       },
       notify() {},
       close() {},
@@ -214,7 +229,7 @@ describe("codex-thread-stop against a shared app-server", () => {
     expect(await runCodexThreadStop(
       { paneId: "%28803", dryRun: false, brokerPort: 7899 },
       { ...quiet, broker: broker.api, connect: async () => silent },
-    )).toBe(EXIT.failed);
+    )).toBe(EXIT.refused);
     expect(broker.gates).toEqual([]);
   });
 
@@ -231,6 +246,9 @@ describe("codex-thread-stop against a shared app-server", () => {
     expect(parseStopArgs(["--pane", "28803"], {}).ok).toBe(false);
     expect(parseStopArgs(["--thread", "nope"], {}).ok).toBe(false);
     expect(parseStopArgs(["--pane", "%1", "--socket", "relative.sock"], {}).ok).toBe(false);
+    expect(parseStopArgs(["--unstop", "--thread", T_LANE, "--operator-override"], {})).toMatchObject({ ok: true, options: { unstop: true, operatorOverride: true } });
+    expect(parseStopArgs(["--unstop", "--pane", "%1"], {}).ok).toBe(false);
+    expect(parseStopArgs(["--pane", "%1", "--operator-override"], {}).ok).toBe(false);
   });
 });
 
@@ -390,11 +408,11 @@ describe("codex-thread-stop CLI over a real ws+unix socket", () => {
         const body = await request.json() as Record<string, unknown>;
         if (path === "/codex-thread-binding") {
           return Response.json({
-            controls: [{ thread_id: T_LANE, tmux_pane_id: "%28803", app_server_socket: socket, bound_at: "x", superseded_at: null, gate: gates.length ? "stopped" : null }],
+            controls: [{ thread_id: T_LANE, tmux_pane_id: "%28803", app_server_socket: socket, bound_at: "x", superseded_at: null, gate: gates.length ? (gates.at(-1) as { gate: string }).gate : null }],
             peers: gates.length ? [] : [{ id: "peer-lane", pid: 1, tmux_pane_id: "%28803", thread_id: T_LANE, non_targetable: 0 }],
           });
         }
-        if (path === "/codex-thread-gate") { gates.push(body); return Response.json({ ok: true, applied: true, gate: "stopped", gated_peer_ids: ["peer-lane"], queued: 0 }); }
+        if (path === "/codex-thread-gate") { gates.push(body); return Response.json({ ok: true, applied: true, gate: body.gate, gated_peer_ids: ["peer-lane"], queued: 0 }); }
         return Response.json({ error: "missing x-peer-token" }, { status: 401 });
       },
     });
@@ -412,7 +430,9 @@ describe("codex-thread-stop CLI over a real ws+unix socket", () => {
       // Async spawn: the fake broker is served from this test's event loop.
       const run = async (args: string[]) => {
         const child = Bun.spawn(["node", "--experimental-strip-types", "--disable-warning=ExperimentalWarning", CLI, ...args], {
-          env: { ...process.env, CLAUDE_PEERS_PORT: String(broker.port) }, stdout: "pipe", stderr: "pipe",
+          // Pin the known-socket set: never enumerate the host's real app-servers.
+          env: { ...process.env, CLAUDE_PEERS_PORT: String(broker.port), CLAUDE_PEERS_CODEX_APP_SERVER_SOCKETS: socket, HOME: root },
+          stdout: "pipe", stderr: "pipe",
         });
         const [stdout, stderr, exitCode] = await Promise.all([
           new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
@@ -427,7 +447,7 @@ describe("codex-thread-stop CLI over a real ws+unix socket", () => {
       expect(recorded.calls.filter((call) => call.method === "turn/interrupt" || call.method === "thread/archive")
         .map((call) => [call.method, call.threadId])).toEqual([["turn/interrupt", T_LANE], ["thread/archive", T_LANE]]);
       expect(recorded.loaded).toEqual([T_OTHER]);
-      expect(gates).toHaveLength(1);
+      expect(gates.map((gate) => (gate as { gate: string }).gate)).toEqual(["stopping", "stopped"]);
       expect((await run(["--pane", "%28803"])).exitCode).toBe(EXIT.gone);
       expect((await run(["--thread", T_LANE, "--socket", join(root, "missing.sock")])).exitCode).toBe(EXIT.refused);
     } finally {
@@ -544,4 +564,190 @@ describe("autodrain poller never wakes a gated thread", () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
+});
+
+// --- socket custody, partial failure, and recovery (two app-servers) ----------
+
+const SOCKET_A = "/run/user/1000/codex-test/account-a.sock";
+const SOCKET_B = "/run/user/1000/codex-test/account-b.sock";
+const SOCKET_C = "/run/user/1000/codex-test/account-c.sock";
+
+function gateOf(broker: TestBroker, threadId: string): string | null {
+  const db = new Database(broker.dbPath, { readonly: true });
+  const row = db.query("SELECT gate FROM codex_thread_controls WHERE thread_id = ?").get(threadId) as { gate: string | null } | null;
+  db.close();
+  return row?.gate ?? null;
+}
+
+function audit(broker: TestBroker, threadId: string): Array<{ action: string; from_gate: string | null; to_gate: string | null; proof: string | null }> {
+  const db = new Database(broker.dbPath, { readonly: true });
+  const rows = db.query("SELECT action, from_gate, to_gate, proof FROM codex_thread_gate_audit WHERE thread_id = ? ORDER BY id").all(threadId) as never;
+  db.close();
+  return rows;
+}
+
+/** Two fake app-servers: A hosts another lane, B hosts the lane being closed. */
+function twoServers() {
+  const a = new FakeCodexAppServer({ [T_OTHER]: { status: "active", turns: [{ id: "turn-a", status: "inProgress" }] } });
+  const b = new FakeCodexAppServer({
+    [T_LANE]: { status: "active", turns: [{ id: "turn-live", status: "inProgress" }] },
+    [T_THIRD]: { status: "idle", turns: [{ id: "turn-b3", status: "completed" }] },
+  });
+  return { a, b, connect: fakeConnect({ [SOCKET_A]: a, [SOCKET_B]: b }) };
+}
+
+describe("socket custody: a wrong or unproven socket never gates a live thread", () => {
+  test("wrong --socket with the thread alive on another server refuses: no gate, no RPC mutation, mail still delivered", async () => {
+    const broker = await startTestBroker({ prefix: "codex-stop-wrong-socket" });
+    brokers.push(broker);
+    const lane = await registerCodexThread(broker, T_LANE, "%28803");
+    queue(broker, lane.id, "still for the live lane");
+    const { a, b, connect } = twoServers();
+    const errors: string[] = [];
+    const code = await runCodexThreadStop(
+      { paneId: "%28803", socket: SOCKET_A, dryRun: false, brokerPort: broker.port },
+      { ...quiet, knownSockets: () => [SOCKET_A, SOCKET_B], err: (line) => errors.push(line), broker: httpBrokerApi(broker.port), connect },
+    );
+    expect(code).toBe(EXIT.refused);
+    expect(errors.join("\n")).toBe("codex-thread-stop: refused (nothing changed)");
+    expect(gateOf(broker, T_LANE)).toBeNull();
+    expect(a.mutatingCalls()).toEqual([]);
+    expect(b.mutatingCalls()).toEqual([]);
+    const claim = await post(broker, "/claim-by-thread", { thread_id: T_LANE, caller_pid: process.pid });
+    expect(claim.status).toBe(200);
+    expect((claim.body.messages as Array<{ text: string }>).map((m) => m.text)).toEqual(["still for the live lane"]);
+
+    // The right socket then stops exactly that thread on B; A is untouched.
+    expect(await runCodexThreadStop(
+      { paneId: "%28803", socket: SOCKET_B, dryRun: false, brokerPort: broker.port },
+      { ...quiet, knownSockets: () => [SOCKET_A, SOCKET_B], broker: httpBrokerApi(broker.port), connect },
+    )).toBe(EXIT.stopped);
+    expect(b.mutatingCalls().map((call) => [call.method, call.threadId])).toEqual([["turn/interrupt", T_LANE], ["thread/archive", T_LANE]]);
+    // A only ever saw read-only status calls; its own lane was never addressed.
+    expect(a.mutatingCalls()).toEqual([]);
+    expect(a.callsFor(T_OTHER)).toEqual([]);
+    expect(a.loadedIds()).toEqual([T_OTHER]);
+    expect(b.loadedIds()).toEqual([T_THIRD]);
+    expect(gateOf(broker, T_LANE)).toBe("stopped");
+  }, 20_000);
+
+  test("unknown on every known app-server is proven absent and marked stopped", async () => {
+    const broker = await startTestBroker({ prefix: "codex-stop-absent" });
+    brokers.push(broker);
+    const lane = await registerCodexThread(broker, T_LANE, "%28803");
+    queue(broker, lane.id, "for a dead lane");
+    const { a, b, connect } = twoServers();
+    b.threads.delete(T_LANE);
+    expect(await runCodexThreadStop(
+      { paneId: "%28803", socket: SOCKET_A, dryRun: false, brokerPort: broker.port },
+      { ...quiet, knownSockets: () => [SOCKET_A, SOCKET_B], broker: httpBrokerApi(broker.port), connect },
+    )).toBe(EXIT.gone);
+    expect(gateOf(broker, T_LANE)).toBe("stopped");
+    expect(a.mutatingCalls()).toEqual([]);
+    expect(b.mutatingCalls()).toEqual([]);
+    expect((await post(broker, "/claim-by-thread", { thread_id: T_LANE, caller_pid: process.pid })).status).toBe(410);
+    expect(delivered(broker, "for a dead lane")).toBe(0);
+  }, 20_000);
+
+  test("an unreachable app-server, or a socket that is not a known app-server, refuses without gating", async () => {
+    const lookup = laneLookup();
+    lookup.controls[0]!.app_server_socket = null;
+    const { connect } = twoServers();
+    const gone = new FakeCodexAppServer({});
+    const withGone = fakeConnect({ [SOCKET_A]: gone });
+    const unreachable = recordingBroker(lookup);
+    expect(await runCodexThreadStop(
+      { paneId: "%28803", socket: SOCKET_A, dryRun: false, brokerPort: 7899 },
+      { ...quiet, knownSockets: () => [SOCKET_A, SOCKET_C], broker: unreachable.api, connect: withGone },
+    )).toBe(EXIT.refused);
+    expect(unreachable.gates).toEqual([]);
+
+    const unknownSocket = recordingBroker(lookup);
+    expect(await runCodexThreadStop(
+      { paneId: "%28803", socket: SOCKET_A, dryRun: false, brokerPort: 7899 },
+      { ...quiet, knownSockets: () => [SOCKET_B], broker: unknownSocket.api, connect },
+    )).toBe(EXIT.refused);
+    expect(unknownSocket.gates).toEqual([]);
+  });
+
+  test("a server answering for a different thread id is refused as foreign", async () => {
+    const fake = sharedServer({ [T_LANE]: { status: "active", turns: [{ id: "turn-live", status: "inProgress" }], answerAs: T_OTHER } });
+    const broker = recordingBroker(laneLookup());
+    expect(await runCodexThreadStop(
+      { paneId: "%28803", dryRun: false, brokerPort: 7899 },
+      { ...quiet, broker: broker.api, connect: fakeConnect(fake) },
+    )).toBe(EXIT.refused);
+    expect(broker.gates).toEqual([]);
+    expect(fake.mutatingCalls()).toEqual([]);
+  });
+});
+
+describe("partial stop failure: retry and recovery", () => {
+  test("archive failure leaves 'stopping' (mail gated, not stopped); a retry stops it; nothing else is touched", async () => {
+    const broker = await startTestBroker({ prefix: "codex-stop-partial" });
+    brokers.push(broker);
+    const lane = await registerCodexThread(broker, T_LANE, "%28803");
+    queue(broker, lane.id, "during a failed stop");
+    const { a, b, connect } = twoServers();
+    b.threads.get(T_LANE)!.failArchive = 1;
+    const lines: string[] = [];
+    const deps = { ...quiet, knownSockets: () => [SOCKET_A, SOCKET_B], broker: httpBrokerApi(broker.port), connect, out: (line: string) => lines.push(line) };
+
+    expect(await runCodexThreadStop({ paneId: "%28803", socket: SOCKET_B, dryRun: false, brokerPort: broker.port }, deps)).toBe(EXIT.failed);
+    expect(gateOf(broker, T_LANE)).toBe("stopping");
+    expect(lines.join("\n")).toContain("NOT marked stopped");
+    expect(b.loadedIds()).toContain(T_LANE);
+    expect((await post(broker, "/claim-by-thread", { thread_id: T_LANE, caller_pid: process.pid })).status).toBe(410);
+    // A mid-stop thread cannot be re-bound around the gate either.
+    expect((await post(broker, "/bind-codex-pane-thread", { caller_pid: process.pid, tmux_pane_id: "%28803", thread_id: T_LANE })).status).toBe(410);
+
+    // Retry by pane: the stopping thread is still the pane's target.
+    expect(await runCodexThreadStop({ paneId: "%28803", socket: SOCKET_B, dryRun: false, brokerPort: broker.port }, deps)).toBe(EXIT.stopped);
+    expect(gateOf(broker, T_LANE)).toBe("stopped");
+    expect(b.mutatingCalls().map((call) => [call.method, call.threadId])).toEqual([
+      ["turn/interrupt", T_LANE], ["thread/archive", T_LANE], ["thread/archive", T_LANE],
+    ]);
+    expect(a.calls.filter((call) => call.threadId !== null)).toEqual([]);
+    expect(delivered(broker, "during a failed stop")).toBe(0);
+    expect(audit(broker, T_LANE).map((row) => [row.action, row.to_gate])).toEqual([["gate", "stopping"], ["gate", "stopping"], ["gate", "stopped"]]);
+  }, 20_000);
+
+  test("--unstop lifts a stop only for a re-loaded thread or with --operator-override, restores delivery, and writes an audit row", async () => {
+    const broker = await startTestBroker({ prefix: "codex-unstop" });
+    brokers.push(broker);
+    const lane = await registerCodexThread(broker, T_LANE, "%28803");
+    queue(broker, lane.id, "held while stopped");
+    const { b, connect } = twoServers();
+    const deps = { ...quiet, knownSockets: () => [SOCKET_A, SOCKET_B], broker: httpBrokerApi(broker.port), connect };
+    expect(await runCodexThreadStop({ paneId: "%28803", socket: SOCKET_B, dryRun: false, brokerPort: broker.port }, deps)).toBe(EXIT.stopped);
+    expect(gateOf(broker, T_LANE)).toBe("stopped");
+
+    // Not loaded anywhere and no override: refused, still stopped.
+    expect(await runCodexThreadStop({ threadId: T_LANE, unstop: true, dryRun: false, brokerPort: broker.port }, deps)).toBe(EXIT.refused);
+    expect(gateOf(broker, T_LANE)).toBe("stopped");
+    // Dry run sends nothing.
+    b.threads.set(T_LANE, { status: "idle", turns: [{ id: "turn-resumed", status: "completed" }] });
+    expect(await runCodexThreadStop({ threadId: T_LANE, unstop: true, dryRun: true, brokerPort: broker.port }, deps)).toBe(EXIT.stopped);
+    expect(gateOf(broker, T_LANE)).toBe("stopped");
+    // Loaded again on its recorded app-server: lifted, mail deliverable again.
+    expect(await runCodexThreadStop({ threadId: T_LANE, unstop: true, dryRun: false, brokerPort: broker.port }, deps)).toBe(EXIT.stopped);
+    expect(gateOf(broker, T_LANE)).toBeNull();
+    const claim = await post(broker, "/claim-by-thread", { thread_id: T_LANE, caller_pid: process.pid });
+    expect(claim.status).toBe(200);
+    expect((claim.body.messages as Array<{ text: string }>).map((m) => m.text)).toEqual(["held while stopped"]);
+    expect(audit(broker, T_LANE).at(-1)).toEqual({ action: "unstop", from_gate: "stopped", to_gate: null, proof: "loaded-on-app-server" });
+    // Nothing left to undo.
+    expect(await runCodexThreadStop({ threadId: T_LANE, unstop: true, dryRun: false, brokerPort: broker.port }, deps)).toBe(EXIT.gone);
+
+    // Operator override lifts a 'stopping' gate left by a failed stop, audited as such.
+    const other = await registerCodexThread(broker, T_OTHER, "%28804");
+    queue(broker, other.id, "held while stopping");
+    expect((await post(broker, "/codex-thread-gate", { caller_pid: process.pid, thread_id: T_OTHER, gate: "stopping" })).body.gate).toBe("stopping");
+    expect(await runCodexThreadStop({ threadId: T_OTHER, unstop: true, operatorOverride: true, dryRun: false, brokerPort: broker.port },
+      { ...deps, connect: async () => { throw new Error("must not need a server"); } })).toBe(EXIT.stopped);
+    expect(audit(broker, T_OTHER).at(-1)).toEqual({ action: "unstop", from_gate: "stopping", to_gate: null, proof: "operator-override" });
+    const otherClaim = await post(broker, "/claim-by-thread", { thread_id: T_OTHER, caller_pid: process.pid });
+    expect((otherClaim.body.messages as Array<{ text: string }>).map((m) => m.text)).toEqual(["held while stopping"]);
+    expect((await post(broker, "/codex-thread-unstop", { caller_pid: process.pid, thread_id: T_OTHER, proof: "because" })).status).toBe(400);
+  }, 30_000);
 });

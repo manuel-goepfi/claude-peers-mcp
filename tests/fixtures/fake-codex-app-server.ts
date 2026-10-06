@@ -23,6 +23,10 @@ export interface FakeThread {
   turns?: Array<{ id: string; status: "inProgress" | "completed" | "interrupted" }>;
   /** Reads that still report "active" after an interrupt (settle latency). */
   settleReads?: number;
+  /** thread/archive fails this many times (partial-stop failure injection). */
+  failArchive?: number;
+  /** thread/read answers with this thread id (foreign-thread injection). */
+  answerAs?: string;
 }
 
 export interface FakeCall {
@@ -78,7 +82,7 @@ export class FakeCodexAppServer {
           if ((thread.settleReads ?? 0) > 0) thread.settleReads! -= 1;
           else { thread.status = "idle"; status = "idle"; }
         }
-        return reply({ thread: { id: threadId, status: status === "active" ? { type: "active", activeFlags: [] } : { type: status } } });
+        return reply({ thread: { id: thread.answerAs ?? threadId, status: status === "active" ? { type: "active", activeFlags: [] } : { type: status } } });
       }
       case "thread/turns/list": {
         if (!thread) return fail(`thread not loaded: ${threadId}`);
@@ -95,6 +99,10 @@ export class FakeCodexAppServer {
       }
       case "thread/archive": {
         if (!thread || thread.archived) return fail(`no rollout found for thread id ${threadId}`);
+        if ((thread.failArchive ?? 0) > 0) {
+          thread.failArchive! -= 1;
+          return fail(`failed to archive thread ${threadId}: injected failure`);
+        }
         thread.archived = true;
         thread.status = "notLoaded";
         for (const turn of thread.turns ?? []) if (turn.status === "inProgress") turn.status = "interrupted";

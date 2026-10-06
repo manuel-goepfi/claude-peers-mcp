@@ -25,6 +25,8 @@ import {
   liftPaneClosedGate,
   purgeCodexThreadControls,
   recordCodexThreadBinding,
+  recordedAppServerSockets,
+  unstopCodexThread,
   validAppServerSocket,
   type CodexThreadGate,
 } from "./shared/codex-thread-control.ts";
@@ -3406,10 +3408,11 @@ function handleBindCodexPaneThread(body: BindCodexPaneThreadRequest): BindCodexP
   }
   const callerErr = verifyPidUid(body.caller_pid);
   if (callerErr) return { ok: false, status: 403, error: `caller rejected: ${callerErr}` };
-  // A stopped thread is never re-bound, even from a live pane: codex-thread-stop
-  // interrupted and archived it, and its queued mail must stay gated.
-  if (codexThreadGate(db, body.thread_id) === "stopped") {
-    return { ok: false, status: 410, error: codexThreadGatedError("stopped") };
+  // A stopped (or mid-stop) thread is never re-bound, even from a live pane:
+  // only `codex-thread-stop --unstop` (audited) returns it to service.
+  const bindGate = codexThreadGate(db, body.thread_id);
+  if (bindGate === "stopped" || bindGate === "stopping") {
+    return { ok: false, status: 410, error: codexThreadGatedError(bindGate) };
   }
   const limited = rateCheck(CODEX_BIND_RATE_KEY, false);
   if (limited) return { ok: false, status: 429, error: limited };
@@ -3513,9 +3516,9 @@ function handleBindCodexPaneThread(body: BindCodexPaneThreadRequest): BindCodexP
 }
 
 function codexThreadGatedError(gate: CodexThreadGate): string {
-  return gate === "stopped"
-    ? "codex thread stopped: peer mail delivery is gated"
-    : "codex thread pane closed: peer mail delivery is gated until a live pane re-binds it";
+  if (gate === "stopped") return "codex thread stopped: peer mail delivery is gated";
+  if (gate === "stopping") return "codex thread stop in progress or incomplete: peer mail delivery is gated";
+  return "codex thread pane closed: peer mail delivery is gated until a live pane re-binds it";
 }
 
 function codexControlCaller(body: Record<string, unknown>, bucket: string):
@@ -3533,7 +3536,7 @@ function codexControlCaller(body: Record<string, unknown>, bucket: string):
 }
 
 function handleCodexThreadBinding(body: Record<string, unknown>):
-  | { ok: true; value: ReturnType<typeof codexThreadBindingLookup> & { peers: Array<{ alive: boolean }> } }
+  | { ok: true; value: ReturnType<typeof codexThreadBindingLookup> & { peers: Array<{ alive: boolean }>; known_sockets: string[] } }
   | { ok: false; status: number; error: string } {
   const caller = codexControlCaller(body, "codex-thread-binding");
   if (!caller.ok) return caller;
@@ -3551,8 +3554,29 @@ function handleCodexThreadBinding(body: Record<string, unknown>):
       controls: lookup.controls,
       // Tokens and seat columns never leave the broker; liveness is advisory.
       peers: lookup.peers.map((peer) => ({ ...peer, alive: isPidAlive(peer.pid) })),
+      // Every socket any relay recorded: input to codex-thread-stop's proof
+      // that an unknown thread is absent from every app-server, not just one.
+      known_sockets: recordedAppServerSockets(db),
     },
   };
+}
+
+function handleCodexThreadUnstopRoute(body: Record<string, unknown>):
+  | { ok: true; value: { ok: true; thread_id: string; from_gate: CodexThreadGate; restored_peer_ids: string[]; queued: number } }
+  | { ok: false; status: number; error: string } {
+  const caller = codexControlCaller(body, "codex-thread-unstop");
+  if (!caller.ok) return caller;
+  if (typeof body.thread_id !== "string" || !THREAD_UUID_RE.test(body.thread_id)) {
+    return { ok: false, status: 400, error: "invalid thread_id" };
+  }
+  if (body.proof !== "loaded-on-app-server" && body.proof !== "operator-override") {
+    return { ok: false, status: 400, error: "proof must be loaded-on-app-server or operator-override" };
+  }
+  const threadId = body.thread_id.toLowerCase();
+  const result = unstopCodexThread(db, { threadId, proof: body.proof, callerPid: caller.callerPid, nowIso: new Date().toISOString() });
+  if (!result.ok) return { ok: false, status: 409, error: result.error };
+  console.error(`[broker] codex thread UNSTOP thread=${threadId.slice(-8)} from=${result.from_gate} proof=${body.proof} restored=${result.restored_peer_ids.length} queued=${result.queued} caller=${caller.callerPid}`);
+  return { ok: true, value: { ok: true, thread_id: threadId, from_gate: result.from_gate, restored_peer_ids: result.restored_peer_ids, queued: result.queued } };
 }
 
 function handleCodexThreadGateRoute(body: Record<string, unknown>):
@@ -3563,8 +3587,8 @@ function handleCodexThreadGateRoute(body: Record<string, unknown>):
   if (typeof body.thread_id !== "string" || !THREAD_UUID_RE.test(body.thread_id)) {
     return { ok: false, status: 400, error: "invalid thread_id" };
   }
-  if (body.gate !== "stopped" && body.gate !== "pane-closed") {
-    return { ok: false, status: 400, error: "gate must be stopped or pane-closed" };
+  if (body.gate !== "stopped" && body.gate !== "stopping" && body.gate !== "pane-closed") {
+    return { ok: false, status: 400, error: "gate must be stopping, stopped or pane-closed" };
   }
   const paneId = typeof body.tmux_pane_id === "string" && /^%\d+$/.test(body.tmux_pane_id) ? body.tmux_pane_id : null;
   const threadId = body.thread_id.toLowerCase();
@@ -3584,6 +3608,8 @@ function handleCodexThreadGateRoute(body: Record<string, unknown>):
     gate: body.gate,
     paneId,
     nowIso: new Date().toISOString(),
+    appServerSocket: validAppServerSocket(body.app_server_socket) ? body.app_server_socket : null,
+    callerPid: caller.callerPid,
   });
   for (const id of applied.gated_peer_ids) buckets.delete(id);
   console.error(`[broker] codex thread gate=${applied.gate} thread=${threadId.slice(-8)} pane=${paneId ?? "-"} peers=${applied.gated_peer_ids.length} queued=${applied.queued} caller=${caller.callerPid}`);
@@ -4393,6 +4419,11 @@ requestHandler = async (req: Request) => {
       }
       if (path === "/codex-thread-gate") {
         const res = handleCodexThreadGateRoute(body);
+        if (!res.ok) return Response.json({ error: res.error }, { status: res.status });
+        return Response.json(res.value);
+      }
+      if (path === "/codex-thread-unstop") {
+        const res = handleCodexThreadUnstopRoute(body);
         if (!res.ok) return Response.json({ error: res.error }, { status: res.status });
         return Response.json(res.value);
       }

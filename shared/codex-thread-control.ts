@@ -23,7 +23,23 @@ import type { Database } from "bun:sqlite";
  * the gated peer ids (non_targetable, so no new mail can be addressed to them)
  * until the ordinary dead-seat retention reaps it.
  */
-export type CodexThreadGate = "pane-closed" | "stopped";
+export type CodexThreadGate = "pane-closed" | "stopping" | "stopped";
+
+/**
+ * Gate strength. A gate is only ever raised by applyCodexThreadGate, never
+ * lowered: pane-closed < stopping < stopped. Lowering happens only through a
+ * proven relay re-bind (pane-closed) or an audited --unstop (stopping, stopped).
+ *
+ *   pane-closed  relay shut down; mail gated until a proven re-bind.
+ *   stopping     codex-thread-stop gated mail and is interrupting/archiving.
+ *                If the stop fails part-way the gate STAYS here: mail stays
+ *                gated, the thread is not labelled stopped, and the stop can
+ *                be retried or undone with --unstop.
+ *   stopped      the server confirmed the thread is no longer loaded (or it
+ *                was proven absent from every known app-server). Terminal
+ *                except for an audited --unstop.
+ */
+const GATE_RANK: Record<CodexThreadGate, number> = { "pane-closed": 1, stopping: 2, stopped: 3 };
 
 export interface CodexThreadControlRow {
   thread_id: string;
@@ -46,12 +62,45 @@ export function ensureCodexThreadControlTable(db: Database): void {
       app_server_socket TEXT,
       bound_at TEXT,
       superseded_at TEXT,
-      gate TEXT CHECK (gate IS NULL OR gate IN ('pane-closed', 'stopped')),
+      gate TEXT CHECK (gate IS NULL OR gate IN ('pane-closed', 'stopping', 'stopped')),
       gated_at TEXT,
       gated_peer_ids TEXT NOT NULL DEFAULT '[]'
     )
   `);
   db.run("CREATE INDEX IF NOT EXISTS idx_codex_thread_controls_pane ON codex_thread_controls(tmux_pane_id)");
+  // Append-only record of every gate change, so a stop, a lifted pane-closed
+  // gate, and above all an operator un-stop can be traced afterwards.
+  db.run(`
+    CREATE TABLE IF NOT EXISTS codex_thread_gate_audit (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      thread_id TEXT NOT NULL,
+      action TEXT NOT NULL,
+      from_gate TEXT,
+      to_gate TEXT,
+      proof TEXT,
+      caller_pid INTEGER,
+      peer_ids TEXT NOT NULL DEFAULT '[]',
+      at TEXT NOT NULL
+    )
+  `);
+  db.run("CREATE INDEX IF NOT EXISTS idx_codex_thread_gate_audit_thread ON codex_thread_gate_audit(thread_id, id)");
+}
+
+export function auditCodexThreadGate(db: Database, entry: {
+  threadId: string;
+  action: "gate" | "lift-pane-closed" | "unstop";
+  fromGate: CodexThreadGate | null;
+  toGate: CodexThreadGate | null;
+  proof?: string | null;
+  callerPid?: number | null;
+  peerIds?: string[];
+  nowIso: string;
+}): void {
+  db.run(`
+    INSERT INTO codex_thread_gate_audit (thread_id, action, from_gate, to_gate, proof, caller_pid, peer_ids, at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `, [entry.threadId.toLowerCase(), entry.action, entry.fromGate, entry.toGate, entry.proof ?? null,
+    entry.callerPid ?? null, JSON.stringify(entry.peerIds ?? []), entry.nowIso]);
 }
 
 export function validAppServerSocket(value: unknown): value is string {
@@ -132,6 +181,8 @@ export function applyCodexThreadGate(db: Database, input: {
   gate: CodexThreadGate;
   paneId: string | null;
   nowIso: string;
+  appServerSocket?: string | null;
+  callerPid?: number | null;
 }): { gated_peer_ids: string[]; queued: number; gate: CodexThreadGate } {
   const threadId = input.threadId.toLowerCase();
   return db.transaction(() => {
@@ -143,17 +194,22 @@ export function applyCodexThreadGate(db: Database, input: {
       RETURNING id
     `).all(threadId) as Array<{ id: string }>).map((row) => row.id);
     const ids = [...new Set([...parsedIds(existing?.gated_peer_ids), ...flagged])];
-    // `stopped` is terminal: a later pane-closed notice never downgrades it.
-    const gate: CodexThreadGate = existing?.gate === "stopped" ? "stopped" : input.gate;
+    // Gates only rise: a later pane-closed notice never downgrades a stop.
+    const gate: CodexThreadGate = existing?.gate && GATE_RANK[existing.gate] > GATE_RANK[input.gate] ? existing.gate : input.gate;
     db.run(`
-      INSERT INTO codex_thread_controls (thread_id, tmux_pane_id, gate, gated_at, gated_peer_ids)
-      VALUES (?, ?, ?, ?, ?)
+      INSERT INTO codex_thread_controls (thread_id, tmux_pane_id, app_server_socket, gate, gated_at, gated_peer_ids)
+      VALUES (?, ?, ?, ?, ?, ?)
       ON CONFLICT(thread_id) DO UPDATE SET
         tmux_pane_id = COALESCE(codex_thread_controls.tmux_pane_id, excluded.tmux_pane_id),
+        app_server_socket = COALESCE(codex_thread_controls.app_server_socket, excluded.app_server_socket),
         gate = excluded.gate,
         gated_at = COALESCE(codex_thread_controls.gated_at, excluded.gated_at),
         gated_peer_ids = excluded.gated_peer_ids
-    `, [threadId, input.paneId, gate, input.nowIso, JSON.stringify(ids)]);
+    `, [threadId, input.paneId, input.appServerSocket ?? null, gate, input.nowIso, JSON.stringify(ids)]);
+    auditCodexThreadGate(db, {
+      threadId, action: "gate", fromGate: existing?.gate ?? null, toGate: gate,
+      proof: input.gate, callerPid: input.callerPid, peerIds: ids, nowIso: input.nowIso,
+    });
     const placeholders = ids.map(() => "?").join(",");
     const queued = ids.length === 0 ? 0 : (db.query(
       `SELECT COUNT(*) AS n FROM messages WHERE delivered = 0 AND to_id IN (${placeholders})`,
@@ -183,8 +239,63 @@ export function liftPaneClosedGate(db: Database, threadId: string): number {
       "UPDATE codex_thread_controls SET gate = NULL, gated_at = NULL, gated_peer_ids = '[]' WHERE thread_id = ?",
       [normalized],
     );
+    auditCodexThreadGate(db, {
+      threadId: normalized, action: "lift-pane-closed", fromGate: "pane-closed", toGate: null,
+      proof: "relay-bind", peerIds: parsedIds(control.gated_peer_ids), nowIso: new Date().toISOString(),
+    });
     return restored;
   })();
+}
+
+export type CodexUnstopProof = "loaded-on-app-server" | "operator-override";
+
+/**
+ * Operator recovery from a mistaken stop. The broker cannot inspect the
+ * app-server itself, so the caller states its proof (the thread is loaded
+ * again on its app-server, or an explicit operator override) and that proof is
+ * written to the audit table with the restored peer ids.
+ */
+export function unstopCodexThread(db: Database, input: {
+  threadId: string;
+  proof: CodexUnstopProof;
+  callerPid: number;
+  nowIso: string;
+}): { ok: true; from_gate: CodexThreadGate; restored_peer_ids: string[]; queued: number } | { ok: false; error: string } {
+  const normalized = input.threadId.toLowerCase();
+  return db.transaction(() => {
+    const control = codexThreadControl(db, normalized);
+    const fromGate = control?.gate;
+    if (fromGate !== "stopped" && fromGate !== "stopping") {
+      return { ok: false as const, error: `thread is not stopped (gate ${fromGate ?? "none"})` };
+    }
+    const restored: string[] = [];
+    for (const id of parsedIds(control!.gated_peer_ids)) {
+      const changed = db.run(
+        "UPDATE peers SET non_targetable = 0 WHERE id = ? AND lower(thread_id) = ? AND client_type = 'codex'",
+        [id, normalized],
+      ).changes;
+      if (changed > 0) restored.push(id);
+    }
+    db.run(
+      "UPDATE codex_thread_controls SET gate = NULL, gated_at = NULL, gated_peer_ids = '[]' WHERE thread_id = ?",
+      [normalized],
+    );
+    auditCodexThreadGate(db, {
+      threadId: normalized, action: "unstop", fromGate, toGate: null,
+      proof: input.proof, callerPid: input.callerPid, peerIds: restored, nowIso: input.nowIso,
+    });
+    const placeholders = restored.map(() => "?").join(",");
+    const queued = restored.length === 0 ? 0 : (db.query(
+      `SELECT COUNT(*) AS n FROM messages WHERE delivered = 0 AND to_id IN (${placeholders})`,
+    ).get(...restored) as { n: number }).n;
+    return { ok: true as const, from_gate: fromGate, restored_peer_ids: restored, queued };
+  })();
+}
+
+/** Every app-server socket a relay has ever recorded (absence-proof input). */
+export function recordedAppServerSockets(db: Database): string[] {
+  return (db.query("SELECT DISTINCT app_server_socket AS socket FROM codex_thread_controls WHERE app_server_socket IS NOT NULL")
+    .all() as Array<{ socket: string }>).map((row) => row.socket);
 }
 
 /** Lookup for codex-thread-stop. Includes superseded, gated, and dead rows. */
