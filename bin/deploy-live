@@ -95,9 +95,15 @@ if [[ "$needs_broker" == 1 ]] && "$SYSTEMCTL" --user is-active --quiet "$UNIT" 2
 
 short_old=$(git_ rev-parse --short "$OLD"); short_new=$(git_ rev-parse --short "$NEW")
 echo "deploy-live: $short_old -> $short_new ($(wc -l <<<"$CHANGED" | tr -d ' ') files)"
-echo "  broker restart: $([[ $managed == 1 ]] && echo yes || { [[ $needs_broker == 1 ]] && echo "needed, but $UNIT is not active" || echo no; })"
-echo "  dependencies:   $([[ $needs_deps == 1 ]] && echo "bun install --frozen-lockfile" || echo unchanged)"
-ROLLBACK="git -C $ROOT reset --keep $short_old$([[ $managed == 1 ]] && echo " && $SYSTEMCTL --user restart $UNIT")"
+restart_plan=no
+if [[ "$managed" == 1 ]]; then restart_plan=yes
+elif [[ "$needs_broker" == 1 ]]; then restart_plan="needed, but $UNIT is not active"; fi
+deps_plan=unchanged
+if [[ "$needs_deps" == 1 ]]; then deps_plan="bun install --frozen-lockfile"; fi
+ROLLBACK="git -C $ROOT reset --keep $short_old"
+if [[ "$managed" == 1 ]]; then ROLLBACK+=" && $SYSTEMCTL --user restart $UNIT"; fi
+echo "  broker restart: $restart_plan"
+echo "  dependencies:   $deps_plan"
 echo "  rollback:       $ROLLBACK"
 if [[ "$DRY_RUN" == 1 ]]; then
   echo "deploy-live: dry run, nothing changed"
@@ -132,6 +138,6 @@ printf '%s %s %s..%s broker_restart=%s status=%s\n' "$(date -Iseconds)" "$BRANCH
 
 [[ "$status" == ok ]] || die "broker did not report ready within ${READY_SECONDS}s; returned to $short_old and restarted it"
 echo "deploy-live: now at $short_new"
-[[ "$touches_adapter" == 1 ]] && echo "  note: running MCP adapters keep their old code until each client session restarts"
-[[ "$touches_hook_config" == 1 ]] && echo "  note: canonical hooks changed; run the hook installers with --check for each profile"
+if [[ "$touches_adapter" == 1 ]]; then echo "  note: running MCP adapters keep their old code until each client session restarts"; fi
+if [[ "$touches_hook_config" == 1 ]]; then echo "  note: canonical hooks changed; run the hook installers with --check for each profile"; fi
 exit 0
