@@ -6,6 +6,10 @@
  *   - thread/archive of a loaded thread -> {} and the thread unloads (notLoaded)
  *   - thread/archive again              -> error "no rollout found for thread id <id>"
  *   - turn/interrupt with no live turn  -> error "no active turn to interrupt"
+ * Subagent threads carry parentThreadId and updatedAt (Unix seconds) as in
+ * the v2 Thread. Archiving a parent does NOT unload its subagents unless the
+ * server is built with cascadeArchive: the real 0.160.1 server cascades
+ * (scratch proof, 2026-10-06), but callers must not rely on it.
  * Every request is recorded with its threadId so tests can prove which
  * threads were touched.
  *
@@ -14,11 +18,15 @@
  *   node --experimental-strip-types fake-codex-app-server.ts SOCKET STATE_JSON CALLS_JSON
  */
 import { createRequire } from "node:module";
-import { writeFileSync } from "node:fs";
+import { renameSync, writeFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
 export interface FakeThread {
-  status: "idle" | "active" | "notLoaded";
+  status: "idle" | "active" | "notLoaded" | "systemError";
+  /** Set on a subagent: the thread that spawned it. */
+  parentThreadId?: string;
+  /** Unix seconds of the last update (thread/read updatedAt). */
+  updatedAt?: number;
   archived?: boolean;
   turns?: Array<{ id: string; status: "inProgress" | "completed" | "interrupted" }>;
   /** Reads that still report "active" after an interrupt (settle latency). */
@@ -40,8 +48,12 @@ export class FakeCodexAppServer {
   readonly calls: FakeCall[] = [];
   initialized = false;
 
-  constructor(threads: Record<string, FakeThread>) {
+  /** Archiving a thread also unloads its loaded subagents (real 0.160.1 behaviour). */
+  readonly cascadeArchive: boolean;
+
+  constructor(threads: Record<string, FakeThread>, options: { cascadeArchive?: boolean } = {}) {
     this.threads = new Map(Object.entries(threads));
+    this.cascadeArchive = options.cascadeArchive ?? false;
   }
 
   callsFor(threadId: string): string[] {
@@ -55,6 +67,14 @@ export class FakeCodexAppServer {
 
   loadedIds(): string[] {
     return [...this.threads].filter(([, thread]) => thread.status !== "notLoaded" && !thread.archived).map(([id]) => id);
+  }
+
+  private unloadSubagentsOf(parentId: string): void {
+    for (const [id, child] of this.threads) {
+      if (child.parentThreadId !== parentId || child.status === "notLoaded") continue;
+      child.status = "notLoaded";
+      this.unloadSubagentsOf(id);
+    }
   }
 
   /** One JSON text frame in, zero or more JSON text frames out. */
@@ -82,7 +102,14 @@ export class FakeCodexAppServer {
           if ((thread.settleReads ?? 0) > 0) thread.settleReads! -= 1;
           else { thread.status = "idle"; status = "idle"; }
         }
-        return reply({ thread: { id: thread.answerAs ?? threadId, status: status === "active" ? { type: "active", activeFlags: [] } : { type: status } } });
+        const parent = thread.parentThreadId ?? null;
+        return reply({ thread: {
+          id: thread.answerAs ?? threadId,
+          status: status === "active" ? { type: "active", activeFlags: [] } : { type: status },
+          parentThreadId: parent,
+          source: parent ? { subAgent: { thread_spawn: { parent_thread_id: parent, depth: 1, agent_path: null, agent_nickname: null, agent_role: null } } } : "vscode",
+          updatedAt: thread.updatedAt ?? Math.floor(Date.now() / 1000),
+        } });
       }
       case "thread/turns/list": {
         if (!thread) return fail(`thread not loaded: ${threadId}`);
@@ -106,6 +133,7 @@ export class FakeCodexAppServer {
         thread.archived = true;
         thread.status = "notLoaded";
         for (const turn of thread.turns ?? []) if (turn.status === "inProgress") turn.status = "interrupted";
+        if (this.cascadeArchive) this.unloadSubagentsOf(threadId!);
         return reply({});
       }
       case "turn/start":
@@ -135,7 +163,9 @@ if (isMain) {
   socketServer.on("connection", (client: { on: (event: string, listener: (data: unknown) => void) => void; send: (text: string) => void }) => {
     client.on("message", (data) => {
       for (const frame of fake.handle(String(data))) client.send(frame);
-      writeFileSync(callsPath, JSON.stringify({ calls: fake.calls, loaded: fake.loadedIds() }));
+      // Atomic replace: the test may read the file while the next frame lands.
+      writeFileSync(`${callsPath}.tmp`, JSON.stringify({ calls: fake.calls, loaded: fake.loadedIds() }));
+      renameSync(`${callsPath}.tmp`, callsPath);
     });
   });
   httpServer.listen(socketPath, () => console.log("ready"));

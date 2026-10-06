@@ -213,11 +213,15 @@ What it does, in order:
 3. Sets the intermediate `stopping` gate in the broker (`/codex-thread-gate`)
    before touching the turn, so peer mail is already held.
 4. Sends `turn/interrupt` for each in-progress turn listed by
-   `thread/turns/list`, then `thread/archive` for that thread only. The
-   server is never restarted and no other thread is addressed.
-5. Verifies with `thread/read` and `thread/loaded/list` that the thread is
-   no longer loaded. Only then does it raise the gate to the permanent
-   `stopped`. `--dry-run` sends only read-only status calls.
+   `thread/turns/list`. It then sends `thread/archive` to each loaded
+   subagent of the thread, deepest first, and then to the thread itself.
+   Subagents are found by reading every loaded thread with `thread/read`
+   and following `parentThreadId`. The server is never restarted, and no
+   thread outside that tree is archived.
+5. Verifies with `thread/read` and `thread/loaded/list` that neither the
+   thread nor any of its subagents is still loaded. Only then does it raise
+   the gate to the permanent `stopped`. `--dry-run` sends only read-only
+   status calls and lists the subagents it would archive.
 
 A thread that the chosen server does not have loaded is not assumed dead.
 This matters because the socket may be wrong: there is one app-server per
@@ -287,6 +291,34 @@ routes, gates and the `codex_thread_controls` table. Running relays keep their
 old code until their `codex-shared-seat` pane is relaunched; until then they
 record no app-server socket and send no pane-closed gate, so use `--socket`
 for panes bound before the deploy.
+
+### Reaping orphaned Codex subagents
+
+A subagent thread stays loaded after its work is done, and it can outlive its
+parent. Each loaded subagent holds managed network proxy listeners and session
+fds, so on a long-lived shared app-server they add up until the server runs
+out of file descriptors. `bin/codex-subagent-reaper` archives the ones that
+are safe to archive:
+
+```bash
+bin/codex-subagent-reaper                 # dry run: list what would be archived
+bin/codex-subagent-reaper --apply         # archive them
+bin/codex-subagent-reaper --grace-min 60  # change the grace period (default 30)
+```
+
+It archives a thread only when all of these hold: it is a subagent (it has a
+`parentThreadId`); its status is `idle`; its parent is absent from
+`thread/loaded/list` on every known app-server socket; and its `updatedAt` is
+older than the grace period. Just before each archive it reads the thread
+again and re-checks the parent on every server. After the archive it confirms
+the thread has left `thread/loaded/list`. It never archives a lane thread
+(no parent), an active subagent, or a subagent whose parent is loaded
+anywhere. A lane thread or orphan in `systemError` is only reported, for its
+owning lane to handle. Known sockets are the same set `codex-thread-stop`
+uses. If any of them is unreachable, the run is refused and nothing changes.
+
+Exit codes: `0` dry run, or every candidate archived; `1` an archive failed
+or did not verify; `2` refused (nothing changed); `64` usage.
 
 ### Verify the installation
 

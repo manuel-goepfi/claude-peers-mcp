@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Archive idle, orphaned Codex subagent threads (see codex-subagent-reaper.ts).
+# Dry run unless --apply. Runs under Node like codex-thread-stop: the installed
+# `ws` package provides the ws+unix transport the app-server socket speaks.
+set -euo pipefail
+SELF="$(readlink -f "$0")"
+ROOT="$(cd -- "$(dirname -- "$SELF")/.." && pwd -P)"
+exec node --experimental-strip-types --disable-warning=ExperimentalWarning \
+  "$ROOT/bin/codex-subagent-reaper.ts" "$@"
