@@ -20,6 +20,7 @@ const EXPECTED_CODEX_GLOBAL_OPTIONS = [
   "--local-provider",
   "--model",
   "--no-alt-screen",
+  "--no-daemon",
   "--oss",
   "--profile",
   "--remote",
@@ -119,7 +120,7 @@ afterEach(() => {
 
 describe("codex-seat launcher", () => {
   const installedCodex = Bun.which("codex");
-  (installedCodex ? test : test.skip)("pins the launcher audit table to the installed Codex --help", () => {
+  (installedCodex ? test : test.skip)("pins the launcher audit table to the installed Codex 0.160.1 --help", () => {
     const result = Bun.spawnSync([installedCodex!, "--help"], { stdout: "pipe", stderr: "pipe" });
     expect(result.exitCode).toBe(0);
     const help = new TextDecoder().decode(result.stdout);
@@ -360,6 +361,55 @@ describe("codex-seat launcher", () => {
     expect(result.exitCode).toBe(0);
     expect(existsSync(join(state, "app.pid"))).toBe(false);
     expect(readFileSync(join(state, "tui.args"), "utf8")).toBe(`${args.join("\n")}\n`);
+  });
+
+  test.each([
+    ["interactive", ["--no-daemon"]],
+    ["resume", ["--no-daemon", "resume"]],
+    ["after a known option", ["--search", "--no-daemon", "resume"]],
+  ])("passes --no-daemon straight to Codex instead of wrapping it in a seat (%s)", (_label, args) => {
+    // Codex 0.160.1 refuses `--no-daemon` together with `--remote`, and every
+    // seat launch injects `--remote`. Wrapping would turn the operator's
+    // in-process request into a launch Codex rejects, so it passes through
+    // verbatim like any explicit endpoint choice.
+    const { root, state, fakeCodex } = fixture();
+    const result = Bun.spawnSync([LAUNCHER, ...args], {
+      env: {
+        PATH: process.env.PATH ?? "",
+        HOME: root,
+        CLAUDE_PEERS_REAL_CODEX: fakeCodex,
+        FAKE_CODEX_STATE: state,
+        FAKE_CODEX_RECORD_ONLY: "1",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(existsSync(join(state, "app.pid"))).toBe(false);
+    expect(readFileSync(join(state, "tui.args"), "utf8")).toBe(`${args.join("\n")}\n`);
+  });
+
+  test("fails loudly instead of wrapping --no-daemon after an unknown option", () => {
+    const { root, state, fakeCodex } = fixture();
+    const result = Bun.spawnSync([LAUNCHER, "--future-option", "--no-daemon", "resume"], {
+      env: {
+        PATH: process.env.PATH ?? "",
+        HOME: root,
+        CODEX_HOME: join(root, ".codex"),
+        CLAUDE_PEERS_REAL_CODEX: fakeCodex,
+        CLAUDE_PEERS_CODEX_SEAT_PORT: String(freePort()),
+        FAKE_CODEX_STATE: state,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    expect(result.exitCode).toBe(2);
+    expect(new TextDecoder().decode(result.stderr)).toContain("--no-daemon conflicts with a pane-local seat");
+    expect(new TextDecoder().decode(result.stderr)).toContain("CLAUDE_PEERS_CODEX_SEAT=0");
+    expect(existsSync(join(state, "app.pid"))).toBe(false);
+    expect(existsSync(join(state, "tui.pid"))).toBe(false);
   });
 
   test("keeps an unknown-option help request on the fail-toward-seat path", () => {

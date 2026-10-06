@@ -55,6 +55,36 @@ async function readReadyLine(stream: ReadableStream<Uint8Array>): Promise<number
   }
 }
 
+/**
+ * Env overrides for a spawned MCP adapter that must register under the
+ * CLAUDE_PEER_NAME its test sets.
+ *
+ * Unsetting TMUX and TMUX_PANE is not enough: the adapter discovers its pane by
+ * walking the process tree against `tmux list-panes -a` on the default socket,
+ * and since d188744 a discovered pane outranks CLAUDE_PEER_NAME. A suite run
+ * from inside a live tmux session therefore registered the adapter under the
+ * operator's pane label (measured 2026-10-06: "infra.6"), and every test that
+ * finds its adapter by name failed, while the same commit passed outside tmux.
+ *
+ * Pointing the adapter at a socket no server listens on makes discovery find
+ * nothing on every host. The CLAUDE_PEER_TMUX_* launch hints are the env-only
+ * route to the same pane. Apply this per spawn, not in the preload: tests that
+ * start a private tmux server rely on processes inside its panes resolving
+ * that server from $TMUX, which a global socket override would defeat.
+ */
+export function withoutHostTmux(root: string): Record<string, string | undefined> {
+  return {
+    TMUX: undefined,
+    TMUX_PANE: undefined,
+    CLAUDE_PEERS_TMUX_SOCKET: join(root, "no-tmux-server.sock"),
+    CLAUDE_PEER_TMUX_SESSION: undefined,
+    CLAUDE_PEER_TMUX_WINDOW_INDEX: undefined,
+    CLAUDE_PEER_TMUX_WINDOW_NAME: undefined,
+    CLAUDE_PEER_TMUX_WINDOW_PANES: undefined,
+    CLAUDE_PEER_TMUX_PANE_ID: undefined,
+  };
+}
+
 export async function waitForBrokerHealth(url: string, timeoutMs = 8000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   let lastError = "no response";
