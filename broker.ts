@@ -47,6 +47,9 @@ import type {
   AckByPidRequest,
   AckByThreadRequest,
   AckByPidResponse,
+  ReleaseByPidRequest,
+  ReleaseByThreadRequest,
+  ReleaseByPidResponse,
   HookHeartbeatByPidRequest,
   HookHeartbeatByThreadRequest,
   DeliveryState,
@@ -787,6 +790,15 @@ const markDeliveredScoped = db.prepare(`
 const markDeliveredClaimedScoped = db.prepare(`
   UPDATE messages SET delivered = 1, delivered_at = ?, retention_at = ?, claimed_by = NULL, claimed_at = NULL
   WHERE id = ? AND to_id IN (${mailboxIdsSql}) AND claimed_by = ?
+`);
+
+// Release returns a claim to the queue at once instead of letting it lapse
+// after CLAIM_TTL_MS. Scoped exactly like markDeliveredClaimedScoped: only the
+// drain that holds the claim, on the authenticated mailbox, and never a
+// delivered row.
+const releaseClaimScoped = db.prepare(`
+  UPDATE messages SET claimed_by = NULL, claimed_at = NULL
+  WHERE id = ? AND to_id IN (${mailboxIdsSql}) AND claimed_by = ? AND delivered = 0
 `);
 
 // Companion lookup for latency telemetry: reads sent_at + from_id BEFORE
@@ -3896,6 +3908,42 @@ function handleAckWithAuth(body: Omit<AckByPidRequest, "pid">, auth: { ok: true;
   return { ok: true, peer_id: auth.id, acked, ...(acked > 0 ? { state: "acknowledged" as const } : {}) };
 }
 
+function handleReleaseByPid(body: ReleaseByPidRequest): ReleaseByPidResponse {
+  const auth = authPidDrain(Number(body.pid), Number(body.caller_pid));
+  if (!auth.ok) return { ok: false, status: auth.status, error: auth.error };
+  return handleReleaseWithAuth(body, auth);
+}
+
+function handleReleaseByThread(body: ReleaseByThreadRequest): ReleaseByPidResponse {
+  const auth = authThreadDrain(body.thread_id, Number(body.caller_pid));
+  if (!auth.ok) return { ok: false, status: auth.status, error: auth.error };
+  return handleReleaseWithAuth(body, auth);
+}
+
+/**
+ * A hook claimed mail and then failed to surface it (renderer crashed, cwd
+ * deleted). Without this the claim held the mail invisible to check_messages
+ * for CLAIM_TTL_MS, and a looping consumer re-claimed it every poll, so it was
+ * never visible at all (2026-10-05 standby-watcher incident).
+ */
+function handleReleaseWithAuth(body: Omit<ReleaseByPidRequest, "pid">, auth: { ok: true; id: string }): ReleaseByPidResponse {
+  const limited = rateCheck(auth.id, false);
+  if (limited) return { ok: false, status: 429, error: limited };
+  const drainId = typeof body.drain_id === "string" ? body.drain_id : "";
+  if (!drainId) return { ok: false, status: 400, error: "missing drain_id" };
+  const ids = Array.isArray(body.ids) ? body.ids.filter((id) => Number.isInteger(id)) : [];
+  const released = db.transaction(() => {
+    let count = 0;
+    for (const id of ids) count += releaseClaimScoped.run(id, auth.id, drainId).changes;
+    return count;
+  })();
+  if (released > 0) {
+    const via = typeof body.via === "string" && body.via.length > 0 ? body.via.slice(0, 64) : "hook";
+    console.error(`[broker] release to=${auth.id} drain=${drainId.slice(0, 160)} released=${released} via=${via}`);
+  }
+  return { ok: true, peer_id: auth.id, released, ...(released > 0 ? { state: "queued" as const } : {}) };
+}
+
 // /poll-by-pid: unauthenticated-by-token, PID-authenticated drain path used
 // by the UserPromptSubmit hook to surface pending peer mail without having
 // the MCP server's in-memory auth token. Atomically fetches undelivered
@@ -4203,6 +4251,14 @@ requestHandler = async (req: Request) => {
         const res = handleSendByPid(body as Record<string, unknown>);
         if (!res.ok) return Response.json({ error: res.error, code: res.code, candidates: res.candidates }, { status: res.status ?? 400 });
         return Response.json(res);
+      }
+
+      if (path === "/release-by-pid" || path === "/release-by-thread") {
+        const res = path === "/release-by-pid"
+          ? handleReleaseByPid(body as unknown as ReleaseByPidRequest)
+          : handleReleaseByThread({ ...body, thread_id: typeof body.thread_id === "string" ? body.thread_id : "" } as ReleaseByThreadRequest);
+        if (!res.ok) return Response.json({ error: res.error }, { status: res.status ?? 400 });
+        return Response.json({ ok: true, peer_id: res.peer_id, released: res.released, state: res.state });
       }
 
       if (path === "/claim-by-thread" || path === "/ack-by-thread" || path === "/hook-heartbeat-by-thread") {

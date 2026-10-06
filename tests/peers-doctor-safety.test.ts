@@ -82,7 +82,7 @@ describe("peers doctor safety", () => {
   test("all doctor source is limited to the coarse health endpoint", () => {
     const source = [doctorWrapper, doctor, doctorLibrary].map((path) => readFileSync(path, "utf8")).join("\n");
     expect(source).toContain("/health");
-    for (const forbidden of ["/poll-by-pid", "/claim-by-pid", "/ack-by-pid", "/hook-heartbeat-by-pid", "/poll-messages", "/ack-messages"]) {
+    for (const forbidden of ["/poll-by-pid", "/claim-by-pid", "/ack-by-pid", "/release-by-pid", "/release-by-thread", "/hook-heartbeat-by-pid", "/poll-messages", "/ack-messages"]) {
       expect(source).not.toContain(forbidden);
     }
   });
