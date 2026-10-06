@@ -22,11 +22,13 @@ import { renameSync, writeFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
 export interface FakeThread {
-  status: "idle" | "active" | "notLoaded" | "systemError";
+  status: "idle" | "active" | "notLoaded" | "systemError" | "unknownFutureStatus";
   /** Set on a subagent: the thread that spawned it. */
   parentThreadId?: string;
-  /** Unix seconds of the last update (thread/read updatedAt). */
-  updatedAt?: number;
+  /** Unix seconds of the last update (thread/read updatedAt); null omits it. */
+  updatedAt?: number | null;
+  /** thread/read `source` override (default: subAgent when parentThreadId is set, else "vscode"). */
+  source?: unknown;
   archived?: boolean;
   turns?: Array<{ id: string; status: "inProgress" | "completed" | "interrupted" }>;
   /** Reads that still report "active" after an interrupt (settle latency). */
@@ -107,8 +109,9 @@ export class FakeCodexAppServer {
           id: thread.answerAs ?? threadId,
           status: status === "active" ? { type: "active", activeFlags: [] } : { type: status },
           parentThreadId: parent,
-          source: parent ? { subAgent: { thread_spawn: { parent_thread_id: parent, depth: 1, agent_path: null, agent_nickname: null, agent_role: null } } } : "vscode",
-          updatedAt: thread.updatedAt ?? Math.floor(Date.now() / 1000),
+          source: thread.source !== undefined ? thread.source
+            : parent ? { subAgent: { thread_spawn: { parent_thread_id: parent, depth: 1, agent_path: null, agent_nickname: null, agent_role: null } } } : "vscode",
+          updatedAt: thread.updatedAt === undefined ? Math.floor(Date.now() / 1000) : thread.updatedAt,
         } });
       }
       case "thread/turns/list": {

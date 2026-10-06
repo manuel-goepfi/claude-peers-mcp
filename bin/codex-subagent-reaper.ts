@@ -12,7 +12,7 @@
  * Dry run by default; `--apply` archives. A thread is archived ONLY when all
  * of these hold:
  *   - it is a subagent (thread/read names a parentThreadId);
- *   - its status is `idle` (never active, systemError, or unknown);
+ *   - its status is `idle` (never active, systemError, or anything else);
  *   - its parent is absent from thread/loaded/list on EVERY known app-server
  *     socket (one unreachable server refuses the whole run);
  *   - its updatedAt is older than the grace period (default 30 minutes).
@@ -20,6 +20,9 @@
  * immediately before its archive, and the archive is verified with
  * thread/loaded/list. Top-level (lane) threads are never archived; a lane
  * thread in `systemError` is only reported, for its owning lane to handle.
+ * Every thread whose type, parent, status or age cannot be determined (an
+ * unreadable thread, an unknown source, a subagent-typed source with no
+ * parent id, an unknown status, no updatedAt) is kept and reported.
  *
  * Known sockets are the same set codex-thread-stop uses:
  * CLAUDE_PEERS_CODEX_APP_SERVER_SOCKETS (colon-separated) when set, else the
@@ -30,6 +33,7 @@
  */
 import { pathToFileURL } from "node:url";
 import {
+  type SourceKind,
   canonicalSocket,
   connectAppServer,
   defaultKnownSockets,
@@ -74,30 +78,39 @@ export interface LoadedThread {
   status: string;
   parentThreadId: string | null;
   updatedAt: number | null;
+  sourceKind: SourceKind;
 }
 
+/** "report" is always kept: it flags a thread for a human or its owning lane. */
 export type Verdict =
   | { action: "archive"; reason: string }
   | { action: "keep"; reason: string }
   | { action: "report"; reason: string };
 
+const KNOWN_STATUSES = new Set(["idle", "active", "systemError"]);
+
 /** The whole archive rule. `loadedEverywhere` is the union of every known server's loaded list. */
 export function classifyThread(thread: LoadedThread, loadedEverywhere: Set<string>, nowMs: number, graceMs: number): Verdict {
-  if (!thread.parentThreadId) {
-    return thread.status === "systemError"
-      ? { action: "report", reason: "lane thread in systemError: route to its owning lane (never archived here)" }
-      : { action: "keep", reason: "lane thread" };
+  const parent = thread.parentThreadId;
+  if (!parent) {
+    // Only a thread whose source says it is client-started counts as a lane thread.
+    if (thread.sourceKind === "subagent") return { action: "report", reason: "subagent-typed thread with no parent id: ownership unknown; kept" };
+    if (thread.sourceKind === "unknown") return { action: "report", reason: "unknown thread source: type unknown; kept" };
+    if (thread.status === "systemError") return { action: "report", reason: "lane thread in systemError: route to its owning lane (never archived here)" };
+    if (!KNOWN_STATUSES.has(thread.status)) return { action: "report", reason: `lane thread with unknown status ${thread.status}; kept` };
+    return { action: "keep", reason: "lane thread" };
   }
-  if (loadedEverywhere.has(thread.parentThreadId)) return { action: "keep", reason: `parent ${thread.parentThreadId} is loaded` };
+  if (loadedEverywhere.has(parent)) return { action: "keep", reason: `parent ${parent} is loaded` };
   if (thread.status !== "idle") {
+    if (thread.status === "active") return { action: "keep", reason: "status active" };
     return thread.status === "systemError"
-      ? { action: "report", reason: `orphan subagent in systemError (parent ${thread.parentThreadId} not loaded); not archived` }
-      : { action: "keep", reason: `status ${thread.status}` };
+      ? { action: "report", reason: `orphan subagent in systemError (parent ${parent} not loaded); kept` }
+      : { action: "report", reason: `orphan subagent with unknown status ${thread.status}; kept` };
   }
-  if (thread.updatedAt === null) return { action: "keep", reason: "no updatedAt; cannot apply the grace period" };
+  if (thread.updatedAt === null) return { action: "report", reason: "orphan subagent with no updatedAt: age unknown; kept" };
   const idleMs = nowMs - thread.updatedAt;
   if (idleMs < graceMs) return { action: "keep", reason: `updated ${minutes(idleMs)}m ago, inside the ${minutes(graceMs)}m grace period` };
-  return { action: "archive", reason: `idle orphan: parent ${thread.parentThreadId} is loaded on no known app-server; idle ${minutes(idleMs)}m` };
+  return { action: "archive", reason: `idle orphan: parent ${parent} is loaded on no known app-server; idle ${minutes(idleMs)}m` };
 }
 
 function minutes(ms: number): number {
@@ -130,7 +143,7 @@ async function listLoaded(servers: Map<string, RpcConnection>):
 async function readLoaded(socket: string, rpc: RpcConnection, threadId: string): Promise<LoadedThread | { error: string } | null> {
   const info = await threadStatus(rpc, threadId);
   if (!info.known) return info.transport ? { error: `thread/read ${threadId} on ${socket} failed: ${info.error}` } : null;
-  return { socket, threadId, status: info.status, parentThreadId: info.parentThreadId, updatedAt: info.updatedAt };
+  return { socket, threadId, status: info.status, parentThreadId: info.parentThreadId, updatedAt: info.updatedAt, sourceKind: info.sourceKind };
 }
 
 export async function runCodexSubagentReaper(options: ReaperOptions, deps: ReaperDeps): Promise<number> {
@@ -162,7 +175,7 @@ export async function runCodexSubagentReaper(options: ReaperOptions, deps: Reape
       for (const threadId of union.bySocket.get(socket)!) {
         const thread = await readLoaded(socket, rpc, threadId);
         if (thread === null) continue; // unloaded since the listing
-        if ("error" in thread) { counts.keep++; out(`  keep    ${threadId} (${socket}): unreadable: ${thread.error}`); continue; }
+        if ("error" in thread) { counts.report++; out(`  report  ${threadId} (${socket}): unreadable, kept: ${thread.error}`); continue; }
         const verdict = classifyThread(thread, union.ids, now(), options.graceMs);
         counts[verdict.action]++;
         if (verdict.action === "archive") candidates.push(thread);
@@ -170,7 +183,7 @@ export async function runCodexSubagentReaper(options: ReaperOptions, deps: Reape
         if (verdict.action !== "keep" || thread.parentThreadId) out(`  ${verdict.action.padEnd(7)} ${threadId} (${socket}): ${verdict.reason}`);
       }
     }
-    out(`codex-subagent-reaper: ${counts.archive} to archive, ${counts.report} reported, ${counts.keep} kept`);
+    out(`codex-subagent-reaper: ${counts.archive} to archive, ${counts.report} reported (kept), ${counts.keep} kept`);
     if (!options.apply) {
       out("codex-subagent-reaper: dry run: read-only calls only; rerun with --apply to archive");
       return REAPER_EXIT.ok;

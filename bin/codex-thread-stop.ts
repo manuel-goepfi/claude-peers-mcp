@@ -384,9 +384,28 @@ export async function loadedThreadIds(rpc: RpcConnection): Promise<Set<string> |
 // saying it does not know a thread, so they must never read as "already gone".
 const TRANSPORT_ERROR_CODES = new Set([-32000, -32001]);
 
+/**
+ * What the v2 Thread `source` says the thread is: a client-started top-level
+ * thread ("cli", "vscode", "exec", "mcp", "appServer", or {custom}), a
+ * subagent ({subAgent}), or anything else ("unknown", {internal}, missing).
+ */
+export type SourceKind = "top-level" | "subagent" | "unknown";
+
 export type ThreadStatus =
   | { known: false; error: string; transport: boolean }
-  | { known: true; status: string; id: string | null; parentThreadId: string | null; updatedAt: number | null };
+  | { known: true; status: string; id: string | null; parentThreadId: string | null; updatedAt: number | null; sourceKind: SourceKind };
+
+const TOP_LEVEL_SOURCES = new Set(["cli", "vscode", "exec", "mcp", "appserver"]);
+
+function sourceKindOf(source: unknown): SourceKind {
+  if (typeof source === "string") return TOP_LEVEL_SOURCES.has(source.toLowerCase()) ? "top-level" : "unknown";
+  if (source && typeof source === "object") {
+    const keys = Object.keys(source).map((key) => key.toLowerCase());
+    if (keys.includes("subagent")) return "subagent";
+    if (keys.length === 1 && keys[0] === "custom") return "top-level";
+  }
+  return "unknown";
+}
 
 /**
  * A subagent names its parent in `parentThreadId` (v2 Thread); older servers
@@ -411,7 +430,7 @@ export async function threadStatus(rpc: RpcConnection, threadId: string): Promis
   const status = thread?.status?.type;
   return {
     known: true, status: typeof status === "string" ? status : "unknown", id: typeof thread?.id === "string" ? thread.id.toLowerCase() : null,
-    parentThreadId: thread ? parentOf(thread) : null, updatedAt: updatedAtMs(thread?.updatedAt),
+    parentThreadId: thread ? parentOf(thread) : null, updatedAt: updatedAtMs(thread?.updatedAt), sourceKind: sourceKindOf(thread?.source),
   };
 }
 

@@ -16,6 +16,11 @@ const ORPHAN_ACTIVE = "01a11200-0000-7000-8000-000000000003";
 const CHILD_OF_LANE_A = "01a11200-0000-7000-8000-000000000004";
 const CHILD_OF_LANE_B = "01a11200-0000-7000-8000-000000000005";
 const ORPHAN_ERR = "01a11200-0000-7000-8000-000000000006";
+const SUBAGENT_NO_PARENT = "01a11200-0000-7000-8000-000000000007";
+const UNKNOWN_SOURCE = "01a11200-0000-7000-8000-000000000008";
+const ORPHAN_NO_AGE = "01a11200-0000-7000-8000-000000000009";
+const ORPHAN_ODD_STATUS = "01a11200-0000-7000-8000-00000000000a";
+const UNREADABLE = "01a11200-0000-7000-8000-00000000000b";
 
 const NOW_MS = Date.UTC(2026, 9, 6, 18, 0, 0);
 const minutesAgo = (minutes: number) => Math.floor((NOW_MS - minutes * 60_000) / 1000);
@@ -192,15 +197,56 @@ describe("codex-subagent-reaper dry run", () => {
 
   test("classification rule", () => {
     const loaded = new Set([LANE_A]);
-    const base = { socket: SOCKET_A, threadId: ORPHAN_OLD, status: "idle", parentThreadId: PARENT_GONE, updatedAt: NOW_MS - 120 * 60_000 };
+    const base = { socket: SOCKET_A, threadId: ORPHAN_OLD, status: "idle", parentThreadId: PARENT_GONE, updatedAt: NOW_MS - 120 * 60_000, sourceKind: "subagent" as const };
     const grace = 30 * 60_000;
     expect(classifyThread(base, loaded, NOW_MS, grace).action).toBe("archive");
     expect(classifyThread({ ...base, parentThreadId: LANE_A }, loaded, NOW_MS, grace).action).toBe("keep");
     expect(classifyThread({ ...base, status: "active" }, loaded, NOW_MS, grace).action).toBe("keep");
-    expect(classifyThread({ ...base, status: "unknown" }, loaded, NOW_MS, grace).action).toBe("keep");
-    expect(classifyThread({ ...base, updatedAt: null }, loaded, NOW_MS, grace).action).toBe("keep");
+    expect(classifyThread({ ...base, status: "unknown" }, loaded, NOW_MS, grace).action).toBe("report");
+    expect(classifyThread({ ...base, updatedAt: null }, loaded, NOW_MS, grace).action).toBe("report");
     expect(classifyThread({ ...base, updatedAt: NOW_MS - 29 * 60_000 }, loaded, NOW_MS, grace).action).toBe("keep");
-    expect(classifyThread({ ...base, parentThreadId: null }, loaded, NOW_MS, grace).action).toBe("keep");
-    expect(classifyThread({ ...base, parentThreadId: null, status: "systemError" }, loaded, NOW_MS, grace).action).toBe("report");
+    const lane = { ...base, parentThreadId: null, sourceKind: "top-level" as const };
+    expect(classifyThread(lane, loaded, NOW_MS, grace).action).toBe("keep");
+    expect(classifyThread({ ...lane, status: "systemError" }, loaded, NOW_MS, grace).action).toBe("report");
+    expect(classifyThread({ ...lane, status: "unknown" }, loaded, NOW_MS, grace).action).toBe("report");
+    // Never "lane thread" unless the source says so.
+    expect(classifyThread({ ...lane, sourceKind: "subagent" }, loaded, NOW_MS, grace)).toMatchObject({ action: "report" });
+    expect(classifyThread({ ...lane, sourceKind: "unknown" }, loaded, NOW_MS, grace)).toMatchObject({ action: "report" });
+  });
+});
+
+describe("codex-subagent-reaper: ambiguous threads are kept and reported", () => {
+  function ambiguousFleet() {
+    const { a, b, servers } = fleet({
+      // Subagent-typed source but no parent id: not a lane thread, not provably orphaned.
+      [SUBAGENT_NO_PARENT]: { status: "idle", updatedAt: minutesAgo(600), source: { subAgent: "review" } },
+      [UNKNOWN_SOURCE]: { status: "idle", updatedAt: minutesAgo(600), source: { internal: "memory_consolidation" } },
+      [ORPHAN_NO_AGE]: { status: "idle", parentThreadId: PARENT_GONE, updatedAt: null },
+      [ORPHAN_ODD_STATUS]: { status: "unknownFutureStatus", parentThreadId: PARENT_GONE, updatedAt: minutesAgo(600) },
+      [UNREADABLE]: { status: "idle", parentThreadId: PARENT_GONE, updatedAt: minutesAgo(600) },
+    });
+    const original = a.handle.bind(a);
+    a.handle = (text: string) => {
+      const message = JSON.parse(text) as { id?: string; method?: string; params?: { threadId?: string } };
+      if (message.method === "thread/read" && message.params?.threadId === UNREADABLE) {
+        return [JSON.stringify({ id: message.id, error: { code: -32001, message: "thread/read timed out" } })];
+      }
+      return original(text);
+    };
+    return { a, b, servers };
+  }
+
+  test("each ambiguous thread is reported, none is archived, and only the provable orphan goes", async () => {
+    const { a, servers } = ambiguousFleet();
+    const run = await reap(["--apply"], servers);
+    expect(run.code).toBe(REAPER_EXIT.ok);
+    expect(archivedIds(a)).toEqual([ORPHAN_OLD]);
+    expect(a.loadedIds()).toEqual(expect.arrayContaining([SUBAGENT_NO_PARENT, UNKNOWN_SOURCE, ORPHAN_NO_AGE, ORPHAN_ODD_STATUS, UNREADABLE]));
+    expect(run.text).toMatch(new RegExp(`report +${SUBAGENT_NO_PARENT}.*subagent-typed thread with no parent id`));
+    expect(run.text).toMatch(new RegExp(`report +${UNKNOWN_SOURCE}.*unknown thread source`));
+    expect(run.text).toMatch(new RegExp(`report +${ORPHAN_NO_AGE}.*no updatedAt`));
+    expect(run.text).toMatch(new RegExp(`report +${ORPHAN_ODD_STATUS}.*unknown status unknownFutureStatus`));
+    expect(run.text).toMatch(new RegExp(`report +${UNREADABLE}.*unreadable`));
+    expect(run.text).not.toMatch(new RegExp(`${SUBAGENT_NO_PARENT}.*: lane thread$`, "m"));
   });
 });

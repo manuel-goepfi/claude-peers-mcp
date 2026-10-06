@@ -314,7 +314,11 @@ again and re-checks the parent on every server. After the archive it confirms
 the thread has left `thread/loaded/list`. It never archives a lane thread
 (no parent), an active subagent, or a subagent whose parent is loaded
 anywhere. A lane thread or orphan in `systemError` is only reported, for its
-owning lane to handle. Known sockets are the same set `codex-thread-stop`
+owning lane to handle. Any thread it cannot classify is kept and reported.
+That covers a thread it cannot read, a source that is neither a client nor
+a subagent, a subagent-typed source with no parent id, an unknown status,
+and a missing `updatedAt`. A thread counts as a lane thread only when its
+source says a client started it. Known sockets are the same set `codex-thread-stop`
 uses. If any of them is unreachable, the run is refused and nothing changes.
 
 Exit codes: `0` dry run, or every candidate archived; `1` an archive failed
