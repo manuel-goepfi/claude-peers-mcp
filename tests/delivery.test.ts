@@ -1357,6 +1357,18 @@ describe("Live broker delivery features", () => {
     const afterAck = await rawPost("/release-by-pid", { pid: child.pid, caller_pid: process.pid, drain_id: "release-drain-3", ids: [sent.id] });
     expect(afterAck.json).toMatchObject({ ok: true, released: 0 });
     expect(await state()).toMatchObject({ state: "acknowledged", delivered: true });
+
+    // The ack clears claimed_by, so the case above cannot reach the delivered
+    // guard. Plant a delivered row that still names the claiming drain (as a
+    // row written before claims were cleared on delivery would): the release
+    // must still leave it delivered.
+    const planted = new Database(TEST_DB);
+    planted.run("UPDATE messages SET claimed_by = ?, claimed_at = ? WHERE id = ?",
+      ["release-drain-3", new Date().toISOString(), sent.id]);
+    planted.close();
+    const deliveredButClaimed = await rawPost("/release-by-pid", { pid: child.pid, caller_pid: process.pid, drain_id: "release-drain-3", ids: [sent.id] });
+    expect(deliveredButClaimed.json).toMatchObject({ ok: true, released: 0 });
+    expect(await state()).toMatchObject({ state: "acknowledged", delivered: true });
   });
 
   test("thread-bound hook routes atomically claim, ack, and heartbeat the exact Codex seat", async () => {
