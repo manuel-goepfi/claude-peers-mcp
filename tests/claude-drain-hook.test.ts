@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -188,6 +188,61 @@ describe("Claude prompt drain hook", () => {
     expect(code).toBe(0);
     expect(stdout).toBe("");
     expect(paths).toEqual(["/claim-by-pid"]);
+  });
+
+  test("renders and acknowledges mail when the session's working directory was deleted", async () => {
+    // A Claude session left running inside a removed worktree: bun refuses to
+    // start from a deleted cwd, so the renderer must not inherit it.
+    const root = mkdtempSync(join(tmpdir(), "claude-peers-drain-deleted-cwd-"));
+    roots.push(root);
+    const doomedCwd = join(root, "removed-worktree");
+    mkdirSync(doomedCwd);
+    const paths: string[] = [];
+    const broker = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch(request) {
+        const path = new URL(request.url).pathname;
+        paths.push(path);
+        if (path === "/claim-by-pid") {
+          return Response.json({
+            peer_id: "claude-peer",
+            drain_id: "drain-gone",
+            messages: [{ id: 14, from_id: "codex-peer", to_id: "claude-peer", text: "mail into a removed worktree", sent_at: "2026-10-06T08:00:00Z", delivered: false, delivered_at: null }],
+          });
+        }
+        if (path === "/ack-by-pid") return Response.json({ ok: true, acked: 1 });
+        return Response.json({ error: "not found" }, { status: 404 });
+      },
+    });
+    servers.push(broker);
+    const anchor = Bun.spawn(["sleep", "20"]);
+    children.push(anchor);
+    // Delete the directory from inside the hook's own shell before the hook
+    // runs, so the hook process genuinely inherits a deleted cwd.
+    const child = Bun.spawn(["bash", "-c", 'cd "$1" && rmdir "$1" && exec bash "$2"', "drain", doomedCwd, hook], {
+      env: {
+        ...process.env,
+        HOME: root,
+        CLAUDE_PEERS_PORT: String(broker.port),
+        CLAUDE_PEERS_DRAIN_CLAUDE_PID: String(anchor.pid),
+        CLAUDE_PEERS_DRAIN_MCP_PID: String(anchor.pid),
+      },
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    children.push(child);
+    child.stdin.write("{}\n");
+    child.stdin.end();
+    const [code, stdout] = await Promise.all([
+      child.exited,
+      new Response(child.stdout as ReadableStream<Uint8Array>).text(),
+    ]);
+    expect(code).toBe(0);
+    expect(existsSync(doomedCwd)).toBe(false);
+    expect(paths).toEqual(["/claim-by-pid", "/ack-by-pid"]);
+    expect(stdout).toContain("mail into a removed worktree");
   });
 });
 

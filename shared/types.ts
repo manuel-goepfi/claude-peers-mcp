@@ -452,6 +452,22 @@ export interface AckByPidResponse {
   status?: number;
 }
 
+/**
+ * Hand a claim back without delivering it: the consumer that claimed the batch
+ * could not surface it. Same identity and drain scoping as an ack.
+ */
+export type ReleaseByPidRequest = AckByPidRequest;
+export type ReleaseByThreadRequest = AckByThreadRequest;
+
+export interface ReleaseByPidResponse {
+  ok: boolean;
+  state?: DeliveryState;
+  peer_id?: string;
+  released?: number;
+  error?: string;
+  status?: number;
+}
+
 export interface HookHeartbeatByPidRequest {
   pid: number;
   caller_pid: number;

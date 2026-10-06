@@ -17,6 +17,10 @@ ACTIVE_SECONDS=$(positive_int "${CLAUDE_PEERS_STANDBY_ACTIVE_SECONDS:-3600}" 360
 POLL_INTERVAL=$(positive_int "${CLAUDE_PEERS_STANDBY_POLL_INTERVAL_SECONDS:-30}" 30)
 IDLE_INTERVAL=$(positive_int "${CLAUDE_PEERS_STANDBY_IDLE_INTERVAL_SECONDS:-120}" 120)
 LOCK_WAIT=$(positive_int "${CLAUDE_PEERS_STANDBY_LOCK_WAIT_SECONDS:-2}" 2)
+# A watcher that cannot render must not hold the session's lock (and keep
+# claiming its mail) for the life of the Claude process. After this many
+# consecutive render failures it exits so a later Stop can arm a working one.
+MAX_RENDER_FAILURES=$(positive_int "${CLAUDE_PEERS_STANDBY_MAX_RENDER_FAILURES:-3}" 3)
 BROKER_PORT="${CLAUDE_PEERS_PORT:-7899}"
 FALLBACK_HOME="${HOME:-${TMPDIR:-/tmp}}"
 
@@ -44,6 +48,15 @@ command -v jq >/dev/null 2>&1 || bail missing-jq
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
 SERVER_PATH="$ROOT/server.ts"
+
+# Never run from the inherited working directory. Claude starts this hook in the
+# session's cwd, which can be a worktree that is removed while the watcher lives
+# on; bun then refuses to start ("The current working directory was deleted")
+# and every render fails. Measured 2026-10-05: one such watcher looped ~22 h,
+# claiming the session's mail every poll. Every path below is absolute.
+cd / 2>/dev/null || bail cwd-unavailable
+BUN=$(command -v bun 2>/dev/null) || BUN=""
+[[ -n "$BUN" ]] || bail missing-bun
 
 child_server_pid() {
   ps -ewwo pid=,ppid=,args= 2>/dev/null | awk -v parent="$1" -v server="$SERVER_PATH" \
@@ -165,7 +178,7 @@ wake_mode() {
   if [[ -n "$query" ]] && command -v sqlite3 >/dev/null 2>&1; then
     summary=$(sqlite3 -readonly "${CLAUDE_PEERS_DB:-$FALLBACK_HOME/.claude-peers.db}" \
       "$query" 2>/dev/null || true)
-    if [[ "$(bun "$SCRIPT_DIR/claude-wake-mode.ts" "$summary" 2>/dev/null)" == "auto" ]]; then
+    if [[ "$("$BUN" "$SCRIPT_DIR/claude-wake-mode.ts" "$summary" 2>/dev/null)" == "auto" ]]; then
       printf 'auto\n'
       return
     fi
@@ -185,6 +198,36 @@ sleep_idle_interruptibly() {
     if [[ "$deadline" =~ ^[0-9]+$ ]] && (( now < deadline )); then return; fi
   done
 }
+
+# Settle the claimed batch in $RESP: verb "ack" marks it delivered, "release"
+# hands it straight back to the queue. Always on the SAME route family the claim
+# used; mixing them would settle against a different resolution of "who we are"
+# than the one that handed us the messages. Sets SETTLE_STATUS and SETTLE_COUNT.
+settle_claim() {
+  local verb="$1" field drain ids path body raw
+  case "$verb" in ack) field=acked ;; release) field=released ;; *) return 1 ;; esac
+  SETTLE_STATUS=""
+  SETTLE_COUNT=0
+  drain=$(printf '%s' "$RESP" | jq -r '.drain_id // empty' 2>/dev/null)
+  ids=$(printf '%s' "$RESP" | jq -c '[.messages[].id]' 2>/dev/null)
+  [[ -n "$drain" && -n "$ids" && "$ids" != "[]" ]] || return 1
+  if [[ "$ROUTE_MODE" == "thread" ]]; then
+    path="/${verb}-by-thread"
+    body=$(jq -nc --arg thread "$SESSION_ID" --argjson caller "$CLAUDE_PID" --arg drain "$drain" --argjson ids "$ids" \
+      '{thread_id:$thread, caller_pid:$caller, drain_id:$drain, ids:$ids, via:"claude-standby-hook", client_type:"claude", receiver_mode:"claude-channel"}')
+  else
+    path="/${verb}-by-pid"
+    body=$(jq -nc --argjson pid "$MCP_PID" --argjson caller "$CLAUDE_PID" --arg drain "$drain" --argjson ids "$ids" \
+      '{pid:$pid, caller_pid:$caller, drain_id:$drain, ids:$ids, via:"claude-standby-hook", client_type:"claude", receiver_mode:"claude-channel"}')
+  fi
+  raw=$(curl -s -m 3 -w $'\n%{http_code}' -X POST "http://127.0.0.1:${BROKER_PORT}${path}" \
+    -H 'Content-Type: application/json' -d "$body" 2>/dev/null)
+  SETTLE_STATUS=$(printf '%s\n' "$raw" | tail -n1)
+  SETTLE_COUNT=$(printf '%s' "$raw" | sed '$d' | jq -r --arg field "$field" '.[$field] // 0' 2>/dev/null)
+  [[ "$SETTLE_COUNT" =~ ^[0-9]+$ ]] || SETTLE_COUNT=0
+}
+
+RENDER_FAILURES=0
 
 # Which identity route is known to work for this session. Latched on first
 # success so we stop paying for a failing probe every tick: "unknown" tries
@@ -239,9 +282,23 @@ while kill -0 "$CLAUDE_PID" 2>/dev/null; do
   else
     COUNT=$(printf '%s' "$RESP" | jq -r '.messages | length // 0' 2>/dev/null)
     if [[ "$COUNT" =~ ^[1-9][0-9]*$ ]]; then
-      BLOCKS=$(printf '%s' "$RESP" | bun "$SCRIPT_DIR/claude-render-peer-messages.ts" 2>/dev/null)
+      BLOCKS=$(printf '%s' "$RESP" | "$BUN" "$SCRIPT_DIR/claude-render-peer-messages.ts" 2>/dev/null)
       if [[ -z "$BLOCKS" ]]; then
-        printf '%s render_failed claimed=%s\n' "$(date -Iseconds)" "$COUNT" >> "$LOG_DIR/standby-watcher.log" 2>/dev/null
+        # Hand the batch back now rather than letting the claim hide it from
+        # check_messages until CLAIM_TTL lapses (and this loop re-claims it).
+        RENDER_FAILURES=$((RENDER_FAILURES + 1))
+        settle_claim release
+        printf '%s render_failed claimed=%s released=%s release_status=%s failures=%s/%s session=%s\n' \
+          "$(date -Iseconds)" "$COUNT" "$SETTLE_COUNT" "${SETTLE_STATUS:-curl_failed}" \
+          "$RENDER_FAILURES" "$MAX_RENDER_FAILURES" "${SESSION_ID:-none}" >> "$STANDBY_LOG" 2>/dev/null
+        if (( RENDER_FAILURES >= MAX_RENDER_FAILURES )); then
+          # Exit 0, not 2: rewaking the model on a permanent fault would turn
+          # into a wake loop. The released mail stays queued for the next
+          # prompt drain or check_messages, and the lock is free for a new Stop.
+          printf '%s render_failures_exhausted failures=%s session=%s claude_pid=%s\n' \
+            "$(date -Iseconds)" "$RENDER_FAILURES" "${SESSION_ID:-none}" "$CLAUDE_PID" >> "$STANDBY_LOG" 2>/dev/null
+          exit 0
+        fi
       else
         WAKE_MODE=$(wake_mode)
         if [[ "$WAKE_MODE" == "auto" ]]; then
@@ -249,28 +306,8 @@ while kill -0 "$CLAUDE_PID" 2>/dev/null; do
         else
           printf 'Peer mail arrived while idle. %s message(s) drained:\n\n%s\n\nSurface this peer update to the user before taking any new action that expands the current task.\n' "$COUNT" "$BLOCKS" >&2
         fi
-        DRAIN_ID=$(printf '%s' "$RESP" | jq -r '.drain_id // empty' 2>/dev/null)
-        IDS=$(printf '%s' "$RESP" | jq -c '[.messages[].id]' 2>/dev/null)
-        if [[ -n "$DRAIN_ID" && "$IDS" != "[]" ]]; then
-          # Ack on the SAME route family the claim used. Mixing them would ack
-          # against a different resolution of "who we are" than the one that
-          # handed us the messages.
-          if [[ "$ROUTE_MODE" == "thread" ]]; then
-            ACK_PATH="/ack-by-thread"
-            ACK_BODY=$(jq -nc --arg thread "$SESSION_ID" --argjson caller "$CLAUDE_PID" --arg drain "$DRAIN_ID" --argjson ids "$IDS" \
-              '{thread_id:$thread, caller_pid:$caller, drain_id:$drain, ids:$ids, via:"claude-standby-hook", client_type:"claude", receiver_mode:"claude-channel"}')
-          else
-            ACK_PATH="/ack-by-pid"
-            ACK_BODY=$(jq -nc --argjson pid "$MCP_PID" --argjson caller "$CLAUDE_PID" --arg drain "$DRAIN_ID" --argjson ids "$IDS" \
-              '{pid:$pid, caller_pid:$caller, drain_id:$drain, ids:$ids, via:"claude-standby-hook", client_type:"claude", receiver_mode:"claude-channel"}')
-          fi
-          ACK_RAW=$(curl -s -m 3 -w $'\n%{http_code}' -X POST "http://127.0.0.1:${BROKER_PORT}${ACK_PATH}" \
-            -H 'Content-Type: application/json' -d "$ACK_BODY" 2>/dev/null)
-          ACK_STATUS=$(printf '%s\n' "$ACK_RAW" | tail -n1)
-          ACK_COUNT=$(printf '%s' "$ACK_RAW" | sed '$d' | jq -r '.acked // 0' 2>/dev/null)
-          if [[ "$ACK_STATUS" != "200" || "$ACK_COUNT" != "$COUNT" ]]; then
-            printf '%s status=%s requested=%s acked=%s\n' "$(date -Iseconds)" "${ACK_STATUS:-curl_failed}" "$COUNT" "${ACK_COUNT:-0}" >> "$LOG_DIR/standby-watcher.log" 2>/dev/null
-          fi
+        if settle_claim ack && [[ "$SETTLE_STATUS" != "200" || "$SETTLE_COUNT" != "$COUNT" ]]; then
+          printf '%s status=%s requested=%s acked=%s\n' "$(date -Iseconds)" "${SETTLE_STATUS:-curl_failed}" "$COUNT" "$SETTLE_COUNT" >> "$STANDBY_LOG" 2>/dev/null
         fi
         exit 2
       fi

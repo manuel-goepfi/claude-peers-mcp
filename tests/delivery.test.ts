@@ -1292,6 +1292,73 @@ describe("Live broker delivery features", () => {
     child.kill();
   });
 
+  test("/release-by-pid and /release-by-thread hand a failed claim back at once, scoped to the claiming drain", async () => {
+    const child = spawnSleep();
+    const other = spawnSleep();
+    const threadId = "019fc274-release-proof";
+    const peer = await brokerFetch<{ id: string }>("/register", {
+      pid: child.pid, cwd: "/claim-release", git_root: null, tty: null, name: "claim-release",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null,
+      thread_id: threadId, client_type: "claude", receiver_mode: "claude-channel", summary: "",
+    });
+    await brokerFetch<{ id: string }>("/register", {
+      pid: other.pid, cwd: "/claim-release-other", git_root: null, tty: null, name: "claim-release-other",
+      tmux_session: null, tmux_window_index: null, tmux_window_name: null,
+      client_type: "claude", receiver_mode: "claude-channel", summary: "",
+    });
+    const sent = await brokerFetch<{ id: number }>("/send-message", {
+      from_id: peer.id, to_id: peer.id, text: "render failed, hand it back",
+    });
+    const state = async () => (await brokerFetch<{ statuses: Array<{ state: string; delivered: boolean }> }>(
+      "/message-status", { id: peer.id, ids: [sent.id] },
+    )).statuses[0];
+
+    const claim = await rawPost("/claim-by-pid", { pid: child.pid, caller_pid: process.pid, drain_id: "release-drain-1" });
+    expect((claim.json.messages as Array<{ id: number }>).map((m) => m.id)).toEqual([sent.id]);
+
+    // Only the drain that holds the claim may release it: a different drain
+    // id, or another seat's identity naming the same message id, releases 0.
+    const wrongDrain = await rawPost("/release-by-pid", { pid: child.pid, caller_pid: process.pid, drain_id: "not-the-claim", ids: [sent.id] });
+    expect(wrongDrain.status).toBe(200);
+    expect(wrongDrain.json).toMatchObject({ ok: true, released: 0 });
+    const wrongSeat = await rawPost("/release-by-pid", { pid: other.pid, caller_pid: process.pid, drain_id: "release-drain-1", ids: [sent.id] });
+    expect(wrongSeat.json).toMatchObject({ ok: true, released: 0 });
+    expect(await state()).toMatchObject({ state: "claimed", delivered: false });
+    const missingDrain = await rawPost("/release-by-pid", { pid: child.pid, caller_pid: process.pid, ids: [sent.id] });
+    expect(missingDrain.status).toBe(400);
+    const deadCaller = Bun.spawn(["true"]);
+    await deadCaller.exited;
+    const unauthenticated = await rawPost("/release-by-pid", { pid: child.pid, caller_pid: deadCaller.pid, drain_id: "release-drain-1", ids: [sent.id] });
+    expect(unauthenticated.status).toBeGreaterThanOrEqual(400);
+    expect(unauthenticated.status).toBeLessThan(500);
+    expect(await state()).toMatchObject({ state: "claimed", delivered: false });
+
+    const released = await rawPost("/release-by-pid", { pid: child.pid, caller_pid: process.pid, drain_id: "release-drain-1", ids: [sent.id] });
+    expect(released.status).toBe(200);
+    expect(released.json).toMatchObject({ ok: true, peer_id: peer.id, released: 1, state: "queued" });
+    // Immediately visible and claimable again, without waiting out the claim TTL.
+    expect(await state()).toMatchObject({ state: "queued", delivered: false });
+    const reclaim = await rawPost("/claim-by-thread", { thread_id: threadId, caller_pid: process.pid, drain_id: "release-drain-2" });
+    expect(reclaim.status).toBe(200);
+    expect((reclaim.json.messages as Array<{ id: number }>).map((m) => m.id)).toEqual([sent.id]);
+
+    // The stale drain cannot release the new claim; the thread route can.
+    const stale = await rawPost("/release-by-thread", { thread_id: threadId, caller_pid: process.pid, drain_id: "release-drain-1", ids: [sent.id] });
+    expect(stale.json).toMatchObject({ ok: true, released: 0 });
+    const byThread = await rawPost("/release-by-thread", { thread_id: threadId, caller_pid: process.pid, drain_id: "release-drain-2", ids: [sent.id] });
+    expect(byThread.status).toBe(200);
+    expect(byThread.json).toMatchObject({ ok: true, peer_id: peer.id, released: 1 });
+
+    // A release never un-delivers acknowledged mail.
+    const third = await rawPost("/claim-by-pid", { pid: child.pid, caller_pid: process.pid, drain_id: "release-drain-3" });
+    expect((third.json.messages as Array<{ id: number }>).map((m) => m.id)).toEqual([sent.id]);
+    const ack = await rawPost("/ack-by-pid", { pid: child.pid, caller_pid: process.pid, drain_id: "release-drain-3", ids: [sent.id] });
+    expect(ack.json.acked).toBe(1);
+    const afterAck = await rawPost("/release-by-pid", { pid: child.pid, caller_pid: process.pid, drain_id: "release-drain-3", ids: [sent.id] });
+    expect(afterAck.json).toMatchObject({ ok: true, released: 0 });
+    expect(await state()).toMatchObject({ state: "acknowledged", delivered: true });
+  });
+
   test("thread-bound hook routes atomically claim, ack, and heartbeat the exact Codex seat", async () => {
     const child = spawnSleep();
     const threadId = "019fc273-thread-drain-proof";

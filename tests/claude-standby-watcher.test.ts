@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
+import { startTestBroker, type TestBroker } from "./helpers/test-broker.ts";
 
 const watcher = new URL("../hooks/claude-standby-watcher.sh", import.meta.url).pathname;
 const children: Bun.Subprocess[] = [];
@@ -26,7 +27,7 @@ function running(pid: number): boolean {
   }
 }
 
-function startWatcher(env: Record<string, string>, sessionId: string): Bun.Subprocess {
+function startWatcher(env: Record<string, string>, sessionId: string, cwd?: string): Bun.Subprocess {
   const childEnv = { ...process.env, ...env };
   // The fallback tests intentionally provide XDG_RUNTIME_DIR but no explicit
   // standby override. Do not let the operator's ambient override defeat that
@@ -36,6 +37,7 @@ function startWatcher(env: Record<string, string>, sessionId: string): Bun.Subpr
   }
   const child = Bun.spawn(["bash", watcher], {
     env: childEnv,
+    ...(cwd ? { cwd } : {}),
     stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe",
@@ -414,6 +416,147 @@ describe("Claude standby watcher", () => {
     expect(existsSync(join(xdg, "claude-peers", "standby"))).toBe(false);
     expect(statSync(explicitState).mode & 0o777).toBe(0o700);
   }, 4_000);
+});
+
+// 2026-10-05/06 live incident: a Stop watcher whose working directory (a removed
+// worktree) had been deleted looped for ~22 h. Every poll it CLAIMED the
+// session's mail, `bun` refused to run the renderer ("The current working
+// directory was deleted"), and the watcher logged render_failed without acking
+// or releasing, so check_messages saw nothing while five messages stayed
+// undelivered. These tests run the watcher against a REAL broker so "delivered"
+// and "released" are the broker's own message states, not a stub's opinion.
+describe("Claude standby watcher never holds mail it cannot render", () => {
+  let broker: TestBroker | null = null;
+  afterEach(async () => {
+    await broker?.stop();
+    broker = null;
+  });
+
+  async function registerSelfMailbox(test: TestBroker, pid: number, name: string) {
+    const register = await fetch(`${test.url}/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        pid, cwd: `/${name}`, git_root: null, tty: null, name,
+        tmux_session: null, tmux_window_index: null, tmux_window_name: null,
+        client_type: "claude", receiver_mode: "claude-channel", summary: "",
+      }),
+    });
+    const peer = await register.json() as { id: string; token: string };
+    const authed = async <T>(path: string, body: Record<string, unknown>): Promise<T> => {
+      const res = await fetch(`${test.url}${path}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Peer-Token": peer.token },
+        body: JSON.stringify({ id: peer.id, from_id: peer.id, ...body }),
+      });
+      return await res.json() as T;
+    };
+    const send = async (text: string) => (await authed<{ id: number }>("/send-message", { to_id: peer.id, text })).id;
+    const state = async (id: number) =>
+      (await authed<{ statuses: Array<{ state: string; delivered: boolean }> }>("/message-status", { ids: [id] })).statuses[0];
+    return { peer, send, state };
+  }
+
+  test("delivers mail queued after the watcher's working directory was deleted", async () => {
+    const live = await startTestBroker({ prefix: "standby-deleted-cwd" });
+    broker = live;
+    const root = mkdtempSync(join(tmpdir(), "claude-peers-standby-deleted-cwd-"));
+    roots.push(root);
+    const runtime = join(root, "runtime");
+    mkdirSync(runtime, { mode: 0o700 });
+    const doomedCwd = mkdtempSync(join(tmpdir(), "claude-peers-standby-doomed-cwd-"));
+    roots.push(doomedCwd);
+    const anchor = Bun.spawn(["sleep", "30"]);
+    children.push(anchor);
+    const mailbox = await registerSelfMailbox(live, anchor.pid, "standby-deleted-cwd");
+
+    const pollSeconds = 1;
+    const child = startWatcher({
+      HOME: root,
+      XDG_RUNTIME_DIR: runtime,
+      CLAUDE_PEERS_PORT: String(live.port),
+      CLAUDE_PEERS_STANDBY_CLAUDE_PID: String(anchor.pid),
+      CLAUDE_PEERS_STANDBY_MCP_PID: String(anchor.pid),
+      CLAUDE_PEERS_STANDBY_POLL_INTERVAL_SECONDS: String(pollSeconds),
+    }, "deleted-cwd-session", doomedCwd);
+    // Let the watcher reach its poll loop, then delete the directory it was
+    // started in (a removed worktree), and only then queue the mail.
+    await Bun.sleep(400);
+    rmSync(doomedCwd, { recursive: true, force: true });
+    const messageId = await mailbox.send("mail after the worktree was removed");
+    const queuedAt = Date.now();
+
+    const stderrText = new Response(child.stderr as ReadableStream<Uint8Array>).text();
+    const outcome = await Promise.race([
+      child.exited.then((code) => ({ code })),
+      // One poll interval to claim, plus generous headroom for the thread
+      // probe and two bun cold starts (renderer + wake-mode) on a loaded host.
+      // Before the fix the watcher never exits here: every render fails.
+      Bun.sleep(pollSeconds * 1_000 + 12_000).then(() => ({ code: "still-running" as const })),
+    ]);
+    expect(outcome.code).toBe(2);
+    expect(Date.now() - queuedAt).toBeLessThan(pollSeconds * 1_000 + 12_000);
+    expect(await stderrText).toContain("mail after the worktree was removed");
+    expect(await mailbox.state(messageId)).toMatchObject({ state: "acknowledged", delivered: true });
+    const log = readFileSync(join(root, ".claude", "logs", "standby-watcher.log"), "utf8");
+    expect(log).not.toContain("render_failed");
+  }, 30_000);
+
+  test("releases claimed mail immediately on a render failure and exits after repeated failures", async () => {
+    const live = await startTestBroker({ prefix: "standby-render-failure" });
+    broker = live;
+    const root = mkdtempSync(join(tmpdir(), "claude-peers-standby-render-failure-"));
+    roots.push(root);
+    const runtime = join(root, "runtime");
+    mkdirSync(runtime, { mode: 0o700 });
+    // A renderer that can never succeed, whatever the cause (deleted cwd,
+    // missing bun, broken install). The watcher resolves bun from PATH.
+    const shimBin = join(root, "bin");
+    mkdirSync(shimBin, { mode: 0o700 });
+    writeFileSync(join(shimBin, "bun"), "#!/usr/bin/env bash\necho 'renderer broken' >&2\nexit 1\n", { mode: 0o755 });
+    const anchor = Bun.spawn(["sleep", "30"]);
+    children.push(anchor);
+    const mailbox = await registerSelfMailbox(live, anchor.pid, "standby-render-failure");
+    const messageId = await mailbox.send("mail the watcher cannot render");
+
+    // Wide enough that the state read below lands well before the next claim.
+    const pollSeconds = 2;
+    const child = startWatcher({
+      HOME: root,
+      XDG_RUNTIME_DIR: runtime,
+      PATH: `${shimBin}:${process.env.PATH ?? ""}`,
+      CLAUDE_PEERS_PORT: String(live.port),
+      CLAUDE_PEERS_STANDBY_CLAUDE_PID: String(anchor.pid),
+      CLAUDE_PEERS_STANDBY_MCP_PID: String(anchor.pid),
+      CLAUDE_PEERS_STANDBY_POLL_INTERVAL_SECONDS: String(pollSeconds),
+      CLAUDE_PEERS_STANDBY_MAX_RENDER_FAILURES: "3",
+    }, "render-failure-session");
+
+    const logPath = join(root, ".claude", "logs", "standby-watcher.log");
+    const readLog = () => (existsSync(logPath) ? readFileSync(logPath, "utf8") : "");
+    const firstFailureDeadline = Date.now() + 12_000;
+    while (!readLog().includes("render_failed") && Date.now() < firstFailureDeadline) await Bun.sleep(25);
+    expect(readLog()).toContain("render_failed");
+    // The failed claim must be handed back at once, not left to lapse after
+    // the 30 s claim TTL (and then be re-claimed by the same broken watcher).
+    // The broker's own release record is the race-free proof; the message
+    // state is re-checked once the watcher has stopped claiming.
+    expect(live.stderr()).toMatch(new RegExp(`\\[broker\\] release to=${mailbox.peer.id} drain=\\S+ released=1 via=claude-standby-hook`));
+    expect(readLog()).toContain("released=1 release_status=200 failures=1/3");
+
+    const outcome = await Promise.race([
+      child.exited.then((code) => ({ code })),
+      Bun.sleep(3 * pollSeconds * 1_000 + 12_000).then(() => ({ code: "still-running" as const })),
+    ]);
+    // Exit 0: giving up must not rewake the model, or a permanent fault would
+    // turn into a wake loop. The released mail stays queued for the next
+    // prompt drain or check_messages.
+    expect(outcome.code).toBe(0);
+    expect(readLog().match(/render_failed/g)?.length).toBe(3);
+    expect(readLog()).toContain("render_failures_exhausted");
+    expect(live.stderr().match(/\[broker\] release to=/g)?.length).toBe(3);
+    expect(await mailbox.state(messageId)).toMatchObject({ state: "queued", delivered: false });
+  }, 45_000);
 });
 
 describe("standby watcher default cadence", () => {

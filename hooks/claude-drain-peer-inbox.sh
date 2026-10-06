@@ -206,7 +206,11 @@ fi
 COUNT=$(printf '%s' "$RESP" | jq -r '.messages | length // 0' 2>/dev/null)
 [[ "$COUNT" =~ ^[1-9][0-9]*$ ]] || exit 0
 
-BLOCKS=$(printf '%s' "$RESP" | bun "$SCRIPT_DIR/claude-render-peer-messages.ts" 2>/dev/null)
+# Render from / with an absolute bun: the session's cwd may be a removed
+# worktree, and bun refuses to start from a deleted cwd. Only the renderer moves;
+# the registration retry above keeps the inherited cwd it records as identity.
+BUN=$(command -v bun 2>/dev/null) || exit 0
+BLOCKS=$(cd / && printf '%s' "$RESP" | "$BUN" "$SCRIPT_DIR/claude-render-peer-messages.ts" 2>/dev/null)
 [[ -n "$BLOCKS" ]] || exit 0
 
 CONTEXT="${COUNT} pending peer message(s) drained before this prompt:
