@@ -163,3 +163,64 @@ whoami reports operator and resolved names equal, mirror OK and no drift.
 The planned recovery is complete. This does not promise zero future failures
 or universal in-place reconnect support: the already-closed standalone MCP
 connection required the single operator-authorized saved-conversation reopen.
+
+## 2026-09-21: retry missed native Claude registration on hook activity
+
+The observed resume started while the original process still owned the same
+conversation. Retained SessionStart records show HTTP 409 from
+`/hook-heartbeat-by-thread`; later MCP reconnects could not manufacture the
+missing native hook identity. Rerunning the installed registrar after the
+original exited restored registration and a correlated native reply.
+
+The fix reuses that registrar from `claude-drain-peer-inbox.sh` only after a
+missing native-PID claim (404). It preserves root hook input, requires an
+existing matching transcript filename, excludes child-agent hooks, and bounds
+registration to three seconds. It does not retry denied/ambiguous claims,
+change broker ownership rules, delete history, or create an idle background
+poller. An absent MCP adapter no longer prevents the documented native-PID
+fallback from running.
+
+Source baseline: `4c8f2f124c01d9746cb94979431b5e760a892824`. Implementation and
+verification used an isolated `codex/claude-registration-retry` worktree because
+the installed checkout contained unrelated shared edits. Only the fix's hunks
+were applied to the installed checkout; those shared edits were preserved.
+
+Verification (Bun 1.3.11):
+
+- Before the change, both new real-process/tmux regression cases failed at the
+  missing-registration assertion after the old native exited.
+- `bun run typecheck`: passed.
+- `bun test tests/claude-drain-hook.test.ts tests/live-mailbox-groups.test.ts tests/hook-config.test.ts tests/install-claude-hook.test.ts tests/seat-identity.test.ts tests/seat-routing-stability.test.ts`:
+  64 passed, 363 assertions, no failures.
+- Final targeted replay after replacing the fixture's example conversation ID:
+  two recovery tests passed, 50 assertions. Both prompt and tool hooks refuse a
+  still-live original, recover after it exits, keep the pane name, receive and
+  acknowledge mail, send a correlated reply, and avoid duplicate receipt.
+- Fault checks cover no retries on 403/409/500 or healthy 200, refusal without
+  re-claiming, registrar timeout, missing/mismatched transcript input, and child
+  hooks. Existing account-mismatch and broker-restart ownership tests passed.
+- Installed checkout replay with its inherited broker/render changes:
+  `bun test tests/claude-drain-hook.test.ts tests/live-mailbox-groups.test.ts`:
+  15 passed, 206 assertions, no failures.
+- `bash -n hooks/claude-drain-peer-inbox.sh` and `git diff --check`: passed.
+
+Installed hook SHA256:
+`818d5fc85745bac8f5a3dc0e03e7aa7ee5f620fe8548f96b25f0bef7e67fb02a`.
+The installed hook is read afresh on the next invocation. No broker, account
+server, or conversation restart was performed. At 07:04:27Z, the inspected
+local broker service remained active with zero automatic restarts. A fresh
+post-install correlated acknowledgment arrived at 07:04:31Z through the
+recovered native session's normal tools. `get_reply_status` confirmed
+`replied, delivery=acknowledged`; the recipient confirmed automatic tool-boundary
+receipt and its outgoing reply without manual registration. This is a healthy
+live-session smoke check; the overlapping-owner recovery itself was exercised
+in the isolated process/tmux regression, without disrupting a user's task.
+
+Review: targeted manual scan of fix-owned hunks for ownership bypasses,
+bounded execution, child-hook exclusion, and preservation of shared edits.
+No broker protocol or schema change. Recovery requires subsequent hook
+activity; it does not repair a closed MCP transport or override a live owner.
+
+Rollback: restore only `hooks/claude-drain-peer-inbox.sh` from baseline
+`4c8f2f1` after checking for subsequent operator edits. No database rollback or
+service restart is needed.

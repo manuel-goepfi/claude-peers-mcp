@@ -1421,9 +1421,9 @@ describe("nudge wording is safe across receive-path changes", () => {
   test("a first-prompt hook upgrade cannot turn its attached brief into an empty-inbox conclusion", () => {
     const startup = { ...laneWith(1), receiver_mode: "manual-drain", last_hook_seen_at: null };
     const text = nudgeText(startup as never);
-    expect(text).toContain("Process attached peer messages first.");
-    expect(text).toContain("Only if none are attached, call check_messages once.");
-    expect(text).toContain("An empty inbox does not cancel an attached message.");
+    expect(text).toContain("Process the attached peer messages.");
+    expect(text).toContain("If none are attached, fetch pending mail with check_messages.");
+    expect(text).toContain("Continue the work.");
     expect(text).toBe(nudgeText({ ...startup, receiver_mode: "codex-hook" } as never));
   });
   test.each([
@@ -1432,8 +1432,8 @@ describe("nudge wording is safe across receive-path changes", () => {
     ["gemini", { ...laneWith(2), client_type: "gemini", receiver_mode: "gemini-hook" }],
   ])("%s hook wake prioritizes the attached body", (_label, lane) => {
     const t = nudgeText(lane as never);
-    expect(t).toBe("[peer-mail] Process attached peer messages first. Only if none are attached, call check_messages once. An empty inbox does not cancel an attached message.");
-    expect(t).toContain("Only if none are attached, call check_messages once.");
+    expect(t).toBe("[peer-mail] Process the attached peer messages. If none are attached, fetch pending mail with check_messages. Continue the work.");
+    expect(t).toContain("If none are attached, fetch pending mail with check_messages.");
     expect(t).not.toContain("authority");
   });
 
@@ -1443,8 +1443,8 @@ describe("nudge wording is safe across receive-path changes", () => {
     ["kimi", { ...cursorLane(1), client_type: "kimi" }],
   ])("%s manual-drain wake checks attachments before requesting a drain", (_label, lane) => {
     const t = nudgeText(lane as never);
-    expect(t).toContain("Only if none are attached, call check_messages once.");
-    expect(t).toContain("Process attached peer messages first.");
+    expect(t).toContain("If none are attached, fetch pending mail with check_messages.");
+    expect(t).toContain("Process the attached peer messages.");
     expect(t).not.toContain("Transport closed");
     expect(t).not.toContain("UNVERIFIABLE");
   });
@@ -1452,7 +1452,7 @@ describe("nudge wording is safe across receive-path changes", () => {
   test("an idle hook asks for a drain only when no message was attached", () => {
     const lane = { ...laneWith(2), last_hook_seen_at: "2020-01-01T00:00:00.000Z" };
     const t = nudgeText(lane as never);
-    expect(t).toBe("[peer-mail] Process attached peer messages first. Only if none are attached, call check_messages once. An empty inbox does not cancel an attached message.");
+    expect(t).toBe("[peer-mail] Process the attached peer messages. If none are attached, fetch pending mail with check_messages. Continue the work.");
     expect(t).not.toContain("unread peer");
   });
 
@@ -1494,8 +1494,8 @@ describe("Codex wake-only delivery", () => {
 
     expect(result).toBe("submitted");
     expect(submissions).toEqual([{ paneId: "%42", text: nudgeText(lane as never) }]);
-    expect(submissions[0]!.text).toBe("[peer-mail] Process attached peer messages first. Only if none are attached, call check_messages once. An empty inbox does not cancel an attached message.");
-    expect(submissions[0]!.text).toContain("Only if none are attached, call check_messages once.");
+    expect(submissions[0]!.text).toBe("[peer-mail] Process the attached peer messages. If none are attached, fetch pending mail with check_messages. Continue the work.");
+    expect(submissions[0]!.text).toContain("If none are attached, fetch pending mail with check_messages.");
     expect(submissions[0]!.text).not.toMatch(/<peer-message\s/);
   });
 

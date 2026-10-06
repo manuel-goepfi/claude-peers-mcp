@@ -221,22 +221,22 @@ describe("codex nudge text", () => {
       nudgeText(hook("claude", "claude-channel")),
       nudgeText(hook("gemini", "gemini-hook")),
     ]) {
-      expect(text).toBe("[peer-mail] Process attached peer messages first. Only if none are attached, call check_messages once. An empty inbox does not cancel an attached message.");
-      expect(text).toContain("Only if none are attached, call check_messages once.");
+      expect(text).toBe("[peer-mail] Process the attached peer messages. If none are attached, fetch pending mail with check_messages. Continue the work.");
+      expect(text).toContain("If none are attached, fetch pending mail with check_messages.");
       expect(text).not.toContain("Transport closed");
       expect(text).not.toContain("UNVERIFIABLE");
       expect(text).not.toContain("<peer-message");
     }
   });
 
-  test("manual-drain lanes are told to call check_messages once", () => {
+  test("manual-drain lanes fetch pending mail when no attachments are present", () => {
     expect(nudgeText(manual(1, "cursor"))).toBe(
-      "[peer-mail] Process attached peer messages first. Only if none are attached, call check_messages once. An empty inbox does not cancel an attached message.",
+      "[peer-mail] Process the attached peer messages. If none are attached, fetch pending mail with check_messages. Continue the work.",
     );
     expect(nudgeText(manual(2, "kimi"))).toBe(
-      "[peer-mail] Process attached peer messages first. Only if none are attached, call check_messages once. An empty inbox does not cancel an attached message.",
+      "[peer-mail] Process the attached peer messages. If none are attached, fetch pending mail with check_messages. Continue the work.",
     );
-    expect(nudgeText(manual(1, "codex"))).toContain("Only if none are attached, call check_messages once.");
+    expect(nudgeText(manual(1, "codex"))).toContain("If none are attached, fetch pending mail with check_messages.");
   });
 
   test("does not repeat authority policy in the wake-up notice", () => {

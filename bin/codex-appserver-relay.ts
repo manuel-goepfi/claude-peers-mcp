@@ -313,9 +313,11 @@ export async function runCodexAppserverRelay(options: RelayOptions): Promise<voi
       });
     });
     client.on("close", (code, reason) => {
+      console.error(`[codex-relay] client-close code=${code}`);
       closeWebSocket(upstream, code, reason);
     });
     upstream.on("close", (code, reason) => {
+      console.error(`[codex-relay] upstream-close code=${code}`);
       closeWebSocket(client, code, reason);
     });
     client.on("error", () => upstream.terminate());
@@ -332,12 +334,13 @@ export async function runCodexAppserverRelay(options: RelayOptions): Promise<voi
     try { unlinkSync(options.socketPath); } catch {}
     try { unlinkSync(options.readyPath); } catch {}
   };
-  const shutdown = () => {
+  const shutdown = (signal: string) => {
+    console.error(`[codex-relay] shutdown signal=${signal}`);
     cleanup();
     process.exit(0);
   };
-  process.once("SIGINT", shutdown);
-  process.once("SIGTERM", shutdown);
+  process.once("SIGINT", () => shutdown("SIGINT"));
+  process.once("SIGTERM", () => shutdown("SIGTERM"));
   process.once("exit", cleanup);
 
   await new Promise<void>((resolve, reject) => {

@@ -105,7 +105,7 @@ export function isHookReceivePath(lane: Lane): boolean {
 export function nudgeText(_lane: Lane): string {
   // Receive mode can change when this wake triggers the first native hook.
   // Queue emptiness after that hook says nothing about the attached batch.
-  return "[peer-mail] Process attached peer messages first. Only if none are attached, call check_messages once. An empty inbox does not cancel an attached message.";
+  return "[peer-mail] Process the attached peer messages. If none are attached, fetch pending mail with check_messages. Continue the work.";
 }
 // Give up nudging a lane after this many consecutive attempts with mail still
 // unread — a lane whose drain hook is broken must NOT be keystroke-bombed
@@ -1402,6 +1402,22 @@ export function composerSubmissionEvidence(capture: string, probe: string): Comp
   return regionContainsSubmissionProbe(transcript, probe) ? "submitted" : "unknown";
 }
 
+export function freshSubmissionObserved(before: string, after: string, probe: string): boolean {
+  before = stripAnsi(before);
+  after = stripAnsi(after);
+  if (composerSubmissionEvidence(after, probe) !== "submitted") return false;
+  // Compare the same compact prefix used by the composer classifier. Ignore
+  // Grok's occasionally hidden opening bracket consistently in both captures.
+  const head = probe.slice(0, 24).replace(/\s+/g, "").replace(/^\[/, "");
+  if (!head) return false;
+  const count = (capture: string) => capture.replace(/\s+/g, "").split(head).length - 1;
+  // A held wake moving into the transcript is new evidence; an old transcript
+  // echo surviving an ineffective paste/Enter is not. Scrolled-out evidence
+  // remains unconfirmed rather than guessing that a new turn was submitted.
+  const priorTranscriptCount = count(before) - Number(composerStillHolds(before, probe));
+  return count(after) > priorTranscriptCount;
+}
+
 export function composerStillHolds(capture: string, probe: string): boolean {
   return composerSubmissionEvidence(capture, probe) === "held";
 }
@@ -1456,7 +1472,7 @@ export function submitPaneText(paneId: string, text: string, clientType: string,
     sleep(SUBMIT_CONFIRM_INTERVAL_S);
     const capture = command(["tmux", "capture-pane", "-p", "-t", paneId]);
     if (!capture.ok) return false; // pane vanished — cannot claim delivery
-    if (composerSubmissionEvidence(capture.out, probe) === "submitted") return true;
+    if (freshSubmissionObserved(before.out, capture.out, probe)) return true;
   }
   log(`wake submit unconfirmed for ${paneId} — no positive transcript evidence; mailbox remains queued`);
   return false;

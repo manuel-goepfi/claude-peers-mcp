@@ -63,7 +63,11 @@ RELAY_PID=""
 TUI_PID=""
 cleanup() {
   local rc=$?
+  local reason="${1:-EXIT}" relay_state=gone
   trap - EXIT HUP INT TERM
+  [[ -n "$RELAY_PID" ]] && kill -0 "$RELAY_PID" 2>/dev/null && relay_state=alive
+  printf '[codex-shared-seat] cleanup reason=%s status=%s relay=%s\n' \
+    "$reason" "$rc" "$relay_state" >>"$RELAY_LOG" 2>/dev/null || true
   [[ -n "$TUI_PID" ]] && kill -TERM "$TUI_PID" 2>/dev/null || true
   [[ -n "$RELAY_PID" ]] && kill -TERM "$RELAY_PID" 2>/dev/null || true
   [[ -n "$TUI_PID" ]] && wait "$TUI_PID" 2>/dev/null || true
@@ -72,7 +76,10 @@ cleanup() {
   rmdir -- "$RELAY_DIR" 2>/dev/null || true
   exit "$rc"
 }
-trap cleanup EXIT HUP INT TERM
+trap 'cleanup EXIT' EXIT
+trap 'cleanup HUP' HUP
+trap 'cleanup INT' INT
+trap 'cleanup TERM' TERM
 
 ACCOUNT_SLOT=""
 # Never guess a label when an explicit socket override points at another home.
@@ -107,5 +114,12 @@ set +e
 wait "$TUI_PID"
 tui_status=$?
 set -e
+if kill -0 "$RELAY_PID" 2>/dev/null; then
+  relay_state=alive
+else
+  relay_state=gone
+fi
+printf '[codex-shared-seat] tui-exit status=%s relay=%s\n' \
+  "$tui_status" "$relay_state" >>"$RELAY_LOG" 2>/dev/null || true
 TUI_PID=""
 exit "$tui_status"

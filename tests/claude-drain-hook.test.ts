@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -75,10 +75,7 @@ describe("Claude prompt drain hook", () => {
     const output = JSON.parse(stdout) as { hookSpecificOutput: { hookEventName: string; additionalContext: string } };
     expect(output.hookSpecificOutput.hookEventName).toBe(expectedEvent);
     expect(output.hookSpecificOutput.additionalContext).toContain('<peer-message from="codex-peer" sent_at="2026-07-12T13:10:00Z" relayed="false" replyable="true">');
-    expect(output.hookSpecificOutput.additionalContext).toContain('<peer-receive-policy source="local-receive-path">');
-    expect(output.hookSpecificOutput.additionalContext.indexOf("<peer-receive-policy")).toBeLessThan(
-      output.hookSpecificOutput.additionalContext.indexOf("<peer-message "),
-    );
+    expect(output.hookSpecificOutput.additionalContext).not.toContain('<peer-receive-policy');
     expect(output.hookSpecificOutput.additionalContext).toContain("codex reply");
     expect(output.hookSpecificOutput.additionalContext).toContain("[REDACTED-PEER-MSG-TAG]");
     expect(output.hookSpecificOutput.additionalContext).not.toContain("</PEER-MESSAGE>");
@@ -180,4 +177,55 @@ describe("Claude prompt drain hook", () => {
     expect(stdout).toBe("");
     expect(paths).toEqual(["/claim-by-pid"]);
   });
+});
+
+describe("Claude missing-registration retry", () => {
+  test.each([
+    [404, "success", 2, true],
+    [404, "refused", 1, true],
+    [404, "timeout", 1, true],
+    [403, "success", 1, false],
+    [409, "success", 1, false],
+    [500, "success", 1, false],
+    [200, "success", 1, false],
+  ] as const)("claim %s with registrar %s", async (status, outcome, expectedClaims, shouldRetry) => {
+    const root = mkdtempSync(join(tmpdir(), "claude-drain-retry-contract-"));
+    roots.push(root);
+    const hookDir = join(root, "hooks");
+    mkdirSync(hookDir);
+    copyFileSync(hook, join(hookDir, "claude-drain-peer-inbox.sh"));
+    // Exercise the shell boundary separately from the real-broker/process test.
+    writeFileSync(join(hookDir, "claude-register-peer-session.sh"),
+      `#!/bin/bash\ncat > "$HOME/retry-input"\n${outcome === "timeout" ? "sleep 20" : outcome === "refused" ? "exit 1" : "exit 0"}\n`);
+    const transcript = join(root, "saved-thread.jsonl");
+    writeFileSync(transcript, '{"sessionId":"saved-thread"}\n');
+    const input = { session_id: "saved-thread", transcript_path: transcript, hook_event_name: "UserPromptSubmit" };
+    let claims = 0;
+    const broker = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch(request) {
+      expect(new URL(request.url).pathname).toBe("/claim-by-pid");
+      claims++;
+      const responseStatus = claims > 1 ? 200 : status;
+      return Response.json(responseStatus === 200 ? { messages: [] } : { error: "fixture refusal" }, { status: responseStatus });
+    } });
+    servers.push(broker);
+    const anchor = Bun.spawn(["sleep", "20"]);
+    children.push(anchor);
+    const child = Bun.spawn(["bash", join(hookDir, "claude-drain-peer-inbox.sh")], {
+      env: { ...process.env, HOME: root, CLAUDE_CONFIG_DIR: join(root, "claude"),
+        CLAUDE_PEERS_PORT: String(broker.port), CLAUDE_PEERS_HOOK_EVENT_NAME: "UserPromptSubmit",
+        CLAUDE_PEERS_DRAIN_CLAUDE_PID: String(anchor.pid), CLAUDE_PEERS_DRAIN_MCP_PID: String(anchor.pid) },
+      stdin: "pipe", stdout: "pipe", stderr: "pipe",
+    });
+    children.push(child);
+    child.stdin.write(JSON.stringify(input));
+    child.stdin.end();
+    const started = Date.now();
+    const [code, stdout] = await Promise.all([child.exited, new Response(child.stdout).text()]);
+    expect(code).toBe(0);
+    expect(stdout).toBe("");
+    expect(claims).toBe(expectedClaims);
+    expect(existsSync(join(root, "retry-input"))).toBe(shouldRetry);
+    if (shouldRetry) expect(JSON.parse(readFileSync(join(root, "retry-input"), "utf8"))).toEqual(input);
+    if (outcome === "timeout") expect(Date.now() - started).toBeLessThan(5000);
+  }, 8000);
 });

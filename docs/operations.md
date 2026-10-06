@@ -40,7 +40,7 @@ stdio. Moving the thread away from a different concrete pane still supersedes
 that pane's old registration. Neither rule proves end-to-end delivery: verify an
 outgoing send with recipient acknowledgment and an incoming reply after recovery.
 
-Open tmux panes use `session.number` as their routable operator name. Allocation
+Open tmux panes use `session.number` as their routable operator name. Proven legacy Codex reconnects and heartbeats reconcile stale broker display names with the assigned pane label without changing peer IDs, threads or mailboxes. Pane borders prefer `@operator_label`; `@peer_resolved_name` is diagnostic metadata. Allocation
 is monotonic across the currently open panes and ignores layout indexes, so a
 move or split does not rename a survivor. A session rename updates the prefix.
 Closing a pane releases its number; no closed-pane reservation is retained.
@@ -50,6 +50,25 @@ account, conversation, and pane. The native peer remains the only targetable
 member; companion IDs remain as non-targetable history aliases so pending mail
 and correlated replies are preserved. A process replacement or mismatched proof
 revokes the group instead of transferring it by name or timestamp.
+
+### Claude resume while the old conversation is still open
+
+Close the original Claude process before resuming its saved conversation in a
+new pane. If the two overlap, the startup registration hook refuses the live
+ownership conflict. After the original exits, the next `UserPromptSubmit` or
+`PostToolBatch` inbox hook retries the installed registrar once when the native
+PID has no registration (HTTP 404). The retry requires root hook input with a
+nonempty session ID and an existing transcript whose filename matches that ID.
+It has a three-second deadline and preserves the registrar's live-owner,
+thread, account, and pane checks. Existing 403/409 claim failures are not retried;
+child hooks cannot register or claim the root inbox. Healthy inbox checks do not
+register again. Recovery does not run while a session is idle without hook activity.
+
+This Linux hook change takes effect on the next invocation, without restarting
+the broker or conversation. Retry diagnostics go to
+`$CLAUDE_CONFIG_DIR/logs/drain-peer-inbox.log` (default `$HOME/.claude/logs`).
+Verify a received message and a correlated reply after recovery; a registration
+or queued send is insufficient.
 
 ## Ownership modes
 
@@ -110,7 +129,7 @@ bun bin/install-opencode-mcp.ts install
 bun bin/install-opencode-mcp.ts --check
 ```
 
-OpenCode has no interactive external receive hook in this contract. It registers one stdio adapter per session in `manual-drain` mode, and the tmux poller wakes only a quiescent pane whose boxed composer contains the exact grey vendor placeholder. The wake submits one `check_messages` turn; typed text, permission prompts, loading states, busy panes, and unconfirmed Enter submissions fail closed.
+OpenCode has no interactive external receive hook in this contract. It registers one stdio adapter per session in `manual-drain` mode, and the tmux poller wakes only a quiescent pane whose boxed composer contains the exact grey vendor placeholder. The wake tells the lane to process attached messages, or fetch pending mail with `check_messages` when none are attached, then continue the work; typed text, permission prompts, loading states, busy panes, and unconfirmed Enter submissions fail closed.
 
 ### Nudger supervision
 
@@ -169,6 +188,32 @@ and republishes that identity instead of registering a competing threadless
 peer. Ambiguous bindings are left unchanged. The broker also rejects discovery
 registration when a thread binding appeared after the discovery snapshot.
 This prevents new duplicates; it does not delete historical duplicate rows.
+
+Local observers read live pane-to-thread bindings through
+`POST /codex-pane-bindings` instead of opening the broker database. The route
+is read-only, takes a same-UID `caller_pid` (JSON integer), is rate-limited to
+600 requests per minute per caller pid (429 beyond), and returns at most 500
+rows: targetable Codex peers whose seat is alive under `peerSeatAlive` and whose
+registered pid is still a same-UID Codex client process (`isClientProcess`). A
+broker that predates the route answers 401 (`missing x-peer-token`) and lacks
+the `observation.codexPaneBindings` capability; observers keep their
+database-file fallback, and back off their retries, until it restarts.
+
+Enabling the route on a managed broker is a broker restart; announce it to the
+fleet operator first:
+
+```bash
+systemctl --user restart claude-peers-broker.service
+curl -s http://127.0.0.1:7899/health | jq '.ready, .capabilities.observation'
+curl -s -X POST -H 'Content-Type: application/json' \
+  -d "{\"caller_pid\": $$}" http://127.0.0.1:7899/codex-pane-bindings | jq '.bindings | length'
+```
+
+Expect `true`, `{"codexPaneBindings": true}`, and a count that matches the live
+Codex panes. T3 Lanes retries the route at most 60 seconds after its last
+fallback, so it switches from the database file within a minute without its own
+restart. Rollback: return the clone to the previous commit and restart the unit
+the same way; observers fall back to the database file on the next 401.
 
 Desktop-only MCP tools can bind to an exact hook-owned thread without a pane
 when its host PID matches the adapter's independently discovered app-server
@@ -235,21 +280,20 @@ The non-tmux path connects to the same explicit upstream socket that was
 validated at startup. It must not substitute the implicit `unix://` default,
 which could select a different server when a socket override is configured.
 
-## Native messaging and broker wake-ups
+## Peer messaging and broker wake-ups
 
-For new Claude-to-Claude conversations, prefer native `ListAgents`/`SendMessage`
-when the exact recipient is discoverable. Use Claude Peers across clients, or
-when native routing is unavailable before sending. Reply on the incoming
-transport. Never duplicate a queued/uncertain send across transports or bypass
-a refusal. Resolve current recipients rather than treating pane labels as IDs.
+Use `claude-peers` for all agent messaging, including Claude-to-Claude.
+Keep discussions with the peers involved. For coordination of assigned work,
+report to the coordinator named in the assignment.
+These instructions live in MCP startup/tool descriptions and automatic receive
+context, rather than a policy block prepended to mail. Delivered batches contain
+only framed messages with sender, reply, and delivery metadata.
 
-Claude owns wake-up for native messages. The broker nudger only considers
-currently unread broker mail and retains its idle/input/ownership checks; do
-not disable Claude recipients, because cross-client mail still needs that path.
-Keep the short hook-backed wake notice. The compact `check_messages` variant
-remains necessary for manual-drain receivers and as an urgent fallback when a
-hook has not produced a recent event. Native safety wrappers are not broker
-nudges and must not be stripped.
+Resolve current recipients rather than treating pane labels as IDs. Never
+duplicate a queued or uncertain send. The broker nudger considers currently
+unread broker mail and retains its idle/input/ownership checks. Its short notice
+asks recipients to process attachments, fetch pending mail when none are
+attached, and continue the work.
 
 Peer discovery reports active presence separately from hook events. For
 hook-backed peers, `hook_event=recent` means a hook ran within two minutes;
