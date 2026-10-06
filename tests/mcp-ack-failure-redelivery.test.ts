@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { startTestBroker, type TestBroker } from "./helpers/test-broker.ts";
+import { startTestBroker, withoutHostTmux, type TestBroker } from "./helpers/test-broker.ts";
 
 const SERVER_SCRIPT = new URL("../server.ts", import.meta.url).pathname;
 const APP_SERVER_FIXTURE = new URL("./fixtures/codex-app-server-parent.ts", import.meta.url).pathname;
@@ -47,6 +47,10 @@ async function post<T>(broker: TestBroker, path: string, body: unknown, token?: 
   return json;
 }
 
+// Same budget as the app-server variant below. The registration wait alone may
+// take 10 s; under bun's 5 s default a miss surfaced as a bare timeout, and the
+// still-running body then raced afterEach cleanup into two unhandled errors
+// (ConnectionRefused on /unregister, SQLITE_CANTOPEN on the removed database).
 test("check_messages returns a claimed body when ACK fails and the lease can be reclaimed", async () => {
   const broker = await startTestBroker({ prefix: "mcp-ack-failure" });
   cleanup.push(() => broker.stop());
@@ -76,8 +80,7 @@ test("check_messages returns a claimed body when ACK fails and the lease can be 
       CLAUDE_PEERS_CLIENT_TYPE: "unknown",
       CLAUDE_PEER_NAME: "mcp-ack-failure-receiver",
       CLAUDE_PEERS_TMUX_IDENTITY_MIRROR: "0",
-      TMUX: undefined,
-      TMUX_PANE: undefined,
+      ...withoutHostTmux(broker.root),
     }).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
   );
   const transport = new StdioClientTransport({
@@ -167,7 +170,7 @@ test("check_messages returns a claimed body when ACK fails and the lease can be 
   expect(reclaimed.messages).toEqual([
     expect.objectContaining({ id: sent.id, text: "survives failed acknowledgement" }),
   ]);
-});
+}, 20_000);
 
 (canUseTmux ? test : test.skip)("Codex app-server claims and retries by exact thread when ACK fails", async () => {
   const broker = await startTestBroker({ prefix: "mcp-thread-ack-failure" });

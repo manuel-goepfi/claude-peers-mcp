@@ -157,6 +157,8 @@ export interface BindCodexPaneThreadRequest {
   caller_pid: number;
   tmux_pane_id: string;
   thread_id: string;
+  /** Absolute app-server control socket the relay forwards to (shared seats). */
+  app_server_socket?: string | null;
 }
 
 export type BindCodexPaneThreadResponse = ReconcilePaneThreadResponse;

@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { startTestBroker } from "./helpers/test-broker.ts";
+import { startTestBroker, withoutHostTmux } from "./helpers/test-broker.ts";
 
 // Two adapter startups include host process discovery before protocol receipt.
 // Keep the lifecycle deadline separate from the three-second HTTP deadlines.
@@ -19,7 +19,7 @@ test("fresh MCP adapter reconnects and receives and acknowledges a new message",
     CLAUDE_PEERS_CLIENT_TYPE: "unknown",
     CLAUDE_PEER_NAME: "rollout-reconnect-receiver",
     CLAUDE_PEERS_TMUX_IDENTITY_MIRROR: "0",
-    TMUX: undefined, TMUX_PANE: undefined,
+    ...withoutHostTmux(broker.root),
   }).filter((entry): entry is [string, string] => typeof entry[1] === "string"));
   async function connect() {
     const next = new Client({ name: "rollout-reconnect", version: "1" });

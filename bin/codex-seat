@@ -90,6 +90,7 @@ fi
 passthrough_command=""
 seen_cd=0
 seen_remote=0
+seen_no_daemon=0
 unknown_option=0
 # Bare `--remote unix://` names Codex's DEFAULT shared app-server socket. The
 # operator chooses it DELIBERATELY: it is how a terminal TUI and Codex Desktop
@@ -125,6 +126,15 @@ while (( argument_index < ${#arguments[@]} )); do
       ;;
     --remote=*)
       seen_remote=1
+      if (( unknown_option == 0 )); then exec "$REAL_CODEX" "$@"; fi
+      ;;
+    --no-daemon)
+      # Codex 0.160.1: run the app-server in-process instead of the shared
+      # background server. Like --remote it names the endpoint, and Codex
+      # rejects it alongside the --remote a seat injects ("--no-daemon cannot
+      # be used with --remote"), so it can never be wrapped. In-process MCP
+      # servers are children of the pane's TUI, so identity still resolves.
+      seen_no_daemon=1
       if (( unknown_option == 0 )); then exec "$REAL_CODEX" "$@"; fi
       ;;
     -C|--cd)
@@ -176,6 +186,10 @@ while (( argument_index < ${#arguments[@]} )); do
 done
 if (( unknown_option != 0 && seen_remote != 0 )); then
   printf 'codex-seat: explicit --remote conflicts with a pane-local seat after an unknown option; rerun with CLAUDE_PEERS_CODEX_SEAT=0 to use the caller endpoint\n' >&2
+  exit 2
+fi
+if (( unknown_option != 0 && seen_no_daemon != 0 )); then
+  printf 'codex-seat: --no-daemon conflicts with a pane-local seat after an unknown option (Codex rejects --no-daemon with --remote); rerun with CLAUDE_PEERS_CODEX_SEAT=0 to run in-process\n' >&2
   exit 2
 fi
 if (( unknown_option == 0 )); then

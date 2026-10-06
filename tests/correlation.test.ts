@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { startTestBroker, type TestBroker } from "./helpers/test-broker.ts";
+import { startTestBroker, withoutHostTmux, type TestBroker } from "./helpers/test-broker.ts";
 import type { ReplyStatusResponse, SendMessageResponse } from "../shared/types.ts";
 
 const SERVER_SCRIPT = new URL("../server.ts", import.meta.url).pathname;
@@ -394,8 +394,7 @@ test("MCP send and get_reply_status render and acknowledge the correlated reply"
     CLAUDE_PEERS_CLIENT_TYPE: "unknown",
     CLAUDE_PEER_NAME: "mcp-correlation-requester",
     CLAUDE_PEERS_TMUX_IDENTITY_MIRROR: "0",
-    TMUX: undefined,
-    TMUX_PANE: undefined,
+    ...withoutHostTmux(broker.root),
   }).filter((entry): entry is [string, string] => typeof entry[1] === "string"));
   const transport = new StdioClientTransport({ command: "bun", args: [SERVER_SCRIPT], cwd: REPO_ROOT, env, stderr: "pipe" });
   const client = new Client({ name: "correlation-test", version: "1" });
@@ -470,8 +469,7 @@ test("get_reply_status returns the claimed body when ACK fails and retries after
     CLAUDE_PEERS_CLIENT_TYPE: "unknown",
     CLAUDE_PEER_NAME: "reply-ack-failure-requester",
     CLAUDE_PEERS_TMUX_IDENTITY_MIRROR: "0",
-    TMUX: undefined,
-    TMUX_PANE: undefined,
+    ...withoutHostTmux(broker.root),
   }).filter((entry): entry is [string, string] => typeof entry[1] === "string"));
   const transport = new StdioClientTransport({ command: "bun", args: [SERVER_SCRIPT], cwd: REPO_ROOT, env, stderr: "pipe" });
   const client = new Client({ name: "reply-ack-failure-test", version: "1" });
