@@ -109,6 +109,9 @@ async function main(): Promise<number> {
     ["@peer_label", applied],
     ["@peer_resolved_name", routable],
     ["@operator_label", applied],
+    // The explicit seat name is what registration and heartbeats re-read; the
+    // auto-label allocator may rewrite @operator_label, but never this.
+    ["@peer_seat_name", applied],
   ] as const) {
     if (!tmux(["set-option", "-p", "-t", pane, option, value]).ok) failures.push(option);
   }

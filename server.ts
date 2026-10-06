@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
-import { ensurePaneOperatorLabel } from "./bin/tmux-label-pane.ts";
+import { claimPaneSeatName, ensurePaneOperatorLabel, paneSeatNameHolder } from "./bin/tmux-label-pane.ts";
+import { SEAT_NAME_OPTION, cleanSeatName } from "./shared/seat-name.ts";
 /**
  * claude-peers MCP server
  *
@@ -754,6 +755,10 @@ let myId: PeerId | null = null;
 // Operator-facing seat label. This is what Manzo sees in tmux and says when
 // routing by intent (e.g. "codex.2"). It must not be replaced by broker dedup.
 let myOperatorName: string | null = null;
+// The name this seat was given on purpose (set_name, the pane's @peer_seat_name,
+// or a broker-pinned name). While set, no automatic path re-derives the name
+// from the pane's auto label: not the heartbeat re-sync, not a re-registration.
+let myExplicitName: string | null = null;
 // Broker-unique runtime label. This may be suffixed (e.g. "codex.2#4") and is
 // debug/transport metadata only.
 let myResolvedName: string | null = null;
@@ -1406,6 +1411,12 @@ function readUsedOperatorLabels(session: string, currentPaneId: string): string[
   return labels;
 }
 
+/** The pane's explicit seat name, when this adapter owns the pane identity. */
+function readTmuxSeatName(tmuxInfo: TmuxPaneInfo | null): string | null {
+  if (!tmuxInfo?.pane_id || !ownsOperatorPaneIdentity) return null;
+  return cleanSeatName(readTmuxPaneOption(tmuxInfo.pane_id, SEAT_NAME_OPTION));
+}
+
 function resolveTmuxOperatorLabel(tmuxInfo: TmuxPaneInfo | null): string | null {
   if (!tmuxInfo?.pane_id) return null;
   if (!ownsOperatorPaneIdentity) return readTmuxPaneOption(tmuxInfo.pane_id,"@operator_label");
@@ -1855,7 +1866,7 @@ const TOOLS = [
   {
     name: "set_name",
     description:
-      "Set a human-readable name for this Claude Code instance. Overrides any CLAUDE_PEER_NAME set at launch. Other peers will see this name in list_peers and can target it via find_peer name=...  Empty string clears the name.",
+      "Set an explicit name for this session's seat. It overrides CLAUDE_PEER_NAME and the pane's launch-order auto label, and it survives heartbeats and re-registration. A name another live seat already holds is refused with the holder named (no silent suffix). Other peers see this name in list_peers and can target it via find_peer name=...  Empty string clears it and returns the seat to its auto label.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -2325,17 +2336,41 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     case "set_name": {
-      const { name: newName } = args as { name: string };
+      const { name: rawName } = args as { name: string };
+      const newName = typeof rawName === "string" ? rawName.trim() : "";
       if (!myId) {
         return {
           content: [{ type: "text" as const, text: "Not registered with broker yet" }],
           isError: true,
         };
       }
+      // A name is unique across the tmux server: refuse one another pane already
+      // answers to before touching the broker, naming that pane.
+      const seatPane = ownsOperatorPaneIdentity && tmuxIdentityMirrorEnabled() ? (myTmuxInfo?.pane_id ?? null) : null;
+      if (newName && seatPane) {
+        const holder = paneSeatNameHolder(seatPane, newName);
+        if (typeof holder === "string") {
+          return {
+            content: [{ type: "text" as const, text: `Name not changed: "${newName}" is already held by ${holder}. That seat must rename or release it first.` }],
+            isError: true,
+          };
+        }
+      }
       try {
-        const res = await brokerFetch<{ ok: boolean; name: string | null; resolved_name: string | null }>("/set-name", { id: myId, name: newName });
+        // explicit: the broker pins the name against automatic re-syncs and
+        // refuses (409, naming the holder) a name another live seat answers to.
+        const res = await brokerFetch<{ ok: boolean; name: string | null; resolved_name: string | null }>("/set-name", { id: myId, name: newName, explicit: true });
         myOperatorName = res.name ?? null;
         myResolvedName = res.resolved_name ?? res.name ?? null;
+        myExplicitName = res.name ?? null;
+        // The pane carries the explicit name across broker restarts and into the
+        // next registration of whatever runs in this pane.
+        let seatWarning = "";
+        if (seatPane) {
+          const claim = claimPaneSeatName(seatPane, myExplicitName ?? "");
+          if (claim.status === "refused") seatWarning = `\nWarning: pane seat name not stamped: held by ${claim.holder}.`;
+          else if (claim.status === "failed") seatWarning = `\nWarning: pane seat name not stamped (${claim.reason}); the broker keeps the name until it restarts.`;
+        }
         const mirror = publishBrokerIdentityToTmux({
           id: myId,
           name: myOperatorName,
@@ -2346,15 +2381,24 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         recordTmuxMirrorResult("set_name", mirror);
         const pending = await drainPendingMessages();
         const tmuxWarning = mirror.ok ? "" : `\nWarning: tmux label update partially failed for ${mirror.failedOptions.join(", ")}.`;
+        const resolvedNote = myResolvedName && myResolvedName !== myOperatorName ? ` (resolved "${myResolvedName}")` : "";
         return {
-          content: [{ type: "text" as const, text: `Name updated: "${newName}"${tmuxWarning}${pending ?? ""}` }],
+          content: [{ type: "text" as const, text: `Name updated: "${myOperatorName ?? ""}"${resolvedNote}${seatWarning}${tmuxWarning}${pending ?? ""}` }],
         };
       } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        // A 409 here is either the broker naming the live holder, or the auth-
+        // recovery re-registration failing its native runtime proof (seen during
+        // launch storms). Neither changed the name; say so instead of leaving the
+        // caller to guess from a later whoami.
+        const hint = message.includes("is held by")
+          ? ""
+          : " The name was not changed; registration recovery failed, so retry set_name after the next prompt and confirm with whoami.";
         return {
           content: [
             {
               type: "text" as const,
-              text: `Error setting name: ${e instanceof Error ? e.message : String(e)}`,
+              text: `Error setting name: ${message}.${hint}`,
             },
           ],
           isError: true,
@@ -2691,7 +2735,9 @@ async function main() {
     : nestedOperatorChildClientType(myClientType, identityEnv, nestedFrames);
   configurePaneIdentityOwnership(isSubagent,nestedChildClient);
   const envName = spareAncestor || tmuxInfo?.pane_id ? null : (identityEnv.CLAUDE_PEER_NAME ?? null);
-  const tmuxOperatorLabel = resolveTmuxOperatorLabel(tmuxInfo);
+  // An explicit seat name on the pane outranks its launch-order auto label.
+  if (!isSubagent && !nestedChildClient) myExplicitName = readTmuxSeatName(tmuxInfo);
+  const tmuxOperatorLabel = myExplicitName ?? resolveTmuxOperatorLabel(tmuxInfo);
   const tmuxFallbackName =
     tmuxOperatorLabel ??
     (tmuxInfo && tmuxInfo.pane_id
@@ -2755,7 +2801,8 @@ async function main() {
     git_root: myGitRoot,
     absolute_git_dir: myAbsoluteGitDir,
     tty,
-    name: peerName,
+    name: myExplicitName ?? peerName,
+    name_explicit: myExplicitName !== null,
     tmux_session: tmuxInfo?.session ?? null,
     tmux_window_index: tmuxInfo?.window_index ?? null,
     tmux_window_name: tmuxInfo?.window_name ?? null,
@@ -2869,7 +2916,8 @@ async function main() {
     tty = getTty(registrationTtyPid(myRegisterPid, myClientType));
     tmuxInfo = await detectTmuxPane(registrationTtyPid(myRegisterPid, myClientType));
     myTmuxInfo = tmuxInfo;
-    const freshLabel = resolveTmuxOperatorLabel(tmuxInfo) ??
+    if (!isSubagent) myExplicitName = readTmuxSeatName(tmuxInfo);
+    const freshLabel = myExplicitName ?? resolveTmuxOperatorLabel(tmuxInfo) ??
       (tmuxInfo?.pane_id ? `${tmuxInfo.session}.${tmuxInfo.pane_id}` : null);
     peerName = resolvePeerName(null, freshLabel, isSubagent, myRegisterPid);
     log(`spare identity refreshed at registration: cwd=${myCwd} name=${peerName} tmux=${tmuxInfo ? tmuxInfo.session : "(none)"}`);
@@ -2898,6 +2946,7 @@ async function main() {
     }
     myId = reg.id;
     myToken = reg.token;
+    if (reg.name_explicit === true && reg.name) myExplicitName = reg.name;
     myOperatorName = reg.name ?? peerName;
     myResolvedName = reg.resolved_name ?? reg.name ?? peerName;
     myClientType = reg.client_type ?? myClientType;
@@ -2926,6 +2975,7 @@ async function main() {
     const r = await brokerFetch<RegisterResponse>("/register", buildRegisterPayload());
     myId = r.id;
     myToken = r.token;
+    if (r.name_explicit === true && r.name) myExplicitName = r.name;
     // Re-capture both identity layers; the broker may have re-dedup'd if other
     // peers came/went during the auth-reset window.
     myOperatorName = r.name ?? peerName;
@@ -3145,10 +3195,15 @@ async function main() {
           if (tmuxInfo?.pane_id===myTmuxInfo.pane_id) tmuxInfo={...tmuxInfo,session:heartbeat.tmux_session};
         }
       } else if (ownsOperatorPaneIdentity && myTmuxInfo?.pane_id) {
-        const canonical=resolveTmuxOperatorLabel(myTmuxInfo);
+        // Re-sync only toward the explicit name when there is one; the auto
+        // label must never overwrite a name the seat was given on purpose.
+        // A name pinned elsewhere (rename-lane, another adapter) comes back as
+        // name_explicit and is adopted, so this does not repeat every tick.
+        const canonical=myExplicitName ?? resolveTmuxOperatorLabel(myTmuxInfo);
         if (canonical && canonical!==myOperatorName) {
-          const renamed=await brokerFetch<{name:string|null;resolved_name:string|null}>("/set-name",{id:myId,name:canonical});
-          peerName=canonical; myOperatorName=renamed.name; myResolvedName=renamed.resolved_name;
+          const renamed=await brokerFetch<{name:string|null;resolved_name:string|null;name_explicit?:boolean}>("/set-name",{id:myId,name:canonical});
+          if (renamed.name_explicit===true && renamed.name) myExplicitName=renamed.name;
+          peerName=renamed.name ?? canonical; myOperatorName=renamed.name; myResolvedName=renamed.resolved_name;
         }
       }
       // Seat-supersede: a NEWER process registered for our exact tmux seat (our

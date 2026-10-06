@@ -45,6 +45,16 @@ is monotonic across the currently open panes and ignores layout indexes, so a
 move or split does not rename a survivor. A session rename updates the prefix.
 Closing a pane releases its number; no closed-pane reservation is retained.
 
+An explicit seat name outranks the pane's auto label. `set_name`, `bin/rename-lane.ts`,
+and a launcher's explicit `-n` stamp it on the pane as `@peer_seat_name`
+(`bun bin/tmux-label-pane.ts --claim-seat-name <pane> <name>`; an empty name
+releases it), and the broker pins it so heartbeats, hook re-registration and
+adapter re-syncs never write the auto label back. `--print-seat <pane>` prints the
+name a pane's seat answers to; `--print` stays the auto label. A name another live
+seat or pane already answers to is refused with the holder named (claim exit 3,
+`set_name` HTTP 409) instead of being suffixed. Control seats whose role labels
+share the `session.number` shape must be launched with an explicit name.
+
 Native Claude mailbox grouping is limited to one independently proven runtime,
 account, conversation, and pane. The native peer remains the only targetable
 member; companion IDs remain as non-targetable history aliases so pending mail
