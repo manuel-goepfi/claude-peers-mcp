@@ -2,7 +2,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
 import { createConnection, type Socket } from "node:net";
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, renameSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { Database } from "bun:sqlite";
@@ -222,10 +222,17 @@ test.skipIf(!Bun.which("tmux")).each(["UserPromptSubmit", "PostToolBatch"])(
     const register = new URL("../hooks/claude-register-peer-session.sh", import.meta.url).pathname;
     const drain = new URL("../hooks/claude-drain-peer-inbox.sh", import.meta.url).pathname;
     const driver = join(root, "driver.py");
+    // Every file handed between this test and the driver appears whole: it is
+    // written to a temporary name and renamed. A reader that polls for the
+    // name otherwise can see it empty or half-written (JSON "Unexpected EOF"
+    // here, or a driver that dies on a partial .input and never answers).
     writeFileSync(driver, `import ctypes,json,os,subprocess,sys,time,urllib.request
 ctypes.CDLL(None).prctl(15,b'claude',0,0,0)
 base=sys.argv[1]
-open(base+'.pid','w').write(str(os.getpid()))
+def publish(path,text):
+ with open(path+'.tmp','w') as f: f.write(text)
+ os.replace(path+'.tmp',path)
+publish(base+'.pid',str(os.getpid()))
 while True:
  if os.path.exists(base+'.input'):
   with open(base+'.input') as f: job=json.load(f)
@@ -235,9 +242,12 @@ while True:
    req=urllib.request.Request('http://127.0.0.1:'+os.environ['CLAUDE_PEERS_PORT']+'/send-by-pid',data=json.dumps(payload).encode(),headers={'Content-Type':'application/json'})
    with urllib.request.urlopen(req,timeout=3) as response: result={'code':0,'stdout':response.read().decode(),'stderr':''}
   else:
-   completed=subprocess.run(['bash',job['script']],input=json.dumps(job['input']),text=True,capture_output=True,timeout=12)
-   result={'code':completed.returncode,'stdout':completed.stdout,'stderr':completed.stderr}
-  with open(base+'.result','w') as f: json.dump(result,f)
+   try:
+    completed=subprocess.run(['bash',job['script']],input=json.dumps(job['input']),text=True,capture_output=True,timeout=12)
+    result={'code':completed.returncode,'stdout':completed.stdout,'stderr':completed.stderr}
+   except subprocess.TimeoutExpired as e:
+    result={'code':124,'stdout':e.stdout or '','stderr':'driver: hook exceeded 12s'}
+  publish(base+'.result',json.dumps(result))
  time.sleep(.02)
 `);
     const env = { ...process.env, HOME: root, CLAUDE_CONFIG_DIR: join(root, "claude"),
@@ -249,9 +259,10 @@ while True:
     const run = async (seat: string, script: string, extra: Record<string, unknown> = {}) => {
       const base = join(root, seat);
       rmSync(base + ".result", { force: true });
-      writeFileSync(base + ".input", JSON.stringify({ script, input: {
+      writeFileSync(base + ".input.tmp", JSON.stringify({ script, input: {
         session_id: thread, transcript_path: transcript, hook_event_name: event, ...extra,
       } }));
+      renameSync(base + ".input.tmp", base + ".input");
       const deadline = Date.now() + 13000;
       while (!existsSync(base + ".result") && Date.now() < deadline) await Bun.sleep(25);
       return JSON.parse(readFileSync(base + ".result", "utf8")) as { code: number; stdout: string; stderr: string };
