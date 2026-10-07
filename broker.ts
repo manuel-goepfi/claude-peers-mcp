@@ -2191,7 +2191,13 @@ function isClientSessionPid(pid: number): boolean {
   }
 }
 
+// Cumulative seat liveness probes: pid probes here plus runtime-group proofs
+// (liveGroups.probes). Reported as one aggregate count by /metrics so tests can
+// prove that a route's proof work does not grow with the peer table.
+let pidProbes = 0;
+
 function isPidAlive(pid: number): boolean {
+  pidProbes++;
   try {
     process.kill(pid, 0);
     return true;
@@ -4661,7 +4667,7 @@ requestHandler = async (req: Request) => {
             return Response.json(response);
           }
         case "/metrics":
-          return Response.json({ ...runtimeMetrics.snapshot(), rate_limit_buckets: buckets.size });
+          return Response.json({ ...runtimeMetrics.snapshot(), rate_limit_buckets: buckets.size, seat_liveness_probes: pidProbes + liveGroups.probes });
         case "/set-summary": {
           const summary = String(body.summary ?? "");
           if (utf8Bytes(summary) > MAX_SUMMARY_BYTES) {

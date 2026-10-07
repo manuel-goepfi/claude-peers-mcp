@@ -19,6 +19,8 @@ function groupKey(peer:Row,proof:SeatRuntimeProof):string {
 /** Runtime-scoped mailbox membership, stored entirely in existing schema2 rows.
  * A group never reserves a display name or transfers to another native process. */
 export class LiveMailboxGroups {
+  /** Runtime-group proofs attempted by current(); an aggregate count, never IDs. */
+  probes=0;
   constructor(private db:Database) {}
   private row(id:string){return this.db.query("SELECT * FROM peers WHERE id=?").get(id) as Row|null;}
   nativeIdentity(callerPid:number) { return this.inspectNative(callerPid); }
@@ -50,6 +52,7 @@ export class LiveMailboxGroups {
     this.db.run("UPDATE peers SET seat_key=? WHERE id=? AND seat_key IS NOT ?",[key,found.peer.id,key]);
   }
   current(id:string):{peer:Row;native:Row;proof:SeatRuntimeProof}|null {
+    this.probes++;
     try{
       const peer=this.row(id),prefix=liveGroupPrefix(peer?.seat_key);
       if(!peer || !prefix || !peer.token || currentSeatProcessKey(peer.pid)!==peer.seat_key!.split(":")[3])return null;

@@ -398,7 +398,7 @@ Require the final command to print `ok`, retain the pre-compaction backup, start
 
 ## Logs, metrics, bridge, and nudge
 
-The broker append log is created owner-only. Keep logs local and avoid copying them into shared tickets without review. `/health` stays content-free; authenticated aggregate metrics contain route counts/latency summaries, not message content or peer IDs.
+The broker append log is created owner-only. Keep logs local and avoid copying them into shared tickets without review. `/health` stays content-free; authenticated aggregate metrics contain route counts/latency summaries and a cumulative seat liveness probe count (`seat_liveness_probes`), not message content or peer IDs.
 
 The AP-063 bridge is a privileged same-UID history cursor. Its 0600 bearer token grants message-history access. Set `CLAUDE_PEERS_BRIDGE_ENABLED=false` to remove token publication and the route completely, then restart the broker.
 
