@@ -197,6 +197,28 @@ describe("codex-thread-stop against a shared app-server", () => {
     expect(broker.gates.map((gate) => gate.gate)).toEqual(["stopping", "stopped"]);
   });
 
+  test("an already-gone lane whose subagent stays loaded is never marked stopped until the subagent unloads", async () => {
+    // The lane thread is gone from the start; its subagent fails archive on the first stop AND on the retry.
+    const fake = new FakeCodexAppServer({
+      [T_LANE]: { status: "notLoaded", archived: true },
+      [T_SUB_1]: { status: "idle", parentThreadId: T_LANE, failArchive: 2 },
+    });
+    const broker = recordingBroker(laneLookup());
+    const lines: string[] = [];
+    const deps = { ...quiet, out: (line: string) => lines.push(line), broker: broker.api, connect: fakeConnect(fake) };
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      lines.length = 0;
+      expect(await runCodexThreadStop({ paneId: "%28803", dryRun: false, brokerPort: 7899 }, deps)).toBe(EXIT.failed);
+      expect(lines.join("\n")).toContain(`verification FAILED: subagent(s) still loaded: ${T_SUB_1}; no gate applied`);
+      expect(broker.gates.map((gate) => gate.gate)).not.toContain("stopped");
+      expect(fake.loadedIds()).toEqual([T_SUB_1]);
+    }
+    // Only once the subagent actually unloads does the gone path mark the lane stopped.
+    expect(await runCodexThreadStop({ paneId: "%28803", dryRun: false, brokerPort: 7899 }, deps)).toBe(EXIT.gone);
+    expect(fake.loadedIds()).toEqual([]);
+    expect(broker.gates.map((gate) => gate.gate)).toEqual(["stopped"]);
+  });
+
   test("a server that unloads subagents with their parent (real 0.160.1 behaviour) still verifies", async () => {
     const fake = new FakeCodexAppServer({
       [T_LANE]: { status: "idle" },
