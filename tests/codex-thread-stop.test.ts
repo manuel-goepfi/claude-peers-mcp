@@ -24,6 +24,11 @@ import { applyCodexThreadGate, ensureCodexThreadControlTable } from "../shared/c
 const T_LANE = "01a1108e-702f-7101-93c2-0824eac7bd3f";
 const T_OTHER = "01a1108e-702f-7101-93c2-0824eac7bd40";
 const T_THIRD = "01a1108e-702f-7101-93c2-0824eac7bd41";
+const T_SUB_1 = "01a1108e-702f-7101-93c2-0824eac7bd51";
+const T_SUB_2 = "01a1108e-702f-7101-93c2-0824eac7bd52";
+const T_GRANDCHILD = "01a1108e-702f-7101-93c2-0824eac7bd53";
+const T_SUB_OTHER = "01a1108e-702f-7101-93c2-0824eac7bd54";
+const T_SUB_ORPHAN = "01a1108e-702f-7101-93c2-0824eac7bd55";
 const SOCKET = "/run/user/1000/codex-test/app-server-control.sock";
 const CLI = new URL("../bin/codex-thread-stop.ts", import.meta.url).pathname;
 const FAKE = new URL("./fixtures/fake-codex-app-server.ts", import.meta.url).pathname;
@@ -109,15 +114,143 @@ describe("codex-thread-stop against a shared app-server", () => {
       ["turn/interrupt", T_LANE],
       ["thread/archive", T_LANE],
     ]);
-    // Neighbouring lanes on the same server: untouched and still running.
-    expect(fake.callsFor(T_OTHER)).toEqual([]);
-    expect(fake.callsFor(T_THIRD)).toEqual([]);
+    // Neighbouring lanes on the same server: only read (subagent discovery),
+    // never interrupted or archived, and still running.
+    expect(fake.callsFor(T_OTHER).every((method) => method === "thread/read")).toBe(true);
+    expect(fake.callsFor(T_THIRD).every((method) => method === "thread/read")).toBe(true);
     expect(fake.loadedIds().sort()).toEqual([T_OTHER, T_THIRD].sort());
     expect(fake.threads.get(T_OTHER)!.turns![0]!.status).toBe("inProgress");
     // The stopped thread can no longer run a turn on the server.
     expect(fake.handle(JSON.stringify({ id: 99, method: "turn/start", params: { threadId: T_LANE, input: [] } }))[0])
       .toContain(`thread not found: ${T_LANE}`);
     expect(lines.join("\n")).toContain("verified");
+  });
+
+  test("stop archives loaded subagent descendants", async () => {
+    const fake = new FakeCodexAppServer({
+      [T_LANE]: { status: "idle", turns: [{ id: "turn-done", status: "completed" }] },
+      [T_SUB_1]: { status: "idle", parentThreadId: T_LANE },
+      [T_SUB_2]: { status: "idle", parentThreadId: T_LANE },
+    });
+    const broker = recordingBroker(laneLookup());
+    const lines: string[] = [];
+    const code = await runCodexThreadStop(
+      { paneId: "%28803", dryRun: false, brokerPort: 7899 },
+      { ...quiet, out: (line) => lines.push(line), broker: broker.api, connect: fakeConnect(fake) },
+    );
+    expect(code).toBe(EXIT.stopped);
+    expect(fake.loadedIds()).toEqual([]);
+    const archives = fake.mutatingCalls().filter((call) => call.method === "thread/archive").map((call) => call.threadId);
+    expect([...archives].sort()).toEqual([T_LANE, T_SUB_1, T_SUB_2].sort());
+    // Subagents go first, so none is left behind as an orphan of an unloaded parent.
+    expect(archives.at(-1)).toBe(T_LANE);
+    expect(broker.gates.map((gate) => gate.gate)).toEqual(["stopping", "stopped"]);
+    expect(lines.join("\n")).toContain("nor are its 2 subagent(s)");
+  });
+
+  test("the subagent tree is followed to grandchildren; other lanes' subagents are untouched; dry run only plans", async () => {
+    const tree = () => new FakeCodexAppServer({
+      [T_LANE]: { status: "active", turns: [{ id: "turn-live", status: "inProgress" }] },
+      [T_SUB_1]: { status: "idle", parentThreadId: T_LANE },
+      [T_GRANDCHILD]: { status: "active", parentThreadId: T_SUB_1, turns: [{ id: "turn-gc", status: "inProgress" }] },
+      [T_OTHER]: { status: "idle" },
+      [T_SUB_OTHER]: { status: "idle", parentThreadId: T_OTHER },
+      [T_SUB_ORPHAN]: { status: "idle", parentThreadId: T_THIRD },
+    });
+    const planned = tree();
+    const dryLines: string[] = [];
+    const dryBroker = recordingBroker(laneLookup());
+    expect(await runCodexThreadStop(
+      { paneId: "%28803", dryRun: true, brokerPort: 7899 },
+      { ...quiet, out: (line) => dryLines.push(line), broker: dryBroker.api, connect: fakeConnect(planned) },
+    )).toBe(EXIT.stopped);
+    expect(planned.mutatingCalls()).toEqual([]);
+    expect(dryBroker.gates).toEqual([]);
+    expect(dryLines.join("\n")).toContain(`would thread/archive 2 loaded subagent(s) first: ${T_GRANDCHILD}, ${T_SUB_1}`);
+
+    const fake = tree();
+    const broker = recordingBroker(laneLookup());
+    expect(await runCodexThreadStop(
+      { paneId: "%28803", dryRun: false, brokerPort: 7899 },
+      { ...quiet, broker: broker.api, connect: fakeConnect(fake) },
+    )).toBe(EXIT.stopped);
+    expect(fake.mutatingCalls().filter((call) => call.method === "thread/archive").map((call) => call.threadId))
+      .toEqual([T_GRANDCHILD, T_SUB_1, T_LANE]);
+    expect(fake.loadedIds().sort()).toEqual([T_OTHER, T_SUB_OTHER, T_SUB_ORPHAN].sort());
+  });
+
+  test("a subagent that stays loaded keeps the gate at 'stopping'; a retry finishes the stop", async () => {
+    const fake = new FakeCodexAppServer({
+      [T_LANE]: { status: "idle" },
+      [T_SUB_1]: { status: "idle", parentThreadId: T_LANE, failArchive: 1 },
+    });
+    const broker = recordingBroker(laneLookup());
+    const lines: string[] = [];
+    const deps = { ...quiet, out: (line: string) => lines.push(line), broker: broker.api, connect: fakeConnect(fake) };
+    expect(await runCodexThreadStop({ paneId: "%28803", dryRun: false, brokerPort: 7899 }, deps)).toBe(EXIT.failed);
+    expect(broker.gates.map((gate) => gate.gate)).toEqual(["stopping"]);
+    expect(lines.join("\n")).toContain(`subagent(s) still loaded: ${T_SUB_1}`);
+    expect(fake.loadedIds()).toEqual([T_SUB_1]);
+    // The lane thread is gone now; the retry archives the leftover subagent before marking it stopped.
+    expect(await runCodexThreadStop({ paneId: "%28803", dryRun: false, brokerPort: 7899 }, deps)).toBe(EXIT.gone);
+    expect(fake.loadedIds()).toEqual([]);
+    expect(broker.gates.map((gate) => gate.gate)).toEqual(["stopping", "stopped"]);
+  });
+
+  test("an already-gone lane whose subagent stays loaded is never marked stopped until the subagent unloads", async () => {
+    // The lane thread is gone from the start; its subagent fails archive on the first stop AND on the retry.
+    const fake = new FakeCodexAppServer({
+      [T_LANE]: { status: "notLoaded", archived: true },
+      [T_SUB_1]: { status: "idle", parentThreadId: T_LANE, failArchive: 2 },
+    });
+    const broker = recordingBroker(laneLookup());
+    const lines: string[] = [];
+    const deps = { ...quiet, out: (line: string) => lines.push(line), broker: broker.api, connect: fakeConnect(fake) };
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      lines.length = 0;
+      expect(await runCodexThreadStop({ paneId: "%28803", dryRun: false, brokerPort: 7899 }, deps)).toBe(EXIT.failed);
+      expect(lines.join("\n")).toContain(`verification FAILED: subagent(s) still loaded: ${T_SUB_1}; no gate applied`);
+      expect(broker.gates.map((gate) => gate.gate)).not.toContain("stopped");
+      expect(fake.loadedIds()).toEqual([T_SUB_1]);
+    }
+    // Only once the subagent actually unloads does the gone path mark the lane stopped.
+    expect(await runCodexThreadStop({ paneId: "%28803", dryRun: false, brokerPort: 7899 }, deps)).toBe(EXIT.gone);
+    expect(fake.loadedIds()).toEqual([]);
+    expect(broker.gates.map((gate) => gate.gate)).toEqual(["stopped"]);
+  });
+
+  test("a server that unloads subagents with their parent (real 0.160.1 behaviour) still verifies", async () => {
+    const fake = new FakeCodexAppServer({
+      [T_LANE]: { status: "idle" },
+      [T_SUB_1]: { status: "idle", parentThreadId: T_LANE },
+      [T_SUB_2]: { status: "idle", parentThreadId: T_LANE },
+    }, { cascadeArchive: true });
+    const broker = recordingBroker(laneLookup());
+    expect(await runCodexThreadStop(
+      { paneId: "%28803", dryRun: false, brokerPort: 7899 },
+      { ...quiet, broker: broker.api, connect: fakeConnect(fake) },
+    )).toBe(EXIT.stopped);
+    expect(fake.loadedIds()).toEqual([]);
+  });
+
+  test("an unreadable loaded thread refuses the stop before any gate (it may be a subagent)", async () => {
+    const fake = sharedServer();
+    const original = fake.handle.bind(fake);
+    fake.handle = (text: string) => {
+      const message = JSON.parse(text) as { id?: string; method?: string; params?: { threadId?: string } };
+      if (message.method === "thread/read" && message.params?.threadId === T_OTHER) {
+        fake.calls.push({ method: "thread/read", threadId: T_OTHER, params: message.params });
+        return [JSON.stringify({ id: message.id, error: { code: -32001, message: "thread/read timed out" } })];
+      }
+      return original(text);
+    };
+    const broker = recordingBroker(laneLookup());
+    expect(await runCodexThreadStop(
+      { paneId: "%28803", dryRun: false, brokerPort: 7899 },
+      { ...quiet, broker: broker.api, connect: fakeConnect(fake) },
+    )).toBe(EXIT.refused);
+    expect(broker.gates).toEqual([]);
+    expect(fake.mutatingCalls()).toEqual([]);
   });
 
   test("--dry-run sends no gate, interrupt, or archive", async () => {

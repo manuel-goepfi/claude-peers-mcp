@@ -15,9 +15,12 @@
  *      BEFORE touching the turn, so an interrupt-triggered Stop hook cannot
  *      claim mail;
  *   4. turn/interrupt every in-progress turn (ids from thread/turns/list);
- *   5. thread/archive the thread (the server unloads it);
- *   6. verify with the server's own status that it is no longer loaded, and
- *      only then raise the gate to the permanent `stopped`.
+ *   5. thread/archive its loaded subagents (threads whose parentThreadId
+ *      chain leads to it, found by thread/read of every loaded thread),
+ *      deepest first, then the thread itself (the server unloads it);
+ *   6. verify with the server's own status that neither the thread nor any
+ *      of its subagents is still loaded, and only then raise the gate to the
+ *      permanent `stopped`.
  *
  * If any step after 3 fails, the gate stays `stopping`: mail stays gated, the
  * thread is NOT labelled stopped, and the operator either reruns the stop
@@ -381,16 +384,85 @@ export async function loadedThreadIds(rpc: RpcConnection): Promise<Set<string> |
 // saying it does not know a thread, so they must never read as "already gone".
 const TRANSPORT_ERROR_CODES = new Set([-32000, -32001]);
 
-type ThreadStatus =
-  | { known: false; error: string; transport: boolean }
-  | { known: true; status: string; id: string | null };
+/**
+ * What the v2 Thread `source` says the thread is: a client-started top-level
+ * thread ("cli", "vscode", "exec", "mcp", "appServer", or {custom}), a
+ * subagent ({subAgent}), or anything else ("unknown", {internal}, missing).
+ */
+export type SourceKind = "top-level" | "subagent" | "unknown";
 
-async function threadStatus(rpc: RpcConnection, threadId: string): Promise<ThreadStatus> {
+export type ThreadStatus =
+  | { known: false; error: string; transport: boolean }
+  | { known: true; status: string; id: string | null; parentThreadId: string | null; updatedAt: number | null; sourceKind: SourceKind };
+
+const TOP_LEVEL_SOURCES = new Set(["cli", "vscode", "exec", "mcp", "appserver"]);
+
+function sourceKindOf(source: unknown): SourceKind {
+  if (typeof source === "string") return TOP_LEVEL_SOURCES.has(source.toLowerCase()) ? "top-level" : "unknown";
+  if (source && typeof source === "object") {
+    const keys = Object.keys(source).map((key) => key.toLowerCase());
+    if (keys.includes("subagent")) return "subagent";
+    if (keys.length === 1 && keys[0] === "custom") return "top-level";
+  }
+  return "unknown";
+}
+
+/**
+ * A subagent names its parent in `parentThreadId` (v2 Thread); older servers
+ * only carry it in source.subAgent.thread_spawn.parent_thread_id.
+ */
+function parentOf(thread: { parentThreadId?: unknown; source?: unknown }): string | null {
+  if (typeof thread.parentThreadId === "string") return thread.parentThreadId.toLowerCase();
+  const spawn = (thread.source as { subAgent?: { thread_spawn?: { parent_thread_id?: unknown } } } | undefined)?.subAgent?.thread_spawn;
+  return typeof spawn?.parent_thread_id === "string" ? spawn.parent_thread_id.toLowerCase() : null;
+}
+
+/** Thread.updatedAt is Unix seconds; tolerate milliseconds. Returns epoch ms. */
+function updatedAtMs(value: unknown): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return null;
+  return value > 1e12 ? value : value * 1000;
+}
+
+export async function threadStatus(rpc: RpcConnection, threadId: string): Promise<ThreadStatus> {
   const reply = await rpc.request("thread/read", { threadId, includeTurns: false });
   if (reply.error) return { known: false, error: errorText(reply), transport: TRANSPORT_ERROR_CODES.has(reply.error.code ?? 0) };
-  const thread = (reply.result as { thread?: { id?: unknown; status?: { type?: unknown } } })?.thread;
+  const thread = (reply.result as { thread?: { id?: unknown; status?: { type?: unknown }; parentThreadId?: unknown; source?: unknown; updatedAt?: unknown } })?.thread;
   const status = thread?.status?.type;
-  return { known: true, status: typeof status === "string" ? status : "unknown", id: typeof thread?.id === "string" ? thread.id.toLowerCase() : null };
+  return {
+    known: true, status: typeof status === "string" ? status : "unknown", id: typeof thread?.id === "string" ? thread.id.toLowerCase() : null,
+    parentThreadId: thread ? parentOf(thread) : null, updatedAt: updatedAtMs(thread?.updatedAt), sourceKind: sourceKindOf(thread?.source),
+  };
+}
+
+/**
+ * Loaded subagents of `threadId` (children, grandchildren, ...), deepest
+ * first so none outlives its parent. `ancestors` adds ids that count as part
+ * of the tree even though they are no longer loaded (a grandchild whose
+ * parent was already archived). Reads every loaded thread; a transport
+ * failure is an error, because an unread thread may be a descendant.
+ */
+export async function loadedDescendants(rpc: RpcConnection, threadId: string, loaded: Set<string>, ancestors: Iterable<string> = []):
+  Promise<{ ids: string[] } | { error: string }> {
+  const parents = new Map<string, string>();
+  for (const id of loaded) {
+    if (id === threadId) continue;
+    const info = await threadStatus(rpc, id);
+    if (!info.known) {
+      if (info.transport) return { error: `thread/read ${id} failed: ${info.error}` };
+      continue; // unloaded between list and read
+    }
+    if (info.parentThreadId) parents.set(id, info.parentThreadId);
+  }
+  const tree = new Set([threadId, ...ancestors]);
+  const depth = new Map<string, number>();
+  for (const id of parents.keys()) {
+    let hops = 0;
+    for (let cursor: string | undefined = id; cursor !== undefined && hops <= parents.size; cursor = parents.get(cursor)) {
+      if (cursor !== id && tree.has(cursor)) { depth.set(id, hops); break; }
+      hops++;
+    }
+  }
+  return { ids: [...depth.keys()].sort((a, b) => depth.get(b)! - depth.get(a)!) };
 }
 
 async function inProgressTurnIds(rpc: RpcConnection, threadId: string): Promise<{ ids: string[]; error?: string }> {
@@ -433,6 +505,23 @@ export async function proveAbsentEverywhere(threadId: string, target: string, kn
   return null;
 }
 
+/**
+ * Archive the given subagents of `threadId`, then re-list. Returns null when
+ * none of its subagents is loaded any more, else the ids still loaded ("" when
+ * that cannot be verified).
+ */
+async function archiveSubagents(rpc: RpcConnection, threadId: string, ids: string[], messages: string[]): Promise<string | null> {
+  for (const id of ids) {
+    const reply = await rpc.request("thread/archive", { threadId: id });
+    messages.push(reply.error ? `subagent ${id}: thread/archive failed: ${errorText(reply)}` : `archived subagent ${id}`);
+  }
+  const loaded = await loadedThreadIds(rpc);
+  if (loaded === null) return "";
+  const left = await loadedDescendants(rpc, threadId, loaded, ids);
+  if ("error" in left) return "";
+  return left.ids.length > 0 ? left.ids.join(", ") : null;
+}
+
 const RECOVERY = (threadId: string) =>
   `mail stays gated as 'stopping' and the thread is NOT marked stopped; rerun codex-thread-stop to retry, or codex-thread-stop --unstop --thread ${threadId} to restore delivery`;
 
@@ -458,14 +547,35 @@ export async function stopThreadOnServer(rpc: RpcConnection, threadId: string, o
   const loadedBefore = await loadedThreadIds(rpc);
   if (loadedBefore === null) { messages.push("thread/loaded/list failed; cannot prove what is running"); return result("refused"); }
   const isLoaded = loadedBefore.has(threadId);
+  // Subagents the thread spawned stay loaded after it finishes (each holds
+  // proxy listeners and session fds), so a stop ends the whole tree. Read
+  // only once this server is proven to be the thread's own.
+  let descendants: string[] = [];
+  let subagentPlan = "";
+  const findSubagents = async (): Promise<string | null> => {
+    const tree = await loadedDescendants(rpc, threadId, loadedBefore);
+    if ("error" in tree) return `cannot list the thread's subagents (${tree.error})`;
+    descendants = tree.ids;
+    subagentPlan = descendants.length > 0
+      ? `would thread/archive ${descendants.length} loaded subagent(s) first: ${descendants.join(", ")}`
+      : "no loaded subagents";
+    return null;
+  };
 
   if (!isLoaded && (!before.known || before.status === "notLoaded")) {
     // Not loaded HERE is not proof of death: the thread may live on another
     // app-server (a wrong --socket, or a binding with no recorded socket).
-    const refusal = await options.proveAbsent();
+    const refusal = await options.proveAbsent() ?? await findSubagents();
     if (refusal) { messages.push(`refused: ${refusal}; no gate applied`); return result("refused"); }
     const where = before.known ? "is not loaded" : `is unknown (${before.error})`;
-    if (options.dryRun) { messages.push(`would mark stopped: thread ${where} here and absent from every known app-server`); return result("dry-run"); }
+    if (options.dryRun) { messages.push(`would mark stopped: thread ${where} here and absent from every known app-server`, subagentPlan); return result("dry-run"); }
+    if (descendants.length > 0) {
+      const remaining = await archiveSubagents(rpc, threadId, descendants, messages);
+      if (remaining !== null) {
+        messages.push(`verification FAILED: subagent(s) still loaded: ${remaining || "unverifiable"}; no gate applied`);
+        return result("failed");
+      }
+    }
     try { messages.push(await options.gate("stopped", before.known)); }
     catch (error) { messages.push(`mail gate FAILED: ${error instanceof Error ? error.message : String(error)}`); return result("failed"); }
     if (before.known) {
@@ -476,6 +586,8 @@ export async function stopThreadOnServer(rpc: RpcConnection, threadId: string, o
     return result("gone");
   }
 
+  const subagentError = await findSubagents();
+  if (subagentError) { messages.push(`refused: ${subagentError}; no gate applied`); return result("refused"); }
   const status = before.known ? before.status : "unknown";
   const turns = status === "active" ? await inProgressTurnIds(rpc, threadId) : { ids: [] as string[] };
   if (options.dryRun) {
@@ -483,7 +595,8 @@ export async function stopThreadOnServer(rpc: RpcConnection, threadId: string, o
       `thread ${threadId} is loaded (status ${status})`,
       "would gate peer mail in the broker (stopping)",
       turns.ids.length > 0 ? `would turn/interrupt ${turns.ids.join(", ")}` : "no in-progress turn to interrupt",
-      "would thread/archive, verify it unloads, then mark it stopped",
+      subagentPlan,
+      "would thread/archive, verify it and its subagents unload, then mark it stopped",
     );
     return result("dry-run");
   }
@@ -514,6 +627,11 @@ export async function stopThreadOnServer(rpc: RpcConnection, threadId: string, o
     }
   }
 
+  // Deepest first; a failure here shows up in the verification below.
+  for (const id of descendants) {
+    const reply = await rpc.request("thread/archive", { threadId: id });
+    messages.push(reply.error ? `subagent ${id}: thread/archive failed: ${errorText(reply)}` : `archived subagent ${id}`);
+  }
   const archive = await rpc.request("thread/archive", { threadId });
   if (archive.error) {
     messages.push(`thread/archive failed: ${errorText(archive)}`, RECOVERY(threadId));
@@ -528,7 +646,14 @@ export async function stopThreadOnServer(rpc: RpcConnection, threadId: string, o
     messages.push(`verification FAILED: thread still ${state} after archive`, RECOVERY(threadId));
     return result("failed");
   }
-  messages.push(`verified: thread ${threadId} is ${after.known ? after.status : "unknown to the server"} and not loaded`);
+  // Includes subagents spawned after the first listing, and grandchildren of
+  // subagents archived above.
+  const left = await loadedDescendants(rpc, threadId, loadedAfter, descendants);
+  if ("error" in left || left.ids.length > 0) {
+    messages.push(`verification FAILED: subagent(s) still loaded: ${"error" in left ? `unverifiable (${left.error})` : left.ids.join(", ")}`, RECOVERY(threadId));
+    return result("failed");
+  }
+  messages.push(`verified: thread ${threadId} is ${after.known ? after.status : "unknown to the server"} and not loaded${descendants.length > 0 ? `, nor are its ${descendants.length} subagent(s)` : ""}`);
   try { messages.push(await options.gate("stopped", true)); }
   catch (error) {
     messages.push(`server confirmed the stop but the broker could not record it (${error instanceof Error ? error.message : String(error)}); mail stays gated as 'stopping'; rerun to finalize`);
