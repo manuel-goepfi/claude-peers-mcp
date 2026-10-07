@@ -5,7 +5,9 @@
  * 2026-10-05 that was 78% of broker CPU and stalled the event loop for seconds.
  *
  * These tests pin the routing semantics (a row competes only with rows on its
- * own seat) and the cost shape (unrelated dead rows do not slow a poll).
+ * own seat) and the cost shape: unrelated dead rows add no liveness proofs to a
+ * poll. The cost is counted, not timed. A wall-clock bound measured host load:
+ * it failed at 1.5 to 4 s in a one-CPU lease with the code unchanged.
  */
 
 import { Database } from "bun:sqlite";
@@ -115,7 +117,26 @@ describe("sender replyability is proved per seat", () => {
     expect(replyable.get(dead)).toBe(0);
   });
 
-  test("unrelated dead rows do not make a poll scale with the table", async () => {
+  // The broker counts every seat liveness probe (a pid probe or a runtime-group
+  // proof) in the authenticated /metrics aggregate. Equal counts at two table
+  // sizes prove that a poll's proofs do not depend on unrelated rows, whatever
+  // the host load. Reverting to a whole-table proof adds one probe per stored
+  // row per sender and fails the equality. Only the proofs are seat-scoped:
+  // each sender's resolution still reads every targetable row, so wall time
+  // stays linear in the table and is deliberately not asserted here.
+  async function probesSoFar(id: string): Promise<number> {
+    const metrics = await call<{ seat_liveness_probes?: number }>("/metrics", { id });
+    expect(typeof metrics.seat_liveness_probes).toBe("number");
+    return metrics.seat_liveness_probes!;
+  }
+
+  async function pollProbes(targetId: string): Promise<{ probes: number; replyable: Map<string, boolean | number | undefined> }> {
+    const before = await probesSoFar(targetId);
+    const replyable = await replyableBySender(targetId);
+    return { probes: (await probesSoFar(targetId)) - before, replyable };
+  }
+
+  test("unrelated dead rows add no liveness proofs to a poll", async () => {
     const target = await registerTarget("sr-target-c", "%970");
     const senders: string[] = [];
     for (let i = 0; i < 25; i++) {
@@ -123,8 +144,18 @@ describe("sender replyability is proved per seat", () => {
       insertPeer({ id, pid: spawnHolder(), pane: `%97${i + 10}`, registeredAt: new Date().toISOString() });
       senders.push(id);
     }
+    for (const sender of senders) queue(sender, target.id, `from ${sender}`);
+
+    const small = await pollProbes(target.id);
+    expect(small.replyable.size).toBe(senders.length);
+    for (const sender of senders) expect(small.replyable.get(sender)).toBe(1);
+    // Non-vacuous: every distinct sender is proved once. A counter that never
+    // moves would make the equality below pass for any implementation.
+    expect(small.probes).toBeGreaterThanOrEqual(senders.length);
+
     // Ended runtime-group rows look like the 1,400+ rows found on the live host:
-    // each one needs a database read and a procfs read to prove it is gone.
+    // each one needs a database read and a procfs read to prove it is gone. The
+    // assertion is exact, so the table only has to dwarf the sender count.
     const insert = db.prepare(
       `INSERT INTO peers (id, pid, cwd, registered_at, last_seen, token, tmux_session, tmux_pane_id,
          client_type, receiver_mode, seat_key, non_targetable)
@@ -132,21 +163,15 @@ describe("sender replyability is proved per seat", () => {
     );
     const iso = new Date().toISOString();
     db.transaction(() => {
-      for (let i = 0; i < 3000; i++) {
+      for (let i = 0; i < 1000; i++) {
         insert.run(`dd${hex(4)}`, 4_000_000 + i, iso, iso, null, `%${20000 + i}`, `live:${hex(32)}:native:${hex(32)}`);
       }
     })();
-    for (const sender of senders) queue(sender, target.id, `from ${sender}`);
 
-    const started = performance.now();
-    const replyable = await replyableBySender(target.id);
-    const elapsedMs = performance.now() - started;
-
-    expect(replyable.size).toBe(senders.length);
-    for (const sender of senders) expect(replyable.get(sender)).toBe(1);
-    // Before this change: 25 senders x 3,000 rows x two group proofs, measured
-    // at several seconds. Seat-scoped proof is a few milliseconds; the bound is
-    // generous for a loaded CI host.
-    expect(elapsedMs).toBeLessThan(1_500);
+    // /poll-messages is read-only, so the same 25 messages come back.
+    const large = await pollProbes(target.id);
+    expect(large.replyable.size).toBe(senders.length);
+    for (const sender of senders) expect(large.replyable.get(sender)).toBe(1);
+    expect(large.probes).toBe(small.probes);
   }, 60_000);
 });
