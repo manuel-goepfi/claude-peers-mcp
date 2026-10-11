@@ -227,4 +227,55 @@ describe("sender replyability is proved per seat", () => {
     expect(large.replyable.get(superseded)).toBe(0);
     expect(large.rows).toBe(small.rows);
   }, 60_000);
+
+  // R2 fence 268 on ac5b2e66: the tty-only seat (no pane) was untested, and
+  // narrowing it to the id's own row still passed. Two pane-less rows on one
+  // tty compete; only the newer is replyable, and the check reads that tty only.
+  test("a tty-only seat: rows on one tty compete and only that tty is read", async () => {
+    const target = await registerTarget("sr-target-e", "%990");
+    const tty = `/dev/pts/sr${hex(2)}`;
+    const insertTty = db.prepare(
+      `INSERT INTO peers (id, pid, cwd, registered_at, last_seen, token, tty, tmux_session, tmux_pane_id,
+         client_type, receiver_mode, seat_key, non_targetable)
+       VALUES (?, ?, '/sr', ?, ?, ?, ?, NULL, NULL, 'claude', 'claude-channel', NULL, 0)`,
+    );
+    const older = `tto${hex(3)}`;
+    const newer = `ttn${hex(3)}`;
+    const iso = new Date().toISOString();
+    insertTty.run(older, spawnHolder(), "2026-10-01T00:00:00.000Z", iso, `tok-${older}`, tty);
+    insertTty.run(newer, spawnHolder(), "2026-10-02T00:00:00.000Z", iso, `tok-${newer}`, tty);
+    tokens.set(older, `tok-${older}`); tokens.set(newer, `tok-${newer}`);
+    queue(older, target.id, "from the superseded tty row");
+    queue(newer, target.id, "from the active tty row");
+
+    const readOnce = async () => {
+      const before = await rowsReadSoFar(target.id);
+      const replyable = await replyableBySender(target.id);
+      return { rows: (await rowsReadSoFar(target.id)) - before, replyable };
+    };
+    const small = await readOnce();
+    expect(small.replyable.get(newer)).toBe(1);
+    expect(small.replyable.get(older)).toBe(0);
+    expect(small.rows).toBeGreaterThanOrEqual(4);   // both senders read both rows of their tty
+
+    // A send to the superseded id is refused and names the active row on the tty.
+    const stale = await call<{ ok: boolean; code?: string; candidates?: Array<{ id: string }> }>(
+      "/send-message", { from_id: target.id, to_id: older, text: "to the old tty row" });
+    expect(stale.ok).toBe(false);
+    expect(stale.code).toBe("STALE_PEER_ID");
+    expect((stale.candidates ?? []).map((c) => c.id)).toContain(newer);
+
+    // Unrelated rows on other ttys add no reads.
+    const insertOther = db.prepare(
+      `INSERT INTO peers (id, pid, cwd, registered_at, last_seen, token, tty, client_type, receiver_mode, non_targetable)
+       VALUES (?, ?, '/sr', ?, ?, NULL, ?, 'claude', 'claude-channel', 0)`,
+    );
+    db.transaction(() => {
+      for (let i = 0; i < 300; i++) insertOther.run(`tx${hex(4)}`, 4_200_000 + i, iso, iso, `/dev/pts/other${i}`);
+    })();
+    const large = await readOnce();
+    expect(large.replyable.get(newer)).toBe(1);
+    expect(large.replyable.get(older)).toBe(0);
+    expect(large.rows).toBe(small.rows);
+  }, 60_000);
 });
