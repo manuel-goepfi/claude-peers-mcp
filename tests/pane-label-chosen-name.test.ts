@@ -109,6 +109,19 @@ describe("a hand-set border label is final", () => {
     expect(tmux.writes).toEqual([]);
   });
 
+  test("the bulk backfill moves a named seat off its unique counter onto its seat name", () => {
+    // Live 2026-10-11 after deploy: %21571 (seat infra.23) still showed the old
+    // counter infra.24, and seats on pre-restart adapter code never re-run the
+    // allocator for an explicit name, so only the backfill can repair them.
+    const tmux = fakeTmux({
+      "%21571": { session: "infra", window: "diskspace", options: { "@operator_label": "infra.24", "@peer_seat_name": "infra.23" } },
+      "%9": { session: "infra", window: "claude", options: { "@operator_label": "infra.9", [AUTO_LABEL_OPTION]: "infra.9" } },
+    });
+    expect(labelAllUnlabeledPanes(tmux.run)).toEqual({ visited: 2, labeled: 1, failed: 0 });
+    expect(tmux.option("%21571", "@operator_label")).toBe("infra.23");
+    expect(tmux.option("%9", "@operator_label")).toBe("infra.9");
+  });
+
   test("the bulk backfill leaves hand-set labels alone", () => {
     const tmux = fakeTmux({
       "%1": { session: "infra", window: "broker.29", options: { "@operator_label": "broker.29" } },
