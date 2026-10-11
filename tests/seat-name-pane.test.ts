@@ -91,9 +91,9 @@ describe("claimPaneSeatName with a fake runner", () => {
     expect(options.has("%11")).toBe(false);
   });
 
-  test("a free name is stamped and read back; the auto label is untouched", () => {
+  test("a free name is stamped and read back", () => {
     const { run } = fakeTmux([row("%10", "", "Orch.142", "claude"), row("%11", "", "Orch.140", "bash")]);
-    expect(claimPaneSeatName("%11", "Orch.135", run)).toEqual({ status: "claimed", name: "Orch.135" });
+    expect(claimPaneSeatName("%11", "Orch.135", run)).toMatchObject({ status: "claimed", name: "Orch.135" });
     expect(readPaneSeatName("%11", run)).toBe("Orch.135");
     expect(resolvePaneSeatName("%11", run)).toEqual({ status: "preserved", label: "Orch.135" });
   });
@@ -101,7 +101,7 @@ describe("claimPaneSeatName with a fake runner", () => {
   test("an empty claim releases the pane back to its auto label", () => {
     const { run } = fakeTmux([row("%11", "", "Orch.140", "bash")]);
     claimPaneSeatName("%11", "Orch.135", run);
-    expect(claimPaneSeatName("%11", "", run)).toEqual({ status: "released" });
+    expect(claimPaneSeatName("%11", "", run)).toMatchObject({ status: "released" });
     expect(readPaneSeatName("%11", run)).toBeNull();
   });
 
@@ -146,13 +146,14 @@ test.skipIf(!Bun.which("tmux") || !Bun.which("flock"))("CLI on a scratch tmux se
     expect(claimed.out).toBe("Orch.1");
     expect(cli("--print-seat", second).out).toBe("Orch.1");
     expect(cli("--print-seat", first).out).toBe("Orch.7");
-    // The auto labels are unchanged; only the explicit layer moved.
-    expect(cli("--print", second).out).toBe("Orch.2");
+    // The border follows the claimed seat name.
+    expect(cli("--print", second).out).toBe("Orch.1");
     expect(tmux(["show-options", "-p", "-t", second, "-v", "@peer_seat_name"])).toBe("Orch.1");
 
-    // Release returns print-seat to the auto label.
+    // Release gives the name up on the border too: the pane gets a fresh
+    // ordinal above every live label rather than keeping Orch.1.
     expect(cli("--claim-seat-name", second, "").code).toBe(0);
-    expect(cli("--print-seat", second).out).toBe("Orch.2");
+    expect(cli("--print-seat", second).out).toBe("Orch.8");
 
     // The auto-labeller never hands out a role name a pane claimed explicitly:
     // with Orch.3 claimed, a new pane must not become Orch.3 (it allocates above

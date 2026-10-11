@@ -7,7 +7,9 @@ import { tmpdir } from "node:os";
 import {
   chooseOperatorLabel,
   cleanTmuxOptionValue,
+  isOperatorChosenWindowName,
   preservedTmuxOperatorLabel,
+  stripResolvedNameSuffix,
 } from "../shared/operator-label.ts";
 import {
   PANE_SEAT_FORMAT,
@@ -25,8 +27,14 @@ export interface TmuxLabelCommandResult {
 
 export type TmuxLabelRunner = (args: string[]) => TmuxLabelCommandResult;
 
+/**
+ * `label` is what the border shows. `name` is set only when the seat's routing
+ * name differs from it: a hand-set `broker.29` in session `infra` is shown as
+ * is, but a seat with no explicit name keeps answering to `infra.29`, so a
+ * border repaired by hand never renames a seat. Use `name ?? label` for names.
+ */
 export type PaneLabelResult =
-  | { status: "preserved" | "labeled"; label: string }
+  | { status: "preserved" | "labeled"; label: string; name?: string }
   | { status: "skipped"; reason: "pane-gone" }
   | { status: "failed"; reason: string };
 
@@ -38,7 +46,17 @@ interface PaneSnapshot {
   windowPanes: number | undefined;
   operatorLabel: string | null;
   peerLabel: string | null;
+  seatName: string | null;
+  autoLabel: string | null;
 }
+
+/**
+ * The allocator records every label it writes here. A pane whose
+ * @operator_label differs from this value was labelled by a person (or by
+ * rename-lane), and that label is never rewritten: the top border must show the
+ * name the operator chose, not one the allocator derived.
+ */
+export const AUTO_LABEL_OPTION = "@operator_label_auto";
 
 const SNAPSHOT_FORMAT = [
   "#{pane_id}",
@@ -48,6 +66,8 @@ const SNAPSHOT_FORMAT = [
   "#{window_panes}",
   "#{@operator_label}",
   "#{@peer_label}",
+  `#{${SEAT_NAME_OPTION}}`,
+  `#{${AUTO_LABEL_OPTION}}`,
 ].join("\t");
 
 function withoutOneTrailingNewline(value: string): string {
@@ -71,6 +91,54 @@ function parseSnapshot(raw: string): PaneSnapshot | null {
     windowPanes: positiveInteger(fields[4]),
     operatorLabel: cleanTmuxOptionValue(fields[5]),
     peerLabel: cleanTmuxOptionValue(fields[6]),
+    seatName: cleanSeatName(fields[7]),
+    autoLabel: cleanTmuxOptionValue(fields[8]),
+  };
+}
+
+/**
+ * Was the pane's current label written by a person rather than the allocator?
+ * With a recorded auto label the answer is exact. Panes labelled before the
+ * record existed fall back to shape. The allocator replaced every non-ordinal
+ * label, so a real name still present was set by hand. An ordinal with another
+ * prefix is usually the pane's label from before a session rename and follows
+ * the session, unless it is the pane's window name: copying the window name
+ * onto the border is how operators repaired labels by hand.
+ */
+function hasHumanLabel(pane: PaneSnapshot): boolean {
+  const label = pane.operatorLabel;
+  if (!label) return false;
+  if (pane.autoLabel) return label !== pane.autoLabel;
+  const ordinal = preservedTmuxOperatorLabel(label, null, pane.session);
+  // Machine fallbacks (`infra.%24`, a bare command name) are not names anyone
+  // chose; the allocator still repairs them.
+  if (ordinal === null) return isOperatorChosenWindowName(label, pane.session);
+  return label === pane.windowName && ordinal !== stripResolvedNameSuffix(label);
+}
+
+/**
+ * The label this pane should show. A hand-set label stays. Otherwise the
+ * seat's explicit name, and only without one, the session ordinal.
+ *
+ * The window name is deliberately not a tier: this label is also the peer name
+ * of a seat with no explicit name, so deriving it from window names would
+ * re-register lanes under their launcher's window name instead of the
+ * `<session>.<n>` address the fleet routes by.
+ */
+function decidePaneLabel(pane: PaneSnapshot, siblings: string): { label: string; keep: boolean; name?: string } {
+  if (hasHumanLabel(pane)) {
+    const label = pane.operatorLabel!;
+    const name = preservedTmuxOperatorLabel(label, null, pane.session);
+    return name && name !== label ? { label, keep: true, name } : { label, keep: true };
+  }
+  if (pane.seatName) return { label: pane.seatName, keep: pane.operatorLabel === pane.seatName };
+  const preserved = preservedTmuxOperatorLabel(pane.operatorLabel, pane.peerLabel, pane.session);
+  const owned = preserved !== null && ownsPreservedLabel(pane, preserved, siblings);
+  if (owned) return { label: preserved, keep: pane.operatorLabel === preserved };
+  return {
+    label: chooseOperatorLabel(pane.session, pane.paneIndex, usedOperatorLabels(siblings, pane.paneId),
+      pane.windowName, pane.windowPanes),
+    keep: false,
   };
 }
 
@@ -130,22 +198,25 @@ function ensurePaneOperatorLabelUnlocked(
   const pane = parseSnapshot(snapshotResult.out);
   if (!pane || pane.paneId !== paneId) return { status: "failed", reason: "invalid-pane-snapshot" };
 
-  const preserved = preservedTmuxOperatorLabel(pane.operatorLabel, pane.peerLabel, pane.session);
   const siblings=siblingLabels(pane,run);
   if (!siblings.ok) {
     return panePresence(pane.paneId,run)==="absent"
       ? {status:"skipped",reason:"pane-gone"}
       : {status:"failed",reason:"session-list-failed"};
   }
-  const keep=preserved && ownsPreservedLabel(pane,preserved,siblings.out);
-  if (keep && pane.operatorLabel===preserved) return {status:"preserved",label:preserved};
-  const label=keep ? preserved : chooseOperatorLabel(pane.session,pane.paneIndex,
-    usedOperatorLabels(siblings.out,pane.paneId),pane.windowName,pane.windowPanes);
+  const {label,keep,name}=decidePaneLabel(pane,siblings.out);
+  if (keep) return name ? {status:"preserved",label,name} : {status:"preserved",label};
 
   // Birth-time allocation owns only the human label. Broker identity fields are
   // registration-owned and must never be fabricated for a zero-turn pane.
+  // The label goes first: if the record write then fails, the new label reads
+  // as hand-set and stays, which is safe; the reverse order would make the old
+  // label read as hand-set and pin it.
   const stamped = run(["set-option", "-p", "-t", pane.paneId, "@operator_label", label]);
-  if (stamped.ok) return { status: "labeled", label };
+  if (stamped.ok) {
+    run(["set-option", "-p", "-t", pane.paneId, AUTO_LABEL_OPTION, label]);
+    return { status: "labeled", label };
+  }
   return panePresence(pane.paneId, run) === "absent"
     ? { status: "skipped", reason: "pane-gone" }
     : { status: "failed", reason: "label-write-failed" };
@@ -155,10 +226,14 @@ export function ensurePaneOperatorLabel(paneId: string, run: TmuxLabelRunner = r
   if (run !== runTmux && !lockSocket) return ensurePaneOperatorLabelUnlocked(paneId,run);
   const snapshot = run(["display-message","-p","-t",paneId,SNAPSHOT_FORMAT]);
   const pane = snapshot.ok ? parseSnapshot(snapshot.out) : null;
-  const canonical = pane && preservedTmuxOperatorLabel(pane.operatorLabel,pane.peerLabel,pane.session);
-  if (pane?.paneId === paneId && canonical && pane.operatorLabel === canonical) {
+  // Read-only fast path: a pane already showing the label it should show needs
+  // no lock. Any write re-decides from a fresh snapshot under the lock.
+  if (pane?.paneId === paneId && pane.operatorLabel) {
     const siblings=siblingLabels(pane,run);
-    if (siblings.ok && ownsPreservedLabel(pane,canonical,siblings.out)) return {status:"preserved",label:canonical};
+    if (siblings.ok) {
+      const {label,keep,name}=decidePaneLabel(pane,siblings.out);
+      if (keep) return name ? {status:"preserved",label,name} : {status:"preserved",label};
+    }
   }
   const identity = run(["display-message","-p","-t",paneId,"#{socket_path}\t#{pid}\t#{session_id}"]);
   if (!identity.ok || identity.out.trim().split("\t").length !== 3) {
@@ -180,8 +255,8 @@ export function ensurePaneOperatorLabel(paneId: string, run: TmuxLabelRunner = r
 }
 
 export type SeatNameClaimResult =
-  | { status: "claimed"; name: string }
-  | { status: "released" }
+  | { status: "claimed"; name: string; label?: PaneLabelResult }
+  | { status: "released"; label?: PaneLabelResult }
   | { status: "refused"; holder: string }
   | { status: "failed"; reason: string };
 
@@ -203,7 +278,9 @@ export function paneSeatNameHolder(paneId: string, name: string, run: TmuxLabelR
 export function resolvePaneSeatName(paneId: string, run: TmuxLabelRunner = runTmux, lockSocket?: string): PaneLabelResult {
   const explicit = readPaneSeatName(paneId, run);
   if (explicit) return { status: "preserved", label: explicit };
-  return ensurePaneOperatorLabel(paneId, run, lockSocket);
+  const result = ensurePaneOperatorLabel(paneId, run, lockSocket);
+  return (result.status === "preserved" || result.status === "labeled") && result.name
+    ? { status: result.status, label: result.name } : result;
 }
 
 function claimPaneSeatNameUnlocked(paneId: string, name: string, run: TmuxLabelRunner): SeatNameClaimResult {
@@ -236,6 +313,39 @@ function claimPaneSeatNameUnlocked(paneId: string, name: string, run: TmuxLabelR
  * not both win.
  */
 export function claimPaneSeatName(paneId: string, name: string, run: TmuxLabelRunner = runTmux, lockSocket?: string): SeatNameClaimResult {
+  const previous = name === "" ? readPaneSeatName(paneId, run) : null;
+  const result = claimPaneSeatNameLocked(paneId, name, run, lockSocket);
+  // The top border follows the claim: a new seat name replaces an allocator
+  // label, a release returns the pane to an ordinal. A hand-set label is kept
+  // (the allocator decides that, under its own lock).
+  if (result.status === "claimed") return { ...result, label: ensurePaneOperatorLabel(paneId, run, lockSocket) };
+  if (result.status === "released") {
+    if (previous) dropReleasedSeatLabel(paneId, previous, run);
+    return { ...result, label: ensurePaneOperatorLabel(paneId, run, lockSocket) };
+  }
+  return result;
+}
+
+/**
+ * A released seat name that the allocator put on the border would otherwise
+ * survive as an ordinal (`C5 Orch.294` has the ordinal shape) and keep the
+ * pane answering to the name it just gave up. Clear it so the allocator
+ * chooses again. A hand-set label is left alone.
+ */
+function dropReleasedSeatLabel(paneId: string, released: string, run: TmuxLabelRunner): void {
+  const snapshot = run(["display-message", "-p", "-t", paneId, SNAPSHOT_FORMAT]);
+  const pane = snapshot.ok ? parseSnapshot(snapshot.out) : null;
+  if (!pane || pane.paneId !== paneId || pane.operatorLabel !== released || hasHumanLabel(pane)) return;
+  run(["set-option", "-p", "-t", paneId, "-u", "@operator_label"]);
+  run(["set-option", "-p", "-t", paneId, "-u", AUTO_LABEL_OPTION]);
+  // The registration mirror would promote the old name straight back; the
+  // seat's next identity publish restamps it from the new label.
+  if (pane.peerLabel && stripResolvedNameSuffix(pane.peerLabel) === released) {
+    run(["set-option", "-p", "-t", paneId, "-u", "@peer_label"]);
+  }
+}
+
+function claimPaneSeatNameLocked(paneId: string, name: string, run: TmuxLabelRunner, lockSocket?: string): SeatNameClaimResult {
   if (run !== runTmux && !lockSocket) return claimPaneSeatNameUnlocked(paneId, name, run);
   const identity = run(["display-message", "-p", "-t", paneId, "#{socket_path}\t#{pid}"]);
   if (!identity.ok || identity.out.trim().split("\t").length !== 2) {
@@ -276,6 +386,8 @@ export function labelAllUnlabeledPanes(
   let failed = 0;
   for (const [index, row] of rows.entries()) {
     const pane = snapshots[index];
+    // A hand-set label, or one already showing the seat name, is final.
+    if (pane?.operatorLabel && (hasHumanLabel(pane) || pane.operatorLabel === pane.seatName)) continue;
     const label = pane && preservedTmuxOperatorLabel(pane.operatorLabel, pane.peerLabel, pane.session);
     if (pane && label === pane.operatorLabel && label && claims.get(claimKey(pane, label)) === 1) continue;
     const paneId = row.split("\t")[0]!;

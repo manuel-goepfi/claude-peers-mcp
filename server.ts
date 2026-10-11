@@ -1423,7 +1423,7 @@ function resolveTmuxOperatorLabel(tmuxInfo: TmuxPaneInfo | null): string | null 
   if (!tmuxInfo?.pane_id) return null;
   if (!ownsOperatorPaneIdentity) return readTmuxPaneOption(tmuxInfo.pane_id,"@operator_label");
   const result=ensurePaneOperatorLabel(tmuxInfo.pane_id);
-  if (result.status === "labeled" || result.status === "preserved") return result.label;
+  if (result.status === "labeled" || result.status === "preserved") return result.name ?? result.label;
   throw new Error("Open pane label is unavailable; refusing an independent name");
 }
 
@@ -2372,6 +2372,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           const claim = claimPaneSeatName(seatPane, myExplicitName ?? "");
           if (claim.status === "refused") seatWarning = `\nWarning: pane seat name not stamped: held by ${claim.holder}.`;
           else if (claim.status === "failed") seatWarning = `\nWarning: pane seat name not stamped (${claim.reason}); the broker keeps the name until it restarts.`;
+          else if (claim.label?.status === "failed") seatWarning = `\nWarning: pane border label not updated (${claim.label.reason}).`;
         }
         const mirror = publishBrokerIdentityToTmux({
           id: myId,

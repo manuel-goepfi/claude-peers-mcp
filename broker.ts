@@ -1449,10 +1449,11 @@ function canonicalNativeCodexPaneName(peer: Peer): {name:string;resolved_name:st
   }
   const label=ensurePaneOperatorLabel(peer.tmux_pane_id);
   if (label.status!=="preserved" && label.status!=="labeled") return null;
-  if (peer.name!==label.label || peer.resolved_name!==label.label) {
-    updateName.run(label.label,label.label,peer.id);
+  const name=label.name ?? label.label;
+  if (peer.name!==name || peer.resolved_name!==name) {
+    updateName.run(name,name,peer.id);
   }
-  return {name:label.label,resolved_name:label.label};
+  return {name,resolved_name:name};
 }
 
 function hasAnyMessageHistory(id:string):boolean {
@@ -3537,7 +3538,7 @@ function handleBindCodexPaneThread(body: BindCodexPaneThreadRequest): BindCodexP
   const absoluteGitDir = gitValue(cwd, ["rev-parse", "--absolute-git-dir"]);
   // An explicit seat name on the pane outranks its auto label.
   const seatName = readPaneSeatName(pane.pane_id);
-  const name = seatName ?? label.label;
+  const name = seatName ?? label.name ?? label.label;
 
   // This bind is fresh proof that a live pane (pane shell ancestry, TTY, and a
   // single native Codex TUI) drives the thread again: lift a pane-closed gate
