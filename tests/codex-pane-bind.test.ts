@@ -93,7 +93,9 @@ async function waitForFile(path: string): Promise<void> {
       // tmux-proven pane path instead.
       // Set @operator_label inside the pane before the bind client runs so the
       // race against an external set-option cannot mint the window-name fallback.
-      const command = `tmux set-option -p -t "$TMUX_PANE" @operator_label bind.test; (cd /; exec "${codexBinary}" 60) & tui=$!; bun "${FIXTURE}" "${broker.port}" "${resultPath}" "${THREAD_A}" "${THREAD_B}" "${THREAD_A}"; while [ ! -f "${mainConflictTrigger}" ]; do sleep 0.05; done; bun "${FIXTURE}" "${broker.port}" "${mainConflictPath}" "${THREAD_B}"; wait "$tui"`;
+      // An older-session ordinal is a raw allocator label: the bind must
+      // canonicalize it. A hand-set name (bind.test) would now be kept as-is.
+      const command = `tmux set-option -p -t "$TMUX_PANE" @operator_label bind.1; (cd /; exec "${codexBinary}" 60) & tui=$!; bun "${FIXTURE}" "${broker.port}" "${resultPath}" "${THREAD_A}" "${THREAD_B}" "${THREAD_A}"; while [ ! -f "${mainConflictTrigger}" ]; do sleep 0.05; done; bun "${FIXTURE}" "${broker.port}" "${mainConflictPath}" "${THREAD_B}"; wait "$tui"`;
       const created = Bun.spawnSync([
         "tmux", "-S", socket, "-f", "/dev/null", "new-session", "-d", "-s", session, "-n", "bind", "-c", root,
         "bash", "-c", command,

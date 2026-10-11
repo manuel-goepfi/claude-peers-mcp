@@ -193,6 +193,7 @@ describe("tmux birth-time operator labels", () => {
     expect(labelAllUnlabeledPanes(run)).toEqual({ visited: 2, labeled: 1, failed: 0 });
     expect(calls.filter((args) => args[0] === "set-option")).toEqual([
       ["set-option", "-p", "-t", "%2", "@operator_label", "infra.2"],
+      ["set-option", "-p", "-t", "%2", "@operator_label_auto", "infra.2"],
     ]);
   });
 
@@ -264,7 +265,7 @@ test("bulk filter keeps cross-session labels and repairs duplicate and legacy cl
   const rows = new Map([
     ["%1", ["infra", "infra.1"]], ["%2", ["infra", "infra.1"]],
     ["%3", ["infra", "old.3"]], ["%4", ["other", "other.1"]],
-    ["%5", ["infra", ""]], ["%6", ["infra", "invalid-label"]],
+    ["%5", ["infra", ""]], ["%6", ["infra", "infra.%6"]],
   ]);
   const writes: string[] = [];
   const snapshot = (id: string) => { const [session, label] = rows.get(id)!;
@@ -274,6 +275,7 @@ test("bulk filter keeps cross-session labels and repairs duplicate and legacy cl
     if (args[0] === "display-message") return { ok: true, out: snapshot(args[args.indexOf("-t") + 1]!) };
     if (args[0] === "list-panes") return { ok: true, out: [...rows].filter(([, r]) => r[0] === args[args.indexOf("-t") + 1]).map(([id, r]) => `${id}\t${r[1]}\t`).join("\n") };
     if (args[0] === "set-option") {
+      if (args.includes("@operator_label_auto")) return { ok: true, out: "" };
       const id = args[args.indexOf("-t") + 1]!;
       rows.get(id)![1] = args.at(-1)!; writes.push(id);
       return { ok: true, out: "" };

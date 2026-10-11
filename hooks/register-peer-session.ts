@@ -577,7 +577,7 @@ async function metadata(threadId: string | null = null): Promise<RegisterMetadat
   // the pane's launch-order auto label. Without this, every hook re-sync wrote
   // the auto label back over the name the seat was given.
   const seatName=tmux?.pane_id ? readPaneSeatName(tmux.pane_id) : null;
-  const name=seatName ?? peerName(CLIENT_TYPE,pid,tmux,identityEnv,canonical && "label" in canonical ? canonical.label : null);
+  const name=seatName ?? peerName(CLIENT_TYPE,pid,tmux,identityEnv,canonical && "label" in canonical ? canonical.name ?? canonical.label : null);
   return {
     pid,
     cwd,
