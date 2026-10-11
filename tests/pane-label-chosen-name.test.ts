@@ -10,6 +10,9 @@
  */
 
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import {
   AUTO_LABEL_OPTION,
   claimPaneSeatName,
@@ -198,3 +201,48 @@ describe("routing names stay stable", () => {
     expect(ensurePaneOperatorLabel("%9", tmux.run)).toEqual({ status: "labeled", label: "C5 Marketing.4" });
   });
 });
+
+test.skipIf(!Bun.which("tmux") || !Bun.which("flock"))("hand-set borders survive repeated heartbeat passes through the real locked allocator", () => {
+  // Live repro 2026-10-11: %22336 set to source.295 was back to `C5 Orch.295`
+  // within minutes, and a fresh pane relabelled closeclerk.296 showed
+  // `C5 Orch.296` again. Every heartbeat runs this allocator through its lock.
+  const root = mkdtempSync(join(tmpdir(), "pane-label-heartbeat-")), socket = join(root, "tmux");
+  const tool = new URL("../bin/tmux-label-pane.ts", import.meta.url).pathname;
+  const env = { ...process.env, TMUX: undefined, TMUX_PANE: undefined, CLAUDE_PEERS_TMUX_SOCKET: socket };
+  const tmux = (args: string[]) => {
+    const result = Bun.spawnSync(["tmux", "-S", socket, ...args], { env, stdout: "pipe", stderr: "pipe", timeout: 3000 });
+    if (result.exitCode !== 0) throw new Error(new TextDecoder().decode(result.stderr));
+    return new TextDecoder().decode(result.stdout).trim();
+  };
+  const cli = (...args: string[]) => {
+    const result = Bun.spawnSync([process.execPath, tool, ...args], { env, stdout: "pipe", stderr: "pipe", timeout: 10_000 });
+    expect(result.exitCode).toBe(0);
+    return result.stdout.toString().trim();
+  };
+  const border = (pane: string) => tmux(["show-options", "-p", "-t", pane, "-v", "@operator_label"]);
+  try {
+    tmux(["-f", "/dev/null", "new-session", "-d", "-s", "Orch", "-n", "lead", "-x", "200", "-y", "50", "sleep", "120"]);
+    const lead = tmux(["display-message", "-p", "-t", "Orch:lead", "#{pane_id}"]);
+    // A pane from before the deploy: no allocator record, repaired to its window name.
+    const legacy = tmux(["new-window", "-d", "-P", "-F", "#{pane_id}", "-t", "Orch", "-n", "source.295", "sleep", "120"]);
+    tmux(["set-option", "-p", "-t", legacy, "@operator_label", "source.295"]);
+    // A pane born under the allocator (record stamped), then relabelled by hand.
+    const born = tmux(["new-window", "-d", "-P", "-F", "#{pane_id}", "-t", "Orch", "sleep", "120"]);
+    cli("--print", lead);
+    expect(cli("--print", born)).toMatch(/^Orch\.[0-9]+$/);
+    tmux(["set-option", "-p", "-t", born, "@operator_label", "closeclerk.296"]);
+    // A seat that claimed its name: the border shows the name, not its counter.
+    expect(cli("--claim-seat-name", lead, "Orch.294")).toBe("Orch.294");
+    for (let tick = 0; tick < 5; tick++) {
+      for (const pane of [lead, legacy, born]) cli("--print", pane);
+      cli("--all");
+      expect([border(lead), border(legacy), border(born)]).toEqual(["Orch.294", "source.295", "closeclerk.296"]);
+    }
+    // The seats still answer to their routing names, not the repaired borders.
+    expect(cli("--print-seat", legacy)).toBe("Orch.295");
+    expect(cli("--print-seat", lead)).toBe("Orch.294");
+  } finally {
+    Bun.spawnSync(["tmux", "-S", socket, "kill-server"], { stdout: "ignore", stderr: "ignore" });
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 60_000);
