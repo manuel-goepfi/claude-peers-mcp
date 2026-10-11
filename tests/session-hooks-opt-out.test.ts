@@ -49,7 +49,7 @@ async function runHook(hook: string, optOut: string | null) {
 
 describe("CLAUDE_PEERS_SESSION_HOOKS_ENABLED opt-out", () => {
   for (const hook of HOOKS) {
-    for (const value of ["false", "0", "off", "no"]) {
+    for (const value of ["false", "0", "off", "no", "FALSE", "Off", "No"]) {
       test(`${hook} with ${value}: exits 0 and touches nothing`, async () => {
         const run = await runHook(hook, value);
         expect(run.code).toBe(0);
@@ -59,7 +59,7 @@ describe("CLAUDE_PEERS_SESSION_HOOKS_ENABLED opt-out", () => {
     }
 
     test(`${hook} by default still runs (the opt-out is not the default)`, async () => {
-      for (const value of [null, "true", ""]) {
+      for (const value of [null, "true", "", "TRUE", "yes"]) {
         const run = await runHook(hook, value);
         expect(run.calls).not.toBe("");
       }
