@@ -174,4 +174,57 @@ describe("sender replyability is proved per seat", () => {
     for (const sender of senders) expect(large.replyable.get(sender)).toBe(1);
     expect(large.probes).toBe(small.probes);
   }, 60_000);
+
+  // Clause5 #6664: replyability for a non-group sender read every targetable
+  // row to find the rows on its seat, so S senders cost S whole-table reads.
+  // Rows on the sender's own pane are all it needs. Counted, not timed.
+  async function rowsReadSoFar(id: string): Promise<number> {
+    const metrics = await call<{ resolution_rows_read?: number }>("/metrics", { id });
+    expect(typeof metrics.resolution_rows_read).toBe("number");
+    return metrics.resolution_rows_read!;
+  }
+
+  test("unrelated targetable rows add no row reads to a poll", async () => {
+    const target = await registerTarget("sr-target-d", "%980");
+    const senders: string[] = [];
+    for (let i = 0; i < 20; i++) {
+      const id = `rdr${hex(3)}`;
+      insertPeer({ id, pid: spawnHolder(), pane: `%98${i + 10}`, registeredAt: new Date().toISOString() });
+      senders.push(id);
+    }
+    // A superseded row sharing a sender's pane must still be read and lose.
+    const superseded = `sup${hex(3)}`;
+    insertPeer({ id: superseded, pid: spawnHolder(), pane: "%9810", registeredAt: "2026-10-01T00:00:00.000Z" });
+    for (const sender of [...senders, superseded]) queue(sender, target.id, `from ${sender}`);
+
+    const readOnce = async () => {
+      const before = await rowsReadSoFar(target.id);
+      const replyable = await replyableBySender(target.id);
+      return { rows: (await rowsReadSoFar(target.id)) - before, replyable };
+    };
+    const small = await readOnce();
+    for (const sender of senders) expect(small.replyable.get(sender)).toBe(1);
+    expect(small.replyable.get(superseded)).toBe(0);
+    // Non-vacuous: every sender reads at least its own row.
+    expect(small.rows).toBeGreaterThanOrEqual(senders.length + 1);
+
+    // Unrelated targetable rows on other panes: ended runtime groups (the ghost
+    // rows a short-lived launcher leaves for an hour) and plain dead rows.
+    const insert = db.prepare(
+      `INSERT INTO peers (id, pid, cwd, registered_at, last_seen, token, tmux_session, tmux_pane_id,
+         client_type, receiver_mode, seat_key, non_targetable)
+       VALUES (?, ?, '/sr', ?, ?, ?, 'sr', ?, 'claude', 'claude-channel', ?, 0)`,
+    );
+    const iso = new Date().toISOString();
+    db.transaction(() => {
+      for (let i = 0; i < 500; i++) {
+        insert.run(`gr${hex(4)}`, 4_100_000 + i, iso, iso, null, `%${30000 + i}`, i % 2 ? `live:${hex(32)}:native:${hex(32)}` : null);
+      }
+    })();
+
+    const large = await readOnce();
+    for (const sender of senders) expect(large.replyable.get(sender)).toBe(1);
+    expect(large.replyable.get(superseded)).toBe(0);
+    expect(large.rows).toBe(small.rows);
+  }, 60_000);
 });

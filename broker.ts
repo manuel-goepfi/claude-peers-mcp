@@ -757,6 +757,17 @@ const selectTargetablePeerById = db.prepare(`
   SELECT ${resolutionPeerColumns} FROM peers WHERE non_targetable = 0 AND id = ?
 `);
 
+// Rows that can share a non-group seat key: a pane key is derived from
+// tmux_pane_id, a tty key from tty with no pane. Callers still filter by the
+// exact key; these only keep a per-sender check from reading the whole table.
+const selectTargetablePeersOnPane = db.prepare(`
+  SELECT ${resolutionPeerColumns} FROM peers WHERE non_targetable = 0 AND tmux_pane_id = ?
+`);
+
+const selectTargetablePeersOnTty = db.prepare(`
+  SELECT ${resolutionPeerColumns} FROM peers WHERE non_targetable = 0 AND tty = ?
+`);
+
 const selectTargetablePeerCount = db.prepare(`
   SELECT COUNT(*) AS count FROM peers WHERE non_targetable = 0
 `);
@@ -2196,6 +2207,14 @@ function isClientSessionPid(pid: number): boolean {
 // (liveGroups.probes). Reported as one aggregate count by /metrics so tests can
 // prove that a route's proof work does not grow with the peer table.
 let pidProbes = 0;
+// Targetable rows materialized while resolving a peer id, reported by /metrics
+// so tests can prove a per-sender check does not read the whole table.
+let resolutionRowsRead = 0;
+
+function readRows(rows: Peer[]): Peer[] {
+  resolutionRowsRead += rows.length;
+  return rows;
+}
 
 function isPidAlive(pid: number): boolean {
   pidProbes++;
@@ -2588,7 +2607,7 @@ function resolveFreshPeerById(targetSelector: PeerSelector & { id: string }, wit
     const supplemental=selectorWithoutId(targetSelector);
     const narrowed=selectorFields(supplemental).length>0;
     const candidates=withCandidates && stored
-      ? activeOnly(livePeersForResolution(selectAllTargetablePeers.all() as Peer[]))
+      ? activeOnly(livePeersForResolution(readRows(selectAllTargetablePeers.all() as Peer[])))
         .filter((p)=>p.id!==stored.id && sameSeatOrName(stored,p))
         .filter((p)=>!narrowed || peerMatchesSelector(p,supplemental))
         .map(describePeerTarget)
@@ -2597,9 +2616,14 @@ function resolveFreshPeerById(targetSelector: PeerSelector & { id: string }, wit
   }
   const staleById = selectTargetablePeerById.get(targetSelector.id) as Peer | null;
   if (!staleById) return { ok: false, code: "PEER_NOT_FOUND", error: `Peer ${targetSelector.id} not found` };
-  const allPeers = selectAllTargetablePeers.all() as Peer[];
   const seatKey = activePeerKey(staleById);
-  const seatPeers = allPeers.filter((p) => activePeerKey(p) === seatKey);
+  // Only rows on the same seat compete with this id, and they all share its pane
+  // (or its tty when it has no pane). Reading every targetable row here made
+  // each sender's replyability check O(table) (Clause5 #6664).
+  const seatRows = staleById.tmux_pane_id
+    ? selectTargetablePeersOnPane.all(staleById.tmux_pane_id) as Peer[]
+    : staleById.tty ? selectTargetablePeersOnTty.all(staleById.tty) as Peer[] : [staleById];
+  const seatPeers = readRows(seatRows).filter((p) => activePeerKey(p) === seatKey);
   const liveIdMatch = activeOnly(livePeersForResolution(seatPeers)).find((p) => p.id === targetSelector.id) ?? null;
   if (liveIdMatch) {
     if (peerMatchesSelector(liveIdMatch, targetSelector)) return { ok: true, peer: liveIdMatch };
@@ -2613,7 +2637,7 @@ function resolveFreshPeerById(targetSelector: PeerSelector & { id: string }, wit
   const supplementalSelector = selectorWithoutId(targetSelector);
   const hasSupplementalFields = selectorFields(supplementalSelector).length > 0;
   const candidates = withCandidates
-    ? activeOnly(livePeersForResolution(allPeers))
+    ? activeOnly(livePeersForResolution(readRows(selectAllTargetablePeers.all() as Peer[])))
       .filter((p) => sameSeatOrName(staleById, p))
       .filter((p) => !hasSupplementalFields || peerMatchesSelector(p, supplementalSelector))
       .map(describePeerTarget)
@@ -4678,7 +4702,7 @@ requestHandler = async (req: Request) => {
             return Response.json(response);
           }
         case "/metrics":
-          return Response.json({ ...runtimeMetrics.snapshot(), rate_limit_buckets: buckets.size, seat_liveness_probes: pidProbes + liveGroups.probes });
+          return Response.json({ ...runtimeMetrics.snapshot(), rate_limit_buckets: buckets.size, seat_liveness_probes: pidProbes + liveGroups.probes, resolution_rows_read: resolutionRowsRead });
         case "/set-summary": {
           const summary = String(body.summary ?? "");
           if (utf8Bytes(summary) > MAX_SUMMARY_BYTES) {
