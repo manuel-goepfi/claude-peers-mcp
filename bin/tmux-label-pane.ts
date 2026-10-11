@@ -125,11 +125,21 @@ function hasHumanLabel(pane: PaneSnapshot): boolean {
  * re-register lanes under their launcher's window name instead of the
  * `<session>.<n>` address the fleet routes by.
  */
-function decidePaneLabel(pane: PaneSnapshot, siblings: string): { label: string; keep: boolean; name?: string } {
+function decidePaneLabel(pane: PaneSnapshot, siblings: string): { label: string; keep: boolean; name?: string; record?: string } {
   if (hasHumanLabel(pane)) {
     const label = pane.operatorLabel!;
+    // A hand-set border is display only; the seat keeps a routing ordinal. An
+    // ordinal-shaped label maps onto the session as before. Any other label
+    // routes by the pane's own ordinal, kept in the record (which already
+    // differs from the border, so the border stays hand-set).
     const name = preservedTmuxOperatorLabel(label, null, pane.session);
-    return name && name !== label ? { label, keep: true, name } : { label, keep: true };
+    if (name) return name !== label ? { label, keep: true, name } : { label, keep: true };
+    const recorded = pane.autoLabel && preservedTmuxOperatorLabel(pane.autoLabel, null, pane.session) === pane.autoLabel
+      ? pane.autoLabel : null;
+    if (recorded) return { label, keep: true, name: recorded };
+    const ordinal = chooseOperatorLabel(pane.session, pane.paneIndex, usedOperatorLabels(siblings, pane.paneId),
+      pane.windowName, pane.windowPanes);
+    return { label, keep: false, name: ordinal, record: ordinal };
   }
   if (pane.seatName) return { label: pane.seatName, keep: pane.operatorLabel === pane.seatName };
   const preserved = preservedTmuxOperatorLabel(pane.operatorLabel, pane.peerLabel, pane.session);
@@ -145,10 +155,15 @@ function decidePaneLabel(pane: PaneSnapshot, siblings: string): { label: string;
 function usedOperatorLabels(raw: string, currentPaneId: string): string[] {
   const labels: string[] = [];
   for (const line of raw.split("\n")) {
-    const [paneId, operatorLabel, peerLabel, seatName] = line.split("\t");
+    const [paneId, operatorLabel, peerLabel, seatName, autoLabel] = line.split("\t");
     if (!paneId || paneId === currentPaneId) continue;
     const label = cleanTmuxOptionValue(operatorLabel) ?? cleanTmuxOptionValue(peerLabel);
     if (label) labels.push(label);
+    // Under a typed non-ordinal border the record is the pane's routing
+    // ordinal (an ordinal border routes by its own number instead).
+    const record = cleanTmuxOptionValue(autoLabel);
+    const border = cleanTmuxOptionValue(operatorLabel);
+    if (record && border && border !== record && preservedTmuxOperatorLabel(border, null, "") === null) labels.push(record);
     // An explicit seat name in the ordinal shape (a role label) is taken too:
     // the next auto label must be allocated above it, never onto it.
     const seat = cleanTmuxOptionValue(seatName);
@@ -172,7 +187,7 @@ function ownsPreservedLabel(pane: PaneSnapshot, label: string, siblings: string)
 }
 
 function siblingLabels(pane: PaneSnapshot, run: TmuxLabelRunner): TmuxLabelCommandResult {
-  return run(["list-panes","-s","-t",pane.session,"-F",`#{pane_id}\t#{@operator_label}\t#{@peer_label}\t#{${SEAT_NAME_OPTION}}`]);
+  return run(["list-panes","-s","-t",pane.session,"-F",`#{pane_id}\t#{@operator_label}\t#{@peer_label}\t#{${SEAT_NAME_OPTION}}\t#{${AUTO_LABEL_OPTION}}`]);
 }
 
 function panePresence(paneId: string, run: TmuxLabelRunner): "present" | "absent" | "unknown" {
@@ -204,8 +219,14 @@ function ensurePaneOperatorLabelUnlocked(
       ? {status:"skipped",reason:"pane-gone"}
       : {status:"failed",reason:"session-list-failed"};
   }
-  const {label,keep,name}=decidePaneLabel(pane,siblings.out);
+  const {label,keep,name,record}=decidePaneLabel(pane,siblings.out);
   if (keep) return name ? {status:"preserved",label,name} : {status:"preserved",label};
+  if (record) {
+    // Allocate a routing ordinal under a hand-set border without touching it.
+    return run(["set-option", "-p", "-t", pane.paneId, AUTO_LABEL_OPTION, record]).ok
+      ? { status: "preserved", label, name: record }
+      : { status: "failed", reason: "routing-ordinal-write-failed" };
+  }
 
   // Birth-time allocation owns only the human label. Broker identity fields are
   // registration-owned and must never be fabricated for a zero-turn pane.

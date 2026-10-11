@@ -94,8 +94,9 @@ describe("a hand-set border label is final", () => {
     const tmux = fakeTmux({
       "%5": { session: "C5_lanes", window: "claude", options: { "@operator_label": "REVIEW-1996" } },
     });
-    expect(ensurePaneOperatorLabel("%5", tmux.run)).toEqual({ status: "preserved", label: "REVIEW-1996" });
-    expect(tmux.writes).toEqual([]);
+    expect(ensurePaneOperatorLabel("%5", tmux.run)).toMatchObject({ status: "preserved", label: "REVIEW-1996" });
+    expect(tmux.option("%5", "@operator_label")).toBe("REVIEW-1996");
+    expect(tmux.writes.filter((args) => args.includes("@operator_label"))).toEqual([]);
   });
 
   test("a label changed by hand after the allocator wrote it is kept", () => {
@@ -180,8 +181,40 @@ describe("routing names stay stable", () => {
       "%4": { session: "infra", window: "REVIEW-7", options: { "@operator_label": "REVIEW-7" } },
     });
     expect(resolvePaneSeatName("%3", tmux.run)).toEqual({ status: "preserved", label: "infra.23" });
-    expect(resolvePaneSeatName("%4", tmux.run)).toEqual({ status: "preserved", label: "REVIEW-7" });
+    expect(resolvePaneSeatName("%4", tmux.run)).toEqual({ status: "preserved", label: "infra.24" });
     expect(tmux.option("%3", "@operator_label")).toBe("disk.23");
+    expect(tmux.option("%4", "@operator_label")).toBe("REVIEW-7");
+  });
+
+  test("fence probe: a typed non-ordinal border keeps the seat on its ordinal across passes", () => {
+    // R2 fence 268 on #26 head 4140eaab: main routes this seat as C5_lanes.1;
+    // the border text must not become its routing name.
+    const tmux = fakeTmux({
+      "%5": { session: "C5_lanes", window: "claude", options: { "@operator_label": "REVIEW-1996" } },
+    });
+    for (let pass = 0; pass < 3; pass++) {
+      expect(ensurePaneOperatorLabel("%5", tmux.run)).toEqual({ status: "preserved", label: "REVIEW-1996", name: "C5_lanes.1" });
+      expect(resolvePaneSeatName("%5", tmux.run)).toEqual({ status: "preserved", label: "C5_lanes.1" });
+    }
+    // One routing ordinal is allocated, once, into the record; the border is never written.
+    expect(tmux.writes).toEqual([["set-option", "-p", "-t", "%5", AUTO_LABEL_OPTION, "C5_lanes.1"]]);
+  });
+
+  test("a pane relabelled by hand keeps the ordinal it already had", () => {
+    const tmux = fakeTmux({
+      "%1": { session: "C5_lanes", window: "claude", options: { "@operator_label": "C5_lanes.1", [AUTO_LABEL_OPTION]: "C5_lanes.1" } },
+      "%5": { session: "C5_lanes", window: "claude", options: { "@operator_label": "REVIEW-1996", [AUTO_LABEL_OPTION]: "C5_lanes.7" } },
+    });
+    expect(ensurePaneOperatorLabel("%5", tmux.run)).toEqual({ status: "preserved", label: "REVIEW-1996", name: "C5_lanes.7" });
+    expect(tmux.writes).toEqual([]);
+  });
+
+  test("another pane's routing ordinal under a typed border is not reallocated", () => {
+    const tmux = fakeTmux({
+      "%5": { session: "C5_lanes", window: "claude", options: { "@operator_label": "REVIEW-1996", [AUTO_LABEL_OPTION]: "C5_lanes.7" } },
+      "%6": { session: "C5_lanes", window: "claude" },
+    });
+    expect(ensurePaneOperatorLabel("%6", tmux.run)).toEqual({ status: "labeled", label: "C5_lanes.8" });
   });
 
   test("a window named on purpose does not replace the ordinal of a seat with no explicit name", () => {
@@ -231,13 +264,18 @@ test.skipIf(!Bun.which("tmux") || !Bun.which("flock"))("hand-set borders survive
     cli("--print", lead);
     expect(cli("--print", born)).toMatch(/^Orch\.[0-9]+$/);
     tmux(["set-option", "-p", "-t", born, "@operator_label", "closeclerk.296"]);
+    // A typed non-ordinal border on a pane with no explicit name.
+    const typed = tmux(["new-window", "-d", "-P", "-F", "#{pane_id}", "-t", "Orch", "sleep", "120"]);
+    tmux(["set-option", "-p", "-t", typed, "@operator_label", "REVIEW-1996"]);
     // A seat that claimed its name: the border shows the name, not its counter.
     expect(cli("--claim-seat-name", lead, "Orch.294")).toBe("Orch.294");
     for (let tick = 0; tick < 5; tick++) {
-      for (const pane of [lead, legacy, born]) cli("--print", pane);
+      for (const pane of [lead, legacy, born, typed]) cli("--print", pane);
       cli("--all");
-      expect([border(lead), border(legacy), border(born)]).toEqual(["Orch.294", "source.295", "closeclerk.296"]);
+      expect([border(lead), border(legacy), border(born), border(typed)])
+        .toEqual(["Orch.294", "source.295", "closeclerk.296", "REVIEW-1996"]);
     }
+    expect(cli("--print-seat", typed)).toMatch(/^Orch\.[0-9]+$/);
     // The seats still answer to their routing names, not the repaired borders.
     expect(cli("--print-seat", legacy)).toBe("Orch.295");
     expect(cli("--print-seat", lead)).toBe("Orch.294");
