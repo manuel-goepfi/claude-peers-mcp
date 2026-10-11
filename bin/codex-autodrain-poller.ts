@@ -130,6 +130,15 @@ const SUBMIT_CONFIRM_INTERVAL_S = process.env.SUBMIT_CONFIRM_INTERVAL_S ?? "0.25
  */
 const SUBMIT_SETTLE_S = process.env.SUBMIT_SETTLE_S ?? "0.35";
 
+/**
+ * Seconds without keyboard input from an attached client viewing the pane
+ * before a wake may be typed into it. Live 2026-10-11: a wake landed while an
+ * operator was typing in a Claude seat's pane and split their input around the
+ * injected prompt. The idle capture had shown an empty composer a moment
+ * before; the operator's next keystrokes arrived between that check and the paste.
+ */
+const OPERATOR_QUIET_S = Number(process.env.OPERATOR_QUIET_S ?? 10);
+
 // Per-client idle profile. A lane is only nudged when its profile says the pane
 // is at an empty/placeholder input prompt and shows no busy marker. The two TUIs
 // render differently, so the prompt glyph and the busy vocabulary differ:
@@ -1453,12 +1462,36 @@ export function composerStillHolds(capture: string, probe: string): boolean {
  * false and do not count the wake. Mail remains untouched in the broker because
  * this poller has no claim or acknowledgement capability.
  */
+/**
+ * Did an operator press a key in `paneId` within `quietS` seconds? Reads
+ * `tmux list-clients` output formatted as `#{client_activity}\t#{pane_id}`: a
+ * client's activity time is its last keyboard or mouse input, and its pane is
+ * the active pane of the window it shows. Clients showing other panes do not count.
+ */
+export function operatorTypedRecently(listClients: string, paneId: string, nowSec: number, quietS = OPERATOR_QUIET_S): boolean {
+  for (const line of listClients.split("\n")) {
+    const [activity = "", pane = ""] = line.split("\t");
+    if (pane.trim() !== paneId) continue;
+    const at = activity.trim() === "" ? NaN : Number(activity);
+    if (!Number.isFinite(at) || nowSec - at < quietS) return true;   // unreadable time: assume active
+  }
+  return false;
+}
+
+function operatorActive(command: typeof sh, paneId: string, nowSec: number): boolean {
+  const clients = command(["tmux", "list-clients", "-F", "#{client_activity}\t#{pane_id}"]);
+  // Fail closed: if tmux cannot say who is typing, do not type into the pane.
+  return !clients.ok || operatorTypedRecently(clients.out, paneId, nowSec);
+}
+
 export function submitPaneText(paneId: string, text: string, clientType: string, deps: {
   command?: typeof sh;
   enterText?: typeof enterWakeText;
   sleep?: (seconds: string) => void;
+  nowSec?: () => number;
 } = {}): boolean {
   const command = deps.command ?? sh;
+  const nowSec = deps.nowSec ?? (() => Date.now() / 1000);
   const enterText = deps.enterText ?? enterWakeText;
   const sleep = deps.sleep ?? ((seconds: string) => { boundedCommand(["sleep", seconds], { operation: "wake-settle" }); });
   const probe = submissionProbe(text);
@@ -1475,10 +1508,22 @@ export function submitPaneText(paneId: string, text: string, clientType: string,
   // Ownership/idle discovery preceded budget persistence. Revalidate the
   // newest capture before writing: the operator or a hook may have acted.
   if (!alreadyHeld && !paneTextIsIdle(before.out, profile)) return false;
+  // Never type into a pane an operator is typing in; a later tick retries.
+  if (operatorActive(command, paneId, nowSec())) {
+    log(`wake deferred for ${paneId}: operator input within ${OPERATOR_QUIET_S}s`);
+    return false;
+  }
   if (!alreadyHeld && !enterText(paneId, text, clientType)) return false;
 
   // Settle longer than the TUI's paste-burst window before submitting.
   sleep(SUBMIT_SETTLE_S);
+  // Keys pressed while the wake was being entered are now mixed into the
+  // composer. Submitting would send the operator's partial input with the wake;
+  // leave everything unsent for the operator instead.
+  if (operatorActive(command, paneId, nowSec())) {
+    log(`wake left unsent in ${paneId}: operator typed while it was entered`);
+    return false;
+  }
   if (!command(["tmux", "send-keys", "-t", paneId, "Enter"]).ok) return false;
 
   // Poll rather than sleep once: submission latency varies with what the TUI is
