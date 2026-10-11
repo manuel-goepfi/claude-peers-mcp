@@ -170,6 +170,42 @@ describe("sync-greeting-hook", () => {
       expect(inspect([join(home, ".claude"), join(home, ".claude-c")], canonical).homes[1]!.state).toBe("unsafe");
     });
 
+    // R2 fence 273, second round: a regular home beneath a symlinked ancestor.
+    function underLinkedAncestor(home: string, name: string) {
+      const real = join(home, "realroot"); mkdirSync(join(real, name, "hooks"), { recursive: true });
+      writeFileSync(join(real, name, "hooks", HOOK_NAME), "FOREIGN-UNDER-ANCESTOR\n");
+      symlinkSync(real, join(home, "linkroot"));
+      return { real, viaLink: join(home, "linkroot", name) };
+    }
+
+    test("a regular home beneath a symlinked ancestor is unsafe; nothing is written or backed up there", () => {
+      const { home, canonical } = homes();
+      const { real, viaLink } = underLinkedAncestor(home, ".claude-q");
+      expect(inspect([viaLink], canonical).homes[0]!.state).toBe("unsafe");
+      expect(install([viaLink], canonical, "STAMP")[0]!.state).toBe("unsafe");
+      expect(readdirSync(join(real, ".claude-q", "hooks"))).toEqual([HOOK_NAME]);
+      expect(readFileSync(join(real, ".claude-q", "hooks", HOOK_NAME), "utf8")).toBe("FOREIGN-UNDER-ANCESTOR\n");
+    });
+
+    test("a shared alias of an owner that sits beneath a symlinked ancestor is not shared but unsafe", () => {
+      const { home, canonical } = homes();
+      const { real, viaLink } = underLinkedAncestor(home, ".claude-q");
+      rmSync(join(home, ".claude-c", "hooks"), { recursive: true });
+      symlinkSync(join(viaLink, "hooks"), join(home, ".claude-c", "hooks"));
+      const states = install([viaLink, join(home, ".claude-c")], canonical, "STAMP");
+      expect(states.map((s) => s.state)).toEqual(["unsafe", "unsafe"]);
+      expect(readFileSync(join(real, ".claude-q", "hooks", HOOK_NAME), "utf8")).toBe("FOREIGN-UNDER-ANCESTOR\n");
+    });
+
+    test("a shared alias that itself sits beneath a symlinked ancestor is unsafe", () => {
+      const { home, canonical } = homes();
+      const real = join(home, "realroot2"); mkdirSync(join(real, ".claude-s"), { recursive: true });
+      symlinkSync(join(home, ".claude", "hooks"), join(real, ".claude-s", "hooks"));
+      symlinkSync(real, join(home, "linkroot2"));
+      const states = inspect([join(home, ".claude"), join(home, "linkroot2", ".claude-s")], canonical).homes;
+      expect(states.map((s) => s.state)).toEqual(["drift", "unsafe"]);
+    });
+
     test("an install leaves no staged temporary files behind", () => {
       const { home, canonical } = homes();
       install(defaultHomes(home), canonical, "STAMP");

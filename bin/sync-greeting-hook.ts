@@ -44,7 +44,20 @@ const HOOK_MODE = 0o755;
  * a regular file owned by this user: a symlink anywhere on the path would let
  * an install overwrite whatever it points to, so it is refused (fail closed).
  */
+/**
+ * Every ancestor of `path` must be a real directory: the path must equal its
+ * own resolved real path. A symlink anywhere above it would redirect writes
+ * outside the intended tree (R2 fence 273, second round).
+ */
+function ancestorReason(path: string): string | null {
+  let real: string;
+  try { real = realpathSync(path); } catch { return `${path} cannot be resolved`; }
+  return real === resolve(path) ? null : `${path} has a symlink on its path (resolves to ${real})`;
+}
+
 function unsafeReason(home: string): string | null {
+  const ancestor = ancestorReason(home);
+  if (ancestor) return ancestor;
   const uid = process.getuid?.();
   const check = (path: string, kind: "dir" | "file", required: boolean): string | null => {
     let st;
@@ -82,6 +95,7 @@ function sharedOwner(home: string, homes: string[]): string | null {
   let st;
   try { st = lstatSync(hooks); } catch { return null; }
   if (!st.isSymbolicLink()) return null;
+  if (ancestorReason(home)) return null;          // the aliasing home itself must sit on a real path
   try {
     const own = lstatSync(home);                 // the home itself must still be a real, owned directory
     if (own.isSymbolicLink() || !own.isDirectory() || (process.getuid && own.uid !== process.getuid())) return null;
