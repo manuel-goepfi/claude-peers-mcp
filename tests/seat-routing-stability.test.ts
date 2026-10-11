@@ -88,6 +88,30 @@ test("legacy duplicate registrations with tied timestamps resolve consistently",
 });
 
 
+test("a relaunched seat's inactive mailbox group names the live successor instead of failing bare", async () => {
+  // A seat whose old registration was enrolled in a runtime mailbox group and
+  // then relaunched: the old group no longer proves a live native process. A
+  // sender still holding the old id must be told who answers for the seat now,
+  // as every other stale id is, not only that the group is inactive.
+  const old = await register("%998", "10000000-0000-4000-8000-000000000006");
+  const sender = await register("%999");
+  const db = new Database(broker.dbPath);
+  try {
+    db.run("UPDATE peers SET seat_key = ? WHERE id = ?",
+      [`live:${"a".repeat(64)}:native:${"b".repeat(64)}`, old.id]);
+  } finally { db.close(); }
+  await Bun.sleep(5);
+  const current = await register("%998", "10000000-0000-4000-8000-000000000007");
+  const stale = await call("/send-message", { from_id: sender.id, to_id: old.id, text: "old group" });
+  expect(stale.ok).toBe(false);
+  expect(stale.code).toBe("STALE_PEER_ID");
+  expect(stale.candidates.map((p: { id: string }) => p.id)).toEqual([current.id]);
+  const check = new Database(broker.dbPath, { readonly: true });
+  try { expect((check.query("SELECT COUNT(*) AS c FROM messages WHERE text = 'old group'").get() as { c: number }).c).toBe(0); }
+  finally { check.close(); }
+  expect((await call("/send-message", { from_id: sender.id, to_id: current.id, text: "successor" })).ok).toBe(true);
+});
+
 test.skipIf(!Bun.which("tmux"))("name routing survives recipient restart in the same real pane with sender unchanged", async () => {
   const root = mkdtempSync(join(tmpdir(), "routing-restart-"));
   const socket = join(root, "tmux");

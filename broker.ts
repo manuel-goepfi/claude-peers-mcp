@@ -2581,8 +2581,18 @@ function resolveFreshPeerById(targetSelector: PeerSelector & { id: string }, wit
   const stored=selectPeerById.get(targetSelector.id) as Peer|null;
   if(liveGroupPrefix(stored?.seat_key)){
     const target=liveGroups.target(targetSelector.id);
-    return target && peerMatchesSelector(target,selectorWithoutId(targetSelector))
-      ? {ok:true,peer:target} : {ok:false,code:"STALE_PEER_ID",error:"runtime mailbox group is inactive or selector conflicts"};
+    if(target && peerMatchesSelector(target,selectorWithoutId(targetSelector))) return {ok:true,peer:target};
+    // A relaunched seat leaves its old group behind. Name who answers for the
+    // seat now, exactly as for any other stale id; never redirect the send.
+    const supplemental=selectorWithoutId(targetSelector);
+    const narrowed=selectorFields(supplemental).length>0;
+    const candidates=withCandidates && stored
+      ? activeOnly(livePeersForResolution(selectAllTargetablePeers.all() as Peer[]))
+        .filter((p)=>p.id!==stored.id && sameSeatOrName(stored,p))
+        .filter((p)=>!narrowed || peerMatchesSelector(p,supplemental))
+        .map(describePeerTarget)
+      : [];
+    return {ok:false,code:"STALE_PEER_ID",error:"runtime mailbox group is inactive or selector conflicts",candidates};
   }
   const staleById = selectTargetablePeerById.get(targetSelector.id) as Peer | null;
   if (!staleById) return { ok: false, code: "PEER_NOT_FOUND", error: `Peer ${targetSelector.id} not found` };
