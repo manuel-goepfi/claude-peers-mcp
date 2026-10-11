@@ -18,6 +18,10 @@ command -v jq >/dev/null 2>&1 || exit 0
 # session started with `claude --agent` also carries it. Never let a subagent
 # claim the root seat's inbox.
 HOOK_INPUT=$(cat)
+# Opt-out for helper Claude processes that must not act as a peer seat: a
+# launcher's short-lived child inherits the operator pane (TMUX_PANE) but is not
+# that pane's seat, and registering it leaves a ghost row under the seat's name.
+case "${CLAUDE_PEERS_SESSION_HOOKS_ENABLED:-true}" in false|0|no|off) exit 0 ;; esac
 AGENT_ID=$(printf '%s' "$HOOK_INPUT" | jq -r 'if (.agent_id | type) == "string" then .agent_id else "" end' 2>/dev/null)
 [[ -n "$AGENT_ID" ]] && exit 0
 
