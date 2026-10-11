@@ -410,7 +410,9 @@ export function labelAllUnlabeledPanes(
     // A hand-set label, or one already showing the seat name, is final.
     if (pane?.operatorLabel && (hasHumanLabel(pane) || pane.operatorLabel === pane.seatName)) continue;
     const label = pane && preservedTmuxOperatorLabel(pane.operatorLabel, pane.peerLabel, pane.session);
-    if (pane && label === pane.operatorLabel && label && claims.get(claimKey(pane, label)) === 1) continue;
+    // A canonical ordinal is final only for a seat with no explicit name: a
+    // named seat's border must move to its name even when its counter is unique.
+    if (pane && !pane.seatName && label === pane.operatorLabel && label && claims.get(claimKey(pane, label)) === 1) continue;
     const paneId = row.split("\t")[0]!;
     if (!/^%[0-9]+$/.test(paneId)) { failed++; continue; }
     const result = ensurePaneOperatorLabel(paneId, run);
