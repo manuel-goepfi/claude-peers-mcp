@@ -31,7 +31,7 @@ cat >/dev/null
 # Opt-out for helper Claude processes that must not act as a peer seat: a
 # launcher's short-lived child inherits the operator pane (TMUX_PANE) but is not
 # that pane's seat, and registering it leaves a ghost row under the seat's name.
-case "${CLAUDE_PEERS_SESSION_HOOKS_ENABLED:-true}" in false|0|no|off) exit 0 ;; esac
+case "${CLAUDE_PEERS_SESSION_HOOKS_ENABLED:-true}" in [Ff][Aa][Ll][Ss][Ee]|0|[Nn][Oo]|[Oo][Ff][Ff]) exit 0 ;; esac
 
 # Soft-fail if sqlite3/jq aren't installed or the DB doesn't exist yet.
 # jq is checked BEFORE any drain: /poll-by-pid acks mail on receipt, so
