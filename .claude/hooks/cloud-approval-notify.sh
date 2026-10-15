@@ -1,16 +1,24 @@
 #!/usr/bin/env bash
-# cloud-approval-notify.sh — show-only approval cards for Claude Code cloud sessions.
+# cloud-approval-notify.sh — approval cards for Claude Code cloud sessions, answerable from T3.
 #
-#   cloud-approval-notify.sh ask    PermissionRequest hook: post state "open"
+#   cloud-approval-notify.sh ask    PermissionRequest hook: post state "open",
+#                                   then wait for the operator's answer
 #   cloud-approval-notify.sh done   PostToolUse hook: post state "done" for an
 #                                   id this VM posted as "open" earlier
 #
 # A cloud session (CLAUDE_CODE_REMOTE=true) with a cloud-peers lane token
 # (C5_PEER_TOKEN) and c5-peer on PATH tells the tailnet gateway (POST /ask on
 # $C5_PEER_URL) that it waits for an approval, so the operator's T3 sidebar can
-# show a card. Step 1 is show-only: this hook never approves or denies. It
-# prints nothing on stdout, always exits 0, and returns at once: the send runs
-# fully detached (setsid, else nohup; stdin/stdout/stderr closed).
+# show a card. The send runs fully detached (setsid, else nohup;
+# stdin/stdout/stderr closed). Always exits 0.
+#
+# Answers (2026-10-15, step 2): after the post, ask mode polls GET
+# /decision?id=<id> every ${C5_CLOUD_ASK_POLL:-3} s for up to
+# ${C5_CLOUD_ASK_WAIT:-300} s (0 turns waiting off). The permission prompt stays
+# open on claude.ai meanwhile and whichever answers first applies. Only a
+# gateway answer of "allow" or "deny" prints a PermissionRequest decision on
+# stdout; anything else (no answer in time, 4xx, the done marker gone because
+# the tool already ran) prints nothing, so the prompt is left to the person.
 #
 # id = first 16 hex of sha256(session_id "\n" tool_name "\n" tool_input as
 # JSON with sorted keys and compact separators). PostToolUse carries the same
@@ -69,9 +77,24 @@ while True:
         time.sleep(0.05)' "$1" "$2" 2>/dev/null
 }
 
+# gw_curl ARGS...: curl to the gateway with the Bearer header and the proxy
+# set-up above; prints the response body, a newline, then the HTTP code.
+gw_curl() {
+  local -a proxy
+  if [[ -n "${C5_PEER_PROXY:-}" ]]; then proxy=(-x "$C5_PEER_PROXY"); else proxy=(--socks5-hostname "${C5_PEER_SOCKS:-localhost:1055}"); fi
+  if [[ "${C5_CLOUD_ASK_DIRECT:-}" == 1 ]]; then
+    # The direct (no-proxy) path exists for the test harness only.
+    if [[ "${C5_CLOUD_ASK_TEST:-}" == 1 ]]; then proxy=(); else note direct-refused-using-proxy; fi
+  fi
+  env -u no_proxy -u NO_PROXY -u http_proxy -u HTTP_PROXY \
+    -u https_proxy -u HTTPS_PROXY -u all_proxy -u ALL_PROXY \
+    curl -sS -w '\n%{http_code}' --max-time 20 ${proxy[@]+"${proxy[@]}"} \
+    -H @<(printf 'Authorization: Bearer %s\n' "${C5_PEER_TOKEN:-}") "$@" 2>/dev/null
+}
+note() { printf '%s %s %s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${C5_CLOUD_ASK_STATE:-?}" "${C5_CLOUD_ASK_ID:-?}" "$1" >"$LOG" 2>/dev/null; }
+
 if [[ "$MODE" == __send ]]; then
   # Detached child: C5_CLOUD_ASK_BODY, C5_CLOUD_ASK_ID, C5_CLOUD_ASK_PEER from the parent.
-  note() { printf '%s %s %s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${C5_CLOUD_ASK_STATE:-?}" "${C5_CLOUD_ASK_ID:-?}" "$1" >"$LOG" 2>/dev/null; }
   fail() { note "$1"; exit 0; }
   LOCK="$ASK_DIR/${C5_CLOUD_ASK_ID:-x}.lock"
   if [[ "${C5_CLOUD_ASK_STATE:-}" == done ]]; then
@@ -88,17 +111,10 @@ if [[ "$MODE" == __send ]]; then
   fi
   # fd 9 closed for c5-peer: a tailscaled it starts must not inherit the lock.
   "${C5_CLOUD_ASK_PEER:-c5-peer}" ensure >/dev/null 2>&1 9>&- || fail ensure-failed
-  if [[ -n "${C5_PEER_PROXY:-}" ]]; then proxy=(-x "$C5_PEER_PROXY"); else proxy=(--socks5-hostname "${C5_PEER_SOCKS:-localhost:1055}"); fi
-  if [[ "${C5_CLOUD_ASK_DIRECT:-}" == 1 ]]; then
-    # The direct (no-proxy) path exists for the test harness only.
-    if [[ "${C5_CLOUD_ASK_TEST:-}" == 1 ]]; then proxy=(); else note direct-refused-using-proxy; fi
-  fi
   URL="${C5_PEER_URL:-http://100.109.108.90:7898}"
-  code="$(printf '%s' "${C5_CLOUD_ASK_BODY:-}" | env -u no_proxy -u NO_PROXY -u http_proxy -u HTTP_PROXY \
-    -u https_proxy -u HTTPS_PROXY -u all_proxy -u ALL_PROXY \
-    curl -sS -o /dev/null -w '%{http_code}' --max-time 20 "${proxy[@]}" -X POST "$URL/ask" \
-    -H @<(printf 'Authorization: Bearer %s\n' "${C5_PEER_TOKEN:-}") \
-    -H 'Content-Type: application/json' --data-binary @- 2>/dev/null)"
+  code="$(printf '%s' "${C5_CLOUD_ASK_BODY:-}" | gw_curl -o /dev/null -X POST "$URL/ask" \
+    -H 'Content-Type: application/json' --data-binary @-)"
+  code="${code##*$'\n'}"
   [[ "$code" == 200 ]] || fail "http-${code:-000}"
   exit 0
 fi
@@ -115,7 +131,7 @@ if [[ "$STATE" == done && -z "$(find "$ASK_DIR" -mindepth 1 -maxdepth 1 -type d 
 fi
 
 IFS= read -r -d '' PY <<'PY'
-import hashlib, json, os, re, sys
+import hashlib, json, os, re, sys, unicodedata
 state = sys.argv[1]
 try:
     data = json.loads(sys.stdin.read())
@@ -146,7 +162,24 @@ elif tool == "WebFetch":
     cmd = "WebFetch " + text(d.get("url"))
 else:
     cmd = json.dumps(ti, separators=(",", ":"), ensure_ascii=False)
+# T3 may answer a card only when it shows exactly what will run: not for
+# tools whose content the card leaves out, hidden control or format (bidi)
+# characters, a cut tool name, or text changed by redaction below.
+# Inputs a card leaves out must be absent or harmless; any other key (for
+# example dangerouslyDisableSandbox) makes the card unanswerable.
+SHOWN_KEYS = {"Bash": {"command", "description", "timeout", "run_in_background"},
+              "Read": {"file_path", "offset", "limit"}, "WebFetch": {"url", "prompt"}}
+answerable = tool not in ("Edit", "Write", "MultiEdit", "NotebookEdit") and len(tool) <= 64
+if tool in SHOWN_KEYS and not set(d) <= SHOWN_KEYS[tool]:
+    answerable = False
+def hidden(c):  # characters a card cannot show faithfully; only space, tab and newline pass
+    return c not in " \t\n" and (unicodedata.category(c) in ("Cc", "Cf", "Co", "Cn", "Zl", "Zp", "Zs") or c == "\x85")
+if any(hidden(c) for c in cmd + tool) or "⏎" in cmd:  # ⏎ is the card's own newline mark
+    answerable = False
+# Newlines separate commands, so the card shows them (as ⏎) instead of folding them into spaces.
+cmd = re.sub(r"[ \t]*\n[ \t\n]*", " ⏎ ", cmd)
 cmd = re.sub(r"[\x00-\x1f\x7f\s]+", " ", cmd).strip()
+shown = cmd
 R = "[redacted]"
 # The lane token's exact value never reaches a card (it travels only in the
 # Authorization header). Replaced before the patterns, so no pattern can split it.
@@ -173,6 +206,7 @@ SUBS = [
 ]
 for pat, rep in SUBS:
     cmd = re.sub(pat, rep, cmd)
+full = len(cmd) <= 500 and answerable and cmd == shown
 cmd = cmd[:500]
 if state == "done":
     cmd = ""
@@ -182,13 +216,20 @@ if len(TOK) >= 8:  # filtering can join a split token back together
 session = session[:128]
 body = json.dumps({"id": aid, "state": state, "tool": tool[:64], "command": cmd, "session": session},
                   ensure_ascii=False, separators=(",", ":"))
-print(aid)
+# The hash of the exact card text: an answer from T3 applies only if the gateway
+# reports it for this text (a VM process could open a card under this id first).
+shown_id = hashlib.sha256((tool[:64] + "\n" + cmd).encode("utf-8")).hexdigest()[:16]
+print(aid + " " + shown_id + ("" if full else " cut"))
 print(body)
 PY
 
 OUT="$(python3 -I -c "$PY" "$STATE" 2>/dev/null)" || exit 0
 ID="${OUT%%$'\n'*}"
 BODY="${OUT#*$'\n'}"
+CUT=""
+[[ "$ID" == *" cut" ]] && { ID="${ID% cut}"; CUT=1; }
+SHOWN="${ID#* }"; ID="${ID%% *}"
+[[ "$SHOWN" =~ ^[0-9a-f]{16}$ ]] || exit 0
 [[ "$ID" =~ ^[0-9a-f]{16}$ && -n "$BODY" && "$BODY" != "$OUT" ]] || exit 0
 
 if [[ "$STATE" == open ]]; then
@@ -209,4 +250,52 @@ if command -v setsid >/dev/null 2>&1; then
 else
   nohup bash "$SELF" __send </dev/null >/dev/null 2>&1 &
 fi
+
+# --- Step 2: wait for the operator's answer from T3 (ask mode only) ---------
+[[ "$STATE" == open ]] || exit 0
+WAIT="${C5_CLOUD_ASK_WAIT:-300}"; [[ "$WAIT" =~ ^[0-9]{1,3}$ ]] || WAIT=300
+POLL="${C5_CLOUD_ASK_POLL:-3}"; [[ "$POLL" =~ ^([1-9]|10)$ ]] || POLL=3
+(( WAIT > 0 )) || exit 0
+# A card that does not show exactly what will run (cut, redacted, hidden
+# characters, edit content left out) is never answered from T3.
+[[ -z "$CUT" ]] || exit 0
+# Let the detached child finish its post first: it holds the per-id lock for
+# the whole post, so taking that lock on a fresh descriptor means open has
+# landed (or failed). This hook's own copy of fd 9 is closed first.
+exec 9>&-
+{ exec 8>>"$ASK_DIR/$ID.lock"; } 2>/dev/null && take_lock 8 40
+exec 8>&-
+URL="${C5_PEER_URL:-http://100.109.108.90:7898}"
+end=$((SECONDS + WAIT))
+while (( SECONDS < end )); do
+  # The marker goes when done is posted: the tool ran, so it was answered elsewhere.
+  [[ -d "$ASK_DIR/$ID" ]] || exit 0
+  resp="$(gw_curl "$URL/decision?id=$ID")"
+  code="${resp##*$'\n'}"
+  case "$code" in
+    200)
+      dec="$(printf '%s' "${resp%$'\n'*}" | python3 -I -c 'import json, sys
+try:
+    r = json.loads(sys.stdin.read())
+    d = r.get("decision")
+    # Allow only for the text this hook showed; a deny is honoured either way.
+    if d == "allow" and r.get("shown") != sys.argv[1]:
+        d = "mismatch"
+except Exception:
+    d = None
+print(d if d in ("allow", "deny", "mismatch") else "")' "$SHOWN" 2>/dev/null)"
+      if [[ "$dec" == allow ]]; then
+        printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}'
+        exit 0
+      elif [[ "$dec" == mismatch ]]; then
+        note wait-shown-mismatch; exit 0
+      elif [[ "$dec" == deny ]]; then
+        printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny","message":"The operator denied this from T3."}}}'
+        exit 0
+      fi ;;
+    000|429|5??) ;;          # gateway unreachable or busy: keep waiting
+    *) note "wait-http-$code"; exit 0 ;;   # 401/404/...: nothing to wait for
+  esac
+  sleep "$POLL"
+done
 exit 0
