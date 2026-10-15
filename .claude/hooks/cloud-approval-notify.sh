@@ -216,7 +216,10 @@ if len(TOK) >= 8:  # filtering can join a split token back together
 session = session[:128]
 body = json.dumps({"id": aid, "state": state, "tool": tool[:64], "command": cmd, "session": session},
                   ensure_ascii=False, separators=(",", ":"))
-print(aid if full else aid + " cut")
+# The hash of the exact card text: an answer from T3 applies only if the gateway
+# reports it for this text (a VM process could open a card under this id first).
+shown_id = hashlib.sha256((tool[:64] + "\n" + cmd).encode("utf-8")).hexdigest()[:16]
+print(aid + " " + shown_id + ("" if full else " cut"))
 print(body)
 PY
 
@@ -225,6 +228,8 @@ ID="${OUT%%$'\n'*}"
 BODY="${OUT#*$'\n'}"
 CUT=""
 [[ "$ID" == *" cut" ]] && { ID="${ID% cut}"; CUT=1; }
+SHOWN="${ID#* }"; ID="${ID%% *}"
+[[ "$SHOWN" =~ ^[0-9a-f]{16}$ ]] || exit 0
 [[ "$ID" =~ ^[0-9a-f]{16}$ && -n "$BODY" && "$BODY" != "$OUT" ]] || exit 0
 
 if [[ "$STATE" == open ]]; then
@@ -271,13 +276,19 @@ while (( SECONDS < end )); do
     200)
       dec="$(printf '%s' "${resp%$'\n'*}" | python3 -I -c 'import json, sys
 try:
-    d = json.loads(sys.stdin.read()).get("decision")
+    r = json.loads(sys.stdin.read())
+    d = r.get("decision")
+    # Allow only for the text this hook showed; a deny is honoured either way.
+    if d == "allow" and r.get("shown") != sys.argv[1]:
+        d = "mismatch"
 except Exception:
     d = None
-print(d if d in ("allow", "deny") else "")' 2>/dev/null)"
+print(d if d in ("allow", "deny", "mismatch") else "")' "$SHOWN" 2>/dev/null)"
       if [[ "$dec" == allow ]]; then
         printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}'
         exit 0
+      elif [[ "$dec" == mismatch ]]; then
+        note wait-shown-mismatch; exit 0
       elif [[ "$dec" == deny ]]; then
         printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny","message":"The operator denied this from T3."}}}'
         exit 0
