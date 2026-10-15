@@ -1,0 +1,40 @@
+{
+  "hooks": {
+    "PermissionRequest": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ \"${CLAUDE_CODE_REMOTE:-}\" = true ] || exit 0; H=\"${CLAUDE_PROJECT_DIR:-}/.claude/hooks/cloud-approval-notify.sh\"; [ -n \"${CLAUDE_PROJECT_DIR:-}\" ] && [ -x \"$H\" ] || exit 0; exec \"$H\" ask",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ \"${CLAUDE_CODE_REMOTE:-}\" = true ] || exit 0; H=\"${CLAUDE_PROJECT_DIR:-}/.claude/hooks/cloud-approval-notify.sh\"; [ -n \"${CLAUDE_PROJECT_DIR:-}\" ] && [ -x \"$H\" ] || exit 0; exec \"$H\" done",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ \"${CLAUDE_CODE_REMOTE:-}\" = true ] || exit 0; H=\"${CLAUDE_PROJECT_DIR:-}/.claude/hooks/cloud-approval-notify.sh\"; [ -n \"${CLAUDE_PROJECT_DIR:-}\" ] && [ -x \"$H\" ] || exit 0; exec \"$H\" done",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
