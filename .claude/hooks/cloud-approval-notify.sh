@@ -174,7 +174,7 @@ if tool in SHOWN_KEYS and not set(d) <= SHOWN_KEYS[tool]:
     answerable = False
 def hidden(c):  # characters a card cannot show faithfully; only space, tab and newline pass
     return c not in " \t\n" and (unicodedata.category(c) in ("Cc", "Cf", "Co", "Cn", "Zl", "Zp", "Zs") or c == "\x85")
-if any(hidden(c) for c in cmd + tool):
+if any(hidden(c) for c in cmd + tool) or "⏎" in cmd:  # ⏎ is the card's own newline mark
     answerable = False
 # Newlines separate commands, so the card shows them (as ⏎) instead of folding them into spaces.
 cmd = re.sub(r"[ \t]*\n[ \t\n]*", " ⏎ ", cmd)
