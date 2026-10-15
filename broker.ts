@@ -4447,7 +4447,10 @@ requestHandler = async (req: Request) => {
         const limit = Number.isFinite(limitParsed) && limitParsed >= 1 && limitParsed <= 1000 ? limitParsed : 100;
         const rows = selectMessagesSinceId.all(since, limit) as Array<{ id: number; from_id: string; to_id: string; text: string; sent_at: string; delivered: number }>;
         const cursor = rows.length > 0 ? Math.max(...rows.map((r) => r.id)) : since;
-        return Response.json({ messages: rows, cursor, limit, count: rows.length });
+        // Complete roster shares the bridge-only auth and rate-limit boundary.
+        // Select only the original daemon columns, with SQLite nulls unchanged.
+        const peers = db.prepare('SELECT id, name, cwd, tmux_session, git_root, registered_at, last_seen FROM peers').all();
+        return Response.json({ messages: rows, cursor, limit, count: rows.length, peers });
       }
       return new Response("claude-peers broker", { status: 200 });
     }
