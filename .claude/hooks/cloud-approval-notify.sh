@@ -165,9 +165,19 @@ else:
 # T3 may answer a card only when it shows exactly what will run: not for
 # tools whose content the card leaves out, hidden control or format (bidi)
 # characters, a cut tool name, or text changed by redaction below.
+# Inputs a card leaves out must be absent or harmless; any other key (for
+# example dangerouslyDisableSandbox) makes the card unanswerable.
+SHOWN_KEYS = {"Bash": {"command", "description", "timeout", "run_in_background"},
+              "Read": {"file_path", "offset", "limit"}, "WebFetch": {"url", "prompt"}}
 answerable = tool not in ("Edit", "Write", "MultiEdit", "NotebookEdit") and len(tool) <= 64
-if re.search(r"[\x00-\x08\x0b-\x1f\x7f]", cmd) or any(unicodedata.category(c) == "Cf" for c in cmd + tool):
+if tool in SHOWN_KEYS and not set(d) <= SHOWN_KEYS[tool]:
     answerable = False
+def hidden(c):  # characters a card cannot show faithfully; only space, tab and newline pass
+    return c not in " \t\n" and (unicodedata.category(c) in ("Cc", "Cf", "Co", "Cn", "Zl", "Zp", "Zs") or c == "\x85")
+if any(hidden(c) for c in cmd + tool):
+    answerable = False
+# Newlines separate commands, so the card shows them (as ⏎) instead of folding them into spaces.
+cmd = re.sub(r"[ \t]*\n[ \t\n]*", " ⏎ ", cmd)
 cmd = re.sub(r"[\x00-\x1f\x7f\s]+", " ", cmd).strip()
 shown = cmd
 R = "[redacted]"
