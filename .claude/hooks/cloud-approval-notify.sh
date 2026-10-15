@@ -131,7 +131,7 @@ if [[ "$STATE" == done && -z "$(find "$ASK_DIR" -mindepth 1 -maxdepth 1 -type d 
 fi
 
 IFS= read -r -d '' PY <<'PY'
-import hashlib, json, os, re, sys
+import hashlib, json, os, re, sys, unicodedata
 state = sys.argv[1]
 try:
     data = json.loads(sys.stdin.read())
@@ -162,7 +162,14 @@ elif tool == "WebFetch":
     cmd = "WebFetch " + text(d.get("url"))
 else:
     cmd = json.dumps(ti, separators=(",", ":"), ensure_ascii=False)
+# T3 may answer a card only when it shows exactly what will run: not for
+# tools whose content the card leaves out, hidden control or format (bidi)
+# characters, a cut tool name, or text changed by redaction below.
+answerable = tool not in ("Edit", "Write", "MultiEdit", "NotebookEdit") and len(tool) <= 64
+if re.search(r"[\x00-\x08\x0b-\x1f\x7f]", cmd) or any(unicodedata.category(c) == "Cf" for c in cmd + tool):
+    answerable = False
 cmd = re.sub(r"[\x00-\x1f\x7f\s]+", " ", cmd).strip()
+shown = cmd
 R = "[redacted]"
 # The lane token's exact value never reaches a card (it travels only in the
 # Authorization header). Replaced before the patterns, so no pattern can split it.
@@ -189,7 +196,7 @@ SUBS = [
 ]
 for pat, rep in SUBS:
     cmd = re.sub(pat, rep, cmd)
-full = len(cmd) <= 500
+full = len(cmd) <= 500 and answerable and cmd == shown
 cmd = cmd[:500]
 if state == "done":
     cmd = ""
@@ -234,7 +241,8 @@ fi
 WAIT="${C5_CLOUD_ASK_WAIT:-300}"; [[ "$WAIT" =~ ^[0-9]{1,3}$ ]] || WAIT=300
 POLL="${C5_CLOUD_ASK_POLL:-3}"; [[ "$POLL" =~ ^([1-9]|10)$ ]] || POLL=3
 (( WAIT > 0 )) || exit 0
-# A card cut at 500 characters hides the tail of the request: never answer it from T3.
+# A card that does not show exactly what will run (cut, redacted, hidden
+# characters, edit content left out) is never answered from T3.
 [[ -z "$CUT" ]] || exit 0
 # Let the detached child finish its post first: it holds the per-id lock for
 # the whole post, so taking that lock on a fresh descriptor means open has
