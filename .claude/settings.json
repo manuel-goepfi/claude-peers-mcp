@@ -7,7 +7,7 @@
           {
             "type": "command",
             "command": "[ \"${CLAUDE_CODE_REMOTE:-}\" = true ] || exit 0; H=\"${CLAUDE_PROJECT_DIR:-}/.claude/hooks/cloud-approval-notify.sh\"; [ -n \"${CLAUDE_PROJECT_DIR:-}\" ] && [ -x \"$H\" ] || exit 0; exec \"$H\" ask",
-            "timeout": 370
+            "timeout": 1870
           }
         ]
       }
