@@ -14,7 +14,7 @@
 #
 # Answers (2026-10-15, step 2): after the post, ask mode polls GET
 # /decision?id=<id> every ${C5_CLOUD_ASK_POLL:-3} s for up to
-# ${C5_CLOUD_ASK_WAIT:-300} s (0 turns waiting off). The permission prompt stays
+# ${C5_CLOUD_ASK_WAIT:-1800} s, at most 1800 (0 turns waiting off). The permission prompt stays
 # open on claude.ai meanwhile and whichever answers first applies. Only a
 # gateway answer of "allow" or "deny" prints a PermissionRequest decision on
 # stdout; anything else (no answer in time, 4xx, the done marker gone because
@@ -104,9 +104,9 @@ if [[ "$MODE" == __send ]]; then
     # Lock files are never deleted here or in the ask path: a quickly repeated
     # identical command reuses this id, and its newer ask child may already hold
     # (or be about to take) this same file. Deleting it would let a later done
-    # lock a fresh inode and overtake that ask. The ask path's 30-min age sweep
+    # lock a fresh inode and overtake that ask. The ask path's 40-min age sweep
     # removes old lock files; every taker touches the file first, so a lock in
-    # use is never older than 30 min.
+    # use is never older than 40 min.
     touch "$LOCK" 2>/dev/null
   fi
   # fd 9 closed for c5-peer: a tailscaled it starts must not inherit the lock.
@@ -131,9 +131,9 @@ fi
 command -v python3 >/dev/null 2>&1 || exit 0
 command -v curl >/dev/null 2>&1 || exit 0
 # PostToolUse fires for every tool: without a recent open ask in this VM there is
-# nothing to close. Markers older than 30 min (asks that were denied, so no done
+# nothing to close. Markers older than 40 min (asks that were denied, so no done
 # came) do not count; T3 already hides those cards.
-if [[ "$STATE" == done && -z "$(find "$ASK_DIR" -mindepth 1 -maxdepth 1 -type d -mmin -30 -print -quit 2>/dev/null)" ]]; then
+if [[ "$STATE" == done && -z "$(find "$ASK_DIR" -mindepth 1 -maxdepth 1 -type d -mmin -40 -print -quit 2>/dev/null)" ]]; then
   exit 0
 fi
 
@@ -184,8 +184,14 @@ def hidden(c):  # characters a card cannot show faithfully; only space, tab and 
 if any(hidden(c) for c in cmd + tool) or "⏎" in cmd:  # ⏎ is the card's own newline mark
     answerable = False
 # Newlines separate commands, so the card shows them (as ⏎) instead of folding them into spaces.
+original = cmd
 cmd = re.sub(r"[ \t]*\n[ \t\n]*", " ⏎ ", cmd)
 cmd = re.sub(r"[\x00-\x1f\x7f\s]+", " ", cmd).strip()
+# The card may be answered only if it gives back the exact command: every ⏎ a single newline and no
+# other whitespace changed. A quoted double space, a tab, indentation or an edge space would make the
+# card show text that is not what runs (infra.341 repro, 2026-10-16), so such a card is view-only.
+if cmd.replace(" ⏎ ", "\n") != original:
+    answerable = False
 shown = cmd
 R = "[redacted]"
 # The lane token's exact value never reaches a card (it travels only in the
@@ -201,6 +207,7 @@ def untoken(v):
         v = v.replace(secret, R)
     return v
 cmd = untoken(cmd)
+original_tool = tool
 tool = untoken(tool)
 sid_card = untoken(sid)
 SUBS = [
@@ -220,7 +227,9 @@ SUBS = [
 ]
 for pat, rep in SUBS:
     cmd = re.sub(pat, rep, cmd)
-full = len(cmd) <= 500 and answerable and cmd == shown
+# Answerable only if both the command and the tool name are shown unchanged: a tool name with a secret
+# in it is shown redacted, so the card no longer names what runs (fence.392 / infra.341, 2026-10-16).
+full = len(cmd) <= 500 and answerable and cmd == shown and tool == original_tool
 cmd = cmd[:500]
 if state == "done":
     cmd = ""
@@ -247,8 +256,8 @@ SHOWN="${ID#* }"; ID="${ID%% *}"
 [[ "$ID" =~ ^[0-9a-f]{16}$ && -n "$BODY" && "$BODY" != "$OUT" ]] || exit 0
 
 if [[ "$STATE" == open ]]; then
-  # Sweep markers and lock files older than 30 min (denied asks get no done).
-  find "$ASK_DIR" -mindepth 1 -maxdepth 1 -mmin +30 -exec rm -rf {} + 2>/dev/null
+  # Sweep markers and lock files older than 40 min (denied asks get no done); an ask waits up to 31 min.
+  find "$ASK_DIR" -mindepth 1 -maxdepth 1 -mmin +40 -exec rm -rf {} + 2>/dev/null
   mkdir -p "$ASK_DIR/$ID" 2>/dev/null && touch "$ASK_DIR/$ID" "$ASK_DIR/$ID.lock" 2>/dev/null || exit 0
   # Per-id lock held by the detached ask child (inherited fd 9) for its whole
   # post; the done child waits on it. Waits at most 0.5 s here.
@@ -267,7 +276,7 @@ fi
 
 # --- Step 2: wait for the operator's answer from T3 (ask mode only) ---------
 [[ "$STATE" == open ]] || exit 0
-WAIT="${C5_CLOUD_ASK_WAIT:-300}"; [[ "$WAIT" =~ ^[0-9]{1,3}$ ]] || WAIT=300
+WAIT="${C5_CLOUD_ASK_WAIT:-1800}"; [[ "$WAIT" =~ ^[0-9]{1,4}$ ]] && (( WAIT <= 1800 )) || WAIT=1800
 POLL="${C5_CLOUD_ASK_POLL:-3}"; [[ "$POLL" =~ ^([1-9]|10)$ ]] || POLL=3
 (( WAIT > 0 )) || exit 0
 # A card that does not show exactly what will run (cut, redacted, hidden
