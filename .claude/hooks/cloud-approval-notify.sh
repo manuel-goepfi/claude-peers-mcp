@@ -120,7 +120,14 @@ if [[ "$MODE" == __send ]]; then
 fi
 
 case "$MODE" in ask) STATE=open ;; done) STATE=done ;; *) exit 0 ;; esac
-PEER="$(command -v c5-peer 2>/dev/null)" || exit 0
+# The approval client: c5-peer on PATH, or C5_T3_PEER (an absolute path the setup pins) where another
+# c5-peer owns that name, as the cloud setup's MCP client does (2026-10-16).
+if [[ -n "${C5_T3_PEER:-}" ]]; then
+  [[ "$C5_T3_PEER" == /* && -x "$C5_T3_PEER" ]] || exit 0
+  PEER="$C5_T3_PEER"
+else
+  PEER="$(command -v c5-peer 2>/dev/null)" || exit 0
+fi
 command -v python3 >/dev/null 2>&1 || exit 0
 command -v curl >/dev/null 2>&1 || exit 0
 # PostToolUse fires for every tool: without a recent open ask in this VM there is
@@ -182,10 +189,17 @@ cmd = re.sub(r"[\x00-\x1f\x7f\s]+", " ", cmd).strip()
 shown = cmd
 R = "[redacted]"
 # The lane token's exact value never reaches a card (it travels only in the
-# Authorization header). Replaced before the patterns, so no pattern can split it.
+# Authorization header), nor do the other credentials a cloud VM carries (the
+# cloud setup's account, session and Tailscale keys). Replaced before the
+# patterns, so no pattern can split them; longest first, so none hides another.
 TOK = os.environ.get("C5_PEER_TOKEN", "")
+SECRETS = sorted({v for v in (os.environ.get(k, "") for k in (
+    "C5_PEER_TOKEN", "C5_ACCOUNT_TOKEN", "TS_AUTHKEY", "C5_SESSION_TOKEN", "C5_SUBAGENT_SESSION_TOKEN"))
+    if len(v) >= 8}, key=len, reverse=True)
 def untoken(v):
-    return v.replace(TOK, R) if len(TOK) >= 8 else v
+    for secret in SECRETS:
+        v = v.replace(secret, R)
+    return v
 cmd = untoken(cmd)
 tool = untoken(tool)
 sid_card = untoken(sid)
@@ -211,8 +225,8 @@ cmd = cmd[:500]
 if state == "done":
     cmd = ""
 session = re.sub(r"[^A-Za-z0-9_-]", "", sid_card)
-if len(TOK) >= 8:  # filtering can join a split token back together
-    session = session.replace(TOK, "redacted")
+for secret in SECRETS:  # filtering can join a split secret back together
+    session = session.replace(secret, "redacted")
 session = session[:128]
 body = json.dumps({"id": aid, "state": state, "tool": tool[:64], "command": cmd, "session": session},
                   ensure_ascii=False, separators=(",", ":"))
