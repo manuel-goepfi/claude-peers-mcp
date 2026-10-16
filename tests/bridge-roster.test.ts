@@ -10,7 +10,7 @@ test('bridge-only complete seven-field roster preserves message response and aut
   db.run('INSERT INTO peers (id,pid,cwd,name,tmux_session,git_root,registered_at,last_seen,token,summary) VALUES (?,?,?,?,?,?,?,?,?,?)',['roster-fixture',process.pid,'/fixture',null,null,null,now,now,'peer-fixture-token','private-not-exported']);
   db.run('INSERT INTO peers (id,pid,cwd,name,tmux_session,git_root,registered_at,last_seen,token,summary) VALUES (?,?,?,?,?,?,?,?,?,?)',['second-fixture',process.pid,'/fixture2','fixture-name','fixture-session','/fixture-repo',now,now,'other-peer-token','private-other-summary']);db.close();
   const token=readFileSync(broker.tokenPath,'utf8').trim();
-  for(const headers of [{},{Authorization:'Bearer wrong'},{'X-Peer-Token':'peer-fixture-token'},{Authorization:'Bearer peer-fixture-token'}]){
+  for(const headers of [{},{Authorization:'Bearer wrong'},{'X-Peer-Token':'peer-fixture-token'},{Authorization:'Bearer peer-fixture-token'}] as Record<string,string>[]){
    const r=await fetch(broker.url+'/messages-since-id',{headers});expect(r.status).toBe(401);expect((await r.json() as any).peers).toBeUndefined();
   }
   const headers={Authorization:`Bearer ${token}`};
