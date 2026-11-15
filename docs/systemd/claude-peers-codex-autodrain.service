@@ -50,8 +50,12 @@ Environment=NUDGE_CLIENTS=codex,gemini,claude,cursor,agy,kimi,grok,opencode
 # Tunables (defaults shown; override here if needed):
 # Environment=POLL_INTERVAL_MS=15000
 # Environment=NUDGE_COOLDOWN_MS=60000
-# Environment=CLAUDE_PEERS_WAKE_BATCH_MS=600000
 # Environment=MAX_NUDGE_ATTEMPTS=5
+# Idle-wake batch window: 2 minutes instead of the 10-minute code default. At 10
+# minutes a second message to an idle seat sat unread until someone nudged the
+# pane by hand (operator 2026-11-15). This sets the poller only; the standby
+# watcher and the broker read their own environment.
+Environment=CLAUDE_PEERS_WAKE_BATCH_MS=120000
 
 # === Process hardening (user-mode-safe subset; PrivateTmp INTENTIONALLY OMITTED
 # because the poller needs the shared /tmp tmux socket) ===
