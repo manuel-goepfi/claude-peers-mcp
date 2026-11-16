@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -15,6 +15,7 @@ import {
   type RpcConnection,
 } from "../bin/codex-thread-stop.ts";
 import { FakeCodexAppServer, type FakeThread } from "./fixtures/fake-codex-app-server.ts";
+import { fakeCodexShell } from "./helpers/fake-codex.ts";
 import { startTestBroker, type TestBroker } from "./helpers/test-broker.ts";
 import { lanesWithUnread } from "../bin/codex-autodrain-poller.ts";
 import { shouldSelfRegisterAfterClaimError } from "../hooks/codex-drain-peer-inbox.ts";
@@ -616,14 +617,12 @@ const canUseTmux = Bun.which("tmux") !== null;
     brokers.push(broker);
     const session = `cp-stop-bind-${process.pid}-${Date.now()}`;
     try {
-      const codexBinary = join(root, "codex");
-      copyFileSync("/usr/bin/sleep", codexBinary);
-      chmodSync(codexBinary, 0o755);
+      const codexTui = fakeCodexShell(root, 60);
       const r1 = join(root, "r1.json"), r2 = join(root, "r2.json"), r3 = join(root, "r3.json");
       const go2 = join(root, "go2"), go3 = join(root, "go3");
       const command = [
         `tmux set-option -p -t "$TMUX_PANE" @operator_label stop.bind`,
-        `(cd /; exec "${codexBinary}" 60) & tui=$!`,
+        `(cd /; exec ${codexTui}) & tui=$!`,
         `bun "${BIND_CLIENT}" "${broker.port}" "${r1}" "${T_LANE}"`,
         `while [ ! -f "${go2}" ]; do sleep 0.05; done`,
         `bun "${BIND_CLIENT}" "${broker.port}" "${r2}" "${T_LANE}" "${T_OTHER}"`,

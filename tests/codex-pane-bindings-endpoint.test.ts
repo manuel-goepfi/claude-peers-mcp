@@ -1,7 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, copyFileSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import { fakeCodexCommand } from "./helpers/fake-codex.ts";
 import { startTestBroker, type TestBroker } from "./helpers/test-broker.ts";
 
 const THREAD_A = "01A003F0-20EC-7AE2-ABA4-6C526AB304E9";
@@ -23,12 +22,7 @@ async function broker(prefix: string): Promise<TestBroker> {
 
 /** A long-lived process whose comm is `codex`, so the broker classifies it as a Codex client. */
 function codexProcess(root: string): ReturnType<typeof Bun.spawn> {
-  const binary = join(root, "codex");
-  if (!existsSync(binary)) {
-    copyFileSync("/usr/bin/sleep", binary);
-    chmodSync(binary, 0o755);
-  }
-  const proc = Bun.spawn([binary, "60"], { stdout: "ignore", stderr: "ignore" });
+  const proc = Bun.spawn(fakeCodexCommand(root, 60), { stdout: "ignore", stderr: "ignore" });
   holders.push(proc);
   return proc;
 }
