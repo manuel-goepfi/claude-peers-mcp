@@ -3471,7 +3471,9 @@ function processTableRowsOnTty(tty: string): ProcessInfo[] {
         comm,
         // Node/Bun shims need their script argument to identify Codex. Read
         // argv only after filtering by TTY and a possible client executable.
-        args: /^(node|bun|codex(?:-.*)?)$/.test(comm)
+        // Node 24 names its main thread "MainThread", and /proc/<pid>/comm
+        // reports that name instead of "node".
+        args: /^(node|MainThread|bun|codex(?:-.*)?)$/.test(comm)
           ? readFileSync(`/proc/${pid}/cmdline`, "utf8").replaceAll("\0", " ").trim()
           : comm,
       });
