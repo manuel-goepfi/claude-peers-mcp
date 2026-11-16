@@ -1,17 +1,16 @@
 import { Database } from "bun:sqlite";
 import { expect,test } from "bun:test";
-import { copyFileSync,chmodSync } from "node:fs";
-import { join } from "node:path";
+import { fakeCodexCommand } from "./helpers/fake-codex.ts";
 import { startTestBroker } from "./helpers/test-broker.ts";
 
 test.skipIf(!Bun.which("tmux"))("empty native Codex duplicate unregisters and threadless reconnect retains the exact keeper",async()=>{
   const broker=await startTestBroker({prefix:"codex-empty-duplicate"});
   const db=new Database(broker.dbPath),session=`empty-duplicate-${process.pid}`;
-  const binary=join(broker.root,"codex");copyFileSync("/usr/bin/sleep",binary);chmodSync(binary,0o755);
+  const tui=fakeCodexCommand(broker.root,120);
   const run=(args:string[])=>{const r=Bun.spawnSync(["tmux",...args],{stdout:"pipe",stderr:"pipe"});expect(r.exitCode).toBe(0);return r.stdout.toString().trim();};
   const call=async(path:string,body:object,token="")=>{const r=await fetch(broker.url+path,{method:"POST",headers:{"Content-Type":"application/json","X-Peer-Token":token},body:JSON.stringify(body)});return {status:r.status,body:await r.json() as any};};
   try {
-    run(["-f","/dev/null","new-session","-d","-s",session,binary,"120"]);
+    run(["-f","/dev/null","new-session","-d","-s",session,...tui]);
     const [pid,pane]=run(["display-message","-p","-t",session,"#{pane_pid}\t#{pane_id}"]).split("\t");
     const registration={pid:Number(pid),cwd:broker.root,git_root:null,tty:null,name:"Codex.1",tmux_session:session,tmux_pane_id:pane,client_type:"codex",receiver_mode:"codex-hook",thread_id:crypto.randomUUID()};
     const keeper=await call("/register",registration);expect(keeper.status).toBe(200);

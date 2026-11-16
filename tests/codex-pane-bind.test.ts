@@ -1,8 +1,9 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fakeCodexShell } from "./helpers/fake-codex.ts";
 import { startTestBroker, type TestBroker } from "./helpers/test-broker.ts";
 
 const FIXTURE = new URL("./fixtures/codex-pane-bind-client.ts", import.meta.url).pathname;
@@ -82,9 +83,7 @@ async function waitForFile(path: string): Promise<void> {
       });
       expect(registered.status).toBe(200);
 
-      const codexBinary = join(root, "codex");
-      copyFileSync("/usr/bin/sleep", codexBinary);
-      chmodSync(codexBinary, 0o755);
+      const codexTui = fakeCodexShell(root, 60);
       const resultPath = join(root, "bind-results.json");
       const mainConflictPath = join(root, "bind-main-conflict.json");
       const mainConflictTrigger = join(root, "bind-main-conflict.trigger");
@@ -95,7 +94,7 @@ async function waitForFile(path: string): Promise<void> {
       // race against an external set-option cannot mint the window-name fallback.
       // An older-session ordinal is a raw allocator label: the bind must
       // canonicalize it. A hand-set name (bind.test) would now be kept as-is.
-      const command = `tmux set-option -p -t "$TMUX_PANE" @operator_label bind.1; (cd /; exec "${codexBinary}" 60) & tui=$!; bun "${FIXTURE}" "${broker.port}" "${resultPath}" "${THREAD_A}" "${THREAD_B}" "${THREAD_A}"; while [ ! -f "${mainConflictTrigger}" ]; do sleep 0.05; done; bun "${FIXTURE}" "${broker.port}" "${mainConflictPath}" "${THREAD_B}"; wait "$tui"`;
+      const command = `tmux set-option -p -t "$TMUX_PANE" @operator_label bind.1; (cd /; exec ${codexTui}) & tui=$!; bun "${FIXTURE}" "${broker.port}" "${resultPath}" "${THREAD_A}" "${THREAD_B}" "${THREAD_A}"; while [ ! -f "${mainConflictTrigger}" ]; do sleep 0.05; done; bun "${FIXTURE}" "${broker.port}" "${mainConflictPath}" "${THREAD_B}"; wait "$tui"`;
       const created = Bun.spawnSync([
         "tmux", "-S", socket, "-f", "/dev/null", "new-session", "-d", "-s", session, "-n", "bind", "-c", root,
         "bash", "-c", command,
