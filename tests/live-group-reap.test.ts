@@ -55,8 +55,10 @@ describe("ended runtime mailbox groups are reaped", () => {
 
   const hex = (bytes: number) => randomBytes(bytes).toString("hex");
 
+  // Sequential, not random: 600 random 24-bit ids collide in about 1% of runs.
+  let nextRow = 0;
   function insertGroupRow(pid: number, processKey: string, lastSeenAgoMs: number): string {
-    const id = `lg${hex(3)}`;
+    const id = `lg${(nextRow++).toString(16).padStart(6, "0")}`;
     const lastSeen = new Date(Date.now() - lastSeenAgoMs).toISOString();
     db.run(
       `INSERT INTO peers (id, pid, cwd, registered_at, last_seen, token, tmux_session, tmux_pane_id,
