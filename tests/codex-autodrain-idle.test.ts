@@ -30,6 +30,37 @@ function idleCapture(afterGlyph: string): string {
   ].join("\n");
 }
 
+describe("paneTextIsIdle: busy markers only in the bottom status area", () => {
+  // A finished turn whose own prose says "Running" or "Working" must not
+  // read as busy forever; only the live status area near the prompt counts.
+  const transcript = [
+    "• Notes on the review step:",
+    "  └ - Running the full high-risk protocol on a low-risk step was too slow.",
+    "  └ - Working through the list took two passes.",
+    ...Array.from({ length: 16 }, (_, i) => `  line ${i} of the reply`),
+    "  Worked for 9s • 11:29 AM",
+  ];
+  const footer = [
+    "  status · model medium · Context 68% left · main",
+    "  ← for agents · ? for shortcuts                ⚠ 1 warning · f2 to view",
+  ];
+
+  test("NUDGE: an idle prompt below transcript prose mentioning Running and Working", () => {
+    const cap = [...transcript, `${prompt} ${dim("Ask Codex to do anything")}`, ...footer].join("\n");
+    expect(paneTextIsIdle(cap)).toBe(true);
+  });
+
+  test("SKIP: a live spinner row just above the prompt is still busy", () => {
+    const cap = [...transcript, "• Working (2s • esc to interrupt)", `${prompt} ${dim("Ask Codex to do anything")}`, ...footer].join("\n");
+    expect(paneTextIsIdle(cap)).toBe(false);
+  });
+
+  test("SKIP: an approval prompt at the bottom is still busy", () => {
+    const cap = [...transcript, "Would you like to run the following command?", "  $ ls", "› 1. Yes", "  2. No", "Press enter to confirm or esc to cancel"].join("\n");
+    expect(paneTextIsIdle(cap)).toBe(false);
+  });
+});
+
 describe("paneTextIsIdle", () => {
   test("NUDGE: idle prompt with a DIM placeholder (empty input)", () => {
     // the exact live shape from marketing.1
