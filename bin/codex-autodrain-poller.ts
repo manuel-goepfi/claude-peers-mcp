@@ -178,6 +178,9 @@ export interface IdleProfile {
   // guessing busy strings: an unknown-but-changing pane is simply never nudged.
   requiresQuiescence?: boolean;
 }
+// Non-empty lines at the bottom of a capture searched for busy markers. Tall enough
+// for a spinner row plus an approval prompt with its options and footer.
+const BUSY_TAIL_LINES = 14;
 const CONFIRMATION_BUSY = [
   /Would you like to run the following command/i,
   /Do you want to proceed/i,
@@ -832,7 +835,11 @@ function stripAnsi(s: string): string {
  */
 export function paneTextIsIdle(captureWithAnsi: string, profile: IdleProfile = PROFILES.codex!): boolean {
   const plain = stripAnsi(captureWithAnsi);
-  if (profile.busy.some((re) => re.test(plain))) return false; // mid-turn
+  // Busy markers live in the live status area at the bottom (spinner row, composer,
+  // footer, approval prompt). Matching the whole capture let transcript prose such
+  // as "Running the full protocol" false-busy an idle lane forever.
+  const busyRegion = plain.split("\n").filter((l) => l.trim() !== "").slice(-BUSY_TAIL_LINES).join("\n");
+  if (profile.busy.some((re) => re.test(busyRegion))) return false; // mid-turn
   if (!profile.prompt.test(plain)) return false;               // no idle prompt visible
 
   // Last line whose stripped form starts with this client's prompt glyph.
