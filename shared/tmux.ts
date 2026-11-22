@@ -6,6 +6,13 @@
  * would spawn a broker, register a peer, and start the poll loop).
  */
 
+import {
+  HOME_SESSION_FIELDS,
+  compareHomeSession,
+  parseSessionCandidate,
+  type SessionCandidate,
+} from "./tmux-home-session.ts";
+
 export interface TmuxPaneInfo {
   session: string;
   // Optional as of Fix B (2026-05-12): parseTmuxPanes always populates these
@@ -31,7 +38,15 @@ export interface TmuxPaneInfo {
 }
 
 /**
- * Parse output of `tmux list-panes -a -F "#{pane_pid}\t#{session_name}\t#{window_index}\t#{window_name}[\t#{pane_index}\t#{pane_id}\t#{window_panes}]"`.
+ * `list-panes -a` format for {@link parseTmuxPanes}. The trailing session
+ * fields let the parser pick a pane's home session when its window belongs to
+ * several sessions (grouped viewer sessions list every pane once per session).
+ */
+export const TMUX_PANES_FORMAT =
+  `#{pane_pid}\t#{session_name}\t#{window_index}\t#{window_name}\t#{pane_index}\t#{pane_id}\t#{window_panes}\t${HOME_SESSION_FIELDS}`;
+
+/**
+ * Parse output of `tmux list-panes -a -F "#{pane_pid}\t#{session_name}\t#{window_index}\t#{window_name}[\t#{pane_index}\t#{pane_id}\t#{window_panes}[\t<HOME_SESSION_FIELDS>]]"`.
  * Returns a Map keyed by pane_pid for O(1) ancestry lookups.
  *
  * Tab-delimited (NOT space-delimited) so session names and window names with
@@ -39,9 +54,15 @@ export interface TmuxPaneInfo {
  * The 5th through 7th fields (pane_index, pane_id, window_panes) are optional and populated only when the upstream
  * format string requested it — used by the tmux-derived peer-name fallback in
  * server.ts when CLAUDE_PEER_NAME isn't set.
+ *
+ * When a pane is listed more than once (its window is in several sessions)
+ * and the rows carry the home-session fields of {@link TMUX_PANES_FORMAT},
+ * the row of the pane's home session wins; see shared/tmux-home-session.ts.
+ * Rows without those fields keep the previous last-row-wins behaviour.
  */
 export function parseTmuxPanes(output: string): Map<number, TmuxPaneInfo> {
   const paneMap = new Map<number, TmuxPaneInfo>();
+  const ranks = new Map<number, SessionCandidate>();
   for (const line of output.trim().split("\n")) {
     const parts = line.split("\t");
     if (parts.length >= 4) {
@@ -62,6 +83,10 @@ export function parseTmuxPanes(output: string): Map<number, TmuxPaneInfo> {
           const windowPanes = Number(parts[6]);
           if (Number.isSafeInteger(windowPanes) && windowPanes > 0) info.window_panes = windowPanes;
         }
+        const rank = parseSessionCandidate(info.session, parts.slice(7));
+        const held = ranks.get(pid);
+        if (rank && held && compareHomeSession(rank, held) >= 0) continue;
+        if (rank) ranks.set(pid, rank);
         paneMap.set(pid, info);
       }
     }

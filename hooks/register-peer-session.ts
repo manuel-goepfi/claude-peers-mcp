@@ -9,7 +9,7 @@ import {
   type TmuxMirrorResult,
 } from "../shared/tmux-identity.ts";
 import type { ClientType, ReceiverMode, RegisterResponse } from "../shared/types.ts";
-import { composeTmuxFromEnv, parsePsTree, parseTmuxPanes, type TmuxPaneInfo } from "../shared/tmux.ts";
+import { TMUX_PANES_FORMAT, composeTmuxFromEnv, parsePsTree, parseTmuxPanes, type TmuxPaneInfo } from "../shared/tmux.ts";
 import {
   chooseOperatorLabel,
   cleanTmuxOptionValue,
@@ -349,7 +349,7 @@ function detectTmuxPane(pid: number, env: Record<string, string | undefined> = p
       "list-panes",
       "-a",
       "-F",
-      "#{pane_pid}\t#{session_name}\t#{window_index}\t#{window_name}\t#{pane_index}\t#{pane_id}\t#{window_panes}",
+      TMUX_PANES_FORMAT,
     ]);
     if (listProc.exitCode !== 0) return composeTmuxFromEnv(env);
     const paneMap = parseTmuxPanes(new TextDecoder().decode(listProc.stdout));

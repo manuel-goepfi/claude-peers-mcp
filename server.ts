@@ -64,7 +64,8 @@ import { MCP_SERVER_INSTRUCTIONS, MESSAGE_ROUTING_HINT, PEER_COORDINATION_INSTRU
 import { PEERS_VERSION } from "./shared/version.ts";
 import { brokerIsReady, openOwnerOnlyAppendLog } from "./shared/broker-client.ts";
 import { brokerServiceConfig, installedBrokerServiceIsCurrent } from "./shared/broker-service.ts";
-import { parseTmuxPanes, composeTmuxFromEnv, prepareTmuxPaneText, tmuxPaneTarget, bgSessionIdFromPtyHostArgs, resolveBgAttachPane, type TmuxPaneInfo } from "./shared/tmux.ts";
+import { parseTmuxPanes, TMUX_PANES_FORMAT, composeTmuxFromEnv, prepareTmuxPaneText, tmuxPaneTarget, bgSessionIdFromPtyHostArgs, resolveBgAttachPane, type TmuxPaneInfo } from "./shared/tmux.ts";
+import { HOME_SESSION_FIELDS, homeSessionName, parseSessionCandidate } from "./shared/tmux-home-session.ts";
 import {
   cleanTmuxOptionValue,
   stripResolvedNameSuffix,
@@ -679,8 +680,9 @@ async function detectTmuxPane(startPid = process.ppid): Promise<TmuxPaneInfo | n
     const listProc = Bun.spawn(
       // pane_index appended as 5th field for the CLAUDE_PEER_NAME tmux-fallback
       // path. parseTmuxPanes treats it as optional, so older callers parsing
-      // 4-field output continue to work.
-      tmuxCommand(["list-panes", "-a", "-F", "#{pane_pid}\t#{session_name}\t#{window_index}\t#{window_name}\t#{pane_index}\t#{pane_id}\t#{window_panes}"]),
+      // 4-field output continue to work. The trailing session fields let it
+      // pick a grouped window's home session over a viewer session.
+      tmuxCommand(["list-panes", "-a", "-F", TMUX_PANES_FORMAT]),
       { stdout: "pipe", stderr: "ignore" }
     );
     const listText = await new Response(listProc.stdout).text();
@@ -1214,12 +1216,16 @@ function resolveTmuxTargetSelector(value: string | null | undefined): { tmux_ses
   const target = normalizeTmuxTargetSelector(value);
   if (!target) return null;
 
-  const out = runTmux(["display-message", "-p", "-t", target, "#{session_name}\t#{pane_id}"]);
+  const out = runTmux(["display-message", "-p", "-t", target, `#{session_name}\t#{pane_id}\t${HOME_SESSION_FIELDS}`]);
   if (!out) return { error: `tmux target '${value}' was not found; use a visible pane address like infra:1.2` };
-  const [tmux_session, tmux_pane_id] = out.trim().split("\t");
-  if (!tmux_session || !tmux_pane_id?.startsWith("%")) {
+  const [displayedSession, tmux_pane_id, ...sessionFields] = out.trim().split("\t");
+  if (!displayedSession || !tmux_pane_id?.startsWith("%")) {
     return { error: `tmux target '${value}' did not resolve to a stable pane id` };
   }
+  // Seats register under their pane's home session; a target typed through a
+  // grouped viewer session must still match them.
+  const displayed = parseSessionCandidate(displayedSession, sessionFields);
+  const tmux_session = displayed ? homeSessionName(tmux_pane_id, displayed, runTmux) : displayedSession;
   return { tmux_session, tmux_pane_id };
 }
 

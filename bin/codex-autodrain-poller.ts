@@ -59,6 +59,7 @@ import { isVisibleCodexArgs, singleInteractiveCodexProcess } from "../shared/vis
 import { wakeBatchMs, wakeHeld } from "../shared/wake-batch.ts";
 import {
   parseTmuxPanes,
+  TMUX_PANES_FORMAT,
   bgSessionIdFromPtyHostArgs,
   resolveBgAttachPane,
   type ProcLike,
@@ -923,7 +924,7 @@ export interface TickSnapshot {
 export function takeSnapshot(processSnapshot = readProcessSnapshot): TickSnapshot | null {
   const procs = processSnapshot();
   if (!procs) return null;
-  const paneOut = sh(["tmux", "list-panes", "-a", "-F", "#{pane_pid}\t#{session_name}\t#{window_index}\t#{window_name}\t#{pane_index}\t#{pane_id}\t#{window_panes}"]);
+  const paneOut = sh(["tmux", "list-panes", "-a", "-F", TMUX_PANES_FORMAT]);
   if (!paneOut.ok) return null;
   const paneMap = parseTmuxPanes(paneOut.out);
   const paneByPid = new Map<string, number>();

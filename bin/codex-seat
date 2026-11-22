@@ -230,7 +230,14 @@ if [[ -n "$PANE_ID" ]]; then
     fi
   done
   export CLAUDE_PEER_TMUX_PANE_ID="$PANE_ID"
-  CLAUDE_PEER_TMUX_SESSION="$(tmux display-message -p -t "$PANE_ID" '#S' 2>/dev/null || true)"
+  # '#S' for a pane names the session tmux picks for its window, which for a
+  # grouped window is often an attached viewer session. Register under the
+  # pane's home session: never a destroy-unattached session, then the session
+  # named after its group (the original), then the oldest. Ungrouped panes are
+  # listed once, so this is '#S'. See shared/tmux-home-session.ts.
+  CLAUDE_PEER_TMUX_SESSION="$(tmux list-panes -a -F '#{pane_id}	#{?#{==:#{destroy-unattached},off},0,1}	#{?#{&&:#{session_grouped},#{==:#{session_name},#{session_group}}},0,1}	#{session_created}	#{session_name}' 2>/dev/null \
+    | awk -F '\t' -v pane="$PANE_ID" '$1 == pane' | LC_ALL=C sort -s -t "$(printf '\t')" -k2,2n -k3,3n -k4,4n | head -n 1 | cut -f 5- || true)"
+  [[ -n "$CLAUDE_PEER_TMUX_SESSION" ]] || CLAUDE_PEER_TMUX_SESSION="$(tmux display-message -p -t "$PANE_ID" '#S' 2>/dev/null || true)"
   CLAUDE_PEER_TMUX_WINDOW_INDEX="$(tmux display-message -p -t "$PANE_ID" '#I' 2>/dev/null || true)"
   CLAUDE_PEER_TMUX_WINDOW_NAME="$(tmux display-message -p -t "$PANE_ID" '#W' 2>/dev/null || true)"
   CLAUDE_PEER_TMUX_WINDOW_PANES="$(tmux display-message -p -t "$PANE_ID" '#{window_panes}' 2>/dev/null || true)"
