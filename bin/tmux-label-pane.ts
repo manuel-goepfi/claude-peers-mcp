@@ -19,6 +19,16 @@ import {
   parsePaneSeatRows,
   seatNameHolder,
 } from "../shared/seat-name.ts";
+import {
+  HOME_SESSION_FIELDS,
+  PANE_HOME_SESSION_FORMAT,
+  chooseHomeSession,
+  compareHomeSession,
+  mayBeForeignSession,
+  parsePaneHomeSessionRows,
+  parseSessionCandidate,
+  type SessionCandidate,
+} from "../shared/tmux-home-session.ts";
 
 export interface TmuxLabelCommandResult {
   ok: boolean;
@@ -48,6 +58,8 @@ interface PaneSnapshot {
   peerLabel: string | null;
   seatName: string | null;
   autoLabel: string | null;
+  /** Ranking data of `session`; null for snapshots without the session fields. */
+  rank: SessionCandidate | null;
 }
 
 /**
@@ -68,6 +80,7 @@ const SNAPSHOT_FORMAT = [
   "#{@peer_label}",
   `#{${SEAT_NAME_OPTION}}`,
   `#{${AUTO_LABEL_OPTION}}`,
+  HOME_SESSION_FIELDS,
 ].join("\t");
 
 function withoutOneTrailingNewline(value: string): string {
@@ -93,7 +106,33 @@ function parseSnapshot(raw: string): PaneSnapshot | null {
     peerLabel: cleanTmuxOptionValue(fields[6]),
     seatName: cleanSeatName(fields[7]),
     autoLabel: cleanTmuxOptionValue(fields[8]),
+    rank: parseSessionCandidate(fields[1], fields.slice(9)),
   };
+}
+
+function readHomeSessions(run: TmuxLabelRunner): Map<string, SessionCandidate[]> | null {
+  const result = run(["list-panes", "-a", "-F", PANE_HOME_SESSION_FORMAT]);
+  return result.ok ? parsePaneHomeSessionRows(result.out) : null;
+}
+
+/**
+ * `display-message -t %N` names the session tmux picks for the window, which
+ * for a grouped window is usually an attached viewer session. Auto labels are
+ * `<session>.<n>`, so they must use the pane's home session instead. Only a
+ * snapshot that may be foreign pays for the extra read; when it fails, the
+ * snapshot is kept as it was.
+ */
+function withHomeSession(pane: PaneSnapshot, run: TmuxLabelRunner, homes?: Map<string, SessionCandidate[]> | null): PaneSnapshot {
+  if (!mayBeForeignSession(pane.rank)) return pane;
+  const sessions = homes === undefined ? readHomeSessions(run) : homes;
+  const home = chooseHomeSession(sessions?.get(pane.paneId) ?? []);
+  return home && home.name !== pane.session ? { ...pane, session: home.name, rank: home } : pane;
+}
+
+function readPaneSnapshot(paneId: string, run: TmuxLabelRunner): { ok: boolean; pane: PaneSnapshot | null } {
+  const snapshot = run(["display-message", "-p", "-t", paneId, SNAPSHOT_FORMAT]);
+  const pane = snapshot.ok ? parseSnapshot(snapshot.out) : null;
+  return { ok: snapshot.ok, pane: pane && pane.paneId === paneId ? withHomeSession(pane, run) : pane };
 }
 
 /**
@@ -202,7 +241,7 @@ function ensurePaneOperatorLabelUnlocked(
   paneId: string,
   run: TmuxLabelRunner = runTmux,
 ): PaneLabelResult {
-  const snapshotResult = run(["display-message", "-p", "-t", paneId, SNAPSHOT_FORMAT]);
+  const snapshotResult = readPaneSnapshot(paneId, run);
   if (!snapshotResult.ok) {
     const presence = panePresence(paneId, run);
     if (presence === "unknown") return { status: "failed", reason: "pane-list-failed" };
@@ -210,7 +249,7 @@ function ensurePaneOperatorLabelUnlocked(
       ? { status: "failed", reason: "pane-snapshot-failed" }
       : { status: "skipped", reason: "pane-gone" };
   }
-  const pane = parseSnapshot(snapshotResult.out);
+  const pane = snapshotResult.pane;
   if (!pane || pane.paneId !== paneId) return { status: "failed", reason: "invalid-pane-snapshot" };
 
   const siblings=siblingLabels(pane,run);
@@ -245,8 +284,7 @@ function ensurePaneOperatorLabelUnlocked(
 
 export function ensurePaneOperatorLabel(paneId: string, run: TmuxLabelRunner = runTmux, lockSocket?: string): PaneLabelResult {
   if (run !== runTmux && !lockSocket) return ensurePaneOperatorLabelUnlocked(paneId,run);
-  const snapshot = run(["display-message","-p","-t",paneId,SNAPSHOT_FORMAT]);
-  const pane = snapshot.ok ? parseSnapshot(snapshot.out) : null;
+  const { pane } = readPaneSnapshot(paneId, run);
   // Read-only fast path: a pane already showing the label it should show needs
   // no lock. Any write re-decides from a fresh snapshot under the lock.
   if (pane?.paneId === paneId && pane.operatorLabel) {
@@ -257,14 +295,19 @@ export function ensurePaneOperatorLabel(paneId: string, run: TmuxLabelRunner = r
     }
   }
   const identity = run(["display-message","-p","-t",paneId,"#{socket_path}\t#{pid}\t#{session_id}"]);
-  if (!identity.ok || identity.out.trim().split("\t").length !== 3) {
+  const lockIdentity = identity.out.trim().split("\t");
+  if (!identity.ok || lockIdentity.length !== 3) {
     return panePresence(paneId, run) === "absent"
       ? {status:"skipped",reason:"pane-gone"}
       : {status:"failed",reason:"lock-identity-unavailable"};
   }
+  // Lock the session the label is allocated in. Through a viewer session,
+  // display-message reports the viewer's id, and two writers of one window
+  // would otherwise hold different locks.
+  if (pane?.paneId === paneId && pane.rank?.id) lockIdentity[2] = pane.rank.id;
   const directory=join(tmpdir(),`claude-peers-pane-labels-${process.getuid?.() ?? "user"}`);
   mkdirSync(directory,{recursive:true,mode:0o700});
-  const lock=join(directory,createHash("sha256").update(identity.out.trim()).digest("hex")+".lock");
+  const lock=join(directory,createHash("sha256").update(lockIdentity.join("\t")).digest("hex")+".lock");
   // Every writer shares a socket/server/session lock. A timeout fails closed;
   // an unlocked fallback would allow two simultaneously opened panes to claim N.
   const result=boundedCommand(["flock","-F","-w","5",lock,process.execPath,new URL(import.meta.url).pathname,"--locked-json",paneId],
@@ -354,8 +397,7 @@ export function claimPaneSeatName(paneId: string, name: string, run: TmuxLabelRu
  * chooses again. A hand-set label is left alone.
  */
 function dropReleasedSeatLabel(paneId: string, released: string, run: TmuxLabelRunner): void {
-  const snapshot = run(["display-message", "-p", "-t", paneId, SNAPSHOT_FORMAT]);
-  const pane = snapshot.ok ? parseSnapshot(snapshot.out) : null;
+  const { pane } = readPaneSnapshot(paneId, run);
   if (!pane || pane.paneId !== paneId || pane.operatorLabel !== released || hasHumanLabel(pane)) return;
   run(["set-option", "-p", "-t", paneId, "-u", "@operator_label"]);
   run(["set-option", "-p", "-t", paneId, "-u", AUTO_LABEL_OPTION]);
@@ -391,8 +433,22 @@ export function labelAllUnlabeledPanes(
   // allocator, which re-reads state under its normal session lock before writes.
   const panes = run(["list-panes", ...(sessionId ? ["-s","-t",sessionId] : ["-a"]), "-F", SNAPSHOT_FORMAT]);
   if (!panes.ok) return { visited: 0, labeled: 0, failed: 1 };
-  const rows = panes.out.split("\n").filter(Boolean);
-  const snapshots = rows.map(parseSnapshot);
+  // A grouped window is listed once per session of its group. Keep one row per
+  // pane, the one of its home session, and label in that session. Panes listed
+  // only under a viewer session (`--session` of a viewer) are mapped back to
+  // their home session with one extra server-wide read.
+  const listed = new Map<string, { row: string; pane: PaneSnapshot | null }>();
+  for (const [index, row] of panes.out.split("\n").filter(Boolean).entries()) {
+    const pane = parseSnapshot(row);
+    const key = pane?.paneId ?? `#${index}`;
+    const held = listed.get(key);
+    if (held?.pane?.rank && pane?.rank && compareHomeSession(pane.rank, held.pane.rank) >= 0) continue;
+    listed.set(key, { row, pane });
+  }
+  const foreign = [...listed.values()].some(({ pane }) => mayBeForeignSession(pane?.rank ?? null));
+  const homes = foreign ? readHomeSessions(run) : null;
+  const rows = [...listed.values()].map(({ row }) => row);
+  const snapshots = [...listed.values()].map(({ pane }) => pane && foreign ? withHomeSession(pane, run, homes) : pane);
   const claims = new Map<string, number>();
   const claimKey = (pane: PaneSnapshot, label: string) => JSON.stringify([pane.session, label]);
   for (const pane of snapshots) {

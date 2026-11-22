@@ -99,6 +99,7 @@ import { classifySeatAdapterLiveness, durableSeatKey, mergeSeatPids, parseSeatPi
 import { isClientProcess, isCodexAppServerProcess, type ProcessInfo } from "./shared/client.ts";
 import { singleInteractiveCodexProcess } from "./shared/visible-codex.ts";
 import { publishBrokerIdentityToTmux } from "./shared/tmux-identity.ts";
+import { HOME_SESSION_FIELDS, homeSessionName, parseSessionCandidate } from "./shared/tmux-home-session.ts";
 import { acquireBrokerOwnership, assertDatabaseIdentity, type BrokerLifecycleIdentity } from "./shared/broker-lifecycle.ts";
 import {
   OWNER_ONLY_UMASK,
@@ -3421,16 +3422,21 @@ function tmuxPaneBindProof(paneId: string): TmuxPaneBindProof | null {
   try {
     const format = [
       "#{pane_id}", "#{pane_pid}", "#{pane_tty}", "#{pane_current_path}", "#{session_name}",
-      "#{window_index}", "#{window_name}", "#{@operator_label}", "#{@peer_label}",
+      "#{window_index}", "#{window_name}", "#{@operator_label}", "#{@peer_label}", HOME_SESSION_FIELDS,
     ].join("\t");
-    const result = Bun.spawnSync(["tmux", "display-message", "-p", "-t", paneId, format], {
-      stdout: "pipe",
-      stderr: "ignore",
-      timeout: 1500,
-    });
-    if (result.exitCode !== 0) return null;
-    const [actualPane, rawPanePid, rawTty, paneCurrentPath, session, windowIndex, windowName, operatorLabel, peerLabel] =
-      new TextDecoder().decode(result.stdout).trimEnd().split("\t");
+    const tmux = (args: string[]): string | null => {
+      const result = Bun.spawnSync(["tmux", ...args], { stdout: "pipe", stderr: "ignore", timeout: 1500 });
+      return result.exitCode === 0 ? new TextDecoder().decode(result.stdout) : null;
+    };
+    const out = tmux(["display-message", "-p", "-t", paneId, format]);
+    if (out === null) return null;
+    const [actualPane, rawPanePid, rawTty, paneCurrentPath, displayedSession, windowIndex, windowName, operatorLabel, peerLabel, ...sessionFields] =
+      out.trimEnd().split("\t");
+    // display-message names the session tmux picks for the window, which for
+    // a grouped window is often an attached viewer session. Bind the seat to
+    // the pane's home session instead.
+    const displayed = displayedSession ? parseSessionCandidate(displayedSession, sessionFields) : null;
+    const session = displayed && actualPane === paneId ? homeSessionName(paneId, displayed, tmux) : displayedSession;
     const panePid = Number(rawPanePid);
     const paneTty = normalizedTtyForIdentity(rawTty);
     if (

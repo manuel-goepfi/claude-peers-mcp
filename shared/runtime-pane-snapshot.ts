@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { readFileSync, readdirSync } from "node:fs";
+import { compareHomeSession, parseSessionCandidate, type SessionCandidate } from "./tmux-home-session.ts";
 
 type ProcessStat = { pid: number; stat: string };
 const snapshots = new AsyncLocalStorage<{
@@ -14,11 +15,23 @@ const PANE_TTL_MS = 1_000;
 const paneCache = new Map<string, { rows: Map<string, string> | null; expires: number }>();
 const paneReads = new Map<string, Promise<Map<string, string> | null>>();
 
+// The first five fields are the proof row; the session fields after them only
+// rank the sessions a grouped window is listed under (once per session).
+const RUNTIME_PANE_FORMAT =
+  `#{pid}\t#{pane_pid}\t#{pane_id}\t#{session_id}\t#{session_name}\t#{session_grouped}\t#{session_group}\t#{session_created}\t#{destroy-unattached}`;
+
 function paneRows(output: string | null): Map<string, string> | null {
-  return output === null ? null : new Map(output.split("\n").filter(Boolean).map(line => {
+  if (output === null) return null;
+  const rows = new Map<string, { line: string; rank: SessionCandidate | null }>();
+  for (const line of output.split("\n").filter(Boolean)) {
     const fields = line.split("\t");
-    return [fields[2]!, line] as const;
-  }));
+    const proof = fields.slice(0, 5).join("\t");
+    const rank = parseSessionCandidate(fields[4] ?? "", [fields[3] ?? "", ...fields.slice(5)]);
+    const held = rows.get(fields[2]!);
+    if (held?.rank && rank && compareHomeSession(rank, held.rank) >= 0) continue;
+    rows.set(fields[2]!, { line: proof, rank });
+  }
+  return new Map([...rows].map(([pane, row]) => [pane, row.line] as const));
 }
 
 /** Share only within one request, never across later ownership decisions. */
@@ -77,7 +90,7 @@ function readProcessStats(): ProcessStat[] {
 
 function readPanes(socket: string): string | null {
   const result = Bun.spawnSync(["tmux", "-S", socket, "list-panes", "-a", "-F",
-    "#{pid}\t#{pane_pid}\t#{pane_id}\t#{session_id}\t#{session_name}"],
+    RUNTIME_PANE_FORMAT],
   { stdout: "pipe", stderr: "ignore", timeout: 1500 });
   return result.exitCode === 0 ? result.stdout.toString().trimEnd() : null;
 }
@@ -85,7 +98,7 @@ function readPanes(socket: string): string | null {
 async function readPanesAsync(socket: string): Promise<string | null> {
   try {
     const child = Bun.spawn(["tmux", "-S", socket, "list-panes", "-a", "-F",
-      "#{pid}\t#{pane_pid}\t#{pane_id}\t#{session_id}\t#{session_name}"],
+      RUNTIME_PANE_FORMAT],
     { stdout: "pipe", stderr: "ignore" });
     const timer = setTimeout(() => child.kill(), 2_000);
     try {
