@@ -53,7 +53,15 @@ adapter re-syncs never write the auto label back. `--print-seat <pane>` prints t
 name a pane's seat answers to; `--print` stays the auto label. A name another live
 seat or pane already answers to is refused with the holder named (claim exit 3,
 `set_name` and `rename-lane` HTTP 409) instead of being suffixed. Control seats whose role labels
-share the `session.number` shape must be launched with an explicit name.
+share the `session.number` shape must be launched with an explicit name. The explicit
+name routes the seat even under a hand-set border (the border stays as display), and
+`bin/codex-seat` reads it before the border label. Releasing a name takes it off the
+border too, back to the pane's recorded ordinal.
+
+A pane is one seat whatever session name a registrar reports for it. A registration
+for a pane id adopts the rows of that pane recorded under another session name (a
+viewer session, a renamed session, or no session), for the same project and tty, so
+`tmux_pane_id` selectors never see two live rows for one pane.
 
 Native Claude mailbox grouping is limited to one independently proven runtime,
 account, conversation, and pane. The native peer remains the only targetable

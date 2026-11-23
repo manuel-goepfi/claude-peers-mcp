@@ -83,3 +83,36 @@ describe("resolvePaneHomeSession and homeSessionName", () => {
     expect(homeSessionName("%3", viewer, () => null)).toBe("viewer-3-abc");
   });
 });
+
+describe("a window linked into another session (link-window)", () => {
+  // `scratch` is newer and is the session display-message names for the pane;
+  // `list-panes -a` lists the pane under both. window_linked_sessions is 2.
+  const workLinked = parseSessionCandidate("work", ["$0", "0", "", "1700000000", "off", "2"])!;
+  const scratchLinked = parseSessionCandidate("scratch", ["$1", "0", "", "1700000100", "off", "2"])!;
+  const rows = [
+    "%3\tscratch\t$1\t0\t\t1700000100\toff\t2",
+    "%3\twork\t$0\t0\t\t1700000000\toff\t2",
+  ].join("\n");
+
+  test("a displayed ungrouped session of a linked window may be foreign", () => {
+    expect(scratchLinked.linked).toBe(true);
+    expect(mayBeForeignSession(scratchLinked)).toBe(true);
+  });
+
+  test("display paths resolve the same session the list-panes paths pick", () => {
+    expect(resolvePaneHomeSession("%3", () => rows)?.name).toBe("work");
+    expect(homeSessionName("%3", scratchLinked, () => rows)).toBe("work");
+    expect(chooseHomeSession([scratchLinked, workLinked])?.name).toBe("work");
+  });
+
+  test("a session group counts once, so a plain group original needs no second read", () => {
+    const original = parseSessionCandidate("work", ["$0", "1", "work", "1700000000", "off", "1"])!;
+    expect(original.linked).toBe(false);
+    expect(mayBeForeignSession(original)).toBe(false);
+  });
+
+  test("five-field rows (no window_linked_sessions) still rank and are not linked", () => {
+    expect(work.linked).toBe(false);
+    expect(mayBeForeignSession(work)).toBe(false);
+  });
+});

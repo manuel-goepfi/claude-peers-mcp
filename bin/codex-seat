@@ -221,7 +221,14 @@ chmod 700 "$LOG_DIR" 2>/dev/null || true
 
 PANE_ID="${TMUX_PANE:-${CLAUDE_PEER_TMUX_PANE_ID:-}}"
 if [[ -n "$PANE_ID" ]]; then
-  for option in @operator_label @peer_resolved_name; do
+  # The name this seat answers to, in the order every registrar uses: the
+  # pane's explicit seat name (set_name, rename-lane, a launcher's claim), then
+  # its border label. Inside tmux the pane is authoritative, so an inherited
+  # CLAUDE_PEER_NAME (often a copy of an older label) is replaced; it is kept
+  # only for a pane with no name at all. An explicit name for this pane is
+  # given with `tmux-label-pane.ts --claim-seat-name`, and an empty claim
+  # clears it again.
+  for option in @peer_seat_name @operator_label @peer_resolved_name; do
     pane_label="$(tmux show-options -p -t "$PANE_ID" -v "$option" 2>/dev/null || true)"
     pane_label="${pane_label//$'\0'/}"
     if [[ -n "${pane_label//[[:space:]]/}" ]]; then
@@ -233,10 +240,12 @@ if [[ -n "$PANE_ID" ]]; then
   # '#S' for a pane names the session tmux picks for its window, which for a
   # grouped window is often an attached viewer session. Register under the
   # pane's home session: never a destroy-unattached session, then the session
-  # named after its group (the original), then the oldest. Ungrouped panes are
-  # listed once, so this is '#S'. See shared/tmux-home-session.ts.
-  CLAUDE_PEER_TMUX_SESSION="$(tmux list-panes -a -F '#{pane_id}	#{?#{==:#{destroy-unattached},off},0,1}	#{?#{&&:#{session_grouped},#{==:#{session_name},#{session_group}}},0,1}	#{session_created}	#{session_name}' 2>/dev/null \
-    | awk -F '\t' -v pane="$PANE_ID" '$1 == pane' | LC_ALL=C sort -s -t "$(printf '\t')" -k2,2n -k3,3n -k4,4n | head -n 1 | cut -f 5- || true)"
+  # named after its group (the original), then the oldest (created, then the
+  # lower $id). A window linked into several sessions is listed under each and
+  # ranks the same way. Ungrouped, unlinked panes are listed once, so this is
+  # '#S'. See shared/tmux-home-session.ts.
+  CLAUDE_PEER_TMUX_SESSION="$(tmux list-panes -a -F '#{pane_id}	#{?#{==:#{destroy-unattached},off},0,1}	#{?#{&&:#{session_grouped},#{==:#{session_name},#{session_group}}},0,1}	#{session_created}	#{session_id}	#{session_name}' 2>/dev/null \
+    | awk -F '\t' -v OFS='\t' -v pane="$PANE_ID" '$1 == pane { sub(/^\$/, "", $5); print }' | LC_ALL=C sort -s -t "$(printf '\t')" -k2,2n -k3,3n -k4,4n -k5,5n | head -n 1 | cut -f 6- || true)"
   [[ -n "$CLAUDE_PEER_TMUX_SESSION" ]] || CLAUDE_PEER_TMUX_SESSION="$(tmux display-message -p -t "$PANE_ID" '#S' 2>/dev/null || true)"
   CLAUDE_PEER_TMUX_WINDOW_INDEX="$(tmux display-message -p -t "$PANE_ID" '#I' 2>/dev/null || true)"
   CLAUDE_PEER_TMUX_WINDOW_NAME="$(tmux display-message -p -t "$PANE_ID" '#W' 2>/dev/null || true)"

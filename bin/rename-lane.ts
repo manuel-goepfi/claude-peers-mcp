@@ -25,7 +25,7 @@
  *         bun bin/rename-lane.ts --show
  */
 
-import { claimPaneSeatName, paneSeatNameHolder } from "./tmux-label-pane.ts";
+import { AUTO_LABEL_OPTION, claimPaneSeatName, paneSeatNameHolder } from "./tmux-label-pane.ts";
 
 const BROKER_PORT = process.env.CLAUDE_PEERS_PORT ?? "7899";
 const BROKER = `http://127.0.0.1:${BROKER_PORT}`;
@@ -117,21 +117,26 @@ async function main(): Promise<number> {
   // rendering the OLD identity until the next heartbeat mirror, which is exactly
   // the drift this command exists to remove.
   const failures: string[] = [];
-  if (!tmux(["rename-window", "-t", pane, applied]).ok) failures.push("window name");
-  for (const [option, value] of [
-    ["@peer_label", applied],
-    ["@peer_resolved_name", routable],
-    ["@operator_label", applied],
-  ] as const) {
-    if (!tmux(["set-option", "-p", "-t", pane, option, value]).ok) failures.push(option);
-  }
-  // The explicit seat name is what registration and heartbeats re-read; the
-  // auto-label allocator may rewrite @operator_label, but never this. Stamp it
-  // through the server-wide claim so a pane that took the name since the check
-  // above keeps it alone.
+  // The explicit seat name is what registration and heartbeats re-read. Stamp
+  // it first, through the server-wide claim so a pane that took the name since
+  // the check above keeps it alone. The border is written after it: written
+  // first, it read as a hand-set label against the pane's older auto record,
+  // so the seat routed by its ordinal and a later release left it on screen.
   const claim = claimPaneSeatName(pane, applied);
   if (claim.status === "refused") console.error(`warning: pane seat name not stamped: held by ${claim.holder}`);
   else if (claim.status === "failed") failures.push(`@peer_seat_name (${claim.reason})`);
+  if (!tmux(["rename-window", "-t", pane, applied]).ok) failures.push("window name");
+  const borderOptions: Array<readonly [string, string]> = [
+    ["@peer_label", applied],
+    ["@peer_resolved_name", routable],
+    ["@operator_label", applied],
+  ];
+  // A border derived from the seat name is the allocator's, not a hand-set
+  // label: record it so releasing the name also returns the border.
+  if (claim.status === "claimed") borderOptions.push([AUTO_LABEL_OPTION, applied]);
+  for (const [option, value] of borderOptions) {
+    if (!tmux(["set-option", "-p", "-t", pane, option, value]).ok) failures.push(option);
+  }
 
   console.log(`tmux window: ${applied}`);
   console.log(`border:      ${routable}`);

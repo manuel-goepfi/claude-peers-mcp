@@ -156,8 +156,11 @@ function hasHumanLabel(pane: PaneSnapshot): boolean {
 }
 
 /**
- * The label this pane should show. A hand-set label stays. Otherwise the
- * seat's explicit name, and only without one, the session ordinal.
+ * The label this pane should show, and the name its seat answers to. An
+ * explicit seat name is always the routing name: the border shows it unless a
+ * different label was set by hand, which stays as display only. Without a seat
+ * name a hand-set label stays and the seat routes by its ordinal; otherwise
+ * the border gets the session ordinal.
  *
  * The window name is deliberately not a tier: this label is also the peer name
  * of a seat with no explicit name, so deriving it from window names would
@@ -165,6 +168,14 @@ function hasHumanLabel(pane: PaneSnapshot): boolean {
  * `<session>.<n>` address the fleet routes by.
  */
 function decidePaneLabel(pane: PaneSnapshot, siblings: string): { label: string; keep: boolean; name?: string; record?: string } {
+  // Checked before the hand-set test: a border that already shows the seat
+  // name (rename-lane writes both) reads as hand-set against an older auto
+  // record, and the hand-set branch would route it by ordinal instead.
+  if (pane.seatName) {
+    if (pane.operatorLabel === pane.seatName) return { label: pane.seatName, keep: true };
+    if (hasHumanLabel(pane)) return { label: pane.operatorLabel!, keep: true, name: pane.seatName };
+    return { label: pane.seatName, keep: false };
+  }
   if (hasHumanLabel(pane)) {
     const label = pane.operatorLabel!;
     // A hand-set border is display only; the seat keeps a routing ordinal. An
@@ -180,7 +191,6 @@ function decidePaneLabel(pane: PaneSnapshot, siblings: string): { label: string;
       pane.windowName, pane.windowPanes);
     return { label, keep: false, name: ordinal, record: ordinal };
   }
-  if (pane.seatName) return { label: pane.seatName, keep: pane.operatorLabel === pane.seatName };
   const preserved = preservedTmuxOperatorLabel(pane.operatorLabel, pane.peerLabel, pane.session);
   const owned = preserved !== null && ownsPreservedLabel(pane, preserved, siblings);
   if (owned) return { label: preserved, keep: pane.operatorLabel === preserved };
@@ -391,16 +401,25 @@ export function claimPaneSeatName(paneId: string, name: string, run: TmuxLabelRu
 }
 
 /**
- * A released seat name that the allocator put on the border would otherwise
- * survive as an ordinal (`C5 Orch.294` has the ordinal shape) and keep the
- * pane answering to the name it just gave up. Clear it so the allocator
- * chooses again. A hand-set label is left alone.
+ * A border still showing a released seat name would otherwise survive as a
+ * hand-set label, or as an ordinal (`Orch.294` has the ordinal shape), and
+ * keep the pane answering to the name it just gave up. Whoever wrote it (the
+ * allocator after a claim, or rename-lane directly), it shows the name being
+ * released, so it goes: back to the pane's recorded ordinal when it has one,
+ * else cleared for the allocator to choose again. A border showing any other
+ * label is left alone.
  */
 function dropReleasedSeatLabel(paneId: string, released: string, run: TmuxLabelRunner): void {
   const { pane } = readPaneSnapshot(paneId, run);
-  if (!pane || pane.paneId !== paneId || pane.operatorLabel !== released || hasHumanLabel(pane)) return;
-  run(["set-option", "-p", "-t", paneId, "-u", "@operator_label"]);
-  run(["set-option", "-p", "-t", paneId, "-u", AUTO_LABEL_OPTION]);
+  if (!pane || pane.paneId !== paneId || pane.operatorLabel !== released) return;
+  const ordinal = pane.autoLabel && pane.autoLabel !== released
+    && preservedTmuxOperatorLabel(pane.autoLabel, null, pane.session) === pane.autoLabel ? pane.autoLabel : null;
+  if (ordinal) {
+    run(["set-option", "-p", "-t", paneId, "@operator_label", ordinal]);
+  } else {
+    run(["set-option", "-p", "-t", paneId, "-u", "@operator_label"]);
+    run(["set-option", "-p", "-t", paneId, "-u", AUTO_LABEL_OPTION]);
+  }
   // The registration mirror would promote the old name straight back; the
   // seat's next identity publish restamps it from the new label.
   if (pane.peerLabel && stripResolvedNameSuffix(pane.peerLabel) === released) {

@@ -923,12 +923,21 @@ const selectRehydrateCandidatesByPane = db.prepare(`
 // pane and same session remain alive. Treating those fields as identity stranded
 // the pane's old id and queued inbox on every such rename.
 //
+// The session prefix of a pane key is descriptive, not identifying: the pane id
+// is unique on its tmux server. A pane's session name can change under a live
+// seat (a grouped viewer session was recorded before the home-session rule, the
+// session was renamed, or a client recovered the pane but not the session), so
+// an occupant keyed under another session of the SAME pane id is the same seat.
+// Those rows are matched by pane id here and merged; the caller then rewrites
+// the survivor's key. A different tty proves a different pane (another tmux
+// server reusing the id), so the caller filters on tty for those rows.
+//
 // Ordered exact-repo-first, then newest: the surviving id is the one most
 // recently advertised to the fleet, so the fewest senders hold a stale reference.
 const selectSeatOccupants = db.prepare(`
-  SELECT id, pid, seat_pids, token, client_type, last_seen, thread_id FROM peers
+  SELECT id, pid, seat_pids, token, client_type, last_seen, thread_id, seat_key, tty FROM peers
   WHERE non_targetable = 0
-    AND seat_key = ?1
+    AND (seat_key = ?1 OR (?5 IS NOT NULL AND tmux_pane_id = ?5 AND seat_key LIKE 'pane:%'))
     AND cwd = ?2
     AND (git_root = ?3 OR git_root IS NULL)
     AND (thread_id IS NULL OR lower(thread_id) = lower(?4))
@@ -1677,13 +1686,18 @@ function handleRegister(body: RegisterRequest): RegisterResult {
       body.cwd,
       body.git_root,
       body.thread_id ?? null,
+      seatKey.startsWith("pane:") ? body.tmux_pane_id ?? null : null,
     ) as Array<{
       id: string; pid: number; seat_pids: string | null; token: string | null; client_type: ClientType | null; last_seen: string; thread_id: string | null;
+      seat_key: string | null; tty: string | null;
     }>)
       // A row whose last_seen is unparseable is untrustworthy state, not a seat
       // to adopt — the same judgement rehydration makes.
       .filter((o) => Number.isFinite(new Date(o.last_seen).getTime())
-        && registrationThreadCompatible(o.thread_id, body.thread_id));
+        && registrationThreadCompatible(o.thread_id, body.thread_id)
+        // Same pane id under another session prefix: one pane only while no
+        // tty says otherwise.
+        && (o.seat_key === seatKey || ttyCompatibleForSamePid(o.tty, body.tty)));
     // A seat hosts one agent at a time, but which software occupies it can
     // change (a pane that ran codex yesterday runs claude today). Only merge
     // rows whose client is compatible — an unknown-typed row is compatible with

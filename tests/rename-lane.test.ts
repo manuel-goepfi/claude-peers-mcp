@@ -16,6 +16,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startTestBroker, type TestBroker } from "./helpers/test-broker.ts";
+import { claimPaneSeatName, ensurePaneOperatorLabel } from "../bin/tmux-label-pane.ts";
 
 describe("/set-name-by-pid", () => {
   let broker: TestBroker;
@@ -212,5 +213,27 @@ describe.skipIf(!Bun.which("tmux") || !Bun.which("flock"))("rename-lane on a scr
     expect(free.code).toBe(0);
     expect(seatName(paneB)).toBe("Orch.160");
     expect(seatName(paneA)).toBe("Orch.135");
+
+    // 4. The explicit name is the seat's routing name. An ordinal-shaped name
+    //    (Role.1 in session Orch) must not be mapped onto the session (Orch.1)
+    //    as if the border had been hand-set.
+    const role = await renameInB("Role.1");
+    expect(role.code).toBe(0);
+    expect(seatName(paneB)).toBe("Role.1");
+    // Every read and write goes to the scratch server, never the caller's.
+    const scratchRun = (args: string[]) => {
+      const result = Bun.spawnSync(["tmux", "-S", socket, ...args], { env, stdout: "pipe", stderr: "ignore", timeout: 3000 });
+      return { ok: result.exitCode === 0, out: new TextDecoder().decode(result.stdout) };
+    };
+    const label = ensurePaneOperatorLabel(paneB, scratchRun, socket);
+    expect(label).toEqual({ status: "preserved", label: "Role.1" });
+
+    // 5. Clearing the name clears it from the border too.
+    const released = claimPaneSeatName(paneB, "", scratchRun, socket);
+    expect(released.status).toBe("released");
+    expect(seatName(paneB)).toBe("");
+    const border = Bun.spawnSync(["tmux", "-S", socket, "show-options", "-p", "-t", paneB, "-v", "@operator_label"], { env, stdout: "pipe", stderr: "ignore" });
+    expect(border.stdout.toString().trim()).not.toBe("Role.1");
+    expect(border.stdout.toString().trim()).toMatch(/^Orch\.[0-9]+$/);
   }, 60_000);
 });

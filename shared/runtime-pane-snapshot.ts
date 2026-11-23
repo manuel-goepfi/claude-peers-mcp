@@ -18,7 +18,7 @@ const paneReads = new Map<string, Promise<Map<string, string> | null>>();
 // The first five fields are the proof row; the session fields after them only
 // rank the sessions a grouped window is listed under (once per session).
 const RUNTIME_PANE_FORMAT =
-  `#{pid}\t#{pane_pid}\t#{pane_id}\t#{session_id}\t#{session_name}\t#{session_grouped}\t#{session_group}\t#{session_created}\t#{destroy-unattached}`;
+  `#{pid}\t#{pane_pid}\t#{pane_id}\t#{session_id}\t#{session_name}\t#{session_grouped}\t#{session_group}\t#{session_created}\t#{destroy-unattached}\t#{window_linked_sessions}`;
 
 function paneRows(output: string | null): Map<string, string> | null {
   if (output === null) return null;
