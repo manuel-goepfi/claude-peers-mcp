@@ -24,6 +24,12 @@
  *   3. the oldest session (`session_created`, then the lower `$id`, which tmux
  *      allocates in creation order).
  * A pane in exactly one session is unaffected.
+ *
+ * Every path must agree, whether it starts from `list-panes -a` (every
+ * session listed) or from `display-message` (one session, tmux's pick). The
+ * display paths re-read `list-panes -a` whenever the displayed session may
+ * not be the home: a viewer, a grouped session other than the group's
+ * original, or a window also linked into another session (`link-window`).
  */
 
 /** Fields appended after `#{session_name}` to rank a pane's sessions. */
@@ -33,8 +39,13 @@ export const HOME_SESSION_FIELDS = [
   "#{session_group}",
   "#{session_created}",
   "#{destroy-unattached}",
+  "#{window_linked_sessions}",
 ].join("\t");
 
+/**
+ * Fields {@link parseSessionCandidate} requires. The sixth,
+ * `window_linked_sessions`, is optional so five-field rows still rank.
+ */
 export const HOME_SESSION_FIELD_COUNT = 5;
 
 /** `list-panes -a` format for {@link resolvePaneHomeSession}. */
@@ -50,6 +61,12 @@ export interface SessionCandidate {
   created: number;
   /** `destroy-unattached` is set to anything other than off. */
   viewer: boolean;
+  /**
+   * The window is also linked into another session (or session group) with
+   * `link-window`. A session group counts once, so grouping alone leaves this
+   * false.
+   */
+  linked: boolean;
 }
 
 /**
@@ -59,7 +76,7 @@ export interface SessionCandidate {
  */
 export function parseSessionCandidate(name: string, fields: readonly string[]): SessionCandidate | null {
   if (!name || fields.length < HOME_SESSION_FIELD_COUNT) return null;
-  const [id = "", grouped = "", group = "", created = "", destroyUnattached = ""] = fields;
+  const [id = "", grouped = "", group = "", created = "", destroyUnattached = "", linkedSessions = ""] = fields;
   const destroy = destroyUnattached.trim().toLowerCase();
   return {
     id: /^\$\d+$/.test(id) ? id : "",
@@ -68,6 +85,7 @@ export function parseSessionCandidate(name: string, fields: readonly string[]): 
     group: grouped === "1" ? group : "",
     created: /^\d+$/.test(created) ? Number(created) : Number.NaN,
     viewer: destroy !== "" && destroy !== "off" && destroy !== "0",
+    linked: /^\d+$/.test(linkedSessions) && Number(linkedSessions) > 1,
   };
 }
 
@@ -100,11 +118,14 @@ export function chooseHomeSession(candidates: readonly SessionCandidate[]): Sess
 
 /**
  * Could `candidate` be a session other than the pane's home? False for an
- * ungrouped session and for a group's original, so the common case needs no
- * further tmux read.
+ * ungrouped session and for a group's original whose window is in no other
+ * session, so the common case needs no further tmux read. A linked window is
+ * listed under every session it is in, and `display-message` names whichever
+ * tmux picks (an attached or the most recent session), so it is re-ranked.
  */
 export function mayBeForeignSession(candidate: SessionCandidate | null): boolean {
-  return candidate !== null && (candidate.viewer || (candidate.grouped && candidate.name !== candidate.group));
+  return candidate !== null
+    && (candidate.viewer || candidate.linked || (candidate.grouped && candidate.name !== candidate.group));
 }
 
 /**

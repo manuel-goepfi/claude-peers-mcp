@@ -118,10 +118,19 @@ describe("auto labels use the home session, not the viewer", () => {
     const tmux = groupedTmux();
     const base = tmux.run;
     const run: TmuxLabelRunner = (args) => args[0] === "display-message" && !args.at(-1)!.includes("#{socket_path}")
-      ? { ok: true, out: ["%3", "viewer-3-abc", "2", "lane", "2", "orchestrator", "", "orchestrator", "", ...VIEWER].join("\t") }
+      ? { ok: true, out: ["%3", "viewer-3-abc", "2", "lane", "2", "orchestrator", "", "", "", ...VIEWER].join("\t") }
       : base(args);
     expect(ensurePaneOperatorLabel("%3", run)).toEqual({ status: "preserved", label: "orchestrator", name: "work.2" });
     expect(tmux.calls.flat().some((arg) => arg.includes("viewer-3-abc"))).toBe(false);
+  });
+
+  test("an explicit seat name routes the seat even when its border reads as hand-set", () => {
+    const tmux = groupedTmux();
+    const base = tmux.run;
+    const run: TmuxLabelRunner = (args) => args[0] === "display-message" && !args.at(-1)!.includes("#{socket_path}")
+      ? { ok: true, out: ["%3", "viewer-3-abc", "2", "lane", "2", "orchestrator", "", "orchestrator", "", ...VIEWER].join("\t") }
+      : base(args);
+    expect(ensurePaneOperatorLabel("%3", run)).toEqual({ status: "preserved", label: "orchestrator" });
   });
 
   test("labelling a viewer session's panes writes home-session labels only", () => {

@@ -542,6 +542,48 @@ fi
     expect(existsSync(join(root, ".codex", "logs", "codex-seat-2432.app-server.log"))).toBe(true);
   });
 
+  test("an explicit pane seat name outranks the border label and an inherited name", () => {
+    const { root, state, fakeCodex } = fixture();
+    const bin = join(root, "bin");
+    Bun.spawnSync(["mkdir", "-p", bin]);
+    const fakeTmux = join(bin, "tmux");
+    writeFileSync(fakeTmux, `#!/usr/bin/env bash
+set -euo pipefail
+if [[ "\${1:-}" == "show-options" ]]; then
+  case "\${*: -1}" in
+    @peer_seat_name) printf 'role.7\\n' ;;
+    @operator_label) printf 'orch.5\\n' ;;
+    @peer_resolved_name) printf 'orch.5\\n' ;;
+  esac
+  exit 0
+fi
+if [[ "\${1:-}" == "display-message" ]]; then
+  case "\${*: -1}" in
+    '#S') printf 'orch\\n' ;;
+  esac
+fi
+`);
+    chmodSync(fakeTmux, 0o755);
+    const result = Bun.spawnSync([LAUNCHER, "resume"], {
+      env: {
+        PATH: `${bin}:${process.env.PATH ?? ""}`,
+        HOME: root,
+        CODEX_HOME: join(root, ".codex"),
+        CLAUDE_PEERS_REAL_CODEX: fakeCodex,
+        CLAUDE_PEERS_CODEX_SEAT_PORT: String(freePort()),
+        CLAUDE_PEER_NAME: "orch.4",
+        TMUX_PANE: "%2433",
+        FAKE_CODEX_STATE: state,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(readFileSync(join(state, "app.env"), "utf8")).toBe("name=role.7\npane=%2433\n");
+    expect(readFileSync(join(state, "tui.env"), "utf8")).toBe("name=role.7\npane=%2433\n");
+  });
+
   test("supplies the launcher cwd as --cd, because wrapping always adds --remote", () => {
     // A remote workspace does not inherit the launching cwd, and the launcher
     // adds --remote on every wrap. Two things broke without this: `codex resume`
