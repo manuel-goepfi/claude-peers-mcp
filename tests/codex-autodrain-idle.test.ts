@@ -1430,10 +1430,10 @@ describe("nudge wording is a compact queue notification", () => {
     expect(nudgeText(cursorLane(1) as never)).not.toContain("unread peer");
     expect(nudgeText(cursorLane(3) as never)).not.toContain("unread peer");
   });
-  // 200, not 180, since 2026-11-26: the nudge also says how much to tell the user.
+  // 220, not 180, since 2026-11-26: the nudge also says what to tell the user.
   test("stays short enough to scan as a wake-up notice", () => {
-    expect(nudgeText(laneWith(2) as never).length).toBeLessThanOrEqual(200);
-    expect(nudgeText(cursorLane(2) as never).length).toBeLessThanOrEqual(200);
+    expect(nudgeText(laneWith(2) as never).length).toBeLessThanOrEqual(220);
+    expect(nudgeText(cursorLane(2) as never).length).toBeLessThanOrEqual(220);
   });
   test("does not duplicate the attached batch policy", () => {
     const t = nudgeText(laneWith(2) as never).toLowerCase();
@@ -1464,7 +1464,7 @@ describe("nudge wording is safe across receive-path changes", () => {
     ["gemini", { ...laneWith(2), client_type: "gemini", receiver_mode: "gemini-hook" }],
   ])("%s hook wake prioritizes the attached body", (_label, lane) => {
     const t = nudgeText(lane as never);
-    expect(t).toBe("[peer-mail] Process the attached peer messages. If none are attached, fetch pending mail with check_messages. Continue the work. Tell the user one line; more if they must act; skip pure acks.");
+    expect(t).toBe("[peer-mail] Process the attached peer messages. If none are attached, fetch pending mail with check_messages. Continue the work. Tell the user who wrote, what you did, what's next or needed from them; skip acks.");
     expect(t).toContain("If none are attached, fetch pending mail with check_messages.");
     expect(t).not.toContain("authority");
   });
@@ -1484,7 +1484,7 @@ describe("nudge wording is safe across receive-path changes", () => {
   test("an idle hook asks for a drain only when no message was attached", () => {
     const lane = { ...laneWith(2), last_hook_seen_at: "2020-01-01T00:00:00.000Z" };
     const t = nudgeText(lane as never);
-    expect(t).toBe("[peer-mail] Process the attached peer messages. If none are attached, fetch pending mail with check_messages. Continue the work. Tell the user one line; more if they must act; skip pure acks.");
+    expect(t).toBe("[peer-mail] Process the attached peer messages. If none are attached, fetch pending mail with check_messages. Continue the work. Tell the user who wrote, what you did, what's next or needed from them; skip acks.");
     expect(t).not.toContain("unread peer");
   });
 
@@ -1526,7 +1526,7 @@ describe("Codex wake-only delivery", () => {
 
     expect(result).toBe("submitted");
     expect(submissions).toEqual([{ paneId: "%42", text: nudgeText(lane as never) }]);
-    expect(submissions[0]!.text).toBe("[peer-mail] Process the attached peer messages. If none are attached, fetch pending mail with check_messages. Continue the work. Tell the user one line; more if they must act; skip pure acks.");
+    expect(submissions[0]!.text).toBe("[peer-mail] Process the attached peer messages. If none are attached, fetch pending mail with check_messages. Continue the work. Tell the user who wrote, what you did, what's next or needed from them; skip acks.");
     expect(submissions[0]!.text).toContain("If none are attached, fetch pending mail with check_messages.");
     expect(submissions[0]!.text).not.toMatch(/<peer-message\s/);
   });
