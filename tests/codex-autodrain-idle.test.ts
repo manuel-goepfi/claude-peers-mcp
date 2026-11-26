@@ -1464,7 +1464,7 @@ describe("nudge wording is safe across receive-path changes", () => {
     ["gemini", { ...laneWith(2), client_type: "gemini", receiver_mode: "gemini-hook" }],
   ])("%s hook wake prioritizes the attached body", (_label, lane) => {
     const t = nudgeText(lane as never);
-    expect(t).toBe("[peer-mail] Process the attached peer messages. If none are attached, fetch pending mail with check_messages. Continue the work. Tell the user who wrote, what you did, what's next or needed from them; skip acks.");
+    expect(t).toBe("[peer-mail] Process the attached peer messages. If none are attached, fetch pending mail with check_messages. Continue the work. Then report to the user as you normally would.");
     expect(t).toContain("If none are attached, fetch pending mail with check_messages.");
     expect(t).not.toContain("authority");
   });
@@ -1484,7 +1484,7 @@ describe("nudge wording is safe across receive-path changes", () => {
   test("an idle hook asks for a drain only when no message was attached", () => {
     const lane = { ...laneWith(2), last_hook_seen_at: "2020-01-01T00:00:00.000Z" };
     const t = nudgeText(lane as never);
-    expect(t).toBe("[peer-mail] Process the attached peer messages. If none are attached, fetch pending mail with check_messages. Continue the work. Tell the user who wrote, what you did, what's next or needed from them; skip acks.");
+    expect(t).toBe("[peer-mail] Process the attached peer messages. If none are attached, fetch pending mail with check_messages. Continue the work. Then report to the user as you normally would.");
     expect(t).not.toContain("unread peer");
   });
 
@@ -1526,7 +1526,7 @@ describe("Codex wake-only delivery", () => {
 
     expect(result).toBe("submitted");
     expect(submissions).toEqual([{ paneId: "%42", text: nudgeText(lane as never) }]);
-    expect(submissions[0]!.text).toBe("[peer-mail] Process the attached peer messages. If none are attached, fetch pending mail with check_messages. Continue the work. Tell the user who wrote, what you did, what's next or needed from them; skip acks.");
+    expect(submissions[0]!.text).toBe("[peer-mail] Process the attached peer messages. If none are attached, fetch pending mail with check_messages. Continue the work. Then report to the user as you normally would.");
     expect(submissions[0]!.text).toContain("If none are attached, fetch pending mail with check_messages.");
     expect(submissions[0]!.text).not.toMatch(/<peer-message\s/);
   });

@@ -226,7 +226,7 @@ describe("codex nudge text", () => {
       nudgeText(hook("claude", "claude-channel")),
       nudgeText(hook("gemini", "gemini-hook")),
     ]) {
-      expect(text).toBe("[peer-mail] Process the attached peer messages. If none are attached, fetch pending mail with check_messages. Continue the work. Tell the user who wrote, what you did, what's next or needed from them; skip acks.");
+      expect(text).toBe("[peer-mail] Process the attached peer messages. If none are attached, fetch pending mail with check_messages. Continue the work. Then report to the user as you normally would.");
       expect(text).toContain("If none are attached, fetch pending mail with check_messages.");
       expect(text).not.toContain("Transport closed");
       expect(text).not.toContain("UNVERIFIABLE");
@@ -236,10 +236,10 @@ describe("codex nudge text", () => {
 
   test("manual-drain lanes fetch pending mail when no attachments are present", () => {
     expect(nudgeText(manual(1, "cursor"))).toBe(
-      "[peer-mail] Process the attached peer messages. If none are attached, fetch pending mail with check_messages. Continue the work. Tell the user who wrote, what you did, what's next or needed from them; skip acks.",
+      "[peer-mail] Process the attached peer messages. If none are attached, fetch pending mail with check_messages. Continue the work. Then report to the user as you normally would.",
     );
     expect(nudgeText(manual(2, "kimi"))).toBe(
-      "[peer-mail] Process the attached peer messages. If none are attached, fetch pending mail with check_messages. Continue the work. Tell the user who wrote, what you did, what's next or needed from them; skip acks.",
+      "[peer-mail] Process the attached peer messages. If none are attached, fetch pending mail with check_messages. Continue the work. Then report to the user as you normally would.",
     );
     expect(nudgeText(manual(1, "codex"))).toContain("If none are attached, fetch pending mail with check_messages.");
   });

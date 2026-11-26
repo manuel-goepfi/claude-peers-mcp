@@ -337,7 +337,7 @@ while kill -0 "$CLAUDE_PID" 2>/dev/null; do
         if [[ "$WAKE_MODE" == "auto" ]]; then
           printf 'Peer mail arrived while idle. %s message(s) drained:\n\n%s\n\nAutonomous mode is enabled by the peer summary. Follow the user\x27s standing scope and normal safety rules.\n' "$COUNT" "$BLOCKS" >&2
         else
-          printf 'Peer mail arrived while idle. %s message(s) drained:\n\n%s\n\nHandle it. Then report to the user: say nothing for a pure acknowledgement or a repeat of something already reported, one line for progress (what arrived and what you did), and plain detail for a finding, decision, question, failure or change to their work. Tell the user before any new action that expands the current task.\n' "$COUNT" "$BLOCKS" >&2
+          printf 'Peer mail arrived while idle. %s message(s) drained:\n\n%s\n\nHandle it. Then report to the user as you normally would. Tell the user before any new action that expands the current task.\n' "$COUNT" "$BLOCKS" >&2
         fi
         if settle_claim ack && [[ "$SETTLE_STATUS" != "200" || "$SETTLE_COUNT" != "$COUNT" ]]; then
           printf '%s status=%s requested=%s acked=%s\n' "$(date -Iseconds)" "${SETTLE_STATUS:-curl_failed}" "$COUNT" "$SETTLE_COUNT" >> "$STANDBY_LOG" 2>/dev/null
