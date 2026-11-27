@@ -12,12 +12,16 @@
 #   - it moves only by fast-forward of <remote>/<branch>;
 #   - it restarts the managed broker only when broker-side code changed, waits
 #     for /health ready, and returns the clone to the old commit if it is not;
+#   - it restarts the managed nudger (the autodrain poller) when its code
+#     changed, after the poller finishes its current tick, and returns the clone
+#     to the old commit if the new poller never writes a heartbeat;
 #   - it prints the exact rollback and logs every deploy.
 #
 # Usage: bin/deploy-live [--dry-run] [--remote NAME] [--branch NAME]
 # Environment (tests): CLAUDE_PEERS_DEPLOY_SYSTEMCTL, CLAUDE_PEERS_DEPLOY_BUN,
 # CLAUDE_PEERS_DEPLOY_HEALTH_URL, CLAUDE_PEERS_DEPLOY_LOG,
-# CLAUDE_PEERS_DEPLOY_READY_SECONDS.
+# CLAUDE_PEERS_DEPLOY_READY_SECONDS, CLAUDE_PEERS_DEPLOY_POLLER_HEARTBEAT,
+# CLAUDE_PEERS_DEPLOY_POLLER_IDLE_SECONDS.
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -25,18 +29,21 @@ DRY_RUN=0
 REMOTE=""
 BRANCH="main"
 UNIT="claude-peers-broker.service"
+POLLER_UNIT="claude-peers-codex-autodrain.service"
 SYSTEMCTL="${CLAUDE_PEERS_DEPLOY_SYSTEMCTL:-systemctl}"
 BUN="${CLAUDE_PEERS_DEPLOY_BUN:-bun}"
 HEALTH_URL="${CLAUDE_PEERS_DEPLOY_HEALTH_URL:-http://127.0.0.1:${CLAUDE_PEERS_PORT:-7899}/health}"
 LOG="${CLAUDE_PEERS_DEPLOY_LOG:-${XDG_STATE_HOME:-$HOME/.local/state}/claude-peers/deploys.log}"
 READY_SECONDS="${CLAUDE_PEERS_DEPLOY_READY_SECONDS:-30}"
+POLLER_HEARTBEAT="${CLAUDE_PEERS_DEPLOY_POLLER_HEARTBEAT:-${CLAUDE_PEERS_AUTODRAIN_HEARTBEAT:-$HOME/.claude-peers-autodrain.heartbeat}}"
+POLLER_IDLE_SECONDS="${CLAUDE_PEERS_DEPLOY_POLLER_IDLE_SECONDS:-15}"
 
 while (($#)); do
   case "$1" in
     --dry-run) DRY_RUN=1 ;;
     --remote) REMOTE="${2:?--remote needs a name}"; shift ;;
     --branch) BRANCH="${2:?--branch needs a name}"; shift ;;
-    -h|--help) sed -n '2,19p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,23p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "deploy-live: unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
@@ -82,27 +89,37 @@ fi
 git_ merge-base --is-ancestor "$OLD" "$NEW" || die "$REMOTE/$BRANCH is not a fast-forward of HEAD; refusing"
 
 CHANGED=$(git_ diff --name-only "$OLD" "$NEW")
-needs_broker=0; needs_deps=0; touches_adapter=0; touches_hook_config=0
+needs_broker=0; needs_deps=0; needs_poller=0; touches_adapter=0; touches_hook_config=0
 while IFS= read -r f; do
   case "$f" in broker.ts|shared/*) needs_broker=1 ;; esac
   case "$f" in package.json|bun.lock) needs_deps=1; needs_broker=1 ;; esac
+  # The poller imports shared/ and reads its code once at start; a running
+  # poller keeps the old code until it is restarted (2026-11-19..23: four days).
+  case "$f" in bin/codex-autodrain-poller.ts|shared/*|package.json|bun.lock) needs_poller=1 ;; esac
   case "$f" in server.ts|shared/*) touches_adapter=1 ;; esac
   case "$f" in shared/hook-config.ts) touches_hook_config=1 ;; esac
 done <<<"$CHANGED"
 
 managed=0
 if [[ "$needs_broker" == 1 ]] && "$SYSTEMCTL" --user is-active --quiet "$UNIT" 2>/dev/null; then managed=1; fi
+poller_managed=0
+if [[ "$needs_poller" == 1 ]] && "$SYSTEMCTL" --user is-active --quiet "$POLLER_UNIT" 2>/dev/null; then poller_managed=1; fi
 
 short_old=$(git_ rev-parse --short "$OLD"); short_new=$(git_ rev-parse --short "$NEW")
 echo "deploy-live: $short_old -> $short_new ($(wc -l <<<"$CHANGED" | tr -d ' ') files)"
 restart_plan=no
 if [[ "$managed" == 1 ]]; then restart_plan=yes
 elif [[ "$needs_broker" == 1 ]]; then restart_plan="needed, but $UNIT is not active"; fi
+poller_plan=no
+if [[ "$poller_managed" == 1 ]]; then poller_plan=yes
+elif [[ "$needs_poller" == 1 ]]; then poller_plan="needed, but $POLLER_UNIT is not active"; fi
 deps_plan=unchanged
 if [[ "$needs_deps" == 1 ]]; then deps_plan="bun install --frozen-lockfile"; fi
 ROLLBACK="git -C $ROOT reset --keep $short_old"
 if [[ "$managed" == 1 ]]; then ROLLBACK+=" && $SYSTEMCTL --user restart $UNIT"; fi
+if [[ "$poller_managed" == 1 ]]; then ROLLBACK+=" && $SYSTEMCTL --user restart $POLLER_UNIT"; fi
 echo "  broker restart: $restart_plan"
+echo "  nudger restart: $poller_plan"
 echo "  dependencies:   $deps_plan"
 echo "  rollback:       $ROLLBACK"
 if [[ "$DRY_RUN" == 1 ]]; then
@@ -119,6 +136,39 @@ wait_ready() {
   return 1
 }
 
+# Restart the poller between ticks, so a wake that is being typed into a pane
+# is never cut before its Enter. A stage that stays busy past the bound means a
+# wedged poller, which a restart is the right answer to anyway.
+wait_poller_idle() {
+  local i
+  for ((i = 0; i < POLLER_IDLE_SECONDS; i++)); do
+    [[ -f "$POLLER_HEARTBEAT.stage" ]] || return 0
+    grep -q '"stage":"idle"' "$POLLER_HEARTBEAT.stage" 2>/dev/null && return 0
+    sleep 1
+  done
+  echo "  note: nudger still busy after ${POLLER_IDLE_SECONDS}s; restarting it anyway" >&2
+}
+
+# The new poller is up once it writes a heartbeat after the restart.
+wait_poller_ready() {
+  local since="$1" i
+  for ((i = 0; i < READY_SECONDS; i++)); do
+    if "$SYSTEMCTL" --user is-active --quiet "$POLLER_UNIT" 2>/dev/null \
+       && [[ -f "$POLLER_HEARTBEAT" ]] && (( $(stat -c %Y "$POLLER_HEARTBEAT" 2>/dev/null || echo 0) >= since )); then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+restart_poller() {
+  local since
+  wait_poller_idle
+  since=$(date +%s)
+  "$SYSTEMCTL" --user restart "$POLLER_UNIT" && wait_poller_ready "$since"
+}
+
 git_ merge --ff-only --quiet "$NEW"
 if [[ "$needs_deps" == 1 ]]; then
   (cd "$ROOT" && "$BUN" install --frozen-lockfile) || { git_ reset --keep "$OLD"; die "bun install failed; returned to $short_old"; }
@@ -132,11 +182,19 @@ if [[ "$managed" == 1 ]]; then
     status="rolled-back"
   fi
 fi
+if [[ "$status" == ok && "$poller_managed" == 1 ]]; then
+  if ! restart_poller; then
+    git_ reset --keep "$OLD"
+    if [[ "$managed" == 1 ]]; then "$SYSTEMCTL" --user restart "$UNIT" || true; fi
+    "$SYSTEMCTL" --user restart "$POLLER_UNIT" || true
+    status="rolled-back"
+  fi
+fi
 
 mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
-printf '%s %s %s..%s broker_restart=%s status=%s\n' "$(date -Iseconds)" "$BRANCH" "$short_old" "$short_new" "$managed" "$status" >>"$LOG" 2>/dev/null || true
+printf '%s %s %s..%s broker_restart=%s poller_restart=%s status=%s\n' "$(date -Iseconds)" "$BRANCH" "$short_old" "$short_new" "$managed" "$poller_managed" "$status" >>"$LOG" 2>/dev/null || true
 
-[[ "$status" == ok ]] || die "broker did not report ready within ${READY_SECONDS}s; returned to $short_old and restarted it"
+[[ "$status" == ok ]] || die "broker or nudger did not report ready within ${READY_SECONDS}s; returned to $short_old and restarted it"
 echo "deploy-live: now at $short_new"
 if [[ "$touches_adapter" == 1 ]]; then echo "  note: running MCP adapters keep their old code until each client session restarts"; fi
 if [[ "$touches_hook_config" == 1 ]]; then echo "  note: canonical hooks changed; run the hook installers with --check for each profile"; fi
