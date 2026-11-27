@@ -337,6 +337,13 @@ const nudgeEpisode = new Map<string, number>(); // peer id -> broker-authored un
 const unreadyCodexWakeWarned = new Set<string>(); // avoid logging the same bad identity every tick
 const legacyCodexWakeWarned = new Set<string>(); // compatibility metadata is visible once, without log spam
 const wakeHeldLogged = new Set<string>(); // one log line per held batch, not one per tick
+// A lane with unread mail whose pane never reads as idle is skipped every tick.
+// That skip was silent, so a lane parked on a blocking screen (an agy quota
+// error with its feedback survey, 2026-11-23: 9 messages for over an hour) looked
+// exactly like a lane that was being served. Log once per stretch instead.
+const notIdleSince = new Map<string, number>(); // peer id -> first tick its pane read busy
+const notIdleWarned = new Set<string>();
+const STUCK_WAKE_WARN_MS = envMs("CLAUDE_PEERS_STUCK_WAKE_WARN_MS", 600_000);
 let nudgeBudgetPersistencePath: string | null = null;
 let nudgeBudgetPersistenceHealthy = true;
 
@@ -904,6 +911,28 @@ export function everyVisibleCharIsDim(s: string): boolean {
     i++;
   }
   return sawVisible;                    // all visible chars were dim (placeholder)
+}
+
+/**
+ * Names what is holding a pane that the idle check keeps rejecting, from a
+ * capture of its screen. Known blockers are named; otherwise the last visible
+ * line is quoted so the log still says what the pane shows.
+ */
+export function blockedScreenReason(capture: string): string {
+  const lines = stripAnsi(capture).split("\n").filter((l) => l.trim() !== "");
+  const tail = lines.slice(-BUSY_TAIL_LINES).join("\n");
+  const reasons: string[] = [];
+  if (/quota reached|usage limit|rate limit/i.test(tail)) reasons.push("quota reached");
+  if (/How.s the CLI experience|\[0\] Skip/.test(tail)) reasons.push("feedback survey");
+  if (/UNAUTHENTICATED|\b401\b/.test(tail)) reasons.push("authentication error");
+  if (reasons.length > 0) return reasons.join(", ");
+  const last = (lines.at(-1) ?? "").trim().slice(0, 120);
+  return last ? `last line: ${JSON.stringify(last)}` : "empty screen";
+}
+
+function capturePaneText(paneId: string): string {
+  const { ok, out } = sh(["tmux", "capture-pane", "-p", "-t", paneId, "-S", "-15"]);
+  return ok ? out : "";
 }
 
 function paneIsIdle(paneId: string, profile: IdleProfile): boolean {
@@ -1605,6 +1634,8 @@ export function __resetNudgeBudgetStateForTest(): void {
   nudgeAttempts.clear();
   lastNudge.clear();
   nudgeEpisode.clear();
+  notIdleSince.clear();
+  notIdleWarned.clear();
   nudgeBudgetPersistencePath = null;
   nudgeBudgetPersistenceHealthy = true;
 }
@@ -1627,6 +1658,9 @@ export interface TickDeps {
   isPidAlive?: (pid: number) => boolean;
   paneIsIdle?: (paneId: string, profile: IdleProfile) => boolean;
   paneIsInCopyMode?: (paneId: string) => boolean;
+  capturePane?: (paneId: string) => string;
+  log?: (msg: string) => void;
+  stuckWakeWarnMs?: number;
   nudgeLane?: (lane: Lane, paneId: string) => WakeOnlyNudgeResult;
   wakeBatchMs?: number;
   now?: () => number;
@@ -1725,6 +1759,8 @@ export function tick(db: Database, snapOverride?: TickSnapshot, deps: TickDeps =
   for (const id of unreadyCodexWakeWarned) if (!active.has(id)) unreadyCodexWakeWarned.delete(id);
   for (const id of legacyCodexWakeWarned) if (!active.has(id)) legacyCodexWakeWarned.delete(id);
   for (const id of wakeHeldLogged) if (!active.has(id)) wakeHeldLogged.delete(id);
+  for (const id of notIdleSince.keys()) if (!active.has(id)) notIdleSince.delete(id);
+  for (const id of notIdleWarned) if (!active.has(id)) notIdleWarned.delete(id);
   for (const id of paneCache.keys()) if (!active.has(id)) paneCache.delete(id);
   if (lanes.length === 0) return;
 
@@ -1810,7 +1846,19 @@ export function tick(db: Database, snapOverride?: TickSnapshot, deps: TickDeps =
       const owned = attachId ? paneOwnedByAttachId(paneId, attachId, snap) : paneOwnedByPid(paneId, lane.pid, snap);
       if (!owned) { paneCache.delete(lane.id); continue; }       // pane gone/reused → drop cache
       const laneProfile = profileFor(lane.client_type);
-      if (!(deps.paneIsIdle ?? paneIsIdle)(paneId, laneProfile)) continue; // busy or has queued input — never disturb
+      if (!(deps.paneIsIdle ?? paneIsIdle)(paneId, laneProfile)) {  // busy or has queued input — never disturb
+        const now = clock();
+        const first = notIdleSince.get(lane.id) ?? now;
+        notIdleSince.set(lane.id, first);
+        if (now - first >= (deps.stuckWakeWarnMs ?? STUCK_WAKE_WARN_MS) && !notIdleWarned.has(lane.id)) {
+          notIdleWarned.add(lane.id);
+          const reason = blockedScreenReason((deps.capturePane ?? capturePaneText)(paneId));
+          (deps.log ?? log)(`wake waiting on ${lane.name ?? "?"}/${lane.id} pane=${paneId}: ${lane.unread} unread, pane not idle for ${Math.round((now - first) / 60_000)}m (${reason})`);
+        }
+        continue;
+      }
+      notIdleSince.delete(lane.id);
+      notIdleWarned.delete(lane.id);
       // Busy vocabulary unknown for this client → require the pane to be unchanged
       // since last tick before typing into it.
       if (laneProfile.requiresQuiescence && !paneQuiescent(paneId)) continue;
